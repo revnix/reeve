@@ -129,7 +129,6 @@ export const GRANDFATHERED = [
   "test/provider-scheduler.test.mjs",
   "test/reconciler.test.mjs",
   "test/repair-message.test.mjs",
-  "test/repo-id-lookup.test.mjs",
   "test/required-evidence.test.mjs",
   "test/retry-brake.test.mjs",
   "test/review-body-findings.test.mjs",
@@ -1290,5 +1289,14 @@ export const STUBS = [
     edits: [{ file: "src/build/replay.mjs",
               find: "  \"project_identity.learned\": { table: \"project_identity\", key: [\"project\"] },",
               replace: "" }],
+  },
+  {
+    name: "repo-id-lookup-propagates-a-failed-query",
+    why: "swallow the lookup's query failure and answer null, which is the catch this file was written to remove. A structurally damaged hub -- one that records a completed migration but has lost the table, and still passes quick_check because the pages it does have are intact -- would then report `no repository id` on every tick. That is indistinguishable from a registered project with no work yet, which is an ORDINARY state, so the guardian skips the project, gate state ages into staleness, and the tick reports a clean pass over a repository it never looked at. The one failure a diagnostic must never render as a benign absence",
+    test: "test/repo-id-lookup.test.mjs",
+    expectRed: "a store that recorded a migration and lost `project_identity` PROPAGATES",
+    edits: [{ file: "src/build/repoid.mjs",
+              find: "  return hub.prepare(\n    `SELECT repo_id FROM project_identity WHERE project = ?`)\n    .get(project.name)?.repo_id ?? null;",
+              replace: "  try {\n    return hub.prepare(`SELECT repo_id FROM project_identity WHERE project = ?`)\n      .get(project.name)?.repo_id ?? null;\n  } catch { return null; }" }],
   },
 ];

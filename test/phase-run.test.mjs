@@ -31,8 +31,24 @@ const SNAP = { cliVersion: "1.2.3", modelId: "claude-fable-4-5-20260101", effort
                argvHash: "a".repeat(64), promptHash: "b".repeat(64), settingsHash: "c".repeat(64),
                toolsHash: "d".repeat(64), agentsHash: "e".repeat(64),
                maxTurns: 60, maxBudgetUsd: 5, canaryId: "canary-1", snapshotHash: "f".repeat(64) };
-const ins = (over = {}) => insertRun(db, { ...KEY, ...PATHS, snapshot: SNAP, drift: null,
-                                           startedAt: 1000, leaseSeconds: 400, isAlive: alive, ...over });
+// A STUB DOES NOT MAKE AN ASSERTION FAIL -- it usually makes a CALL THROW, and a
+// throw kills the whole file, so every assertion after it never runs and reads
+// in the log exactly like one that passed. Two entries in the manifest were
+// UNRUNNABLE for that reason before this existed.
+//
+// `ok: null` is neither true nor false, so whichever direction the consuming
+// assertion tests, it goes red rather than the file dying on the line above it.
+// `threw` is carried so a red says what happened instead of merely that it did.
+//
+// NOT APPLIED where the exception IS the subject: `bindRun` must throw, and the
+// assertion for that calls it directly inside its own try, because wrapping it
+// would report a fail-closed binding as having succeeded.
+const attempt = (fn) => {
+  try { return fn(); } catch (e) { return { ok: null, reason: null, threw: String(e.message) }; }
+};
+const ins = (over = {}) => attempt(() => insertRun(db, { ...KEY, ...PATHS, snapshot: SNAP, drift: null,
+                                           startedAt: 1000, leaseSeconds: 400, isAlive: alive, ...over }));
+const beat = (args) => attempt(() => heartbeatRun(db, args));
 
 // ── one live run per task, enforced by the index ─────────────────────────────
 {
@@ -79,14 +95,14 @@ const ins = (over = {}) => insertRun(db, { ...KEY, ...PATHS, snapshot: SNAP, dri
 
 // ── the heartbeat names its own cadence, and a beat for nothing is a refusal ──
 {
-  const h = heartbeatRun(db, { ...KEY, at: 1100, leaseSeconds: 400, isAlive: alive });
+  const h = beat({ ...KEY, at: 1100, leaseSeconds: 400, isAlive: alive });
   check(h.ok === true && h.expiresAt === 1500,
     "a heartbeat extends the lease from NOW, not from the run's start", JSON.stringify(h));
   check(h.beatEvery === 100,
     "and returns the cadence it must be called at, derived as lease/4 rather than configured twice",
     JSON.stringify(h));
 
-  const nothing = heartbeatRun(db, { ...KEY, attempt: 9, at: 1100, leaseSeconds: 400, isAlive: alive });
+  const nothing = beat({ ...KEY, attempt: 9, at: 1100, leaseSeconds: 400, isAlive: alive });
   check(nothing.ok === false && nothing.reason === "no-such-run",
     "a heartbeat for a run that does not exist is a refusal, never a silent no-op",
     JSON.stringify(nothing));

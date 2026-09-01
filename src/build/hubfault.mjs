@@ -84,13 +84,37 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
   // versions this binary knows cannot have been produced by migrating. It is
   // damage wearing a high number, and the healthy-ahead remedy below would tell
   // an operator not to restore the one kind of store that needs it.
-  if (hist.version > expect && hist.missing.length)
+  // `holed` AS WELL AS `missing`, because they answer different questions.
+  // `missing` is about the range this binary KNOWS -- 1 through `expect` -- and a
+  // history like [1,2,3,4,5,7] against expect 5 is missing none of it while
+  // skipping 6. `migrationStateOf` reports that as `holed`, and without this the
+  // store fell through to the healthy-ahead remedy and was told not to restore.
+  // The gap is above this binary's range, so this binary cannot say WHICH
+  // migration is absent -- but it can say the history is not one migrating
+  // produced, which is the part that decides the remedy.
+  if (hist.version > expect && (hist.missing.length || hist.holed))
     return { kind: "ahead-and-holed",
              detail: `it records version ${hist.version}, which is newer than the ${expect} this binary ` +
-                     `knows, AND is missing migration(s) ${hist.missing.join(", ")} below that. A ` +
-                     "forward-only history cannot be both, so this store has been altered outside reeve",
-             remedy: "restore a snapshot (`reeve restore --hub --force`); do not run a newer binary " +
-                     "against it, because the history it would read is not one migrating produced" };
+                     `knows, and its history is not contiguous` +
+                     (hist.missing.length ? ` (missing ${hist.missing.join(", ")} below that)` : "") +
+                     ". A forward-only history cannot be both, so this store has been altered outside reeve",
+             // A REMEDY THAT CAN ACTUALLY BE RUN, and the first version of this
+             // could not. `restoreHub` refuses a live hub whose recorded version
+             // exceeds this binary's BEFORE it takes the lock, and `--force` does
+             // not reach that check -- so `reeve restore --hub --force` answers
+             // "Upgrade reeve" and nothing is repaired. That is the second refusal
+             // this whole module exists to stop an operator walking into, written
+             // into the module by me.
+             //
+             // Upgrading does not help either: the newer binary reads the same
+             // non-contiguous history and refuses it for the same reason. The hub
+             // has to stop being the live hub before anything will touch it, so
+             // the remedy names the move, and the move keeps the file as evidence
+             // rather than deleting it.
+             remedy: "no binary will repair this in place: a restore refuses a store recording a " +
+                     "newer version, and a newer binary refuses a history with a gap. Stop the daemon, " +
+                     "move the hub aside (keep it -- it is the evidence), then `reeve restore --hub " +
+                     "--force` installs the newest usable snapshot in its place" };
 
   // NO SNAPSHOT REMEDY FOR A HEALTHY NEWER HUB, and this is the one case where
   // offering the usual repair is dangerous rather than merely unhelpful.

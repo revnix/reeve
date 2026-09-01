@@ -1871,8 +1871,8 @@ export const STUBS = [
     expectRed: "a refused send is not reported as paged",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "    if (result?.ok) return { why, count, kind, body: body ?? null, channels: result.channels ?? [] };",
-      replace: "    return { why, count, kind, body: body ?? null, channels: result?.channels ?? [] };",
+      find: "    if (result?.ok || accepted.length)",
+      replace: "    if (true)",
     }],
   },
 
@@ -1962,8 +1962,8 @@ export const STUBS = [
     expectRed: "and the rendered alert carries it, which is the only place a phone shows it",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "        `${action ? `\\n-> ${action}` : \"\"}`;",
-      replace: "        \"\";",
+      find: "        `${action ? `\\n-> ${action}` : \"\"}${detail}`;",
+      replace: "        `${detail}`;",
     }],
   },
   {
@@ -1975,6 +1975,40 @@ export const STUBS = [
       file: "bin/reeve",
       find: "    if (stray.length || positionals.length > 1)",
       replace: "    if (false)",
+    }],
+  },
+
+  {
+    name: "the-triage-command-names-the-actual-task",
+    why: "render the identity shape's action with its `<id>` placeholder intact. The alert then hands the founder a command they cannot paste — under a shell `<id>` is input redirection — and makes them reconstruct by hand the identifier the alert is already holding. An action that has to be edited before it can be run is not the single action the design requires; it is a hint",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "and no placeholder survives into something a founder is asked to run",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  return subject === null ? action : action.replaceAll(\"<id>\", subject);",
+      replace: "  return action;",
+    }],
+  },
+  {
+    name: "a-page-is-sent-as-an-interruption",
+    why: "send a page with no priority. `notify` falls back to \"default\" for an alert that names none, so the closed page list — the whole point of which is that these few identities interrupt a human — would deliver ordinary notifications indistinguishable from anything else. `buildAlert`, the existing escalation producer, sets \"high\" explicitly for exactly this reason",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a raised page names high priority, or `notify` falls back to default and the page list promises an interruption it does not deliver",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "        priority: isCleared ? \"default\" : \"high\",",
+      replace: "        priority: undefined,",
+    }],
+  },
+  {
+    name: "one-dead-channel-does-not-repage-the-live-one",
+    why: "treat `notify`'s aggregate ok:false as undelivered. It reports failure when ANY configured channel fails, while the healthy channel has already delivered — so the cause is never marked announced and the working channel is paged again on every pass until the broken one recovers. That is precisely the alert fatigue the closed page list exists to prevent, produced by the deduplication that exists to prevent it. Nothing accepted is still a refusal; the failed channel is not hidden, it rides on `channels`",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a page one channel accepted is paged, not declined",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    const accepted = (result?.channels ?? []).filter(c => c.ok);",
+      replace: "    const accepted = [];",
     }],
   },
 ];

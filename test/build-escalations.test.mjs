@@ -986,8 +986,20 @@ const freshHub = () => {
   check(Object.keys(ACTION_FOR).every(k => IDENTITY_SHAPES.includes(k)),
     "and the action map names no identity that does not exist",
     Object.keys(ACTION_FOR).filter(k => !IDENTITY_SHAPES.includes(k)).join(", "));
-  check(actionFor("bt:7:phase:blocked:RESEARCH") === ACTION_FOR["bt:<id>:phase:blocked:<phase>"],
-    "control: a concrete key resolves to its shape's action", String(actionFor("bt:7:phase:blocked:RESEARCH")));
+  // THE PLACEHOLDER IS REPLACED. The shapes carry `<id>` because they are
+  // shapes; an alert that says `reeve task why <id>` hands the founder a command
+  // they cannot paste -- under a shell `<id>` is input redirection -- and makes
+  // them reconstruct the identifier the alert is already holding.
+  check(actionFor("bt:7:phase:blocked:RESEARCH") ===
+        ACTION_FOR["bt:<id>:phase:blocked:<phase>"].replaceAll("<id>", "bt:7"),
+    "a concrete key resolves to its shape's action with the task substituted",
+    String(actionFor("bt:7:phase:blocked:RESEARCH")));
+  check(!/<id>/.test(actionFor("bt:7:phase:blocked:RESEARCH")),
+    "and no placeholder survives into something a founder is asked to run",
+    String(actionFor("bt:7:phase:blocked:RESEARCH")));
+  check(actionFor("builder:backup:failed") === ACTION_FOR["builder:backup:failed"],
+    "control: a process identity has no task to substitute and is unchanged",
+    String(actionFor("builder:backup:failed")));
   check(actionFor("bt:7:not:declared") === null,
     "and an undeclared key resolves to none rather than to something near it");
 
@@ -1029,6 +1041,100 @@ const freshHub = () => {
   // arrive, or an operator gets a clean message that says nothing.
   check(/line one/.test(msg) && /FAILED/.test(msg),
     "control: and the legitimate detail still arrives", JSON.stringify(msg));
+}
+
+
+// ── the action survives a body long enough to truncate ─────────────────────
+//
+// `redact` caps a message and truncates the TAIL. An action appended after an
+// externally supplied body is therefore the first thing a long CI error deletes,
+// producing an actionless alert for exactly the escalations whose detail is
+// longest — the ones a founder most needs a next step for.
+{
+  const hub = freshHub();
+  const sent = [];
+  const send = (a) => { sent.push(a); return { ok: true, channels: [{ name: "t", ok: true }] }; };
+  const key = escalationKey({ task: "bt:0C", kind: "phase:blocked", phase: "RESEARCH" });
+  const huge = body({ type: "FAILED", detail: "E".repeat(2000) });
+
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                  bodies: new Map([[key, huge]]) });
+  const msg = sent[0]?.message ?? "";
+  check(/truncated/.test(msg),
+    "control: the body really is long enough to be truncated", String(msg.length));
+  check(/reeve task why bt:0C/.test(msg),
+    "and the action still arrives, because it is above the detail rather than after it",
+    JSON.stringify(msg.slice(0, 200)));
+}
+
+// ── a page is sent as an interruption; a clearing is not ───────────────────
+{
+  const hub = freshHub();
+  const sent = [];
+  const send = (a) => { sent.push(a); return { ok: true, channels: [{ name: "t", ok: true }] }; };
+  const key = escalationKey({ task: "bt:0D", kind: "phase:blocked", phase: "SIZING" });
+
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send });
+  check(sent[0]?.priority === "high",
+    "a raised page names high priority, or `notify` falls back to default and the page " +
+    "list promises an interruption it does not deliver", JSON.stringify(sent[0]?.priority));
+
+  announce(hub, { escalations: new Map(), at: NOW + 60, isAlive: ALIVE, send,
+                  examined: new Set(["bt:0D"]) });
+  check(sent[1]?.kind === "cleared" && sent[1]?.priority === "default",
+    "and a clearing does not interrupt: there is nothing to do about a resolved cause",
+    JSON.stringify({ kind: sent[1]?.kind, priority: sent[1]?.priority }));
+}
+
+// ── one channel down does not re-page the one that works ───────────────────
+//
+// `notify` reports ok:false when ANY configured channel fails, while the healthy
+// one has already delivered. Treating that as undelivered re-pages the working
+// channel on every pass until the broken one recovers, which is the alert
+// fatigue the closed page list exists to prevent.
+{
+  const hub = freshHub();
+  const sent = [];
+  const partial = (a) => {
+    sent.push(a);
+    return { ok: false, why: "desktop: osascript is not on this host",
+             channels: [{ name: "ntfy", ok: true, ref: "ntfy:1" },
+                        { name: "desktop", ok: false, why: "osascript is not on this host" }] };
+  };
+  const key = escalationKey({ task: "bt:0A", kind: "phase:blocked", phase: "DESIGN" });
+
+  const first = announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                                send: partial });
+  check(first.paged.length === 1 && first.declined.length === 0,
+    "a page one channel accepted is paged, not declined", JSON.stringify(first.declined));
+  // OPTIONAL READS. The assertion above proves how many were paged; these must
+  // still RUN when that number is zero, or a stub that reclassifies a partial
+  // delivery kills the file instead of failing this line.
+  check(first.paged[0]?.partial === true,
+    "and is marked partial, so the failed channel is not hidden",
+    JSON.stringify(first.paged[0]?.partial ?? null));
+  check(first.paged[0]?.channels?.some(c => !c.ok) === true,
+    "control: the failed channel rides on the result for a caller to read",
+    JSON.stringify(first.paged[0]?.channels ?? null));
+  check(hub.prepare("SELECT announced_count c FROM escalation WHERE why=?").get(key).c === 1,
+    "and it is marked announced, because a human was reached");
+
+  const second = announce(hub, { escalations: new Map([[key, 1]]), at: NOW + 60,
+                                 isAlive: ALIVE, send: partial });
+  check(second.paged.length === 0 && sent.length === 1,
+    "so the next pass does not page the working channel again", JSON.stringify(second.paged));
+
+  // CONTROL: nothing accepted is still a refusal, or this rule would swallow a
+  // total failure as delivery.
+  const hub2 = freshHub();
+  const none = () => ({ ok: false, why: "every channel is down",
+                        channels: [{ name: "ntfy", ok: false, why: "down" }] });
+  const dead = announce(hub2, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                                send: none });
+  check(dead.declined.length === 1 && dead.paged.length === 0,
+    "control: a send no channel accepted is still declined", JSON.stringify(dead.declined));
+  check(hub2.prepare("SELECT announced_count c FROM escalation WHERE why=?").get(key).c === 0,
+    "control: and is not marked announced, so it comes back");
 }
 
 hub.close();

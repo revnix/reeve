@@ -457,22 +457,37 @@ export function reviewArtifact({ phase, dir, expect }) {
     // passed. Markdown ends a list at a blank line followed by a block that is
     // not part of it; a paragraph indented into the item is a continuation and
     // does not.
-    const width = (s) => s.replace(/\t/g, "    ").length;
+    // A TAB STOP IS COUNTED FROM WHERE THE TAB IS, not from column zero.
+    // Markdown advances a tab to the next multiple-of-four column, so the tab in
+    // `-\tparent` -- sitting at column 1, after the marker -- reaches column 4,
+    // not 1 + 4. Replacing every tab with four spaces wherever it appeared
+    // recorded a content column of 5, and a child indented four spaces, a valid
+    // nested elaboration in Markdown, fell to the LEFT of it: counted as a
+    // top-level claim and refused for having no citation of its own.
+    //
+    // So the helper takes the column it STARTS at and returns the one it ends
+    // at. There is no width of a string in isolation to ask for; a tab is only
+    // ever four wide when it happens to start on a tab stop.
+    const advance = (s, from) => {
+      let col = from;
+      for (const ch of s) col = ch === "\t" ? col + 4 - (col % 4) : col + 1;
+      return col;
+    };
     let blank = false;
     for (const line of scope) {
       if (line.trim() === "") { blank = true; continue; }
       const m = CLAIM.exec(line);
       if (!m) {
-        const indent = width(/^[ \t]*/.exec(line)[0]);
+        const indent = advance(/^[ \t]*/.exec(line)[0], 0);
         if (blank && (open.length === 0 || indent < open[open.length - 1])) open.length = 0;
         blank = false;
         continue;
       }
       blank = false;
-      const indent = width(m[1]);
+      const indent = advance(m[1], 0);
       while (open.length && indent < open[open.length - 1]) open.pop();
       const nested = open.length > 0;
-      open.push(indent + m[2].length + width(m[3]));
+      open.push(advance(m[2] + m[3], indent));
       if (nested) continue;
       claims++;
       // THE COUNT THE CALLER ASKED FOR. `minCitationsPerClaim` was read and
@@ -545,16 +560,25 @@ export function reviewArtifact({ phase, dir, expect }) {
         // So: content after the colon, or any non-blank line before the next
         // label or heading. Bounded that way rather than by blank lines, because
         // the documented block is separated from its label by one.
+        // ONE ANSWER TO "WHERE DOES THIS FIELD END", asked by both readers.
+        // The presence loop below stopped at the next heading OR the next
+        // label; this bound stopped at headings alone. Two definitions of one
+        // boundary, and they disagreed exactly where it mattered: a slice whose
+        // `Done when:` held only prose, followed by a `Tests:` carrying a fenced
+        // command, had the TEST field's block read as its done condition --
+        // `Done when: someone approves` reported as machine-checkable over a
+        // command belonging to another field. The scan now ends where the field
+        // ends, which is what the presence loop already meant by it.
+        const isBoundary = (l) => /^#{2,3}\s+/.test(l) ||
+          ["Files:", "Packages:", "Tests:", "Test plan:", "Done when:"].some(n => bare(l).startsWith(n));
         const nextBoundary = (rs, from) => {
           let chars = 0;
           for (let j = from; j < rs.length; j++) {
-            if (j > from && /^#{2,3}\s+/.test(rs[j])) return chars;
+            if (j > from && isBoundary(rs[j])) return chars;
             chars += rs[j].length + 1;
           }
           return chars;
         };
-        const isBoundary = (l) => /^#{2,3}\s+/.test(l) ||
-          ["Files:", "Packages:", "Tests:", "Test plan:", "Done when:"].some(n => bare(l).startsWith(n));
         let has = !!bare(rows[at]).slice(label.length).trim();
         for (let j = at + 1; j < rows.length && !has; j++) {
           if (isBoundary(rows[j])) break;

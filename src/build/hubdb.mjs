@@ -507,17 +507,28 @@ export function historyGaps(versions, upTo) {
  * `schema_version` DDL, so the command that promised no writes writes to a
  * future-version database before anything refuses it.
  */
-export function missingMigrations(path) {
-  // ONE SHAPE FROM EVERY EXIT, `holed` included. A caller reading `.holed` off
-  // an unreadable answer would otherwise get `undefined`, which is falsy, and
-  // "this file cannot be read" would silently answer "no hole".
-  const unreadable = { readable: false, missing: [], have: [], holed: false, version: 0, invalid: [] };
-  if (!existsSync(path)) return unreadable;
-  let q;
-  try { q = new DatabaseSync(path, { readOnly: true, timeout: HUB_BUSY_TIMEOUT_MS }); }
-  catch { return unreadable; }
+// ONE SHAPE FROM EVERY EXIT, `holed` included. A caller reading `.holed` off an
+// unreadable answer would otherwise get `undefined`, which is falsy, and "this
+// file cannot be read" would silently answer "no hole".
+//
+// A factory rather than a shared constant: the arrays are the caller's, and one
+// frozen object handed to every caller is a different promise from the one this
+// has always made.
+const unreadableHistory = () => ({ readable: false, missing: [], have: [], holed: false, version: 0, invalid: [] });
+
+/**
+ * The migration history recorded on a connection the CALLER owns.
+ *
+ * Split out of `missingMigrations` because a caller that must read the history
+ * and then read the tables has to do both on ONE connection to be reading one
+ * store. Opening a second connection to answer "which migrations are missing"
+ * and a third to act on the answer leaves a window between them: a newer reeve
+ * migrating in that window makes the answer describe a hub that no longer
+ * exists, and the command proceeds against a schema it had promised to refuse.
+ */
+export function migrationStateOf(db) {
   try {
-    const have = new Set(q.prepare("SELECT version FROM schema_version").all().map((r) => r.version));
+    const have = new Set(db.prepare("SELECT version FROM schema_version").all().map((r) => r.version));
     const missing = [];
     for (let v = 1; v <= HUB_SCHEMA_VERSION; v++) if (!have.has(v)) missing.push(v);
     // A RECORDED VERSION THAT IS NOT A VERSION IS ITS OWN FAULT, and it has to
@@ -535,7 +546,15 @@ export function missingMigrations(path) {
     // its bound, which is exactly the untrusted number.
     return { readable: true, missing, have: present, holed: hasHistoryHole(present), invalid,
              version: present.length ? present[present.length - 1] : 0 };
-  } catch { return unreadable; }
+  } catch { return unreadableHistory(); }
+}
+
+export function missingMigrations(path) {
+  if (!existsSync(path)) return unreadableHistory();
+  let q;
+  try { q = new DatabaseSync(path, { readOnly: true, timeout: HUB_BUSY_TIMEOUT_MS }); }
+  catch { return unreadableHistory(); }
+  try { return migrationStateOf(q); }
   finally { try { q.close(); } catch { /* already gone */ } }
 }
 
@@ -662,6 +681,87 @@ function newestHubSnapshot(path) {
 // guardian's restricted connection reads it rather than repeating it.
 export const HUB_BUSY_TIMEOUT_MS = 10000;
 
+/**
+ * Is this hub's FILE intact? Returns the refusal to raise, or null.
+ *
+ * Extracted because it acquired a second caller and was very nearly not given
+ * one. `task file --dry-run` opens the hub read-only itself rather than through
+ * `openHub` -- it has to, because `openHub`'s first act is a write -- and in
+ * taking that route it silently left this check behind. A hub with a complete
+ * migration history and a correct catalogue but a damaged data or index page
+ * then passed every probe the dry run made, and either emitted a plan over a
+ * broken store or reached `liveLeases` and surfaced a raw `database disk image
+ * is malformed` from inside a command that had already called the hub healthy.
+ *
+ * A caller that opens its own connection needs the same verdict in the same
+ * words; the alternative is a second integrity check that drifts from this one,
+ * which is the shape this file keeps having to remove. Returning the error
+ * rather than throwing it is what lets both callers keep their own way of
+ * closing -- `openHub` has a once-only `closeHub`, the dry run has a bare
+ * handle -- without this function knowing about either.
+ */
+export function hubIntegrityError(db, path) {
+  // THREE ANSWERS, because a check that could not RUN has not answered.
+  //
+  // "not ok" and "could not tell" are different facts with different remedies:
+  // one is restore-from-backup, the other is find out why the check would not
+  // run — a locked file, an odd page size, SQLite unhappy for a reason that is
+  // not corruption. Collapsing them sends an operator to replace a database
+  // that may be perfectly intact, which is the strongest claim this file makes
+  // and the one that must not be made on a guess. `rawOpen` and the admission
+  // probe in `backup.mjs` each had to learn this separately; it is the same
+  // shape a third time.
+  let verdict = null, checkFailed = null;
+  try { verdict = Object.values(db.prepare("PRAGMA quick_check(1)").get() ?? {})[0]; }
+  catch (e) { checkFailed = e; }
+
+  if (checkFailed) {
+    // A CHECK THAT THREW *CORRUPTION* HAS ANSWERED. SQLITE_CORRUPT and
+    // SQLITE_NOTADB out of `quick_check` are not "could not tell": they are the
+    // file saying so through a different door, and calling that unknown would
+    // leave an operator with no remedy for a hub that is genuinely broken. Any
+    // other errcode -- BUSY, READONLY, PERM, CANTOPEN, IOERR -- is the
+    // situation failing rather than the file.
+    if (checkFailed.errcode === 11 || checkFailed.errcode === 26)
+      verdict = `the check failed with ${checkFailed.message}`;
+    else {
+      // NOT marked `hubDamaged`: nothing here established damage. The errcode
+      // is carried ONTO this error rather than left only on `cause`, so
+      // `isOperational` classifies it on the evidence it actually has instead
+      // of on the wrapper happening to have no errcode of its own.
+      return Object.assign(new Error(
+        `the hub at ${path} could not be checked (${checkFailed.message}).\n` +
+        `  This is NOT a verdict on the file: the integrity check itself did not run, so the hub ` +
+        `may be perfectly intact.\n` +
+        `  recover  find out why the check could not run — another process may hold the file, or ` +
+        `its permissions may be wrong — and re-run. Do NOT restore over it on this evidence.`,
+        { cause: checkFailed }),
+        checkFailed.errcode === undefined ? {} : { errcode: checkFailed.errcode });
+    }
+  }
+
+  if (verdict !== "ok") {
+    const newest = newestHubSnapshot(path);
+    return Object.assign(new Error(
+      // `quick_check(1)` stops at the FIRST problem, which is what makes it
+      // cheap enough for every open — and it means this line is a sample, not
+      // a census. Saying so stops an operator reading one reported error as
+      // one actual problem.
+      `the hub at ${path} is damaged. The first problem found is: ${verdict}\n` +
+      `  (the check stops at the first problem, so there may be more; ` +
+      `reeve builder doctor runs the full integrity_check)\n` +
+      (newest
+        ? `  recover  reeve restore --hub --force --from ${newest}\n` +
+          `           pass --tail from a durable export-events --hub to carry history forward`
+        : `  recover  no snapshot was found under ${join(dirname(dirname(path)), "backups", basename(path, ".db"))}; ` +
+          `if one exists elsewhere, pass it with --from`)),
+      // The marker `isOperational` reads. This verdict is reeve's, not
+      // SQLite's, so it has no errcode to classify by.
+      { hubDamaged: true });
+  }
+  return null;
+}
+
 export function openHub(path, { skipIntegrity = false } = {}) {
   // state/ may not exist yet: on a fresh REEVE_HOME no guardian store has
   // created it, and DatabaseSync will not create a missing parent. Without this
@@ -786,66 +886,8 @@ export function openHub(path, { skipIntegrity = false } = {}) {
   // callers about to USE the hub; the restore is about to REPLACE it, and it
   // validates the SNAPSHOT it installs rather than the wreck it is removing.
   if (!skipIntegrity) {
-    // THREE ANSWERS, because a check that could not RUN has not answered.
-    //
-    // "not ok" and "could not tell" are different facts with different remedies:
-    // one is restore-from-backup, the other is find out why the check would not
-    // run — a locked file, an odd page size, SQLite unhappy for a reason that is
-    // not corruption. Collapsing them sends an operator to replace a database
-    // that may be perfectly intact, which is the strongest claim this file makes
-    // and the one that must not be made on a guess. `rawOpen` and the admission
-    // probe in `backup.mjs` each had to learn this separately; it is the same
-    // shape a third time.
-    let verdict = null, checkFailed = null;
-    try { verdict = Object.values(db.prepare("PRAGMA quick_check(1)").get() ?? {})[0]; }
-    catch (e) { checkFailed = e; }
-
-    if (checkFailed) {
-      closeHub();
-      // A CHECK THAT THREW *CORRUPTION* HAS ANSWERED. SQLITE_CORRUPT and
-      // SQLITE_NOTADB out of `quick_check` are not "could not tell": they are the
-      // file saying so through a different door, and calling that unknown would
-      // leave an operator with no remedy for a hub that is genuinely broken. Any
-      // other errcode -- BUSY, READONLY, PERM, CANTOPEN, IOERR -- is the
-      // situation failing rather than the file.
-      if (checkFailed.errcode === 11 || checkFailed.errcode === 26)
-        verdict = `the check failed with ${checkFailed.message}`;
-      else {
-        // NOT marked `hubDamaged`: nothing here established damage. The errcode
-        // is carried ONTO this error rather than left only on `cause`, so
-        // `isOperational` classifies it on the evidence it actually has instead
-        // of on the wrapper happening to have no errcode of its own.
-        throw Object.assign(new Error(
-          `the hub at ${path} could not be checked (${checkFailed.message}).\n` +
-          `  This is NOT a verdict on the file: the integrity check itself did not run, so the hub ` +
-          `may be perfectly intact.\n` +
-          `  recover  find out why the check could not run — another process may hold the file, or ` +
-          `its permissions may be wrong — and re-run. Do NOT restore over it on this evidence.`,
-          { cause: checkFailed }),
-          checkFailed.errcode === undefined ? {} : { errcode: checkFailed.errcode });
-      }
-    }
-
-    if (verdict !== "ok") {
-      closeHub();
-      const newest = newestHubSnapshot(path);
-      throw Object.assign(new Error(
-        // `quick_check(1)` stops at the FIRST problem, which is what makes it
-        // cheap enough for every open — and it means this line is a sample, not
-        // a census. Saying so stops an operator reading one reported error as
-        // one actual problem.
-        `the hub at ${path} is damaged. The first problem found is: ${verdict}\n` +
-        `  (the check stops at the first problem, so there may be more; ` +
-        `reeve builder doctor runs the full integrity_check)\n` +
-        (newest
-          ? `  recover  reeve restore --hub --force --from ${newest}\n` +
-            `           pass --tail from a durable export-events --hub to carry history forward`
-          : `  recover  no snapshot was found under ${join(dirname(dirname(path)), "backups", basename(path, ".db"))}; ` +
-            `if one exists elsewhere, pass it with --from`)),
-        // The marker `isOperational` reads. This verdict is reeve's, not
-        // SQLite's, so it has no errcode to classify by.
-        { hubDamaged: true });
-    }
+    const damaged = hubIntegrityError(db, path);
+    if (damaged) { closeHub(); throw damaged; }
   }
 
   // `schema_version` was created and first read INSIDE the guard above, so it

@@ -86,7 +86,7 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
                     queuedRequests, cancelQueued, measureContainment, noteRateLimit,
                     carriedReleases, carriedCooldowns, providerBind,
                     resolveRepoIdFn, project, keepDir = false, seams = null,
-                    haltMarker, openPrs, containment, ticks = 1, dbPath } = {}) => {
+                    haltMarker, openPrs, containment, ticks = 1, dbPath, evaluate } = {}) => {
   const dir = mkdtempSync(join(tmpdir(), "reeve-prov-"));
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
@@ -172,7 +172,12 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     // complete read and a partial one differently.
     observe: () => ({ ok: false, observations: [], incomplete: true,
                       threads: { readable: false, total: null, unresolved: 0, seen: 0 } }),
-    evaluate: () => EVAL,
+    // OVERRIDABLE. A tick is COMPLETE only when every listed pull request was
+    // evaluated, and `complete` is what `announceable` consults before it retires
+    // a standing cause that names no pull request. With a fixed evaluator no
+    // fixture could produce an INCOMPLETE tick at all, so the whole branch that
+    // decides whether absence may be read as repair was unreachable.
+    evaluate: evaluate ?? (() => EVAL),
     publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
     spawnWorker: spawnWorker ?? (async a => { spawned.push(a); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }; }),
     ...(heartbeatMs != null ? { heartbeatMs } : {}),

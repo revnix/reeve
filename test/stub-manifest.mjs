@@ -1655,12 +1655,12 @@ export const STUBS = [
   },
   {
     name: "task-file-dry-run-prescribes-the-remedy-that-works",
-    why: "print one remedy for both migration faults in the --dry-run guard. The rule distinguishing them can be entirely correct while the route still reads past it; this entry is the difference between the discrimination existing and the operator receiving it",
+    why: "swap the two migration remedies, so each fault is sent to the repair that belongs to the other. The decision moved out of the --dry-run guard into `hubfault.mjs` when both callers were routed through it, and this entry followed it: the rule distinguishing a hole from a tail can be entirely correct while the route still reads past it. The rule distinguishing them can be entirely correct while the route still reads past it; this entry is the difference between the discrimination existing and the operator receiving it",
     test: "test/migration-history.test.mjs",
     expectRed: "the route tells an operator with a HOLED hub to restore a snapshot",
-    edits: [{ file: "bin/reeve",
-              find: "          console.error(hist.holed",
-              replace: "          console.error(false && hist.holed" }],
+    edits: [{ file: "src/build/hubfault.mjs",
+              find: "  return hist.holed",
+              replace: "  return !hist.holed" }],
   },
   {
     name: "artifact-done-condition-fence-closer-matches-its-opener",
@@ -1691,12 +1691,12 @@ export const STUBS = [
   },
   {
     name: "task-file-dry-run-refuses-a-newer-hub-unopened",
-    why: "let a hub whose contiguous history is NEWER than this binary through the dry-run guard. It is missing none of what this binary expects and has no hole, so `missing` and `holed` both say nothing is wrong. The write that used to follow is now prevented by the read-only handle, so what this guard uniquely does is REFUSE: without it the command proceeds against a store written by a binary whose migrations it cannot interpret, and the operator is told nothing about why the answer is wrong",
+    why: "let a hub whose contiguous history is NEWER than this binary through the shared decision, which both the dry-run guard and the read routes now consult. It is missing none of what this binary expects and has no hole, so `missing` and `holed` both say nothing is wrong. The write that used to follow is now prevented by the read-only handle, so what this guard uniquely does is REFUSE: without it the command proceeds against a store written by a binary whose migrations it cannot interpret, and the operator is told nothing about why the answer is wrong",
     test: "test/migration-history.test.mjs",
     expectRed: "the route refuses a hub NEWER than this binary and names the remedy",
-    edits: [{ file: "bin/reeve",
-              find: "        if (hist.version > HUB_SCHEMA_VERSION) {",
-              replace: "        if (false && hist.version > HUB_SCHEMA_VERSION) {" }],
+    edits: [{ file: "src/build/hubfault.mjs",
+              find: "  if (hist.version > expect)",
+              replace: "  if (false && hist.version > expect)" }],
   },
   {
     name: "artifact-nested-levels-close",

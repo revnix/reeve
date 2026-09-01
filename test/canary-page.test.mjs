@@ -17,6 +17,8 @@
 // happens would therefore announce CLEARED on the next quiet tick, for a sandbox
 // nobody re-measured. That is why several of these run more than one tick.
 import { run } from "./fixtures/tick-harness.mjs";
+import { CANARY_PAGE } from "../src/daemon.mjs";
+import { open } from "../src/db/ops.mjs";
 import { rmSync } from "node:fs";
 
 let fail = 0;
@@ -25,7 +27,11 @@ const check = (ok, name, detail) => {
   if (!ok) { if (detail) console.log("        " + detail); fail++; }
 };
 
-const PAGE = "builder:sandbox:canary-failed";
+// THE IDENTITY THE DESIGN ASSIGNS THIS DAEMON. §4.4 splits it by raising process
+// -- `builder:sandbox:canary-failed` from the builder, `guardian:...` from a
+// guardian daemon -- and §11.7 forbids either from writing the other's. Imported
+// rather than spelled, so a rename cannot leave this suite asserting the old one.
+const PAGE = CANARY_PAGE;
 // The verdict shape the daemon really receives: `measureContainment` returns the
 // canary's own result beside the credential answer. A fixture carrying only
 // `credentialRead` cannot exhibit anything here.
@@ -34,6 +40,22 @@ const openWith = (canary) => ({ credentialRead: "open", why: `sandbox canary ${c
 // Takes either a run() result or a single tick's result, so a multi-tick
 // scenario can ask the same question of one tick as of the last.
 const has = (x, key) => [...((x.r ?? x).escalations?.keys?.() ?? [])].some(k => k.startsWith(key));
+
+// ── the identity itself, spelled out ────────────────────────────────────────
+//
+// THE ONE PLACE A LITERAL BELONGS. Everything else in this file imports
+// `CANARY_PAGE`, which is right -- a rename must not leave the suite asserting a
+// name nothing raises. But an imported constant also FOLLOWS a rename, so nothing
+// here could notice the identity being changed to the builder's. The design fixes
+// this name, so the test states it.
+{
+  check(PAGE === "guardian:sandbox:canary-failed",
+    "the identity is the GUARDIAN's, because this daemon raises it in its own store",
+    `it is ${JSON.stringify(PAGE)}; §4.4 assigns builder:sandbox:canary-failed to the builder and guardian:sandbox:canary-failed to a guardian daemon`);
+  check(!PAGE.startsWith("builder:"),
+    "and it is not a builder identity, which this process may not write",
+    "§11.7: the guardian never writes a builder identity and the builder never writes a guardian one, because announceable runs in the process that owns the store it reads");
+}
 
 // ── the control comes first ───────────────────────────────────────────────────
 //
@@ -55,9 +77,12 @@ const has = (x, key) => [...((x.r ?? x).escalations?.keys?.() ?? [])].some(k => 
   const out = await run({ containment: openWith({ ok: false, id: "cn-2", why: "the worker read the decoy" }) });
   check(has(out, PAGE), "a canary that ran and FAILED raises the page identity",
     `escalations were: ${out.esc}`);
-  check(out.esc.includes("cn-2"),
-    "the page names WHICH canary failed, so a second failure under a new policy is a new page",
-    `escalations were: ${out.esc}`);
+  check(out.esc.includes(PAGE) && !out.esc.includes("cn-2"),
+    "the KEY is the bare identity, with the canary id kept out of it",
+    `a key that moves when the policy changes is retired and re-raised, which is two pushes for one fault; escalations were: ${out.esc}`);
+  check(out.log.includes("canary cn-2 FAILED"),
+    "and the log names WHICH canary, which is where the detail lives until an alert body exists",
+    `log did not name the canary`);
   // THE WHOLE LINE, not just the reason. The containment verdict's own `why`
   // already carries the canary's reason, and the dispatch refusal logs that --
   // so asserting the reason appears ANYWHERE in the log passed with this line
@@ -148,6 +173,44 @@ const has = (x, key) => [...((x.r ?? x).escalations?.keys?.() ?? [])].some(k => 
   check([...(noId.r.escalations?.keys?.() ?? [])].some(k => k === "guardian:containment:open"),
     "control: dispatch is still refused and said, by the generic containment identity",
     `escalations were: ${noId.esc}`);
+}
+
+// ── a pass clears it even when the tick did not finish looking ───────────────
+//
+// `announceable` retires a standing cause by inferring repair from ABSENCE, and it
+// refuses to infer it on a tick that did not finish -- `complete` is false whenever
+// one pull request could not be evaluated. That rule is right for causes derived
+// from pull requests and wrong for this one: the canary is a repo-wide measurement
+// that does not depend on any pull request. Without an explicit retirement, one
+// unreadable PR on the tick that PROVED the sandbox healthy leaves the row standing,
+// the next quiet tick re-raises it from the store, and the page never clears again.
+// Review found this; it is the reason the passing branch retires the row itself.
+{
+  const first = await run({ containment: openWith({ ok: false, id: "cn-7", why: "the worker read the decoy" }),
+                            keepDir: true });
+  check(has(first, PAGE), "control: the page is standing before the passing tick",
+    `escalations were: ${first.esc}`);
+
+  const contained = { credentialRead: "closed", why: "contained",
+                      canary: { ok: true, id: "cn-7", why: null },
+                      keychain: { measured: true, items: [], why: null } };
+  // TWO pull requests, one evaluation. `evaluated.size === prs.length` is what the
+  // tick hands `announceable` as `complete`, so this is a tick that did not finish
+  // looking -- the condition under which absence may not be read as repair.
+  const second = await run({ containment: contained, dbPath: first.dbPath,
+                             openPrs: () => [42, 43], keepDir: true });
+  check(second.log.includes("2 open PR(s)"),
+    "control: the tick really listed two pull requests, so it could not have been complete",
+    second.log.split("\n")[0]);
+
+  const store = open(first.dbPath);
+  const row = store.prepare("SELECT why FROM escalation WHERE why = ?").get(PAGE);
+  store.close();
+  check(!row, "a canary that PASSED retires the page even on a tick that did not finish looking",
+    "the row survived, so the next quiet tick would re-raise it and the page would never clear");
+
+  rmSync(first.dir, { recursive: true, force: true });
+  rmSync(second.dir, { recursive: true, force: true });
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

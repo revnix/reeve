@@ -31,7 +31,12 @@ const inDb = new Set(db.prepare(
   "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all().map(r => r.name));
 const declared = new Set(Object.keys(TABLE_OWNERS));
 
-check(inDb.size === 34, `the hub has exactly 34 tables (got ${inDb.size})`, [...inDb].sort().join(","));
+// A LITERAL ON PURPOSE. Deriving this from `TABLE_OWNERS` would make the check
+// agree with itself: the point is that adding a table to the DDL forces someone
+// to come here and say so, which is the moment the two lists below get updated.
+// 34 -> 35 with `hub_incarnation` (migration 6), which is how a reader tells a
+// restored log from a quiet one.
+check(inDb.size === 35, `the hub has exactly 35 tables (got ${inDb.size})`, [...inDb].sort().join(","));
 
 // direction 0: HUB_TABLES, the set snapshot validation uses, equals the live one.
 // Task 8's paragraph promised this assertion and no test made it: HUB_TABLES is

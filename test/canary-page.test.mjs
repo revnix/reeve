@@ -57,7 +57,11 @@ const has = (x, key) => [...((x.r ?? x).escalations?.keys?.() ?? [])].some(k => 
   check(out.esc.includes("cn-2"),
     "the page names WHICH canary failed, so a second failure under a new policy is a new page",
     `escalations were: ${out.esc}`);
-  check(out.log.includes("the worker read the decoy"),
+  // THE WHOLE LINE, not just the reason. The containment verdict's own `why`
+  // already carries the canary's reason, and the dispatch refusal logs that --
+  // so asserting the reason appears ANYWHERE in the log passed with this line
+  // deleted. Measured: the sweep reported NOT_CAUGHT for exactly that stub.
+  check(out.log.includes("canary cn-2 FAILED — the worker read the decoy"),
     "the REASON is in the log rather than in the key, because the key is what the phone renders",
     "a reason that moves between runs of one broken sandbox would retire and re-raise the same fault");
 }
@@ -67,7 +71,17 @@ const has = (x, key) => [...((x.r ?? x).escalations?.keys?.() ?? [])].some(k => 
   // Two ticks against one ctx. The second carries no canary in its verdict --
   // exactly what a tick that wanted no worker produces -- so it re-raises from
   // the standing value or it does not raise at all.
-  const out = await run({ containment: openWith({ ok: false, id: "cn-3", why: "no sandbox" }), ticks: 2 });
+  // THE SECOND VERDICT CARRIES NO CANARY. Passing one verdict for both ticks
+  // re-measured the same failing canary on tick two, so the standing value was
+  // never what raised it and the stub that removes the standing raise stayed
+  // green -- the sweep reported NOT_CAUGHT, which is what a fixture that cannot
+  // exhibit the defect looks like from outside.
+  const quiet = { credentialRead: "closed", why: "contained",
+                  keychain: { measured: true, items: [], why: null } };
+  const out = await run({ containment: [openWith({ ok: false, id: "cn-3", why: "no sandbox" }), quiet], ticks: 2 });
+  check(has(out.all[0], PAGE), "control: the first tick raised it, so the second tick is the question",
+    `first tick's escalations were: ${[...(out.all[0].escalations?.keys?.() ?? [])].join(" | ")}`);
+  check(!("canary" in quiet), "control: the second tick's verdict carries no canary, so nothing re-measured it");
   check(out.all.length === 2, "control: two ticks really ran", `ran ${out.all.length}`);
   check(has(out, PAGE),
     "the page still stands on a second tick, so a quiet tick cannot announce it CLEARED",

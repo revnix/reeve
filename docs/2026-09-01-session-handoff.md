@@ -87,9 +87,14 @@ gh issue list --repo revnix/reeve --state open --limit 100 --json number,title -
 # Backticks in THIS block declare a subject the rest of the documents must defer to,
 # so keep them for terms §0 genuinely owns. Quoting a tool name here in passing makes
 # every durable sentence elsewhere that mentions the tool look like a state claim.
-prs=$(gh pr list --repo revnix/reeve --state all --limit 200 \
-        --json headRefName,headRefOid,isCrossRepository \
-        -q '.[] | select(.isCrossRepository | not) | "\(.headRefOid) \(.headRefName)"') \
+# PAGINATED, not capped. `--limit` is a maximum number of items to FETCH, so once the
+# repository passes that number the oldest records drop out silently and every origin
+# branch whose pull request fell outside the window reads as unopened work. A cap on an
+# inventory used to decide what has NOT been reviewed fails in the direction that
+# invents work. `gh api --paginate` walks every page; its `-q` runs per page, which is
+# what this per-item filter wants.
+prs=$(gh api --paginate "repos/revnix/reeve/pulls?state=all&per_page=100" \
+        -q '.[] | select(.head.repo.full_name == .base.repo.full_name) | "\(.head.sha) \(.head.ref)"') \
   || { echo "PR LISTING FAILED — cannot tell unopened from reviewed; stop"; exit 1; }
 heads=$(git ls-remote --heads origin) \
   || { echo "REMOTE LISTING FAILED — an empty answer would read as nothing-unopened; stop"; exit 1; }
@@ -118,10 +123,20 @@ grep "shadow:" ~/.reeve/reeve.log | tail -1 \
 # variable cannot satisfy both, and running them in sequence always produced
 # one real verdict and one refusal that looks like a verdict. Run the one whose
 # moment you are in. Neither is pinned to a number; unset is an abort.
-: "${open_pr:?set open_pr=<number> of an OPEN pull request}"
-node scripts/premerge.mjs "$open_pr"                  # SHOULD this merge happen
-: "${merged_pr:?set merged_pr=<number> of a MERGED pull request}"
-node scripts/verify-merge.mjs "$merged_pr"            # did that merge carry everything
+# SET THE ONE WHOSE MOMENT YOU ARE IN, and only that one. Requiring both aborted the
+# block for every session that had exactly one -- which is every session -- so the
+# commands below this line never ran at all. Running no gate is reported rather than
+# passed over in silence: a gate that did not run and a gate that said yes must not
+# look alike, which is the same rule the rest of this block is built on.
+if [ -n "${open_pr:-}" ]; then
+  node scripts/premerge.mjs "$open_pr"                # SHOULD this merge happen
+fi
+if [ -n "${merged_pr:-}" ]; then
+  node scripts/verify-merge.mjs "$merged_pr"          # did that merge carry everything
+fi
+if [ -z "${open_pr:-}${merged_pr:-}" ]; then
+  echo "NO MERGE GATE RAN — set open_pr=<number> of an OPEN pull request, or merged_pr=<number> of a MERGED one"
+fi
 # ~4ms; every anchor still resolves. IN FLIGHT when this was written, so check it
 # exists first: a missing file exits MODULE_NOT_FOUND, which is not the same answer
 # as "no anchors rotted".
@@ -144,20 +159,40 @@ else echo "anchors-resolve is ABSENT -- this checkout cannot answer the anchor q
 # missing entries that exist on the default branch.
 sweepdir=$(mktemp -d) && git worktree add -q --detach "$sweepdir" origin/main \
   || { echo "could not make an isolated copy; do not sweep the shared checkout"; exit 1; }
-( cd "$sweepdir" && node scripts/stub-sweep.mjs ) ; sweeprc=$?
-git worktree remove --force "$sweepdir"
-echo "sweep exit: $sweeprc"
 
-# COVERAGE, not just verdicts. The sweep prints `N entries over M of K test file(s)`
-# and refuses an ORPHAN -- a test file with no entry and not grandfathered. The entry
-# count is the number people quote and the FILE count is the one that describes the
-# tree; six files hold most of the entries, so the two say very different things.
-node -e 'import("./src/stubsweep.mjs").then(async S=>{
+# COVERAGE, not just verdicts, and INSIDE the copy. The sweep prints
+# `N entries over M of K test file(s)` and refuses an ORPHAN -- a test file with no
+# entry and not grandfathered. The entry count is the number people quote and the
+# FILE count is the one that describes the tree; six files hold most of the entries,
+# so the two say very different things.
+# IN THE COPY, because this reads `./src` and `./test` relative to the working
+# directory. Run from the block's own cwd it imports the DELIBERATELY STALE checkout
+# and reports that tree's debt under the default branch's name.
+( cd "$sweepdir" && node -e 'import("./src/stubsweep.mjs").then(async S=>{
   const m=await import("./test/stub-manifest.mjs");
   const f=require("node:fs").readdirSync("test").filter(x=>x.endsWith(".test.mjs")).map(x=>"test/"+x);
   const c=S.coverage(m.STUBS,f,m.GRANDFATHERED);
-  console.log(`files=${c.files.length} covered=${c.covered.length} grandfathered=${c.spared.length} orphans=${c.orphans.length}`);})' \
-  || { echo "COVERAGE READ FAILED -- do not read the absence as zero debt"; exit 1; }
+  console.log(`files=${c.files.length} covered=${c.covered.length} grandfathered=${c.spared.length} orphans=${c.orphans.length}`);})' ) ; covrc=$?
+
+# A DIFF BASE THAT IS NOT THIS COMMIT. The sweep's base defaults to `origin/main`
+# in the sweep script itself, and this copy IS `origin/main` -- so the merge base is
+# HEAD, the change set is empty, and the half of the sweep that enforces the
+# grandfather ratchet measures nothing while reporting a pass. The script refuses that
+# only under `GITHUB_ACTIONS`, so here it is silent. `origin/main~1` asks the question
+# that is actually available on the default branch: did the last merge add an orphan or
+# edit a grandfathered file. It is the same answer the workflow gets by passing the
+# push event's previous commit.
+( cd "$sweepdir" && STUB_SWEEP_BASE=origin/main~1 node scripts/stub-sweep.mjs ) ; sweeprc=$?
+git worktree remove --force "$sweepdir"
+
+# AND THE STATUS SURVIVES. `sweeprc` used to be printed and then dropped: the block's
+# exit status came from whatever ran last, so a FAILED sweep left an authoritative
+# block reporting success -- the pre-merge gate treated as passed on a run that said
+# no. Both statuses are named, and either one non-zero fails the block.
+[ "$covrc" -eq 0 ] || echo "COVERAGE READ FAILED (exit $covrc) -- do not read the absence as zero debt"
+[ "$sweeprc" -eq 0 ] || echo "THE SWEEP FAILED (exit $sweeprc) -- read the verdict list, not the exit alone"
+echo "sweep exit: $sweeprc; coverage exit: $covrc"
+[ "$covrc" -eq 0 ] && [ "$sweeprc" -eq 0 ] || exit 1
 ```
 
 ### 0.2 Facts no command answers — the ones that need a person

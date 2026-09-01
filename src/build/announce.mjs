@@ -13,6 +13,7 @@
  */
 import { HOLD_ESCALATION, PHASES } from "./phases.mjs";
 import { hubTx, hubEvent } from "./hubdb.mjs";
+import { printable, redact } from "../notify.mjs";
 import { assertWritable } from "./locks.mjs";
 
 /**
@@ -280,7 +281,7 @@ export function builderAnnounceable(db, escalations, {
 
   return hubTx(db, () => {
     assertWritable(db, { isAlive, at, inTx: true });
-    const fresh = [], cleared = [];
+    const fresh = [], cleared = [], clearable = [];
     const standing = new Map(
       db.prepare("SELECT why, count, announced_count FROM escalation").all().map(r => [r.why, r]));
 
@@ -325,18 +326,44 @@ export function builderAnnounceable(db, escalations, {
       // actually TAKEN clears one.
       const subject = subjectOf(why);
       if (subject === null || examined === null || !examined.has(subject)) continue;
-      db.prepare("DELETE FROM escalation WHERE why=?").run(why);
-      // THE CLEARING IS LOGGED, in the same transaction that performs it.
-      // `escalation` is in the replayed set and `escalation.raised` is its only
-      // event, so a snapshot whose tail spans a clear replayed the raise and
-      // resurrected the row -- and an operator was paged again about something
-      // that had been resolved before the restore.
-      hubEvent(db, { kind: "escalation.cleared", task: /^bt:/.test(why) ? subject : null,
-                     payload: { why } });
+      // A PAGING CAUSE IS NOT DELETED HERE. Its recovery has to reach the same
+      // human the alarm did, and deleting the row first destroys the only
+      // durable record that a clearing is owed -- so a channel that was down for
+      // one pass lost the recovery permanently, while the raise it is recovering
+      // from had just been taught to wait. The same rule on both sides: the
+      // durable state changes when the notification lands, not before.
+      if (pages(why)) { clearable.push(why); continue; }
+      clearOne(db, why);
       cleared.push(why);
     }
-    return { fresh, cleared };
+    return { fresh, cleared, clearable };
   });
+}
+
+/**
+ * Retire a cause, and log it, in one transaction.
+ *
+ * Separated because a paging cause is retired only once its recovery has been
+ * delivered, which happens outside the reduction that decided it was retirable.
+ */
+export function clearEscalation(db, why, { isAlive, at = Math.floor(Date.now() / 1000) } = {}) {
+  if (typeof isAlive !== "function")
+    throw refuse("not_writable", "clearEscalation writes, so it needs an isAlive predicate.");
+  return hubTx(db, () => {
+    assertWritable(db, { isAlive, at, inTx: true });
+    clearOne(db, why);
+  });
+}
+
+/** The delete and its event, IN THE CALLER'S TRANSACTION. */
+function clearOne(db, why) {
+  db.prepare("DELETE FROM escalation WHERE why=?").run(why);
+  // `escalation` is in the replayed set and `escalation.raised` is its only
+  // other event, so a snapshot whose tail spans a clear replays the raise and
+  // resurrects the row -- paging the founder again about something resolved
+  // before the restore.
+  hubEvent(db, { kind: "escalation.cleared",
+                 task: /^bt:/.test(why) ? subjectOf(why) : null, payload: { why } });
 }
 
 /**
@@ -350,6 +377,44 @@ export function builderAnnounceable(db, escalations, {
  * one -- so this asks it, and there is one rule to get wrong instead of two.
  */
 export const pages = (key) => PAGES.includes(shapeOf(key));
+
+/**
+ * The single action that changes each situation.
+ *
+ * §11.7 ends "Every alert names the single founder action needed", and an alert
+ * that arrives on a phone at night without one is a notification the reader can
+ * only file away. The identity says what happened; this says what to do about
+ * it, and the two together are the whole of what a page is for.
+ *
+ * CLOSED against `IDENTITY_SHAPES`, and asserted to be: an identity added
+ * without an action would page with nothing to do, which is the shape that
+ * teaches a reader to stop opening them.
+ */
+export const ACTION_FOR = Object.freeze({
+  "bt:<id>:phase:blocked:<phase>":
+    "reeve task why <id> — a worker stopped and named a reason only you can settle",
+  "bt:<id>:phase:failed:<phase>":
+    "reeve task why <id> — retries are exhausted for this phase",
+  "bt:<id>:infeasible":
+    "reeve task why <id> — the task was judged infeasible and will not resume",
+  "bt:<id>:gate:revision-loop":
+    "reeve task why <id> — the spec has hit the revision cap and needs your decision",
+  "bt:<id>:depth:post-approval":
+    "reeve task why <id> — the depth changed after approval",
+  "bt:<id>:intake:ownership-lost":
+    "reeve task why <id> — the repository is no longer owned as admission recorded it",
+  "bt:<id>:impl:harness-touched":
+    "reeve task why <id> — the worker changed the harness it is judged by",
+  "bt:<id>:impl:over-budget":
+    "reeve task why <id> — the implementation exceeded its budget",
+  "bt:<id>:spec:reopened":
+    "reeve task why <id> — an approved spec was reopened",
+  "builder:backup:failed":
+    "reeve backup --hub — there is no working snapshot until this succeeds",
+});
+
+/** The action for a concrete key, or null where nothing is declared. */
+export const actionFor = (key) => ACTION_FOR[shapeOf(key)] ?? null;
 
 /**
  * Record every escalation, and interrupt a human about the few that earn it.
@@ -377,7 +442,7 @@ export function announce(db, {
       "announce needs a send function: whether a page reached anyone is the one thing this " +
       "cannot infer, and a default that silently succeeded would report delivery it never made.");
 
-  const { fresh, cleared } = builderAnnounceable(db, escalations, { at, isAlive, examined });
+  const { fresh, cleared, clearable } = builderAnnounceable(db, escalations, { at, isAlive, examined });
   const paged = [], digested = [], declined = [];
 
   /**
@@ -402,13 +467,27 @@ export function announce(db, {
       ? Object.entries(body).filter(([k]) => k !== "type")
           .map(([k, v]) => `\n${k}: ${v}`).join("")
       : "";
-    const title = isCleared ? `reeve: CLEARED ${why}` : `reeve: ${why}`;
-    const message = isCleared
+    // THE ACTION, ON EVERY ALERT. An identity says what happened; without the one
+    // command that changes it, a page read at night is a notification the reader
+    // can only file away -- and a channel whose alerts cannot be acted on is one
+    // that gets muted, which is the outcome the closed page list exists to avoid.
+    const action = actionFor(why);
+    const raw = isCleared
       ? `CLEARED — ${why} is no longer standing.`
       // The count is the shape of a shared cause, and it is only worth saying
       // when it is more than one.
       : `${why}${count > 1 ? ` (${count} subjects)` : ""}` +
-        `${body?.type ? ` [${body.type}]` : ""}${detail}`;
+        `${body?.type ? ` [${body.type}]` : ""}${detail}` +
+        `${action ? `\n-> ${action}` : ""}`;
+    // SANITISED AT THE BOUNDARY, exactly as `buildAlert` does it. A body carries
+    // externally sourced text -- CI output, a pathname, a validation error -- and
+    // this is the last point before it leaves the machine. `notify` does not do
+    // it: `buildAlert` is the only caller that ever has, so a second producer of
+    // alerts is a second place the boundary has to be applied, and skipping it
+    // lets control characters forge a rendered alert and an echoed credential
+    // leave the host.
+    const title = redact(printable(isCleared ? `reeve: CLEARED ${why}` : `reeve: ${why}`));
+    const message = redact(printable(raw));
 
     // THE SENDER'S OWN VERDICT, never an assumption. A throw and an `ok: false`
     // are the same fact to a reader who needs to know a human was not reached.
@@ -436,10 +515,17 @@ export function announce(db, {
     if (sent) { paged.push(sent); markAnnounced(f.why, f.count); }
   }
 
-  for (const why of cleared) {
-    if (!pages(why)) continue;
+  // THE RETIREMENT HAPPENS WHEN THE RECOVERY LANDS. `clearable` is the set the
+  // reduction judged retirable and deliberately did not delete; a refused send
+  // leaves the row standing, so the next pass offers the clearing again instead
+  // of losing it.
+  const retired = [...cleared];
+  for (const why of clearable) {
     const sent = dispatch(why, 0, "cleared", bodies?.get(why) ?? null);
-    if (sent) paged.push(sent);
+    if (!sent) continue;
+    clearEscalation(db, why, { isAlive, at });
+    paged.push(sent);
+    retired.push(why);
   }
-  return { paged, digested, declined, cleared };
+  return { paged, digested, declined, cleared: retired };
 }

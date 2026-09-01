@@ -81,17 +81,27 @@ export const HUB_SCHEMA_VERSION = 5;
  * a repository recreated under the same key, the newest task is the only record
  * of the new id. Filling gaps only would leave the old one standing.
  */
-export function backfillProjectIdentities(db) {
-  db.exec(`
+export function backfillProjectIdentities(db, projects = null) {
+  // SCOPED WHEN THE CALLER KNOWS WHICH PROJECTS NEED IT. A restore repairs the
+  // ones whose filings could not carry an identity; repairing every project
+  // would also invent identities for tasks that never had one, which is a state
+  // admission does not produce and a restore must not introduce.
+  //
+  // `projects` null means all, which is what the migration wants: it runs over a
+  // whole store whose identities do not exist yet.
+  const list = projects == null ? null : [...new Set(projects)].filter(Boolean);
+  if (list && list.length === 0) return;
+  const where = list ? `AND project IN (${list.map(() => "?").join(",")})` : "";
+  db.prepare(`
     INSERT INTO project_identity (project, repo_id, learned_at)
     SELECT project, repo_id, unixepoch() FROM (
       SELECT project, repo_id,
              ROW_NUMBER() OVER (PARTITION BY project ORDER BY updated_at DESC, id DESC) rn
-        FROM task WHERE repo_id IS NOT NULL AND repo_id > 0
+        FROM task WHERE repo_id IS NOT NULL AND repo_id > 0 ${where}
     ) WHERE rn = 1
     ON CONFLICT(project) DO UPDATE SET repo_id = excluded.repo_id, learned_at = excluded.learned_at
-     WHERE project_identity.repo_id <> excluded.repo_id;
-  `);
+     WHERE project_identity.repo_id <> excluded.repo_id
+  `).run(...(list ?? []));
 }
 
 export function backfillPinDeadlines(db) {

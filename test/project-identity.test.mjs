@@ -23,7 +23,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openHub, HUB_SCHEMA_VERSION, backfillProjectIdentities } from "../src/build/hubdb.mjs";
 import { openHubAsGuest, ALLOWED } from "../src/build/hubguest.mjs";
-import { repoIdFromHub } from "../src/build/repoid.mjs";
+import { hubAccess } from "../src/build/hubaccess.mjs";
+import { repoIdFromHub, IDENTITY_SINCE } from "../src/build/repoid.mjs";
 import { replayableKinds, COMPARISON_SET } from "../src/build/replay.mjs";
 import { TABLE_OWNERS, PROSE_TABLES } from "../src/build/tables.mjs";
 
@@ -142,6 +143,66 @@ try {
     check(r.prepare(`SELECT count(*) c FROM project_identity WHERE project='replayed'`).get().c === 1,
       "control: still one row, so the upsert replaced rather than accumulated");
     r.close();
+  }
+
+  // ---- A PRE-v5 HUB IS STILL USABLE. Adding the table to ALLOWED puts it in
+  // the guardian's schema gate, and an unconditional scan reported it missing on
+  // a v3 or v4 store -- so hubAccess returned no hub at all and the guardian was
+  // refused outright, taking away the very compatibility the lookup provides.
+  // SCHEDULER_MIN_HUB_VERSION is 3, so those versions are supported by design.
+  {
+    const p4 = join(dir, "v4.db");
+    const h = openHub(p4);
+    h.exec("PRAGMA foreign_keys = OFF");
+    h.exec("DROP TABLE project_identity");
+    h.prepare("DELETE FROM schema_version WHERE version >= ?").run(IDENTITY_SINCE);
+    h.close();
+    const acc = hubAccess(p4, { isAlive: () => true });
+    check(acc.hub !== null, "a hub below the identity migration is still usable by the guardian",
+      String(acc.why));
+    try { acc.hub?.close?.(); } catch { /* the shape varies; the assertion is about `why` */ }
+    check(!/project_identity is missing/.test(acc.why ?? ""),
+      "and the absent table is not reported as a defect at that version", String(acc.why));
+  }
+
+  // ---- THE SCOPED BACKFILL, which is what makes a mixed-version tail work.
+  // A tail can span the upgrade: a pre-v5 filing, then a post-v5 filing carrying
+  // its own identity event. A tail-WIDE test sees an identity event, calls the
+  // whole tail modern and skips the repair, leaving the earlier project with a
+  // task and no identity. So the restore names the projects that need it.
+  {
+    const r2 = openHub(join(dir, "scoped.db"));
+    const mk = (id, proj, rid, key) => {
+      const cols = r2.prepare(`SELECT name, type, "notnull" nn, dflt_value d FROM pragma_table_info('task')`).all();
+      const ddl = r2.prepare(`SELECT sql FROM sqlite_master WHERE name='task'`).get().sql;
+      const allowed = {};
+      for (const m of ddl.matchAll(/(\w+)\s+IN\s*\(([^)]*)\)/g)) {
+        const vals = [...m[2].matchAll(/'([^']*)'/g)].map(x => x[1]);
+        if (vals.length) allowed[m[1]] = vals[0];
+      }
+      const row = { id, project: proj, repo_id: rid, source_key: key, updated_at: 1 };
+      for (const c of cols) {
+        if (c.name in row) continue;
+        if (!c.nn || c.d !== null) continue;
+        row[c.name] = c.name in allowed ? allowed[c.name] : (c.type === "INTEGER" ? 1 : "x");
+      }
+      const k = Object.keys(row);
+      r2.prepare(`INSERT INTO task(${k.join(",")}) VALUES(${k.map(() => "?").join(",")})`).run(...k.map(x => row[x]));
+    };
+    mk("s1", "needs-it", 111, "k1");
+    mk("s2", "leave-alone", 222, "k2");
+    r2.prepare(`DELETE FROM project_identity`).run();
+    backfillProjectIdentities(r2, ["needs-it"]);
+    check(r2.prepare(`SELECT repo_id FROM project_identity WHERE project='needs-it'`).get()?.repo_id === 111,
+      "a scoped reconciliation repairs the project it names");
+    check(r2.prepare(`SELECT count(*) c FROM project_identity WHERE project='leave-alone'`).get().c === 0,
+      "and leaves every project it does not, so a restore adds no row the snapshot never held");
+    // An empty list is not "all". Reading it as all is how a scoped repair
+    // becomes the global one it was narrowed away from.
+    backfillProjectIdentities(r2, []);
+    check(r2.prepare(`SELECT count(*) c FROM project_identity`).get().c === 1,
+      "control: an EMPTY list repairs nothing, rather than everything");
+    r2.close();
   }
 
   // ---- the schema refuses what the writer would, because the writer is not the

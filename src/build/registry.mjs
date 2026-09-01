@@ -365,14 +365,21 @@ export function admitTask(db, snapshot, filing, { isAlive = () => true } = {}) {
     // but a repository deleted and recreated under the same key is a different
     // repository, and the newest admission is the one that saw it. That is the
     // rule `repoid.mjs` already states for the read; the write agrees with it.
-    db.prepare(
+    const learned = db.prepare(
       `INSERT INTO project_identity(project, repo_id, learned_at)
        VALUES(?,?,unixepoch())
        ON CONFLICT(project) DO UPDATE SET repo_id = excluded.repo_id, learned_at = excluded.learned_at
         WHERE project_identity.repo_id <> excluded.repo_id`)
       .run(filing.project, snapshot.repoId);
-    hubEvent(db, { kind: "project_identity.learned", task: filing.id,
-      payload: db.prepare(`SELECT * FROM project_identity WHERE project = ?`).get(filing.project) });
+    // ONLY WHEN THE ROW MOVED. Every task after the first for a project writes
+    // the id it already holds, so an unconditional event put one row in the
+    // durable log per admission recording that nothing changed. The restore's
+    // reconciliation reads these events to decide which projects a tail already
+    // carried, and it is not weakened by the gate: a filing whose identity did
+    // not move is repaired to the value it already has.
+    if (learned.changes > 0)
+      hubEvent(db, { kind: "project_identity.learned", task: filing.id,
+        payload: db.prepare(`SELECT * FROM project_identity WHERE project = ?`).get(filing.project) });
 
     for (const claim of claims) {
       db.prepare(

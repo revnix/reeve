@@ -593,22 +593,21 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
       //
       // Same rule as admission: an unchanged id writes nothing, so the ordinary
       // regenerate leaves no row and no event.
-      db.prepare(
+      const wroteIdentity = db.prepare(
         `INSERT INTO project_identity(project, repo_id, learned_at)
          VALUES(?,?,unixepoch())
          ON CONFLICT(project) DO UPDATE SET repo_id = excluded.repo_id, learned_at = excluded.learned_at
           WHERE project_identity.repo_id <> excluded.repo_id`)
         .run(task.project, snapshot.repoId);
-      // ITS OWN EVENT, or a restore replays the adoption and rebuilds the task
-      // against the new repository with the identity still naming the old one.
-      // Emitted only when the row is actually this snapshot's id, so an
-      // unchanged adoption appends nothing.
-      {
-        const now = db.prepare(
-          `SELECT * FROM project_identity WHERE project = ?`).get(task.project);
-        if (now?.repo_id === snapshot.repoId)
-          hubEvent(db, { kind: "project_identity.learned", task: taskId, payload: now });
-      }
+      // GATED ON THE WRITE, not on a read after it. Reading the row back and
+      // comparing it to the id just written answers "is the row what I asked
+      // for", which is true whether or not anything changed -- so an ordinary
+      // regenerate appended a learning event on every run, and the durable log
+      // and every exported tail filled with events recording that nothing
+      // happened. `changes` is the only thing that knows.
+      if (wroteIdentity.changes > 0)
+        hubEvent(db, { kind: "project_identity.learned", task: taskId,
+          payload: db.prepare(`SELECT * FROM project_identity WHERE project = ?`).get(task.project) });
       return;                       // the row image rides on task.transitioned
     }
 

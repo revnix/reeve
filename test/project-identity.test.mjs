@@ -21,7 +21,8 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openHub, HUB_SCHEMA_VERSION, backfillProjectIdentities } from "../src/build/hubdb.mjs";
+import { openHub, HUB_SCHEMA_VERSION, backfillProjectIdentities,
+         identityReconciliation } from "../src/build/hubdb.mjs";
 import { openHubAsGuest, ALLOWED } from "../src/build/hubguest.mjs";
 import { hubAccess } from "../src/build/hubaccess.mjs";
 import { repoIdFromHub, IDENTITY_SINCE } from "../src/build/repoid.mjs";
@@ -143,6 +144,52 @@ try {
     check(r.prepare(`SELECT count(*) c FROM project_identity WHERE project='replayed'`).get().c === 1,
       "control: still one row, so the upsert replaced rather than accumulated");
     r.close();
+  }
+
+  // ---- WHICH PROJECTS A TAIL LEAVES UNRECONCILED.
+  //
+  // This existed inline in restoreHub and was WRONG in a way no test could
+  // reach: it read `payload.project` off a `task.transitioned` image, and that
+  // image carries an explicit column list with no `project` in it. The set was
+  // always empty, the reconciliation never ran, and every test passed.
+  {
+    const ev = (kind, payload, task = null) => ({ kind, task, payload: JSON.stringify(payload) });
+    // A TRANSITION IMAGE, shaped as transition.mjs actually emits one: id,
+    // repo_id and the rest -- and no `project`. This is the fixture that makes
+    // the assertion below mean something.
+    const transition = ev("task.transitioned", { id: "bt:9", repo_id: 777, updated_at: 3 }, "bt:9");
+    check(!("project" in JSON.parse(transition.payload)),
+      "fixture: a transition image genuinely carries no project, which is why the id must resolve it");
+
+    const byId = (id) => (id === "bt:9" ? "rebound-project" : null);
+    const r = identityReconciliation([transition], byId);
+    check(r.changed.includes("rebound-project"),
+      "a legacy adoption is found by resolving the event's task id, not by reading a project it never had",
+      JSON.stringify(r));
+    check(r.admitted.length === 0,
+      "and it is NOT treated as an admission, so no identity is created for it", JSON.stringify(r));
+
+    // A FILING is the other half, and it may create.
+    const filing = ev("task.filed", { id: "bt:10", project: "admitted-project", repo_id: 888 }, "bt:10");
+    const r2 = identityReconciliation([filing], byId);
+    check(r2.admitted.includes("admitted-project") && r2.changed.length === 0,
+      "a filing is an admission and may create an identity", JSON.stringify(r2));
+
+    // CARRIED wins over both: a tail that already brought the identity needs no
+    // repair, and repairing anyway would overwrite what the tail restored.
+    const carried = ev("project_identity.learned", { project: "admitted-project", repo_id: 888 }, "bt:10");
+    const r3 = identityReconciliation([filing, carried], byId);
+    check(r3.admitted.length === 0 && r3.changed.length === 0,
+      "control: a tail that carried the identity needs no reconciliation at all", JSON.stringify(r3));
+
+    // And the MIXED tail the second review round was about: one project filed
+    // before the upgrade, another filed after with its identity. A tail-wide
+    // test called this modern and skipped the first.
+    const other = ev("task.filed", { id: "bt:11", project: "pre-upgrade", repo_id: 999 }, "bt:11");
+    const r4 = identityReconciliation([other, filing, carried], byId);
+    check(r4.admitted.length === 1 && r4.admitted[0] === "pre-upgrade",
+      "a tail SPANNING the upgrade still repairs the project whose identity it did not carry",
+      JSON.stringify(r4));
   }
 
   // ---- A PRE-v5 HUB IS STILL USABLE. Adding the table to ALLOWED puts it in

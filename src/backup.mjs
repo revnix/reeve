@@ -29,7 +29,7 @@ import { open as openStore, exportJsonl } from "./db/ops.mjs";
 // naming a module that does not exist yet breaks every import of this file.
 import { openHub, isOperational, faultKind, HUB_SCHEMA_VERSION, HUB_TABLES, tablesAt,
          schemaDefectsAt, isKnownVersion, backfillPinDeadlines,
-         backfillProjectIdentities } from "./build/hubdb.mjs";
+         backfillProjectIdentities, identityReconciliation } from "./build/hubdb.mjs";
 // Task 9's additions. `restoreHub` takes the maintenance lock before it refuses,
 // enumerates live writers to name them, and replays the tail -- and it needs
 // `replayableKinds`/`NON_REPLAYED_KINDS` to refuse a tail exported by a NEWER
@@ -1941,26 +1941,14 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         // never had an identity at all -- and a restore that adds rows the
         // snapshot never held is no longer restoring it. The drill that compares
         // row for row is what said so.
-        const payloadOf = (e) => { try { return JSON.parse(e.payload); } catch { return null; } };
-        const projectsIn = (kind) => new Set(tail.filter(e => e.kind === kind)
-          .map(e => payloadOf(e)?.project).filter(Boolean));
-        const filed = projectsIn("task.filed");
-        const carried = projectsIn("project_identity.learned");
-        // A LEGACY ADOPTION IS NOT A FILING. `adopt-snapshot` moves
-        // `task.repo_id` when a repository is recreated or a project rebound,
-        // and it rides on `task.transitioned` -- so a pre-v5 tail containing one
-        // never appears in `filed`. Migration 5 backfilled the snapshot's OLD
-        // id, replay moves the task to the new one, and no legacy event moves
-        // the identity: the restore reports success while the guardian scopes
-        // to the repository that was replaced.
-        //
-        // UPDATE-ONLY for these, because a transition proves the project changed
-        // and not that it was admitted. A project the tail merely touched, with
-        // no identity, is not a gap to fill -- it was never admitted under this
-        // schema, and creating one adds a row the snapshot never held.
-        const changed = [...projectsIn("task.transitioned")]
-          .filter(p => !carried.has(p) && !filed.has(p));
-        const admitted = [...filed].filter(p => !carried.has(p));
+        // The decision is a pure function so it can be asked without a restore.
+        // Inline, it read `payload.project` off a transition image that has no
+        // such field, so the set was always empty and this never ran -- and no
+        // test could reach it to say so.
+        const projectOfTask = back.prepare(`SELECT project FROM task WHERE id = ?`);
+        const { admitted, changed } = identityReconciliation(tail, (id) => {
+          try { return projectOfTask.get(id)?.project ?? null; } catch { return null; }
+        });
         if (admitted.length) backfillProjectIdentities(back, admitted);
         if (changed.length) backfillProjectIdentities(back, changed, { updateOnly: true });
         releaseMaintenanceLock(back, { pid, lstart });

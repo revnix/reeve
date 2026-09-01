@@ -81,6 +81,43 @@ export const HUB_SCHEMA_VERSION = 5;
  * a repository recreated under the same key, the newest task is the only record
  * of the new id. Filling gaps only would leave the old one standing.
  */
+/**
+ * Which projects a replayed tail leaves without a correct identity.
+ *
+ * PURE, AND EXPORTED, because the version of this that lived inline in
+ * `restoreHub` was WRONG AND UNTESTABLE IN THE SAME WAY. It read
+ * `payload.project` from a `task.transitioned` image; that image carries an
+ * explicit column list which does not include `project`, so the set was always
+ * empty and the reconciliation never ran. Every test passed, because nothing
+ * could reach the logic to ask it anything.
+ *
+ * Two answers, because the two events prove different things:
+ *
+ *   `admitted` — projects FILED in the tail whose identity it did not carry.
+ *     A filing proves an admission, so an identity may be CREATED for it.
+ *   `changed`  — projects a transition touched, resolved THROUGH THE TASK ID
+ *     against the replayed task table. A transition proves only that something
+ *     moved, so an existing identity may be updated and none created.
+ *
+ * `projectOfTask` is injected so this can be asked without a database.
+ */
+export function identityReconciliation(tail, projectOfTask) {
+  const payloadOf = (e) => { try { return JSON.parse(e.payload); } catch { return null; } };
+  const projectsIn = (kind) => new Set((tail ?? []).filter(e => e.kind === kind)
+    .map(e => payloadOf(e)?.project).filter(Boolean));
+  const filed = projectsIn("task.filed");
+  const carried = projectsIn("project_identity.learned");
+  const touched = new Set((tail ?? []).filter(e => e.kind === "task.transitioned")
+    // THE EVENT'S OWN `task` COLUMN FIRST, and the image's `id` as the fallback
+    // a supplied tail may arrive with. Never `project`: it is not in the image.
+    .map(e => e.task ?? payloadOf(e)?.id).filter(Boolean)
+    .map(id => projectOfTask(id)).filter(Boolean));
+  return {
+    admitted: [...filed].filter(p => !carried.has(p)),
+    changed: [...touched].filter(p => !carried.has(p) && !filed.has(p)),
+  };
+}
+
 export function backfillProjectIdentities(db, projects = null, { updateOnly = false } = {}) {
   // SCOPED WHEN THE CALLER KNOWS WHICH PROJECTS NEED IT. A restore repairs the
   // ones whose filings could not carry an identity; repairing every project

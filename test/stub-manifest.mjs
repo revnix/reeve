@@ -2190,4 +2190,13 @@ export const STUBS = [
               find: "        const fault = historyFault(hist);",
               replace: "        const fault = null; void historyFault;" }],
   },
+  {
+    name: "an-unreadable-history-keeps-its-cause",
+    why: "drop the exception on the floor, which is what `unreadableHistory()` did before it carried one. A caller refusing on an unreadable history has to tell an operator whether to retry, and that is `faultKind`'s question about the ORIGINAL exception -- a store held by another process past the busy timeout answers SQLITE_BUSY and is worth retrying, while a damaged one never is. Without the cause the read route hard-coded `retryable: false` and reported a transient lock as permanent",
+    test: "test/task-show.test.mjs",
+    expectRed: "an unreadable schema_version is refused",
+    edits: [{ file: "src/build/hubdb.mjs",
+              find: "  } catch (e) { return unreadableHistory(e); }",
+              replace: "  } catch { return unreadableHistory(); }" }],
+  },
 ];

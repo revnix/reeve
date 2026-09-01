@@ -1649,6 +1649,33 @@ const filed = {};
         "and damage is NOT retryable, because retrying a broken file forever is the wrong advice",
         JSON.stringify(j));
 
+      // AND A HUB WHOSE schema_version ITSELF CANNOT BE READ. That is a different
+      // path from the query-time failure above: the history read fails, so the
+      // route never reaches an application query at all.
+      //
+      // ASSERTING THE CAUSE REACHES THE OPERATOR, not merely that `retryable` is
+      // a boolean. `migrationStateOf` swallows the exception, and the first
+      // version of this refusal hard-coded `retryable: false` -- which passes any
+      // assertion about the bit's VALUE while telling a client not to retry a hub
+      // another process was holding past the busy timeout. The observable that
+      // only exists when the cause survives is the cause itself, in the message.
+      const noHist = mkdtempSync(join(tmpdir(), "reeve-nohist-"));
+      mkdirSync(join(noHist, "state"), { recursive: true });
+      const nh = new DatabaseSync(join(noHist, "state", "hub.db"));
+      nh.exec("CREATE TABLE placeholder (x INTEGER)");
+      nh.close();
+      const nr = spawnSync(process.execPath, [BIN, "task", "list", "--home", noHist, "--json"],
+        { encoding: "utf8", timeout: 60_000 });
+      const nj = parse(nr.stdout ?? "");
+      check(nj?.kind === "hub_unreadable",
+        "a hub whose schema_version cannot be read is a typed refusal",
+        ((nr.stdout ?? "") + (nr.stderr ?? "")).slice(0, 300));
+      check(/no such table: schema_version/.test(nj?.message ?? ""),
+        "an unreadable schema_version is refused WITH the reason it could not be read",
+        `the reason is what decides whether retrying can help, and it is the thing a swallowed exception loses: ${JSON.stringify(nj?.message)}`);
+      check(typeof nj?.retryable === "boolean",
+        "control: and it still carries a retryable bit", JSON.stringify(nj));
+
       // THE PROJECT PREFILTER READS THE SAME BROKEN STORE. It ran outside the
       // guard, so `--project` was the one path that still escaped as a trace.
       const f = spawnSync(process.execPath, [BIN, "task", "list", "--project", "alpha", "--home", rotten, "--json"],

@@ -1323,10 +1323,17 @@ switch (cmd) {
         // came to disagree; the decision is `historyFault` now and this site only
         // renders it.
         const hist = migrationStateOf(db);
+        // RETRYABILITY SURVIVES, and this is what the first version of this block
+        // lost. `migrationStateOf` swallows the exception, so a hard-coded
+        // `retryable: false` told a client not to retry a hub another process was
+        // holding past the busy timeout -- a transient lock reported as permanent.
+        // The state now carries its `cause`, and `faultKind` classifies it exactly
+        // as the hand-rolled read this replaced did.
         if (!hist.readable)
           fail("hub_unreadable",
-               `reeve task ${sub}: the hub at ${hub} has no readable schema_version`,
-               { exit: EXITS.refused, retryable: false });
+               `reeve task ${sub}: the hub at ${hub} has no readable schema_version` +
+               (hist.cause ? ` — ${hist.cause.message}` : ""),
+               { exit: EXITS.refused, retryable: faultKind(hist.cause) === "operational" });
         // THE KIND IS A LITERAL, deliberately, and this cost a round to learn.
         // `test/cli-flags.test.mjs` extracts every `fail("<kind>"` from this file
         // by pattern and asserts the declared vocabulary against what the CLI can

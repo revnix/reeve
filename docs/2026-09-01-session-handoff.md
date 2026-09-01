@@ -38,14 +38,14 @@ cd ~/Work/Products/reeve || exit 1
 # success while a gate inside it said no. Fixing them one at a time left the twin
 # standing each time -- the sweep was repaired and the merge gates were not, in the
 # same commit. So the read that can be forgotten is gone: every fallible step calls
-# `refused`, and the last line exits from what it accumulated.
+# `note_refusal`, and the last line exits from what it accumulated.
 #
 # READS THAT MUST ABORT still abort on the spot, and they are a different thing: a
 # failed fetch or a failed pull-request listing makes every line below it answer
 # from stale or empty data, and continuing would produce confident wrong output
 # rather than an incomplete report.
 blockrc=0
-refused() { blockrc=1; echo "SECTION 0 REFUSES: $*"; }
+note_refusal() { blockrc=1; echo "SECTION 0 REFUSES: $*"; }
 
 # CHAINED, because a failed fetch is silent and every read below then answers from the
 # CACHED remote-tracking ref. The line labelled "what `main` is" would report stale
@@ -146,17 +146,17 @@ grep "shadow:" ~/.reeve/reeve.log | tail -1 \
 # look alike, which is the same rule the rest of this block is built on.
 if [ -n "${open_pr:-}" ]; then
   node scripts/premerge.mjs "$open_pr" \
-    || refused "premerge says this merge should not happen (#$open_pr)"   # SHOULD this merge happen
+    || note_refusal "premerge says this merge should not happen (#$open_pr)"   # SHOULD this merge happen
 fi
 if [ -n "${merged_pr:-}" ]; then
   node scripts/verify-merge.mjs "$merged_pr" \
-    || refused "verify-merge says that merge did not carry everything (#$merged_pr)"
+    || note_refusal "verify-merge says that merge did not carry everything (#$merged_pr)"
 fi
 # NO GATE IS A REFUSAL, not a warning. A block whose exit status cannot tell "no
 # gate ran" from "the gate said yes" is the same defect as one that drops a gate's
 # verdict, and a caller reads the status rather than the text.
 if [ -z "${open_pr:-}${merged_pr:-}" ]; then
-  refused "no merge gate ran — set open_pr=<number> of an OPEN pull request, or merged_pr=<number> of a MERGED one"
+  note_refusal "no merge gate ran — set open_pr=<number> of an OPEN pull request, or merged_pr=<number> of a MERGED one"
 fi
 # ~4ms; every anchor still resolves. IN FLIGHT when this was written, so check it
 # exists first: a missing file exits MODULE_NOT_FOUND, which is not the same answer
@@ -165,8 +165,8 @@ fi
 # and the sweep below then runs as though no anchor had failed -- the two outcomes the
 # comment above says must differ, rendered identically.
 if [ -f test/anchors-resolve.test.mjs ]; then
-  node test/anchors-resolve.test.mjs || refused "a manifest anchor no longer resolves"
-else refused "anchors-resolve is ABSENT -- this checkout cannot answer the anchor question"; fi
+  node test/anchors-resolve.test.mjs || note_refusal "a manifest anchor no longer resolves"
+else note_refusal "anchors-resolve is ABSENT -- this checkout cannot answer the anchor question"; fi
 # ~20 minutes, and run it in an ISOLATED detached worktree at a COMMITTED head. It
 # writes stubbed source and restores a startup snapshot, so an edit made while it runs
 # is silently overwritten — and this checkout is shared by three sessions.
@@ -211,8 +211,8 @@ git worktree remove --force "$sweepdir"
 # exit status came from whatever ran last, so a FAILED sweep left an authoritative
 # block reporting success -- the pre-merge gate treated as passed on a run that said
 # no. Both statuses are named, and either one non-zero fails the block.
-[ "$covrc" -eq 0 ] || refused "the coverage read failed (exit $covrc) -- do not read the absence as zero debt"
-[ "$sweeprc" -eq 0 ] || refused "the sweep failed (exit $sweeprc) -- read the verdict list, not the exit alone"
+[ "$covrc" -eq 0 ] || note_refusal "the coverage read failed (exit $covrc) -- do not read the absence as zero debt"
+[ "$sweeprc" -eq 0 ] || note_refusal "the sweep failed (exit $sweeprc) -- read the verdict list, not the exit alone"
 echo "sweep exit: $sweeprc; coverage exit: $covrc"
 
 # THE LAST LINE, and the only place this block decides anything.

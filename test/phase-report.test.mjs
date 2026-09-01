@@ -10,8 +10,9 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PHASES, BUILD_ACTION_FOR, BUILD_ACTIONS } from "../src/build/phases.mjs";
-import { ACTIONS, PHASE_FOR_ACTION, schemaFor, validateReport, evidenceFor, badReportPlan }
-  from "../src/build/report.mjs";
+import { ACTIONS, PHASE_FOR_ACTION, schemaFor, schemaTextFor, validateReport, evidenceFor,
+         badReportPlan, MAPPED_OUTCOMES } from "../src/build/report.mjs";
+import { workerArgs } from "../src/supervisor.mjs";
 // THROUGH `applyTransition`, not `nextPhase` alone. A pure-function assertion
 // cannot see whether a refusal reached the database, and the database is what
 // `task why` renders -- so a refusal that is decided and not recorded is
@@ -332,6 +333,14 @@ const lastRefusal = (db, id) => db.prepare(
 // green while `evidenceFor` starts emitting a phase `nextPhase` refuses -- and
 // then every worker's perfectly good report fails at the transition with a
 // message about attribution, which names neither half.
+// The reports the freeze drives, one per action per declared outcome. Each is
+// VALID for its own action, because `evidenceFor` now validates before mapping.
+const OK_FOR = { BUILD_SIZE: SIZE_OK, BUILD_RESEARCH: RESEARCH_OK, BUILD_DESIGN: DESIGN_OK };
+const FREEZE_CASES = ACTIONS.flatMap(a => [
+  [a, "ok", OK_FOR[a]],
+  [a, "blocked", { outcome: "blocked", reason: "r", escalation: "bt:x:e" }],
+  [a, "infeasible", { outcome: "infeasible", reason: "r" }],
+]);
 {
   const frozen = JSON.parse(readFileSync(new URL("./fixtures/report-schemas-v1.json", import.meta.url), "utf8"));
   const sha = (v) => createHash("sha256").update(JSON.stringify(v)).digest("hex");
@@ -341,8 +350,12 @@ const lastRefusal = (db, id) => db.prepare(
       `${now} vs ${frozen.schemas[action]}\n        ` +
       "A change here changes what every dispatched worker is asked for.");
   }
-  const map = sha(ACTIONS.map(a => [a, evidenceFor({ action: a,
-    report: { outcome: "ok", reason: "r", depth: "standard" } })]));
+  // EVERY ACTION AND EVERY DECLARED OUTCOME, not just `ok`. A freeze over the
+  // success path alone reports the map intact while a hold stops carrying its
+  // escalation identity or an infeasible stops carrying its reason -- and those
+  // are the two the machine refuses, so the failure would arrive as a refusal
+  // nobody could trace back to this file.
+  const map = sha(FREEZE_CASES.map(([a, , report]) => [a, evidenceFor({ action: a, report })]));
   check(map === frozen.evidence_map,
     "and so is the outcome-to-evidence map, which the JSON freeze cannot see",
     `${map} vs ${frozen.evidence_map}`);
@@ -350,5 +363,83 @@ const lastRefusal = (db, id) => db.prepare(
 }
 
 rmSync(dir, { recursive: true, force: true });
+// ── The schema reaches the worker as TEXT ───────────────────────────────────
+//
+// `workerArgs` pushes its `jsonSchema` straight into the argv array and its
+// tested contract is serialized JSON. The documented handoff passes
+// `schemaFor(action)` -- a parsed object -- so every phase dispatch following it
+// would spawn a worker whose structured-output contract is the literal string
+// `[object Object]`. Not a validation failure: an argument that is syntactically
+// fine and semantically nothing, on all three phases at once.
+{
+  for (const action of ACTIONS) {
+    const text = schemaTextFor(action);
+    check(typeof text === "string", `${action}'s schema is available as text`, typeof text);
+    check(JSON.stringify(JSON.parse(text)) === JSON.stringify(schemaFor(action)),
+      `and the text parses to the same schema the validator uses`, action);
+    // THROUGH THE REAL ARGV BUILDER, not a claim about it. Passing the object is
+    // what produced `[object Object]`, and only the builder can show that.
+    const argv = workerArgs({ prompt: "p", settings: "/tmp/s.json", jsonSchema: text });
+    const at = argv.indexOf("--json-schema");
+    check(at !== -1 && argv[at + 1] === text,
+      `and workerArgs carries it verbatim`, String(argv[at + 1]).slice(0, 40));
+    const bad = workerArgs({ prompt: "p", settings: "/tmp/s.json", jsonSchema: schemaFor(action) });
+    const badAt = bad.indexOf("--json-schema");
+    check(String(bad[badAt + 1]) === "[object Object]",
+      `control: passing the parsed object instead spawns with "[object Object]"`, String(bad[badAt + 1]));
+  }
+}
+
+// ── Every declared outcome has evidence, asserted rather than hoped for ─────
+//
+// The map used to be two `if`s and a trailing `return`, so anything that was not
+// `infeasible` or `blocked` became a `phase.succeeded`. An outcome added to the
+// schema later -- `cancelled`, `partial` -- would have ADVANCED the task the day
+// it was declared, and no freeze would notice, because a freeze exercises the
+// outcomes that exist. This fails the moment the enum grows past the map.
+{
+  for (const action of ACTIONS) {
+    for (const outcome of schemaFor(action).properties.outcome.enum) {
+      check(MAPPED_OUTCOMES.includes(outcome),
+        `${action}'s declared outcome ${outcome} has evidence to become`, MAPPED_OUTCOMES.join(","));
+    }
+  }
+  check(MAPPED_OUTCOMES.length === 3, "control: and the map has exactly the three that exist today",
+    MAPPED_OUTCOMES.join(","));
+}
+
+// ── A report valid for ANOTHER action does not become this action's evidence ─
+//
+// Checking only that the outcome word is declared, a valid RESEARCH report
+// handed in as BUILD_DESIGN produced a successful DESIGN evidence -- which
+// `nextPhase` accepts while the task is in DESIGN. That is exactly the miswired
+// or adopted-report case the phase-attribution guard exists for, defeated one
+// layer above it.
+{
+  let threw = null;
+  try { evidenceFor({ action: "BUILD_DESIGN", report: RESEARCH_OK }); } catch (e) { threw = String(e.message); }
+  check(threw !== null && /not a valid BUILD_DESIGN report/.test(threw),
+    "a valid RESEARCH report is refused as DESIGN evidence", String(threw));
+  check(validateReport("BUILD_RESEARCH", RESEARCH_OK).ok === true,
+    "control: and that same report is perfectly valid for the action it belongs to");
+  check(evidenceFor({ action: "BUILD_RESEARCH", report: RESEARCH_OK }).phase === "RESEARCH",
+    "control: and becomes RESEARCH evidence there");
+}
+
+// ── The cached schema cannot be mutated by a caller ─────────────────────────
+//
+// One cache, handed to every consumer. A consumer mutating what it was given
+// would change what every later validation enforces, and the freeze would go on
+// reporting the contract intact because it hashes the same mutated object.
+{
+  const s = schemaFor("BUILD_SIZE");
+  let threw = null;
+  try { "use strict"; s.properties.confidence = { type: "integer" }; } catch (e) { threw = String(e.message); }
+  check(!("confidence" in s.properties),
+    "a caller cannot add a property to the shared schema", threw ?? "(silently ignored)");
+  check(validateReport("BUILD_SIZE", { ...SIZE_OK, confidence: 1 }).ok === false,
+    "control: and validation still refuses the property that mutation tried to declare");
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

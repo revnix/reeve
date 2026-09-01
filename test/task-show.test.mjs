@@ -1544,7 +1544,15 @@ const filed = {};
     mkdirSync(join(ahead, "state"), { recursive: true });
     const aheadDb = new DatabaseSync(join(ahead, "state", "hub.db"));
     aheadDb.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, at INTEGER NOT NULL)");
-    aheadDb.prepare("INSERT INTO schema_version(version, at) VALUES (?, 1)").run(HUB_SCHEMA_VERSION + 1);
+    // EVERY VERSION UP TO THE NEWER ONE, which is what a hub written by a newer
+    // binary actually looks like. This recorded ONLY `HUB_SCHEMA_VERSION + 1`, so
+    // it built a store that no binary could produce: migrations are forward-only,
+    // so a history that reached 6 carries 1 through 5 as well. The old refusal
+    // compared only the maximum and could not tell the difference; the decision
+    // now distinguishes AHEAD from ahead-and-missing, and that shape is damage.
+    // The damaged shape is covered as its own row in `test/hub-fault.test.mjs`.
+    for (let v = 1; v <= HUB_SCHEMA_VERSION + 1; v++)
+      aheadDb.prepare("INSERT INTO schema_version(version, at) VALUES (?, 1)").run(v);
     aheadDb.close();
     const a = spawnSync(process.execPath, [BIN, "task", "list", "--home", ahead, "--json"],
       { encoding: "utf8", timeout: 60_000 });

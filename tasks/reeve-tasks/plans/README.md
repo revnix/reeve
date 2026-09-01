@@ -268,3 +268,40 @@ same kind as the ones already recorded: a "produces" clause nobody ran. Three of
 them are the plan disagreeing with the SPEC it cites, which no amount of reading
 the plans against each other could have found. S3-C, S3-D and S3-F have still
 never been executed.
+
+## Fifth round: what executing S3-B's PR-B3 found
+
+Task 1 of the report contract, executed 2026-09-01. Three of these are defects in
+the plan's own code snippet, which is a category the earlier rounds did not
+produce, because the earlier rounds read plans rather than running them.
+
+| what the plan says | what is true | how |
+|---|---|---|
+| `export const ACTIONS = Object.freeze(["BUILD_SIZE", "BUILD_RESEARCH", "BUILD_DESIGN"])` and a literal `PHASE_FOR_ACTION` | `phases.mjs` already exports `BUILD_ACTIONS` and `BUILD_ACTION_FOR`, under a comment stating that **a second inventory of three names that agree today is the defect this codebase keeps finding**. The plan specifies writing exactly that second inventory | `src/build/phases.mjs:41-46`; the comment above it runs to sixteen lines and names this failure |
+| `export function validateReport(action, value) { const errors = walk(...); return errors.length ? ... }` | every early return in `walk` is `return errors.push(...)`, which is a **number**. `errors.length` is then `undefined`, which is falsy, so `validateReport("BUILD_SIZE", "not an object")` answers `{ok: true}`. Only the ROOT call reads that return value, so the one input that reaches it is a non-object — which is what a worker answering in prose instead of JSON produces | run the plan's own `report.mjs` against a string; the plan's own tests pass only objects, so they cannot exhibit it |
+| `evidenceFor` maps `infeasible`, then `blocked`, then returns `phase.succeeded` | anything that is not one of those two becomes a SUCCESS. A report that skipped validation, or one validated against a different action, therefore **advances the task**. Failing open in the one function whose output moves a task forward | `evidenceFor({action:"BUILD_SIZE", report:{outcome:"nonsense"}})` returns `kind: "phase.succeeded"` |
+| S3-B: `validateReport(action, value) -> {ok:true, report} \| {ok:false, errors}` | S3-D's consumed table names `{ok:false, kind:"BAD_REPORT", errors}` and dispatches on `kind`. The producer's clause omits the field the consumer branches on | S3-B `:1703`; S3-D `:50` |
+
+**Stale anchors in PR-B3's consumed list**, all in `src/build/phases.mjs`:
+`PHASES` is cited at `:42` and is at `:66`; `HOLD_ESCALATION` at `:89` and is at
+`:113`; `holdReasonRefusal` at `:132` and is at `:144`. The fourth, `nextPhase`
+at `:654`, is right in substance — `:654` is its `phase.succeeded` branch rather
+than its declaration, and that branch is what the sentence is about.
+
+**What the mapping got right, verified rather than assumed.** Every evidence
+shape the plan produces is one `nextPhase` accepts, and the four requirements it
+relies on are real: `phase.succeeded` needs `evidence.phase` and, in SIZING,
+`evidence.depth` from `DEPTHS` (`:662` and `:676`); `founder.infeasible` needs a
+non-blank `reason` (`:267`); `phase.failed` needs `retriesExhausted` (`:449`);
+and `evidence.detail` is read by `transition.mjs` (`:202`, `:519`), so the hold
+branch is not inventing a field. The plan's refusal to default a `blocked_other`
+escalation identity is also correct and load-bearing: `holdReasonRefusal`
+(`:144`) refuses a blank one, and a default here would be a second copy of that
+rule.
+
+**The shape this round adds to the list.** The earlier rounds found plans
+disagreeing with the code, with each other, and with themselves. This one found a
+plan whose *code* is wrong in ways its *own tests cannot see* — the non-object
+case is invisible to a test suite that only ever passes objects. A plan that
+ships both the implementation and the assertions can be internally consistent and
+still wrong, and reading it against itself will never say so.

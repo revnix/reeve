@@ -86,16 +86,30 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
                     queuedRequests, cancelQueued, measureContainment, noteRateLimit,
                     carriedReleases, carriedCooldowns, providerBind,
                     resolveRepoIdFn, project, keepDir = false, seams = null,
-                    haltMarker, openPrs } = {}) => {
+                    haltMarker, openPrs, containment, ticks = 1, dbPath, evaluate } = {}) => {
   const dir = mkdtempSync(join(tmpdir(), "reeve-prov-"));
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
   const guest = hub === undefined ? openHubAsGuest(hubPath) : hub;
   const claims = [], releases = [], spawned = [];
   const ctx = {
-    nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
+    // A STORE THIS RUN DID NOT CREATE, when the caller names one. `bin/reeve`
+    // builds a fresh context per process, so "the daemon restarted" means a new
+    // ctx over an EXISTING store -- and a fixture that always makes its own store
+    // cannot express it at all. Anything a tick is supposed to carry across a
+    // restart has to be read back from the store, and this is the only way to
+    // watch it happen.
+    nwo: "o/r", db: open(dbPath ?? join(dir, "s.db")), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
-    containment: containmentThrows ? null : { credentialRead: "closed", why: "test" },
+    // OVERRIDABLE, and the default is a verdict with NO canary in it. The
+    // daemon's containment verdict carries the canary's own result beside the
+    // credential answer, and the two are different facts: a scenario about what
+    // the tick does when the SANDBOX stopped containing a worker cannot be
+    // expressed by a `credentialRead` alone. Written as a fixed literal, this
+    // made every canary branch in the tick unreachable through this harness.
+    containment: containmentThrows ? null
+               : (Array.isArray(containment) ? containment[0]
+                  : (containment ?? { credentialRead: "closed", why: "test" })),
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: capacity ?? (() => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 })),
     profile: {
@@ -158,7 +172,12 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     // complete read and a partial one differently.
     observe: () => ({ ok: false, observations: [], incomplete: true,
                       threads: { readable: false, total: null, unresolved: 0, seen: 0 } }),
-    evaluate: () => EVAL,
+    // OVERRIDABLE. A tick is COMPLETE only when every listed pull request was
+    // evaluated, and `complete` is what `announceable` consults before it retires
+    // a standing cause that names no pull request. With a fixed evaluator no
+    // fixture could produce an INCOMPLETE tick at all, so the whole branch that
+    // decides whether absence may be read as repair was unreachable.
+    evaluate: evaluate ?? (() => EVAL),
     publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
     spawnWorker: spawnWorker ?? (async a => { spawned.push(a); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }; }),
     ...(heartbeatMs != null ? { heartbeatMs } : {}),
@@ -211,12 +230,36 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
       ctx[op] = (...args) => { seams.push({ op, args }); return inner(...args); };
     }
   }
-  const r = await tick(ctx);
-  const out = { r, claims, releases, spawned, ctx,
+  // ONE VERDICT PER TICK when the caller gives a list. A scenario about a fault
+  // that CLEARS needs the containment verdict to differ between ticks, and ctx is
+  // built once -- so the alternative was a caller smuggling the sequence in
+  // through a getter, which reads as a puzzle and breaks silently the day the
+  // tick reads the property a second time. An explicit list per tick cannot.
+  const verdictFor = (i) => Array.isArray(containment)
+    ? (containment[Math.min(i, containment.length - 1)] ?? null)
+    : ctx.containment;
+
+  // THE SAME ctx, N TIMES. Some of what the tick decides is carried on `ctx`
+  // between ticks on purpose -- a standing escalation that must not be retired
+  // by a quiet tick is the case this was added for -- and a fixture that can only
+  // ever run one tick cannot tell a fact that STANDS from one that was merely
+  // raised once. `r` is the LAST tick's result, which is the one such a scenario
+  // asks about; every tick's escalation map is kept in `all` for a caller that
+  // wants to compare them.
+  const all = [];
+  let r;
+  for (let i = 0; i < ticks; i++) {
+    if (!containmentThrows) ctx.containment = verdictFor(i);
+    r = await tick(ctx);
+    all.push(r);
+  }
+  const out = { r, all, claims, releases, spawned, ctx,
                 esc: [...(r.escalations?.keys?.() ?? [])].join(" | "),
                 log: readFileSync(join(dir, "log.txt"), "utf8") };
   out.dir = dir;
   out.hubPath = hubPath;
+  // Named so a caller can hand it to a second run as `dbPath`.
+  out.dbPath = dbPath ?? join(dir, "s.db");
   ctx.db.close();
   try { guest?.close?.(); } catch {}
   // keepDir: the caller dumps the database after the tick, so the directory

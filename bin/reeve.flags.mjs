@@ -32,7 +32,7 @@ export const APPLIES = Object.freeze({
   // doctor 2, builder 8, task 8 -- and `build` 0, across all 447 of its lines. The
   // flag is accepted there and cannot do anything, on any of its subcommands. So
   // it is refused until something honours it, rather than advertised and inert.
-  json: Object.freeze(["doctor", "status", "builder", "task"]),
+  json: Object.freeze(["doctor", "status", "builder", "task", "notify"]),
 
   // `--dry-run` was the first flag to need this and had its own allow-list, one
   // gate above the dispatch switch, for the right reason: a per-route check is a
@@ -61,6 +61,13 @@ export const APPLIES = Object.freeze({
   // `--since` is the cursor a previous digest handed back, and only the digest
   // answers "what moved since then".
   since: Object.freeze(["task dash"]),
+
+  // `--test` is the whole of `reeve notify`: there is no other thing that
+  // command does. It is listed rather than left unconstrained so that typing it
+  // at a command that sends nothing is refused instead of quietly ignored --
+  // which, for a flag whose entire meaning is "do not treat this as real", is
+  // the most expensive place to be wrong.
+  test: Object.freeze(["notify"]),
 });
 
 /**

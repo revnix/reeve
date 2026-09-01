@@ -522,18 +522,34 @@ const fresh = tag => open(join(mkdtempSync(join(tmpdir(), `reeve-dep-${tag}-`)),
   // fixture that already had the column would pass this block without testing it.
   check(before === 0, "control: the fixture's outbox genuinely lacks the column", String(before));
 
-  const e = threw(() => {
-    const db = open(path);
-    const cols = db.prepare("SELECT name FROM pragma_table_info('outbox')").all().map(c => c.name);
-    check(cols.includes("depends_on"), "the column is added to a table that predates it");
-    check(db.prepare("SELECT count(*) n FROM sqlite_master WHERE type='index' AND name='outbox_depends'").get().n === 1,
-      "and its index is created AFTER the column, not before");
-    check(db.prepare("SELECT count(*) n FROM outbox").get().n === 1, "and the existing row survives");
-    check(db.prepare("SELECT depends_on FROM outbox WHERE idem_key='legacy'").get().depends_on === null,
-      "with null meaning what it should: this row waited for nothing");
-    open(path);   // reopening must be idempotent, since every daemon start does it
-  });
+  let db = null;
+  // The reopen stays under the same assertion: every daemon start reopens, so a
+  // second open that throws is the same defect as a first one that does.
+  const e = threw(() => { db = open(path); open(path); });
   check(e === null, "opening a store whose outbox predates the column does not throw", String(e));
+
+  // HOISTED OUT OF THAT CLOSURE, and the reason is the whole point of the block.
+  //
+  // These four used to sit inside it. When the open throws -- which is exactly
+  // what this file's manifest entry makes it do -- all four were SKIPPED. The
+  // named assertion went red, the file still reached its own end, and four
+  // properties went unmeasured while reading in the log precisely like four
+  // passes. 84 assertions where the control reports 88, and nothing said so.
+  //
+  // They now run whether or not the store opened, and each says which it was.
+  const one = (sql) => { try { return db?.prepare(sql).get(); } catch { return undefined; } };
+  const why = db ? null : "the store never opened, so this property was not measured";
+  const cols = (() => {
+    try { return db?.prepare("SELECT name FROM pragma_table_info('outbox')").all().map(c => c.name) ?? []; }
+    catch { return []; }
+  })();
+  check(cols.includes("depends_on"), "the column is added to a table that predates it",
+    why ?? cols.join(","));
+  check(one("SELECT count(*) n FROM sqlite_master WHERE type='index' AND name='outbox_depends'")?.n === 1,
+    "and its index is created AFTER the column, not before", why);
+  check(one("SELECT count(*) n FROM outbox")?.n === 1, "and the existing row survives", why);
+  check(one("SELECT depends_on FROM outbox WHERE idem_key='legacy'")?.depends_on === null,
+    "with null meaning what it should: this row waited for nothing", why);
 }
 
 console.log(fail ? `\nFAILED ${fail}` : "\nok");

@@ -45,8 +45,14 @@ const check = (ok, name, detail) => {
   const gone = unresolvedAnchors([{ name: "gone", edits: [{ file: "a.mjs", find: "const z = 3;" }] }], { read, key: f => f });
   check(gone.length === 1 && gone[0].count === 0, "an anchor that appears NOWHERE is reported",
     JSON.stringify(gone));
-  check(/no part of the anchor|then diverged|reads/.test(gone[0].why ?? ""),
-    "and the report says where it diverged, not merely that it failed", gone[0].why);
+  // OPTIONAL CHAINING ON THE INDEX, not just the property. `gone[0].why ?? ""`
+  // guards the value and not the indexing, so when the assertion above fails
+  // because `gone` came back EMPTY, this line throws and takes the remaining
+  // twelve assertions with it. The stub that empties it is in the manifest, and
+  // it reported CAUGHT for years: the named assertion had already gone red, and
+  // nothing in the verdict looked at how much of the file still ran.
+  check(/no part of the anchor|then diverged|reads/.test(gone[0]?.why ?? ""),
+    "and the report says where it diverged, not merely that it failed", gone[0]?.why);
 
   const dup = unresolvedAnchors([{ name: "dup", edits: [{ file: "b.mjs", find: "dup" }] }], { read, key: f => f });
   check(dup.length === 1 && dup[0].count === 2,

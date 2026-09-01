@@ -241,6 +241,35 @@ const holeAt = (p, v) => {
   check(digestOf(hub) === beforeRun,
     "and leaves it byte-identical, which is the whole promise of --dry-run",
     `${beforeRun.slice(0, 12)} -> ${digestOf(hub).slice(0, 12)}`);
+
+  // AND A HEALTHY, CURRENT HUB IS NOT WRITTEN EITHER.
+  //
+  // The version checks stop `openHub` from MIGRATING, which was the
+  // irreversible write. They do not stop it writing at all: its first act is
+  // `PRAGMA journal_mode = WAL`, which rewrites the header of a database in
+  // DELETE mode. A hub restored from a snapshot is in delete mode, because
+  // `VACUUM INTO` writes it that way -- so the ordinary case, a fully migrated
+  // hub with nothing wrong with it, was the one still being modified.
+  rmSync(hub, { force: true });
+  openHub(hub).close();
+  {
+    const q = new DatabaseSync(hub);
+    q.exec("PRAGMA journal_mode = DELETE");
+    q.close();
+  }
+  const beforeHealthy = digestOf(hub);
+  const healthy = dryRun();
+  // THE CONTROL IS THAT THE HUB WAS REACHED, not that the whole command
+  // succeeded. This fixture has no git repository, so the run stops further
+  // along -- and that is what proves it got PAST the hub guard and opened the
+  // store, which is what makes the byte comparison below mean something. Without
+  // it, a route that exited before touching the hub would satisfy it too.
+  check(!/reeve task: the hub at/.test(healthy.out),
+    "control: a healthy current hub is not refused by the dry-run guard, so the store is opened",
+    healthy.out.slice(0, 300));
+  check(digestOf(hub) === beforeHealthy,
+    "and does not write to it -- the version checks stopped the migration, not the pragma",
+    `${beforeHealthy.slice(0, 12)} -> ${digestOf(hub).slice(0, 12)}`);
 }
 
 // ── THE RECORDED VERSION IS NOT A LOOP BOUND ────────────────────────────────

@@ -1479,7 +1479,20 @@ switch (cmd) {
             : `-> run a command that writes (for example \`reeve task file\` without --dry-run) to migrate, then retry`);
           process.exit(1);
         }
-        db = openHub(hubPath);
+        // READ-ONLY, and this is the last write the dry run had left.
+        //
+        // The version checks above stop `openHub` from MIGRATING, which was the
+        // irreversible one. They do not stop it from writing at all: its first
+        // act is `PRAGMA journal_mode = WAL`, which rewrites the header of a
+        // database in DELETE mode -- and a hub restored from a snapshot is in
+        // delete mode, because `VACUUM INTO` writes it that way. So a fully
+        // migrated, entirely healthy hub was still modified by the command whose
+        // whole promise is that it modifies nothing.
+        //
+        // A read-only handle also makes the promise ENFORCED rather than
+        // reviewed: if a dry run ever tries to write, SQLite refuses it loudly
+        // instead of the write succeeding and nobody noticing.
+        db = new DatabaseSync(hubPath, { readOnly: true, timeout: HUB_BUSY_TIMEOUT_MS });
       }
     } else {
       db = openHub(hubPath);

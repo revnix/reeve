@@ -403,10 +403,26 @@ export function reviewArtifact({ phase, dir, expect }) {
     // at or beyond the innermost of them is nested; one to its left closes levels
     // until it is not.
     const open = [];
+    // AND A LIST ENDS. `open` described the list currently being read, and
+    // nothing ever closed it -- so a cited list, a blank line, a paragraph, and
+    // then a NEW list starting with one to three spaces had its first item
+    // measured against the OLD list's content column and skipped as nested. The
+    // new list's uncited claim disappeared from the count, and the artifact
+    // passed. Markdown ends a list at a blank line followed by a block that is
+    // not part of it; a paragraph indented into the item is a continuation and
+    // does not.
+    const width = (s) => s.replace(/\t/g, "    ").length;
+    let blank = false;
     for (const line of scope) {
+      if (line.trim() === "") { blank = true; continue; }
       const m = CLAIM.exec(line);
-      if (!m) continue;
-      const width = (s) => s.replace(/\t/g, "    ").length;
+      if (!m) {
+        const indent = width(/^[ \t]*/.exec(line)[0]);
+        if (blank && (open.length === 0 || indent < open[open.length - 1])) open.length = 0;
+        blank = false;
+        continue;
+      }
+      blank = false;
       const indent = width(m[1]);
       while (open.length && indent < open[open.length - 1]) open.pop();
       const nested = open.length > 0;

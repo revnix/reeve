@@ -926,6 +926,22 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   // AND AN INDENTED LIST NESTS RELATIVE TO ITSELF, not to column zero.
   check(g("RESEARCH", "# r\n\n## Findings\n\n   - a claim (src/x.mjs:1)\n     - elaboration\n", {}).ok === true,
     "control: a list that starts indented still nests relative to its own first item");
+  // AND A LIST ENDS. Nothing ever closed the open levels, so a cited list, a
+  // blank line, a paragraph and then a NEW list had its first item measured
+  // against the OLD list's content column. An uncited claim in the second list
+  // disappeared from the count entirely.
+  check(g("RESEARCH",
+    "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n  - elaboration\n\nSome prose.\n\n  - unsupported\n",
+    {}).ok === false,
+    "a new list after a paragraph is top-level again, however the previous one was indented");
+  // AND A CONTINUATION DOES NOT END IT. A paragraph indented into the item
+  // belongs to the item, so the list is still open and its sub-bullets are still
+  // nested -- ending the list there would make every elaboration a claim again,
+  // which is the defect this whole rule was written to remove.
+  check(g("RESEARCH",
+    "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n\n  more about it\n\n  - elaboration\n",
+    {}).ok === true,
+    "control: a paragraph indented into the item is a continuation, and the list stays open");
 
   // minCitationsPerClaim IS APPLIED. It was accepted and ignored, so a claim with
   // one citation satisfied a caller asking for two -- an argument read but not

@@ -1426,4 +1426,22 @@ export const STUBS = [
               find: "    for (let d = start; ; d = dirname(d)) { chain.push(d); if (d === top || d === dirname(d)) break; }",
               replace: "    for (let d = start; ; d = dirname(d)) { chain.push(d); if (d === dirname(d)) break; }" }],
   },
+  {
+    name: "artifact-a-list-ends-at-a-new-block",
+    why: "never close the open list levels. `open` described the list being read and nothing ended it, so a cited list, a blank line, a paragraph and then a NEW list had its first item measured against the OLD list's content column and skipped as nested. The second list's uncited claim disappeared from the count and the artifact passed -- the further apart the two lists, the more certainly the rule stopped applying",
+    test: "test/artifact.test.mjs",
+    expectRed: "a new list after a paragraph is top-level again, however the previous one was indented",
+    edits: [{ file: "src/build/artifact.mjs",
+              find: "        if (blank && (open.length === 0 || indent < open[open.length - 1])) open.length = 0;",
+              replace: "        if (false) open.length = 0;" }],
+  },
+  {
+    name: "task-file-dry-run-opens-the-hub-read-only",
+    why: "open a healthy, current hub through the WRITABLE opener during a dry run. The version checks stop it MIGRATING, which was the irreversible write, and not from writing at all: openHub's first act is PRAGMA journal_mode = WAL, which rewrites the header of a database in DELETE mode -- and a hub restored from a snapshot is in delete mode, because VACUUM INTO writes it that way. So the ordinary case, a fully migrated hub with nothing wrong with it, was the one still being modified by the command whose whole promise is that it modifies nothing",
+    test: "test/migration-history.test.mjs",
+    expectRed: "and does not write to it -- the version checks stopped the migration, not the pragma",
+    edits: [{ file: "bin/reeve",
+              find: "        db = new DatabaseSync(hubPath, { readOnly: true, timeout: HUB_BUSY_TIMEOUT_MS });",
+              replace: "        db = openHub(hubPath);" }],
+  },
 ];

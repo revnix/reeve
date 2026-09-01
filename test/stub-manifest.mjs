@@ -1388,13 +1388,13 @@ export const STUBS = [
               replace: "  if (false)" }],
   },
   {
-    name: "report-keywords-are-scanned-when-the-schema-loads",
-    why: "check keywords during VALIDATION, where the recursion follows only the properties a report happens to carry. An unimplemented keyword added beneath an optional property is then never visited by a report that omits it, and the schema silently enforces less than it declares -- the promised unimplemented-keyword error never appears, on exactly the branch nobody exercises",
+    name: "report-the-keyword-scan-visits-every-property",
+    why: "stop the keyword scan at the top level instead of descending into every declared property. That is the OLD behaviour with the call site moved: checking during validation followed only the properties a report happened to carry, so an unimplemented keyword beneath an optional property was never visited by a report that omitted it and the schema silently enforced less than it declares. Moving the scan to load time is worth nothing unless the scan is COMPLETE, and the completeness is the half a stub can measure -- the call site is exercised by every other assertion in the file, all of which load a schema",
     test: "test/phase-report.test.mjs",
     expectRed: "an unimplemented keyword under an optional property is refused when the schema loads",
     edits: [{ file: "src/build/report.mjs",
-              find: "    assertKnownKeywords(schema, \"\");",
-              replace: "    void 0;" }],
+              find: "    if (k === \"properties\") for (const [p, sub] of Object.entries(v)) assertKnownKeywords(sub, `${where}${p}.`);",
+              replace: "    if (k === \"properties\") continue;" }],
   },
   {
     name: "report-shape-checks-are-not-gated-on-a-declared-type",

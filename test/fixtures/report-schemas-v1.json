@@ -1,11 +1,11 @@
 {
   "version": 1,
   "schemas": {
-    "BUILD_SIZE": "763d4efc4c599f9da1e25dfaba4cd0e45a1187eed80dae3e3dcebd8085b44064",
-    "BUILD_RESEARCH": "112eb99c433541c29e7d1f90bd3eabccf743840596b9c4e7e4f7c69fd09b20d4",
-    "BUILD_DESIGN": "2fadd8f99c8a2432c9734bf67e44e2edef5a7917aaf9ad8afa26f21f54b7528a"
+    "BUILD_SIZE": "341e9523ce234b7b3eb27ed7e91694d976d116fb1d2a892df7b13403a5f775cb",
+    "BUILD_RESEARCH": "4da159fe410ad4895aac210af6339a83cfb5c3ea99a5458f8f420361a2abec02",
+    "BUILD_DESIGN": "4ee8879052aea8ff18146ea974338883a10e6a186490f2cabeb4132fc69f6e72"
   },
-  "evidence_map": "d1e228e207c63e6741a385bb133c2c459b2232689031b3da33fa9487ca91b857",
+  "evidence_map": "fb4353f1d08d8a1802a140581f0ebb8243d27261ed83b127543399ab3e805ccd",
   "frozen_at": "2026-09-01",
   "note": "a change here changes what every dispatched worker is asked for"
 }

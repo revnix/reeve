@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PHASES, BUILD_ACTION_FOR, BUILD_ACTIONS } from "../src/build/phases.mjs";
 import { ACTIONS, PHASE_FOR_ACTION, schemaFor, schemaTextFor, validateReport, evidenceFor,
-         badReportPlan, MAPPED_OUTCOMES } from "../src/build/report.mjs";
+         badReportPlan, MAPPED_OUTCOMES, assertKnownKeywords } from "../src/build/report.mjs";
 import { workerArgs } from "../src/supervisor.mjs";
 // THROUGH `applyTransition`, not `nextPhase` alone. A pure-function assertion
 // cannot see whether a refusal reached the database, and the database is what
@@ -136,19 +136,27 @@ const DESIGN_OK = { outcome: "ok", reason: "designed", artifact: "design.md",
     "an ok RESEARCH report names its phase and no depth", JSON.stringify(res));
 
   const blocked = evidenceFor({ action: "BUILD_DESIGN",
-    report: { outcome: "blocked", reason: "the lockfile needs a change I cannot make",
-              escalation: "bt:x:phase:blocked:DESIGN" } });
+    report: { outcome: "blocked", reason: "the lockfile needs a change I cannot make" } });
   check(blocked.kind === "hold" && blocked.reason === "blocked_other",
     "a blocked outcome becomes a hold", JSON.stringify(blocked));
-  check(blocked.escalation === "bt:x:phase:blocked:DESIGN",
-    "carrying the escalation identity the report supplied", JSON.stringify(blocked));
-
-  // AND NEVER MANUFACTURES ONE. `holdReasonRefusal` refuses a blocked_other with
-  // an empty escalation, and that rule has exactly one home. A default here
-  // would be a second copy of it, and the copy that wins is the one that runs.
-  const noId = evidenceFor({ action: "BUILD_DESIGN", report: { outcome: "blocked", reason: "stuck" } });
-  check(noId.escalation === undefined || String(noId.escalation).trim() === "",
-    "and an absent escalation identity stays absent", JSON.stringify(noId));
+  // THE IDENTITY IS MINTED, not taken from the report. It is the key notification
+  // and retirement are routed by, so a report that could name it could file its
+  // hold under another task's cause.
+  check(blocked.escalation === "bt:<id>:phase:blocked:DESIGN",
+    "under an identity minted from the phase, with the id left for applyTransition",
+    JSON.stringify(blocked));
+  check(blocked.detail === "the lockfile needs a change I cannot make",
+    "and the worker's explanation still travels, as detail", JSON.stringify(blocked));
+  // AND THE REPORT CANNOT NAME IT AT ALL. The field is gone from the schemas, so
+  // a worker that tries is refused rather than ignored -- a declared field that
+  // is silently dropped is a trap for whoever reads the contract next.
+  let named = null;
+  try {
+    evidenceFor({ action: "BUILD_DESIGN",
+      report: { outcome: "blocked", reason: "stuck", escalation: "bt:someone-else:cause" } });
+  } catch (e) { named = String(e.message); }
+  check(named !== null && /escalation/.test(named),
+    "a report that supplies its own escalation identity is refused", String(named));
 
   const inf = evidenceFor({ action: "BUILD_DESIGN",
     report: { outcome: "infeasible", reason: "the API this needs was removed upstream" } });
@@ -175,7 +183,9 @@ const DESIGN_OK = { outcome: "ok", reason: "designed", artifact: "design.md",
   // a function that throws on everything.
   const mapped = ["ok", "blocked", "infeasible"].map(outcome =>
     evidenceFor({ action: "BUILD_SIZE", report: { outcome, reason: "x", depth: "standard",
-                                                  escalation: "bt:x:e" } }).kind);
+                                                  rationale: "r", est_files: 1, est_weighted_files: 1,
+                                                  est_packages: 1, est_slices: 1,
+                                                  risk_paths_touched: [] } }).kind);
   check(mapped.length === 3 && new Set(mapped).size === 3,
     "control: and each declared outcome still maps to its own evidence kind", mapped.join(","));
 }
@@ -245,45 +255,67 @@ const lastRefusal = (db, id) => db.prepare(
   db.close();
 }
 
-// A SIZING report with no depth is refused with the section 5 message.
+// A SIZING success with no depth is refused TWICE, by two rules that belong to
+// different layers, and both are asserted.
+//
+// The schema refuses it first now: an `ok` report must carry what its phase
+// produces, which for SIZING includes the depth. That is new -- it used to be
+// accepted here and refused only at the transition, and the estimates were not
+// required at all, so a success carrying just a depth advanced the task while
+// the floors compared against nothing.
+//
+// The machine's rule is unchanged and is still the machine's, so it is exercised
+// directly rather than through a report that can no longer express the case.
 {
   const { db, id } = await inSizing("no depth");
   const { depth, ...noDepth } = SIZE_OK;
+  const bySchema = validateReport("BUILD_SIZE", noDepth);
+  check(bySchema.ok === false && bySchema.errors.some(e => /depth/.test(e)),
+    "an ok SIZING report that names no depth is refused by its own schema",
+    JSON.stringify(bySchema.errors));
   const r = applyTransition(db, { taskId: id, expectedPhase: "SIZING", expectedGeneration: 1,
-    evidence: evidenceFor({ action: "BUILD_SIZE", report: noDepth }),
+    evidence: { kind: "phase.succeeded", phase: "SIZING" },
     artifactSha: "b".repeat(64), op: "phase.advanced", isAlive: isSameProcess });
-  check(r.applied === false, "a SIZING report that names no depth is refused", JSON.stringify(r));
+  check(r.applied === false, "and evidence that names no depth is refused by the machine", JSON.stringify(r));
   check(/must name the depth it selected/.test(String(r.refusal)),
     "with the message that says why the depth is load-bearing", String(r.refusal));
-  // AND THE VALIDATOR IS NOT WHAT REFUSED IT. The schema deliberately does not
-  // require `depth`, so a blocked sizing worker need not invent one -- which
-  // means this refusal has to come from the machine, and only asserting it
-  // through applyTransition can tell the two apart.
-  check(validateReport("BUILD_SIZE", noDepth).ok === true,
-    "control: the schema itself accepts a depth-less report",
-    JSON.stringify(validateReport("BUILD_SIZE", noDepth)));
+  check(phaseOf(db, id) === "SIZING", "and the task did not move", phaseOf(db, id));
+  // AND A STOP STILL NEEDS NO DEPTH, which is why the schema's requirement is
+  // conditional: a blocked sizing worker has none to give, and demanding one is
+  // how a stop becomes a fabricated success.
+  check(validateReport("BUILD_SIZE", { outcome: "blocked", reason: "cannot size it" }).ok === true,
+    "control: and a blocked SIZING report needs no depth at all");
   db.close();
 }
 
-// A blocked outcome with no escalation identity reaches no founder, so it is
-// refused rather than held silently.
+// A hold with no escalation identity reaches no founder, so it is refused
+// rather than held silently.
+//
+// THE EVIDENCE IS BLANKED BY HAND, because a report can no longer carry one. The
+// identity is minted from the phase, so this path cannot produce a blank -- and
+// the machine's rule is still the machine's, so it is exercised directly rather
+// than deleted along with the way it used to be reachable.
 {
   const { db, id } = await inSizing("blocked with no identity");
-  const r = applyTransition(db, { taskId: id, expectedPhase: "SIZING", expectedGeneration: 1,
-    evidence: evidenceFor({ action: "BUILD_SIZE",
-      report: { outcome: "blocked", reason: "stuck", escalation: "  " } }),
-    op: "hold", isAlive: isSameProcess });
-  check(r.applied === false, "a blocked_other hold with an empty escalation is refused", JSON.stringify(r));
-  check(/no identity reaches no founder/.test(String(r.refusal)),
-    "and says that a hold nobody is told about is not a hold", String(r.refusal));
+  const minted = evidenceFor({ action: "BUILD_SIZE", report: { outcome: "blocked", reason: "stuck" } });
+  const blank = applyTransition(db, { taskId: id, expectedPhase: "SIZING", expectedGeneration: 1,
+    evidence: { ...minted, escalation: "  " }, op: "hold", isAlive: isSameProcess });
+  check(blank.applied === false,
+    "a blocked_other hold with an empty escalation is refused", JSON.stringify(blank));
+  check(/no identity reaches no founder/.test(String(blank.refusal)),
+    "and says that a hold nobody is told about is not a hold", String(blank.refusal));
   check(phaseOf(db, id) === "SIZING", "and the task did not enter BLOCKED", phaseOf(db, id));
 
+  // THE CONTROL IS THE MINTED ONE, unedited: the same hold, from the same report,
+  // is accepted. Without it the assertions above are satisfied by a machine that
+  // refuses every hold.
   const ok = applyTransition(db, { taskId: id, expectedPhase: "SIZING", expectedGeneration: 1,
-    evidence: evidenceFor({ action: "BUILD_SIZE",
-      report: { outcome: "blocked", reason: "stuck", escalation: "bt:x:phase:blocked:SIZING" } }),
-    op: "hold", isAlive: isSameProcess });
+    evidence: minted, op: "hold", isAlive: isSameProcess });
   check(ok.applied === true && phaseOf(db, id) === "BLOCKED",
-    "control: the same hold WITH an identity is accepted", JSON.stringify(ok));
+    "control: the same hold with the identity reeve minted is accepted", JSON.stringify(ok));
+  const why = db.prepare("SELECT why FROM escalation").all().map(e => e.why);
+  check(why.includes(`${id}:phase:blocked:SIZING`),
+    "and it is filed under the task's OWN id, which no report could have named", why.join(","));
   db.close();
 }
 
@@ -338,7 +370,7 @@ const lastRefusal = (db, id) => db.prepare(
 const OK_FOR = { BUILD_SIZE: SIZE_OK, BUILD_RESEARCH: RESEARCH_OK, BUILD_DESIGN: DESIGN_OK };
 const FREEZE_CASES = ACTIONS.flatMap(a => [
   [a, "ok", OK_FOR[a]],
-  [a, "blocked", { outcome: "blocked", reason: "r", escalation: "bt:x:e" }],
+  [a, "blocked", { outcome: "blocked", reason: "r" }],
   [a, "infeasible", { outcome: "infeasible", reason: "r" }],
 ]);
 {
@@ -449,6 +481,92 @@ rmSync(dir, { recursive: true, force: true });
     "a caller cannot add a property to the shared schema", threw ?? "(silently ignored)");
   check(validateReport("BUILD_SIZE", { ...SIZE_OK, confidence: 1 }).ok === false,
     "control: and validation still refuses the property that mutation tried to declare");
+}
+
+// ── An `ok` report carries what its phase produces ──────────────────────────
+//
+// `required` listed only outcome and reason, so a SIZING success carrying just a
+// depth advanced the task -- and the deterministic floors read est_packages and
+// est_weighted_files as absent, comparing against nothing and preserving a depth
+// the estimates never supported. Requiring them unconditionally is the other
+// error: a blocked worker would have to invent them, which is how a stop becomes
+// a fabricated success. The requirement is conditional on the outcome.
+{
+  const bare = validateReport("BUILD_SIZE", { outcome: "ok", reason: "sized", depth: "trivial" });
+  check(bare.ok === false, "an ok SIZING report with no estimates is refused", JSON.stringify(bare.errors));
+  for (const field of ["est_files", "est_weighted_files", "est_packages", "est_slices",
+                       "risk_paths_touched", "rationale"]) {
+    const missing = { ...SIZE_OK }; delete missing[field];
+    check(validateReport("BUILD_SIZE", missing).ok === false,
+      `an ok SIZING report omitting ${field} is refused`, JSON.stringify(validateReport("BUILD_SIZE", missing).errors));
+  }
+  check(validateReport("BUILD_DESIGN", { outcome: "ok", reason: "designed", artifact: "design.md" }).ok === false,
+    "an ok DESIGN report with no slices is refused");
+  check(validateReport("BUILD_RESEARCH", { outcome: "ok", reason: "researched" }).ok === false,
+    "an ok RESEARCH report naming no artifact is refused");
+
+  // AND A STOP STILL NEEDS NONE OF IT. This is the half that makes the
+  // requirement conditional rather than absolute: a worker that cannot size the
+  // task has no estimates to give, and demanding them is how a stop becomes a
+  // fabricated success.
+  for (const action of ACTIONS) {
+    check(validateReport(action, { outcome: "blocked", reason: "stuck" }).ok === true,
+      `control: a blocked ${action} report needs none of it`,
+      JSON.stringify(validateReport(action, { outcome: "blocked", reason: "stuck" }).errors));
+    check(validateReport(action, { outcome: "infeasible", reason: "gone upstream" }).ok === true,
+      `control: and neither does an infeasible one`,
+      JSON.stringify(validateReport(action, { outcome: "infeasible", reason: "gone upstream" }).errors));
+  }
+}
+
+// ── A reason with no words in it is not a reason ────────────────────────────
+//
+// `minLength` counts CHARACTERS, so " " satisfied it. `nextPhase` then refuses
+// an infeasible on exactly that ground -- so validation passed, the transition
+// refused, and the BAD_REPORT retry path that exists for a malformed report was
+// never reached. The two now agree.
+{
+  for (const action of ACTIONS) {
+    const blankReason = validateReport(action, { outcome: "blocked", reason: "   " });
+    check(blankReason.ok === false, `a whitespace-only reason is refused for ${action}`,
+      JSON.stringify(blankReason.errors));
+  }
+  check(validateReport("BUILD_SIZE", { ...SIZE_OK, rationale: "\t " }).ok === false,
+    "and so is a whitespace-only rationale");
+  check(validateReport("BUILD_SIZE", { ...SIZE_OK, risk_paths_touched: ["  "] }).ok === false,
+    "and a whitespace-only risk path");
+  check(validateReport("BUILD_SIZE", { ...SIZE_OK, rationale: " x " }).ok === true,
+    "control: and a reason with a word in it, however padded, is accepted");
+}
+
+// ── The keyword scan visits branches no report reaches ──────────────────────
+//
+// Checked during validation, the recursion follows only the properties a REPORT
+// carries -- so an unimplemented keyword added beneath an OPTIONAL property was
+// never visited by a report that omitted it, and the schema silently enforced
+// less than it declares. The scan runs over the whole tree when the schema is
+// loaded.
+{
+  const hidden = { type: "object", properties: { optional: { type: "string", format: "email" } } };
+  let threw = null;
+  try { assertKnownKeywords(hidden, ""); } catch (e) { threw = String(e.message); }
+  check(threw !== null && /format/.test(threw),
+    "an unimplemented keyword under an optional property is refused when the schema loads", String(threw));
+  // AND IT IS NOT REACHED BY VALIDATING. The report that omits the property is
+  // exactly the one the old check could not see.
+  check(validateReport("BUILD_SIZE", { outcome: "blocked", reason: "stuck" }).ok === true,
+    "control: and a report omitting an optional property validates normally");
+  let clean = null;
+  try { assertKnownKeywords({ type: "object", properties: { a: { type: "string", minLength: 1 } } }, ""); }
+  catch (e) { clean = String(e.message); }
+  check(clean === null, "control: and a schema using only implemented keywords passes", String(clean));
+  // THE SHIPPED SCHEMAS PASS IT, which is what makes the throw above a guard
+  // rather than a thing that refuses everything.
+  for (const action of ACTIONS) {
+    let why = null;
+    try { assertKnownKeywords(schemaFor(action), ""); } catch (e) { why = String(e.message); }
+    check(why === null, `control: ${action}'s shipped schema uses only implemented keywords`, String(why));
+  }
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

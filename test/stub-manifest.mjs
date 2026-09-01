@@ -99,7 +99,6 @@ export const GRANDFATHERED = [
   "test/hub-derived-schema.test.mjs",
   "test/hub-doctor.test.mjs",
   "test/hub-drills.test.mjs",
-  "test/hub-gatestate.test.mjs",
   "test/hub-locks.test.mjs",
   "test/hub-outbox.test.mjs",
   "test/hub-phases.test.mjs",
@@ -1457,5 +1456,14 @@ export const STUBS = [
     edits: [{ file: "src/build/repoid.mjs",
               find: "  return hub.prepare(\n    `SELECT repo_id FROM project_identity WHERE project = ?`)\n    .get(project.name)?.repo_id ?? null;",
               replace: "  try {\n    return hub.prepare(`SELECT repo_id FROM project_identity WHERE project = ?`)\n      .get(project.name)?.repo_id ?? null;\n  } catch { return null; }" }],
+  },
+  {
+    name: "gatestate-records-the-app-a-check-is-bound-to",
+    why: "record the EXPECTED app as the bound one, so a required check satisfied by a different App reads as satisfied by reeve's. The gate state is what the guardian renders a merge decision from: `bound_app_id` is how it tells `the ruleset requires this check and reeve's App produces it` from `the ruleset requires a check of that name and something else produces it`. A check name is not an identity -- anything installed on the repository can publish one -- so recording the expectation in place of the observation makes an unrelated integration's green look like reeve's, and drift that a human must decide on disappears into a pass",
+    test: "test/hub-gatestate.test.mjs",
+    expectRed: "a check bound to another app is recorded as drift, not as a pass",
+    edits: [{ file: "src/build/gatestate.mjs",
+              find: "    bound_app_id: required ? (required.integration_id ?? null) : null,",
+              replace: "    bound_app_id: required ? (expectedAppId ?? null) : null," }],
   },
 ];

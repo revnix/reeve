@@ -1357,8 +1357,8 @@ export const STUBS = [
     test: "test/phase-report.test.mjs",
     expectRed: "a caller cannot add a property to the shared schema",
     edits: [{ file: "src/build/report.mjs",
-              find: "const deepFreeze = (v) => {",
-              replace: "const deepFreeze = (v) => { if (false) {" }],
+              find: "  if (v && typeof v === \"object\") { for (const k of Object.keys(v)) deepFreeze(v[k]); Object.freeze(v); }",
+              replace: "  if (false) { for (const k of Object.keys(v)) deepFreeze(v[k]); Object.freeze(v); }" }],
   },
   {
     name: "report-evidence-map-freeze-covers-the-hold-branch",

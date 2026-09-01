@@ -12,6 +12,8 @@
  * not, a count or a duration or a path or a sha, rides in the body.
  */
 import { HOLD_ESCALATION, PHASES } from "./phases.mjs";
+import { hubTx } from "./hubdb.mjs";
+import { assertWritable } from "./locks.mjs";
 
 /**
  * How a stop is classified, for the body.
@@ -160,4 +162,119 @@ export function body({ type, ...detail } = {}) {
     throw refuse("escalation_body_type",
       `body: ${JSON.stringify(type)} is not a failure type (${FAILURE_TYPES.join(", ")}).`);
   return Object.freeze({ type, ...detail });
+}
+
+/**
+ * Refuse a store that is not the builder's hub.
+ *
+ * The guardian's store has an `escalation` table of the SAME shape -- measured
+ * 2026-09-01, the two stores share exactly three tables: `escalation`, `inbox`
+ * and `outbox`. So handing this module a guardian store would not fail: it would
+ * silently write builder identities into the guardian's escalations, and nothing
+ * anywhere would report that it had.
+ *
+ * The guardian half of that symmetry needs no code and is asserted rather than
+ * built: `openHubAsGuest`'s allowlist admits only `provider_lease`,
+ * `provider_state`, `pr_hold` and `maintenance_lock`, so the guardian's own
+ * `announceable` throws on the hub before it reads a row.
+ *
+ * PROVENANCE, NOT ABSENCE. This asks whether the store carries the hub's own
+ * migration ledger and its core table, rather than whether it lacks something a
+ * guardian store happens to have: absence has no natural positive control, and a
+ * store that is neither would answer "not a guardian" perfectly well. Both are
+ * checked because one table name could coincide; `schema_version` is the ledger
+ * the hub cannot exist without, and the guardian store does not have it.
+ */
+export function assertHub(db) {
+  for (const [table, why] of [["schema_version", "the hub's migration ledger"],
+                              ["task", "the builder's own tasks"]]) {
+    let ok = false;
+    try { db.prepare(`SELECT count(*) c FROM ${table}`).get(); ok = true; } catch { ok = false; }
+    if (!ok)
+      throw refuse("not_a_hub",
+        `this store has no ${table} table (${why}), so it is not the builder's hub. The guardian's ` +
+        `store carries an escalation table of the same shape, and writing builder identities into ` +
+        `it would land silently and be reported by nothing.`);
+  }
+  return db;
+}
+
+/**
+ * Reduce this pass's escalations against the standing set.
+ *
+ * The builder's copy of the guardian's `announceable`, and deliberately a COPY:
+ * that one reads the guardian store's own `escalation` table, and neither
+ * process may read the other's. The SHAPE is what is shared, not the code.
+ *
+ * A cause is announced when it ARRIVES and when its shape CHANGES, never on
+ * every pass. Clearing is announced too, because an operator who is only ever
+ * told about problems cannot tell "resolved" from "reeve stopped looking".
+ *
+ * ABSENCE IS NOT SUCCESS, and this is the property the guardian paid for in
+ * production rather than one it reasoned its way to. A pass that could not
+ * examine a task simply does not produce its escalation, and retiring the cause
+ * on that silence announces "resolved" for something nobody looked at -- then
+ * re-announces it on the next pass that does look, with the reason string
+ * identical each time. Two pushes for one unchanged condition is how a channel
+ * earns being muted, and a muted channel is worse than none.
+ *
+ * So `covered` names the tasks this pass actually examined, and `complete` says
+ * whether it finished what it set out to do. A `builder:` identity names no
+ * task, so only a complete pass may retire it. `covered: null` is a caller
+ * making no claim rather than a caller promising it looked everywhere.
+ *
+ * @param {Map<string, number>} escalations  identity -> how many subjects share it
+ * @returns {{fresh: {why: string, count: number}[], cleared: string[]}}
+ */
+export function builderAnnounceable(db, escalations, {
+  at = Math.floor(Date.now() / 1000), isAlive, covered = null, complete = true } = {}) {
+  assertHub(db);
+  // EXPLICIT, never defaulted. `assertWritable` reads the restore lock and asks
+  // whether its holder is alive; a predicate that always answered true would
+  // leave a dead restore's lock standing for ever, and one that always answered
+  // false would reap a LIVE restore's lock and write into a hub being replaced
+  // underneath this process.
+  if (typeof isAlive !== "function")
+    throw refuse("not_writable",
+      "builderAnnounceable needs an isAlive predicate: it writes, and whether a restore holds the " +
+      "hub is decided by whether that restore's process is still running.");
+
+  return hubTx(db, () => {
+    assertWritable(db, { isAlive, at, inTx: true });
+    const fresh = [], cleared = [];
+    const standing = new Map(
+      db.prepare("SELECT why, count, announced_count FROM escalation").all().map(r => [r.why, r]));
+
+    for (const [why, count] of escalations) {
+      const prev = standing.get(why);
+      if (!prev) {
+        db.prepare(`INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count)
+                    VALUES(?,?,?,?,?)`).run(why, count, at, at, count);
+        fresh.push({ why, count });
+      } else {
+        db.prepare("UPDATE escalation SET count=?, last_seen_at=? WHERE why=?").run(count, at, why);
+        // The count is the SHAPE of a shared cause: one task blocked at RESEARCH
+        // and four blocked there are different situations, and both deserve
+        // saying. Comparing against `announced_count` rather than against
+        // `count` is what makes a repeat silent and a change loud.
+        if (prev.announced_count !== count) {
+          db.prepare("UPDATE escalation SET announced_count=? WHERE why=?").run(count, why);
+          fresh.push({ why, count });
+        }
+      }
+    }
+
+    for (const why of standing.keys()) {
+      if (escalations.has(why)) continue;
+      // The subject is the TASK where there is one. A task id is already two
+      // colon-separated components, so the subject is the first two and the
+      // cause is the rest.
+      const task = /^(bt:[0-9A-Za-z]+):/.exec(why)?.[1] ?? null;
+      const looked = task === null ? complete : (covered === null || covered.has(task));
+      if (!looked) continue;
+      db.prepare("DELETE FROM escalation WHERE why=?").run(why);
+      cleared.push(why);
+    }
+    return { fresh, cleared };
+  });
 }

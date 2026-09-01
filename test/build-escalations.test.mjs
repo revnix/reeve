@@ -5,12 +5,19 @@
 // that re-announces itself is how an unattended system trains its owner to
 // ignore it. So the key carries only what says WHICH situation this is, and
 // everything that changes while the situation does not rides in the body.
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, rmSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { HOLD_ESCALATION, PHASES } from "../src/build/phases.mjs";
+import { openHub } from "../src/build/hubdb.mjs";
+import { openHubAsGuest } from "../src/build/hubguest.mjs";
+import { open as openGuardianStore } from "../src/db/ops.mjs";
+import { announceable } from "../src/daemon.mjs";
 import {
   FAILURE_TYPES, IDENTITY_SHAPES, PAGES, escalationKey, shapeOf, body,
+  assertHub, builderAnnounceable,
 } from "../src/build/announce.mjs";
 
 let fail = 0;
@@ -191,6 +198,167 @@ const refused = (args) => {
   try { body({ seconds: 1 }); } catch (e) { none = e.kind; }
   check(none === "escalation_body_type", "control: and so is a body with no type at all");
 }
+
+
+// ── neither process may read the other's escalations ───────────────────────
+//
+// Escalation ownership is by PROCESS, and the proof is that each reader refuses
+// the other's store. The two halves are not symmetric, and pretending they were
+// would hide the asymmetry that matters: the guardian is already refused
+// structurally, by the guest allowlist; the builder is refused by nothing,
+// because the guardian's store carries an `escalation` table of the same shape
+// and a write would land in it silently.
+const dir = mkdtempSync(join(tmpdir(), "reeve-esc-"));
+const NOW = 1_800_000_000;
+const ALIVE = () => true, DEAD = () => false;
+mkdirSync(join(dir, "state"), { recursive: true });
+const hubPath = join(dir, "state", "hub.db");
+const hub = openHub(hubPath);
+const guardian = openGuardianStore(join(dir, "guardian.db"));
+
+{
+  // --- the guardian half: already true, asserted rather than built ----------
+  const guest = openHubAsGuest(hubPath);
+  let readsLease = false;
+  try { guest.prepare("SELECT count(*) c FROM provider_lease").get(); readsLease = true; }
+  catch { readsLease = false; }
+  check(readsLease,
+    "control: the guardian's guest handle CAN read the hub's provider_lease, so the handle works");
+
+  let guardianThrew = null;
+  try { announceable(guest, new Map([["x", 1]]), { at: NOW }); }
+  catch (e) { guardianThrew = e.message; }
+  check(guardianThrew !== null && /escalation/.test(guardianThrew),
+    "the guardian's announceable is refused the hub's escalation table by the guest allowlist",
+    String(guardianThrew));
+
+  // --- the builder half: the one that needed code --------------------------
+  let builderKind = null;
+  try { builderAnnounceable(guardian, new Map([["builder:backup:failed", 1]]),
+                            { at: NOW, isAlive: ALIVE }); }
+  catch (e) { builderKind = e.kind ?? "threw"; }
+  check(builderKind === "not_a_hub",
+    "the builder's announcer refuses the guardian's store, which has an escalation table of the " +
+    "same shape and would have taken the write", String(builderKind));
+
+  // CONTROL: the guardian store really does carry the table, so the refusal
+  // above is about WHOSE store it is and not about a missing table.
+  let hasEscalation = false;
+  try { guardian.prepare("SELECT count(*) c FROM escalation").get(); hasEscalation = true; }
+  catch { hasEscalation = false; }
+  check(hasEscalation,
+    "control: the guardian's store does carry an `escalation` table, so the refusal is about ownership");
+  check(guardian.prepare("SELECT count(*) c FROM escalation").get().c === 0,
+    "and nothing was written into it");
+
+  // CONTROL: the refusal is not "everything is refused".
+  const ok = builderAnnounceable(hub, new Map(), { at: NOW, isAlive: ALIVE });
+  check(Array.isArray(ok.fresh) && Array.isArray(ok.cleared),
+    "control: the same call against the real hub is accepted", JSON.stringify(ok));
+
+  let notHub = null;
+  try { assertHub(guardian); } catch (e) { notHub = e.kind; }
+  check(notHub === "not_a_hub", "assertHub names the refusal so a caller can tell it apart",
+    String(notHub));
+  check(assertHub(hub) === hub, "control: and returns the hub it was given");
+}
+
+// ── arrival, change, and silence in between ────────────────────────────────
+{
+  const key = escalationKey({ task: "bt:01AA", kind: "phase:blocked", phase: "RESEARCH" });
+  const first = builderAnnounceable(hub, new Map([[key, 1]]), { at: NOW, isAlive: ALIVE });
+  check(first.fresh.length === 1 && first.fresh[0].why === key,
+    "a cause is announced when it arrives", JSON.stringify(first));
+
+  const again = builderAnnounceable(hub, new Map([[key, 1]]), { at: NOW + 60, isAlive: ALIVE });
+  check(again.fresh.length === 0,
+    "and NOT announced again while its shape is unchanged, or the channel earns being muted",
+    JSON.stringify(again));
+  check(hub.prepare("SELECT last_seen_at FROM escalation WHERE why=?").get(key).last_seen_at === NOW + 60,
+    "control: though the row was touched, so silence is a decision and not a skipped write");
+
+  const changed = builderAnnounceable(hub, new Map([[key, 4]]), { at: NOW + 120, isAlive: ALIVE });
+  check(changed.fresh.length === 1 && changed.fresh[0].count === 4,
+    "and announced again when the count changes: one task blocked and four are different situations",
+    JSON.stringify(changed));
+}
+
+// ── absence is not success ─────────────────────────────────────────────────
+//
+// The property the guardian paid for in production. A pass that could not
+// examine a task produces no escalation for it, and retiring the cause on that
+// silence announces "resolved" for something nobody looked at.
+{
+  const key = escalationKey({ task: "bt:01BB", kind: "infeasible" });
+  builderAnnounceable(hub, new Map([[key, 1]]), { at: NOW, isAlive: ALIVE });
+  check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 1,
+    "control: the cause is standing");
+
+  const blind = builderAnnounceable(hub, new Map(), { at: NOW + 60, isAlive: ALIVE, covered: new Set() });
+  check(blind.cleared.length === 0,
+    "a cause absent from a pass that did NOT examine its task is not retired", JSON.stringify(blind));
+  check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 1,
+    "and the row still stands, so nothing was announced as resolved");
+
+  const looked = builderAnnounceable(hub, new Map(), {
+    at: NOW + 120, isAlive: ALIVE, covered: new Set(["bt:01BB"]) });
+  check(looked.cleared.includes(key),
+    "and IS retired by a pass that examined it, so clearing still works", JSON.stringify(looked));
+  check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 0,
+    "control: the row is gone");
+}
+
+// ── a process-scoped cause needs a COMPLETE pass ───────────────────────────
+{
+  const key = escalationKey({ kind: "backup:failed" });
+  builderAnnounceable(hub, new Map([[key, 1]]), { at: NOW, isAlive: ALIVE });
+  const partial = builderAnnounceable(hub, new Map(), {
+    at: NOW + 60, isAlive: ALIVE, complete: false, covered: new Set() });
+  check(partial.cleared.length === 0,
+    "a `builder:` cause names no task, so an incomplete pass may not retire it",
+    JSON.stringify(partial));
+  const done = builderAnnounceable(hub, new Map(), {
+    at: NOW + 120, isAlive: ALIVE, complete: true, covered: new Set() });
+  check(done.cleared.includes(key),
+    "and a complete pass does, because that is a positive fact about the whole pass",
+    JSON.stringify(done));
+}
+
+// ── it writes, so it asks whether the hub is being replaced ────────────────
+{
+  let noPredicate = null;
+  try { builderAnnounceable(hub, new Map(), { at: NOW }); } catch (e) { noPredicate = e.kind; }
+  check(noPredicate === "not_writable",
+    "the announcer refuses to write without an isAlive predicate, rather than defaulting one",
+    String(noPredicate));
+
+  hub.prepare("INSERT INTO maintenance_lock(name,pid,lstart,acquired_at) VALUES('restore',?,?,?)")
+    .run(4242, "L", NOW);
+  let held = null;
+  try { builderAnnounceable(hub, new Map([["builder:backup:failed", 1]]),
+                            { at: NOW, isAlive: ALIVE }); }
+  catch (e) { held = e.message; }
+  check(held !== null && /restore/.test(held),
+    "a LIVE restore holds the hub read-only, and the announcer refuses rather than writing into it",
+    String(held));
+  check(hub.prepare("SELECT count(*) c FROM escalation WHERE why='builder:backup:failed'").get().c === 0,
+    "control: and nothing was written while it was held");
+
+  // A DEAD holder's lock is reaped rather than obeyed for ever, which is the
+  // other half: a lock that outlives its process would stop the builder
+  // permanently and look exactly like a live restore.
+  const reaped = builderAnnounceable(hub, new Map([["builder:backup:failed", 1]]),
+                                     { at: NOW, isAlive: DEAD });
+  check(reaped.fresh.length === 1,
+    "and a DEAD holder's lock is reaped rather than stopping the builder for ever",
+    JSON.stringify(reaped));
+  check(hub.prepare("SELECT count(*) c FROM maintenance_lock WHERE name='restore'").get().c === 0,
+    "control: the stale lock is gone");
+}
+
+hub.close();
+guardian.close();
+rmSync(dir, { recursive: true, force: true });
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

@@ -1178,12 +1178,15 @@ export const STUBS = [
   },
   {
     name: "report-a-non-object-is-not-a-report",
-    why: "read the error list from `walk`'s RETURN VALUE, which is `errors.push(...)` -- a number -- on every early return. `errors.length` is then undefined, which is falsy, so a report that is a string, a number, null or an array validates as OK. It is not an exotic input: it is what a worker answering in prose instead of JSON produces, and it would reach `evidenceFor` as a validated report",
+    why: "read the error list from `walk`'s RETURN VALUE, which is `errors.push(...)` -- a number -- on every early return. `errors.length` is then undefined, which is falsy, so a report that is a string, a number, null or an array validates as OK. It is not an exotic input: it is what a worker answering in prose instead of JSON produces, and it would reach `evidenceFor` as a validated report. TWO EDITS, because two things independently prevent it: the caller owning the array, and every early return handing the array back. Reverting either alone leaves the other, and an entry that stubs one of two sufficient guards cannot go red -- which is a stub reporting that a property is measured when it is not",
     test: "test/phase-report.test.mjs",
     expectRed: "a report that is a string is refused",
     edits: [{ file: "src/build/report.mjs",
               find: "  const errors = [];\n  walk(schemaFor(action), value, \"\", errors);",
-              replace: "  const errors = walk(schemaFor(action), value, \"\", []);\n  void 0;" }],
+              replace: "  const errors = walk(schemaFor(action), value, \"\", []);\n  void 0;" },
+            { file: "src/build/report.mjs",
+              find: "      errors.push(`${path}: expected an object`);\n      return errors;",
+              replace: "      return errors.push(`${path}: expected an object`);" }],
   },
   {
     name: "report-an-undeclared-outcome-does-not-advance",

@@ -1929,15 +1929,25 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         // and the restore reports success while the guardian cannot scope a
         // provider lease for it.
         //
-        // CONDITIONED ON THE TAIL, not on a version number, because the tail is
-        // the thing that either carries the identities or does not. Running it
-        // unconditionally also repairs states no admission produces -- a task
-        // whose project never had an identity at all -- and a restore that adds
-        // rows the snapshot never held is no longer restoring it. The drill that
-        // compares row for row is what said so.
-        const legacyTail = tail.some(e => e.kind === "task.filed")
-          && !tail.some(e => e.kind === "project_identity.learned");
-        if (legacyTail) backfillProjectIdentities(back);
+        // PER PROJECT, not per tail. A tail can SPAN the upgrade: a pre-v5
+        // filing, then a post-v5 filing carrying its own identity event. A
+        // tail-wide test then sees an identity event, calls the whole tail
+        // modern, and skips the repair -- leaving the earlier project with a
+        // task and no identity, which is the case this exists for.
+        //
+        // So: every project FILED in the tail whose identity the tail did not
+        // also carry. Scoped rather than global because running it over every
+        // project repairs states no admission produces -- a task whose project
+        // never had an identity at all -- and a restore that adds rows the
+        // snapshot never held is no longer restoring it. The drill that compares
+        // row for row is what said so.
+        const payloadOf = (e) => { try { return JSON.parse(e.payload); } catch { return null; } };
+        const filed = new Set(tail.filter(e => e.kind === "task.filed")
+          .map(e => payloadOf(e)?.project).filter(Boolean));
+        const carried = new Set(tail.filter(e => e.kind === "project_identity.learned")
+          .map(e => payloadOf(e)?.project).filter(Boolean));
+        const unreconciled = [...filed].filter(p => !carried.has(p));
+        if (unreconciled.length) backfillProjectIdentities(back, unreconciled);
         releaseMaintenanceLock(back, { pid, lstart });
       } finally { back.close(); }
     }

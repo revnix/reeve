@@ -31,7 +31,7 @@ const SCHEMA_VERSION_DDL = `CREATE TABLE IF NOT EXISTS schema_version (
   applied_at INTEGER NOT NULL
 ) STRICT`;
 
-export const HUB_SCHEMA_VERSION = 4;
+export const HUB_SCHEMA_VERSION = 5;
 
 /**
  * Forward-only. Each entry runs exactly once, in order, in its own transaction,
@@ -249,6 +249,61 @@ const MIGRATIONS = [
       // dangerous when something consumes it as the newest current answer -- and
       // it catches rows this database never validated, such as one replayed from
       // a snapshot written by an older binary.
+    } },
+  // ---------------------------------------------------------------- 5
+  // AN IDENTITY THE GUARDIAN MAY READ.
+  //
+  // The guardian scopes every provider_lease on GitHub's numeric repository id,
+  // and it deliberately cannot read `task`: its hub surface is the provider
+  // scheduler and pr_hold, and hubguest.mjs enforces that. So the id reached it
+  // through a privileged handle opened in the CLI and closed after one
+  // statement -- which made the guarantee "the tick is restricted" rather than
+  // "the guardian process is".
+  //
+  // KEYED ON THE PROJECT, never the name. A repository can be renamed or
+  // transferred; its id cannot. That is the same rule repoid.mjs already states,
+  // and it is why an earlier version keyed on `nwo_snapshot` returned null for a
+  // renamed repository whose id the hub was holding all along.
+  //
+  // NO NAME COLUMN, deliberately. A name here could only ever be a snapshot, and
+  // a snapshot in a table called `identity` invites the next reader to treat it
+  // as current -- which is the defect this table exists to remove, not one to
+  // reintroduce in a spare column. `task.nwo_snapshot` and projects.json already
+  // hold names, both with something that keeps them honest.
+  { version: 5, up: (db) => {
+      // RE-RUNNABLE, like every migration here.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS project_identity (
+          project    TEXT    PRIMARY KEY,
+          repo_id    INTEGER NOT NULL,
+          learned_at INTEGER NOT NULL,
+          CHECK (project <> ''),
+          -- NEVER GUESSED. Every id here came from GitHub through the API
+          -- client's snapshot; zero and negative are not ids, and a row that
+          -- cannot be an id must not be storable as one.
+          CHECK (repo_id > 0),
+          CHECK (learned_at > 0)
+        ) STRICT;
+      `);
+      // BACKFILLED FROM `task`, because an existing hub already knows the answer
+      // and a migration that left the table empty would make every guardian on
+      // an established hub fall through to GitHub on its first tick -- turning a
+      // local read into a network dependency at exactly the moment the operator
+      // upgraded.
+      //
+      // The row chosen is the one `repoIdFromHub` would have returned: newest by
+      // `updated_at`, then by `id`. Stated as a window rather than a correlated
+      // subquery so the tie-break is the same expression, not a second one that
+      // has to be kept in step.
+      db.exec(`
+        INSERT INTO project_identity (project, repo_id, learned_at)
+        SELECT project, repo_id, unixepoch() FROM (
+          SELECT project, repo_id,
+                 ROW_NUMBER() OVER (PARTITION BY project ORDER BY updated_at DESC, id DESC) rn
+            FROM task WHERE repo_id IS NOT NULL AND repo_id > 0
+        ) WHERE rn = 1
+        ON CONFLICT(project) DO NOTHING;
+      `);
     } },
 ];
 

@@ -119,8 +119,17 @@ try {
           BY_WRITER, "a future timestamp is refused BY THE WRITER: it would be permanently recent");
   refuses(() => recordMeasurement(db, { isAlive: LIVE, kind: KIND, result: "SHARED", evidence: "x", measuredAt: 1800000000 }),
           BY_WRITER, "control: the exact test-clock value that reached a real store is refused");
-  check(latestMeasurement(db, { kind: KIND })?.result === "INCONCLUSIVE",
-        "control: none of the refusals above wrote anything");
+  // COUNTED, not read back through latestMeasurement. The question here is
+  // whether a refused write left a row, and counting answers it directly. Going
+  // through the read couples this control to the read's own guards: with the
+  // writer's future-timestamp check stubbed out, the row lands, the read refuses
+  // it, and the throw is uncaught HERE -- aborting the file with half its
+  // assertions unexecuted, which a log cannot tell from half its assertions
+  // passing. The stub still reported CAUGHT while proving a third of what it
+  // claimed.
+  check(db.prepare(`SELECT count(*) c FROM provider_measurement`).get().c === 2,
+        "control: none of the refusals above wrote anything",
+        String(db.prepare(`SELECT count(*) c FROM provider_measurement`).get().c));
 
   // ---- THE SCHEMA IS THE BACKSTOP, because the writer is not the only way in.
   // A caller reaching the store directly is exactly the case the writer cannot

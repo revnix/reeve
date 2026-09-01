@@ -32,6 +32,12 @@ export const ALLOWED = Object.freeze({
   // READ ONLY. The guardian renders a BLOCK from these rows; the builder is the
   // only thing that may write them.
   pr_hold: ["read"],
+  // READ ONLY, and the narrowest thing that answers the question. The guardian
+  // scopes every provider_lease on the numeric repository id; it must not read
+  // `task`, which is the builder's work table and the widening this allowlist
+  // exists to refuse. An identity table is the id and nothing else, so granting
+  // it adds no reach beyond the fact the guardian already acts on.
+  project_identity: ["read"],
   // Read to see whether a restore holds it, delete to reap one whose holder is
   // dead. Never written: taking the lock is a restore's act, not a guest's.
   maintenance_lock: ["read", "delete"],

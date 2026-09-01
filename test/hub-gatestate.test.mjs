@@ -403,22 +403,24 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
       "control: an unknown project key is still skipped", JSON.stringify(other));
 
     // AND A QUERY FAILURE IS NOT "NEVER ADMITTED". A catch that returned null
-    // said the two were the same, so a structurally damaged hub -- a file whose
-    // `task` table is gone, which still passes `quick_check` because the pages it
-    // does have are intact -- reported "no repository id" on every tick while
-    // gate state aged into staleness. The one failure a diagnostic must never
-    // render as a benign absence.
-    // Foreign keys OFF for the drop only: `repo_gate_state` and friends reference
-    // `task`, so the drop itself would fail the constraint rather than producing
-    // the damaged-hub state this asserts about.
+    // said the two were the same, so a structurally damaged hub -- one that still
+    // passes `quick_check` because the pages it does have are intact -- reported
+    // "no repository id" on every tick while gate state aged into staleness. The
+    // one failure a diagnostic must never render as a benign absence.
+    //
+    // THE TABLE DROPPED IS THE ONE THE LOOKUP READS. It was `task` while the id
+    // was resolved from there; the lookup reads `project_identity` now, and
+    // dropping `task` leaves the read working -- so this assertion would have
+    // gone on passing against a hub that was no longer damaged in any way the
+    // lookup could see. A fixture has to break the thing under test.
     db4.exec("PRAGMA foreign_keys = OFF");
-    db4.exec("DROP TABLE task");
+    db4.exec("DROP TABLE project_identity");
     let broke = null;
     try { await buildTick({ hub: db4, projects: [{ name: "nextly", nwo: "o/r" }] }); }
     catch (e) { broke = e; }
-    check(broke !== null, "a hub whose task table is missing makes the tick FAIL",
+    check(broke !== null, "a hub whose identity table is missing makes the tick FAIL",
       String(broke?.message));
-    check(/task/.test(broke?.message ?? ""), "naming what could not be read",
+    check(/project_identity/.test(broke?.message ?? ""), "naming what could not be read",
       String(broke?.message));
     db4.close();
   }

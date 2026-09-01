@@ -583,6 +583,31 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
              snapshot.profileHash, snapshot.defaultBranch, snapshot.visibility,
              snapshot.specRepoId, snapshot.gateDefinitionHash, snapshot.registryVersion,
              snapshot.founderUserId, taskId);
+      // AND THE IDENTITY, because the resolver reads it rather than the newest
+      // task. `adopt-snapshot` is the other place a project's repository id can
+      // change: a repository deleted and recreated, or a registry project
+      // rebound. Moving `task.repo_id` alone used to be enough, since the
+      // lookup took the newest task -- now it is not, and the guardian would go
+      // on scoping holds and provider leases to the old repository until some
+      // unrelated task happened to be admitted.
+      //
+      // Same rule as admission: an unchanged id writes nothing, so the ordinary
+      // regenerate leaves no row and no event.
+      const wroteIdentity = db.prepare(
+        `INSERT INTO project_identity(project, repo_id, learned_at)
+         VALUES(?,?,unixepoch())
+         ON CONFLICT(project) DO UPDATE SET repo_id = excluded.repo_id, learned_at = excluded.learned_at
+          WHERE project_identity.repo_id <> excluded.repo_id`)
+        .run(task.project, snapshot.repoId);
+      // GATED ON THE WRITE, not on a read after it. Reading the row back and
+      // comparing it to the id just written answers "is the row what I asked
+      // for", which is true whether or not anything changed -- so an ordinary
+      // regenerate appended a learning event on every run, and the durable log
+      // and every exported tail filled with events recording that nothing
+      // happened. `changes` is the only thing that knows.
+      if (wroteIdentity.changes > 0)
+        hubEvent(db, { kind: "project_identity.learned", task: taskId,
+          payload: db.prepare(`SELECT * FROM project_identity WHERE project = ?`).get(task.project) });
       return;                       // the row image rides on task.transitioned
     }
 

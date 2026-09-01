@@ -362,6 +362,14 @@ export function renderDash(m) {
       out.push(`      territory ${r.kind} ${oneLine(r.path)}` +
                (r.pinned_until ? `  pinned until ${r.pinned_until}` : "") +
                `  expires ${r.expires_at}`);
+    // THE PULL REQUESTS, IN THE TEXT. The model carries every open PR for the
+    // task and the JSON hands them over, while the default rendering finished the
+    // row without reading the list -- so the operator who did not think to ask for
+    // JSON could not see that a task was waiting on a review that already exists.
+    // Same three facts and same order as `task show`, because a reader who learns
+    // the shape in one place should not have to learn it twice.
+    for (const p of t.prs)
+      out.push(`      pull request ${p.kind} #${p.pr}  ${p.head_sha}`);
     if (t.unknown.length) out.push(`      unknown: ${t.unknown.join(", ")}`);
   }
   return out.join("\n");

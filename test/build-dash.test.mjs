@@ -112,6 +112,16 @@ const T = {};
   setPhase(T.moving, "SIZING");
   setPhase(T.quota, "SIZING");
   setPhase(T.cancel, "CANCELLING");
+  // AN OPEN PULL REQUEST ON ONE TASK. Nothing writes `task_pr` before S7, so a
+  // fixture built only from the producer leaves every task's `prs` empty -- and a
+  // render that drops the list then passes a walk with nothing to walk, which is
+  // exactly how the digest shipped a PR its JSON advertised and its text never
+  // showed. `generation` and `slice` are NULL because `task_pr`'s CHECK forbids
+  // them on a spec row: values there fail the constraint rather than the
+  // assertion, and the test would report a database error where it meant to
+  // report a missing reader.
+  db.prepare(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+              VALUES(?, 'spec', NULL, NULL, 3, 11, 'specheadsha', ?)`).run(T.moving, NOW - 400);
 }
 
 // ── one object, two renderings ───────────────────────────────────────────────
@@ -684,6 +694,8 @@ const T = {};
       "switches.implementLocal": "the PROJECT's map, rendered once in the switches block as on/off",
       "switches.publishPr": "the PROJECT's map, rendered once in the switches block as on/off",
       "switches.mergeBuilderPr": "the PROJECT's map, rendered once in the switches block as on/off",
+      "prs[].created_at": "a timestamp; the row presents the same three facts `show` does, " +
+        "kind, number and head, and the digest reports elapsed figures rather than clock values",
       depth: "shown by `task show`, not the digest",
       model: "shown by `task show`, not the digest",
     },
@@ -694,7 +706,10 @@ const T = {};
   // phase/slice/attempt" and the drift warning rode along inside the excuse.
   const leaves = (obj, prefix = "") => Object.entries(obj).flatMap(([k, v]) => {
     const path = prefix ? `${prefix}.${k}` : k;
-    if (v && typeof v === "object" && !Array.isArray(v)) return leaves(v, path);
+    if (Array.isArray(v)) return v.flatMap(el => el && typeof el === "object"
+      ? leaves(el, `${path}[]`)
+      : [[`${path}[]`, el]]);
+    if (v && typeof v === "object") return leaves(v, path);
     return [[path, v]];
   });
   const missing = [];
@@ -1010,6 +1025,77 @@ const T = {};
   const wrong = cli("task", "list", "--since", String(NOW), "--json");
   check(parse(wrong.stdout)?.kind === "flag_not_applicable" && wrong.status === 2,
     "and --since on another subcommand is refused rather than ignored", wrong.out.slice(0, 200));
+
+  // ── a bare word nothing reads ──────────────────────────────────────────────
+  //
+  // The parser refuses an unknown flag and `inapplicable` refuses a known flag on
+  // a command that cannot act on it. An extra POSITIONAL was governed by neither,
+  // so a cursor typed without its flag was discarded in silence: the digest
+  // answered from the beginning of the log, printed an empty movement list and
+  // exited 0, which is indistinguishable from a genuinely quiet period. Driven
+  // through the CLI and not through `extraArgs`, because the library agreeing
+  // with itself is what a green stub looks like -- the defect was the ROUTE never
+  // calling it.
+  const stray = cli("task", "dash", "1234.1800000000", "--json");
+  check(stray.status === 2,
+    "a cursor typed as a positional is refused, not discarded",
+    `rc=${stray.status} ${stray.out.slice(0, 200)}`);
+  check(parse(stray.stdout)?.kind === "usage",
+    "as a usage refusal, under a kind a script can branch on", stray.out.slice(0, 200));
+  check(/--since <cursor>/.test(stray.out),
+    "and the refusal shows where a cursor actually belongs", stray.out.slice(0, 300));
+  check(cli("task", "dash", "--json").status === 0,
+    "control: the same digest without the stray word still answers");
+
+  // THE SAME HOLE ON THE THREE SIBLING READERS, closed in the same place. `list`
+  // reads no positional either, and `show`/`why` read exactly one and answered
+  // about it while discarding whatever followed.
+  check(cli("task", "list", "alpha", "--json").status === 2,
+    "`task list` refuses a stray argument rather than listing everything");
+  check(cli("task", "show", T.moving, "extra", "--json").status === 2,
+    "`task show` refuses the argument after its id rather than ignoring it");
+  check(cli("task", "why", T.moving, "extra", "--json").status === 2,
+    "and so does `task why`");
+  check(cli("task", "show", T.moving, "--json").status === 0,
+    "control: `task show` still answers when given its id alone");
+  check(cli("task", "list", "--json").status === 0,
+    "control: `task list` still answers when given none");
+
+  // ── one database moment, not two ───────────────────────────────────────────
+  //
+  // The digest names the projects and then enumerates the tasks. Run as two
+  // reads, a project registered and given its first task between them puts that
+  // task in the digest while the `projects` and `switches` blocks have never
+  // heard of it, and the row renders under a project the text does not name.
+  //
+  // ASSERTED OVER SOURCE, and that bound is real: `bin/reeve` runs its route
+  // table on import, so nothing can import the route to observe the ordering, and
+  // a concurrent writer racing a subprocess would be a flaky test rather than a
+  // proof. The counter-control below is what keeps it from being a regex that
+  // passes over anything.
+  const BINSRC = readFileSync(BIN, "utf8");
+  const from = BINSRC.indexOf('if (sub === "dash") {');
+  const to = BINSRC.indexOf('if (sub === "list") {', from);
+  check(from > 0 && to > from,
+    "control: the dash branch was located in the route source", `${from}..${to}`);
+  const branch = BINSRC.slice(from, to);
+  const snapAt = branch.indexOf("inSnapshot(");
+  const discAt = branch.indexOf("projectsWithTasks(");
+  const inside = snapAt > -1 && discAt > snapAt;
+  check(inside,
+    "project discovery runs inside the digest's snapshot, so naming and enumeration " +
+    "describe one database moment",
+    `inSnapshot@${snapAt} projectsWithTasks@${discAt}`);
+  check(discAt > -1 && branch.indexOf("projectsWithTasks(", discAt + 1) === -1,
+    "and the hub is asked exactly once, so no second read reopens the gap");
+  // COUNTER-CONTROL: the predicate must reject the shape it replaced, or it is a
+  // check that passes over any source at all.
+  const WAS = 'if (sub === "dash") {\n  let seen;\n  try { seen = projectsWithTasks(db); } catch (e) {}\n' +
+              '  model = inSnapshot(db, () => dashModel(db, {}));\n}';
+  const wSnap = WAS.indexOf("inSnapshot("), wDisc = WAS.indexOf("projectsWithTasks(");
+  check(!(wSnap > -1 && wDisc > wSnap),
+    "counter-control: the same predicate rejects the two-moment shape this replaced",
+    `inSnapshot@${wSnap} projectsWithTasks@${wDisc}`);
 }
 
 rmSync(dir, { recursive: true, force: true });

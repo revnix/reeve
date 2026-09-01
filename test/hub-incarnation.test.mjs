@@ -33,6 +33,17 @@ const check = (ok, name, detail) => {
 // failing -- which the sweep reports as UNRUNNABLE, and which leaves every
 // assertion after it unmeasured. Measured: with the mint removed, this file
 // reported 9 of 18 assertions before the repair and 18 of 18 after.
+// ONE READER, and a throw is a VALUE here rather than an exit.
+//
+// `hubIncarnation` answers null, a row, or throws, and which of the three it does
+// is exactly what several of these assertions are about -- so a bare call kills
+// the file the moment a stub makes it take the third path. Measured twice: the
+// same entry came back UNRUNNABLE at 5 of 26 assertions and again at 5 of 26 after
+// only the FIRST call was guarded, because the next unguarded one was four blocks
+// down. Guarding them one at a time is how a file ends up half-covered.
+const read = (db) => { try { return { value: hubIncarnation(db), threw: null }; }
+                       catch (e) { return { value: null, threw: e.message }; } };
+
 const dir = mkdtempSync(join(tmpdir(), "reeve-incarn-"));
 const DEAD = () => false;
 
@@ -47,10 +58,9 @@ const DEAD = () => false;
   // older tree had reported CAUGHT. The entry did not change; the code under it
   // did, which is why a verification has to be re-run after the tree moves rather
   // than carried forward.
-  let inc = null, mintThrew = null;
-  try { inc = hubIncarnation(db); } catch (e) { mintThrew = e.message; }
+  const fresh = read(db); const inc = fresh.value;
   check(inc !== null, "a freshly created hub carries an incarnation",
-    mintThrew ?? JSON.stringify(inc));
+    fresh.threw ?? JSON.stringify(inc));
   check(typeof inc?.id === "string" && /^[0-9a-f]{32}$/.test(inc.id),
     "and it is 128 bits of hex, which is compared for equality and never parsed", JSON.stringify(inc));
   check(inc?.startedAt > 0, "and it records when this incarnation began", JSON.stringify(inc));
@@ -83,7 +93,7 @@ const DEAD = () => false;
   check(wasEmpty === 0, "control: the fixture really is a store without the table, not a fresh one");
 
   const up = openHub(p);
-  const inc = hubIncarnation(up);
+  const inc = read(up).value;
   up.close();
   check(inc !== null && /^[0-9a-f]{32}$/.test(inc.id),
     "an EXISTING hub gets an incarnation when it upgrades, not merely the empty table",
@@ -143,7 +153,7 @@ const DEAD = () => false;
   raw.close();
   const ro = new DatabaseSync(p, { readOnly: true });
   let threw = null, answer;
-  try { answer = hubIncarnation(ro); } catch (e) { threw = e.message; }
+  ({ value: answer, threw } = read(ro));
   ro.close();
   check(threw === null, "reading a hub that predates the table does not throw", String(threw));
   check(answer === null, "it answers null, which a caller reads as `cannot prove`", JSON.stringify(answer));
@@ -158,7 +168,7 @@ const DEAD = () => false;
   draw.close();
   const dro = new DatabaseSync(d, { readOnly: true });
   let dthrew = null, danswer;
-  try { danswer = hubIncarnation(dro); } catch (e) { dthrew = e.message; }
+  ({ value: danswer, threw: dthrew } = read(dro));
   dro.close();
   check(dthrew !== null,
     "a v6 hub that has LOST the table propagates, rather than reading as an older store",
@@ -178,7 +188,7 @@ const DEAD = () => false;
   eraw.close();
   const ero = new DatabaseSync(e6, { readOnly: true });
   let ethrew = null, eanswer;
-  try { eanswer = hubIncarnation(ero); } catch (e) { ethrew = e.message; }
+  ({ value: eanswer, threw: ethrew } = read(ero));
   ero.close();
   check(ethrew !== null,
     "a v6 hub whose incarnation ROW is gone propagates too, not only one missing the table",
@@ -191,11 +201,11 @@ const DEAD = () => false;
 // ── minting REPLACES, because a restore must be able to end an incarnation ────
 {
   const db = openHub(join(dir, "remint.db"));
-  const first = hubIncarnation(db) ?? { id: null };
+  const first = read(db).value ?? { id: null };
   const second = mintIncarnation(db);
   check(second.id !== first.id, "minting again yields a DIFFERENT id");
-  check((hubIncarnation(db) ?? {}).id === second.id,
-    "and the store now answers with the new one, not the old", JSON.stringify(hubIncarnation(db)));
+  check((read(db).value ?? {}).id === second.id,
+    "and the store now answers with the new one, not the old", JSON.stringify(read(db)));
   check(db.prepare("SELECT count(*) n FROM hub_incarnation").get().n === 1,
     "control: replacing rather than appending, so there is still exactly one row");
   db.close();
@@ -205,7 +215,7 @@ const DEAD = () => false;
 {
   const p = join(dir, "live.db");
   const db = openHub(p);
-  const beforeSnapshot = (hubIncarnation(db) ?? {}).id ?? null;
+  const beforeSnapshot = (read(db).value ?? {}).id ?? null;
   const snap = snapshot(db, join(dir, "snaps"), "hub", Math.floor(Date.now() / 1000), { keep: Infinity });
   check(snap.ok === true, "control: the snapshot was actually taken", JSON.stringify(snap));
   db.close();
@@ -214,7 +224,7 @@ const DEAD = () => false;
   // was taken. This is the whole trap: that id is also the id a reader's cursor
   // would carry, so a restore that does not re-mint hands back a MATCH.
   const snapDb = openHub(snap.path);
-  const inSnapshot = (hubIncarnation(snapDb) ?? {}).id ?? null;
+  const inSnapshot = (read(snapDb).value ?? {}).id ?? null;
   snapDb.close();
   check(inSnapshot === beforeSnapshot,
     "control: the snapshot carries the incarnation that was live when it was taken -- which is why re-minting is the fix",
@@ -224,7 +234,7 @@ const DEAD = () => false;
   check(r.ok === true, "control: the restore succeeded, so what follows is about the restored store", JSON.stringify(r).slice(0, 300));
 
   const after = openHub(p);
-  const restored = (hubIncarnation(after) ?? {}).id ?? null;
+  const restored = (read(after).value ?? {}).id ?? null;
   after.close();
   check(restored !== inSnapshot,
     "a restore begins a NEW incarnation, so a cursor issued before it can no longer prove it belongs to this log",

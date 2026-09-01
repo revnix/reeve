@@ -17,6 +17,7 @@
 // happens would therefore announce CLEARED on the next quiet tick, for a sandbox
 // nobody re-measured. That is why several of these run more than one tick.
 import { run } from "./fixtures/tick-harness.mjs";
+import { rmSync } from "node:fs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -86,6 +87,32 @@ const has = (x, key) => [...((x.r ?? x).escalations?.keys?.() ?? [])].some(k => 
   check(has(out, PAGE),
     "the page still stands on a second tick, so a quiet tick cannot announce it CLEARED",
     `second tick's escalations were: ${out.esc}`);
+}
+
+// ── and it survives a RESTART, which ctx cannot ──────────────────────────────
+//
+// The first version of this kept the standing failure on `ctx`, and review found
+// the hole: `bin/reeve` builds a fresh context per process, so a daemon restart
+// or a one-shot `reeve tick` arrives with an empty latch while the escalation ROW
+// is still in the store. The next complete tick then finds that row standing and
+// absent from the tick, and RETIRES it -- a restart announcing that a sandbox
+// nobody re-measured is fine.
+//
+// Two runs, two ctx objects, one store. That is what a restart is.
+{
+  const first = await run({ containment: openWith({ ok: false, id: "cn-6", why: "the worker read the decoy" }),
+                            keepDir: true });
+  check(has(first, PAGE), "control: the first process raised the page",
+    `escalations were: ${first.esc}`);
+
+  const quiet = { credentialRead: "closed", why: "contained",
+                  keychain: { measured: true, items: [], why: null } };
+  const after = await run({ containment: quiet, dbPath: first.dbPath });
+  check(after.ctx.db !== first.ctx.db, "control: the second run really is a different context");
+  check(has(after, PAGE),
+    "the page survives a RESTART, because the row is the latch and not the process",
+    `the restarted process's escalations were: ${after.esc}`);
+  rmSync(first.dir, { recursive: true, force: true });
 }
 
 // ── a canary that PASSES afterwards clears it ─────────────────────────────────

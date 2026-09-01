@@ -86,14 +86,20 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
                     queuedRequests, cancelQueued, measureContainment, noteRateLimit,
                     carriedReleases, carriedCooldowns, providerBind,
                     resolveRepoIdFn, project, keepDir = false, seams = null,
-                    haltMarker, openPrs, containment, ticks = 1 } = {}) => {
+                    haltMarker, openPrs, containment, ticks = 1, dbPath } = {}) => {
   const dir = mkdtempSync(join(tmpdir(), "reeve-prov-"));
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
   const guest = hub === undefined ? openHubAsGuest(hubPath) : hub;
   const claims = [], releases = [], spawned = [];
   const ctx = {
-    nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
+    // A STORE THIS RUN DID NOT CREATE, when the caller names one. `bin/reeve`
+    // builds a fresh context per process, so "the daemon restarted" means a new
+    // ctx over an EXISTING store -- and a fixture that always makes its own store
+    // cannot express it at all. Anything a tick is supposed to carry across a
+    // restart has to be read back from the store, and this is the only way to
+    // watch it happen.
+    nwo: "o/r", db: open(dbPath ?? join(dir, "s.db")), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
     // OVERRIDABLE, and the default is a verdict with NO canary in it. The
     // daemon's containment verdict carries the canary's own result beside the
@@ -247,6 +253,8 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
                 log: readFileSync(join(dir, "log.txt"), "utf8") };
   out.dir = dir;
   out.hubPath = hubPath;
+  // Named so a caller can hand it to a second run as `dbPath`.
+  out.dbPath = dbPath ?? join(dir, "s.db");
   ctx.db.close();
   try { guest?.close?.(); } catch {}
   // keepDir: the caller dumps the database after the tick, so the directory

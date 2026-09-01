@@ -1215,4 +1215,22 @@ export const STUBS = [
               find: "{ ok: false, kind: \"BAD_REPORT\", errors }",
               replace: "{ ok: false, errors }" }],
   },
+  {
+    name: "report-evidence-names-the-phase-it-came-from",
+    why: "drop the phase from a SIZING success. `nextPhase` refuses an unattributed report -- an unattributed success advances nothing -- so the evidence map omitting it means every well-formed sizing report is refused at the transition with a message about attribution, and the worker that produced a perfectly good report is told its report came from nowhere. A pure-function test of the map cannot see this; only driving it through applyTransition can",
+    test: "test/phase-report.test.mjs",
+    expectRed: "a well-formed report advances the task",
+    edits: [{ file: "src/build/report.mjs",
+              find: "    ? { kind: \"phase.succeeded\", phase, depth: report.depth }",
+              replace: "    ? { kind: \"phase.succeeded\", depth: report.depth }" }],
+  },
+  {
+    name: "report-hold-never-manufactures-an-escalation",
+    why: "supply an escalation identity the report did not carry. `holdReasonRefusal` refuses a blocked_other with a blank one, and that rule has exactly one home -- a default here is a second copy of it, and the copy that wins is the one that runs. The task then enters BLOCKED under an identity nobody minted, so the founder is notified about a hold under a name that appears in no report",
+    test: "test/phase-report.test.mjs",
+    expectRed: "a blocked_other hold with an empty escalation is refused",
+    edits: [{ file: "src/build/report.mjs",
+              find: "    return { kind: \"hold\", reason: \"blocked_other\", detail: report.reason, escalation: report.escalation };",
+              replace: "    return { kind: \"hold\", reason: \"blocked_other\", detail: report.reason, escalation: \"bt:manufactured\" };" }],
+  },
 ];

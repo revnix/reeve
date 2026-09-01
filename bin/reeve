@@ -1449,7 +1449,19 @@ switch (cmd) {
                         `${hist.missing.join(", ")} (it carries ${hist.have.join(", ") || "none"}, and this ` +
                         `binary expects 1 through ${HUB_SCHEMA_VERSION}). A dry run will not migrate it, ` +
                         `because migrating is a write and this command promises none.`);
-          console.error(`-> run a command that writes (for example \`reeve task file\` without --dry-run) to migrate, then retry`);
+          // THE REMEDY HAS TO BE ONE THAT WORKS ON THIS FAULT. Both faults
+          // arrive here as a non-empty `missing`, and only one of them
+          // migrates: `openHub` re-runs a missing TAIL, and refuses a HOLE
+          // outright, because a migration beneath an applied one cannot be
+          // re-run over a store that has already moved past it. Sending an
+          // operator with a holed hub to the writing command sends them to a
+          // second refusal -- and that second refusal is the one that names the
+          // repair, so the first message cost them a round trip to reach it.
+          console.error(hist.holed
+            ? `-> this is a HOLE, not a missing tail, so migrating cannot repair it: the migrations ` +
+              `beneath the ones already applied cannot be re-run. Restore a snapshot ` +
+              `(\`reeve restore --hub --force\`), then retry`
+            : `-> run a command that writes (for example \`reeve task file\` without --dry-run) to migrate, then retry`);
           process.exit(1);
         }
         db = openHub(hubPath);

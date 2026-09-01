@@ -205,6 +205,31 @@ const MIGRATIONS = [
  * store than `no such table: singleton_lease` does.
  */
 /**
+ * The versions absent BENEATH the highest one recorded -- a HOLE, as distinct
+ * from a history that is merely short.
+ *
+ * The two are different faults with different repairs, and only one of them
+ * migrates. `openHub` re-runs a missing tail and refuses a hole outright,
+ * because a migration beneath an applied one cannot be re-run over a store that
+ * has already moved past it. A caller that cannot tell them apart prescribes the
+ * wrong remedy for one of them.
+ *
+ * Spelled ONCE, and read by every site that asks: `openHub`'s own refusal, the
+ * snapshot validator in backup.mjs -- whose comment already said it was applying
+ * "the same contiguity rule `openHub` applies" while carrying its own copy of
+ * the loop -- and `missingMigrations` for the CLI. Three literal copies of one
+ * rule is how the answers drift, and the drift is invisible until two of them
+ * disagree in front of an operator.
+ */
+export function historyGaps(versions) {
+  const have = new Set(versions);
+  const top = versions.length ? Math.max(...versions) : 0;
+  const gaps = [];
+  for (let v = 1; v <= top; v++) if (!have.has(v)) gaps.push(v);
+  return gaps;
+}
+
+/**
  * Which migrations a hub is MISSING, from 1 to the version this binary expects.
  *
  * `completedVersion` answers `max(version)`, and a maximum is not a history. A
@@ -220,18 +245,28 @@ const MIGRATIONS = [
  * `readable: false` means the file could not be opened or carries no
  * `schema_version` at all, which is a different answer from "some are missing"
  * and must not be collapsed into it.
+ *
+ * `holed` says WHICH fault it is, because the remedy differs: a hole needs a
+ * snapshot, a short history needs a migration. Without it every caller reads a
+ * non-empty `missing` as one condition and names one remedy, which is right for
+ * exactly one of the two.
  */
 export function missingMigrations(path) {
-  if (!existsSync(path)) return { readable: false, missing: [], have: [] };
+  // ONE SHAPE FROM EVERY EXIT, `holed` included. A caller reading `.holed` off
+  // an unreadable answer would otherwise get `undefined`, which is falsy, and
+  // "this file cannot be read" would silently answer "no hole".
+  const unreadable = { readable: false, missing: [], have: [], holed: false };
+  if (!existsSync(path)) return unreadable;
   let q;
   try { q = new DatabaseSync(path, { readOnly: true, timeout: HUB_BUSY_TIMEOUT_MS }); }
-  catch { return { readable: false, missing: [], have: [] }; }
+  catch { return unreadable; }
   try {
     const have = new Set(q.prepare("SELECT version FROM schema_version").all().map((r) => r.version));
     const missing = [];
     for (let v = 1; v <= HUB_SCHEMA_VERSION; v++) if (!have.has(v)) missing.push(v);
-    return { readable: true, missing, have: [...have].sort((a, b) => a - b) };
-  } catch { return { readable: false, missing: [], have: [] }; }
+    const present = [...have].sort((a, b) => a - b);
+    return { readable: true, missing, have: present, holed: historyGaps(present).length > 0 };
+  } catch { return unreadable; }
   finally { try { q.close(); } catch { /* already gone */ } }
 }
 
@@ -560,8 +595,9 @@ export function openHub(path, { skipIntegrity = false } = {}) {
   // cannot be re-run, because the ones above it have already been applied.
   {
     const rows = db.prepare("SELECT version FROM schema_version ORDER BY version").all().map(r => r.version);
-    const gaps = [];
-    for (let v = 1; v <= seen; v++) if (!rows.includes(v)) gaps.push(v);
+    // The rule itself is `historyGaps`, so the refusal here and the advice the
+    // CLI prints are the same judgement rather than two implementations of it.
+    const gaps = historyGaps(rows);
     if (gaps.length) {
       closeHub();
       throw new Error(

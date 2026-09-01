@@ -28,7 +28,7 @@ import { open as openStore, exportJsonl } from "./db/ops.mjs";
 // `restoreHub` needs them, and not before -- ESM resolves at instantiation, so
 // naming a module that does not exist yet breaks every import of this file.
 import { openHub, isOperational, faultKind, HUB_SCHEMA_VERSION, HUB_TABLES, tablesAt,
-         schemaDefectsAt, isKnownVersion, backfillPinDeadlines } from "./build/hubdb.mjs";
+         schemaDefectsAt, isKnownVersion, backfillPinDeadlines, historyGaps } from "./build/hubdb.mjs";
 // Task 9's additions. `restoreHub` takes the maintenance lock before it refuses,
 // enumerates live writers to name them, and replays the tail -- and it needs
 // `replayableKinds`/`NON_REPLAYED_KINDS` to refuse a tail exported by a NEWER
@@ -249,10 +249,13 @@ export function validateSnapshot(path, { expectVersion = null, kind = "repo", de
       // the one moment an operator has nothing to fall back to. A validator that
       // says "usable" about a file the restore will reject is worse than no
       // validator.
+      // "The same contiguity rule" is now the same CODE. This carried its own
+      // copy of the loop directly under a comment saying it applied openHub's
+      // rule, which is the arrangement in which two answers drift apart without
+      // either comment becoming false.
       const versions = probe.prepare("SELECT version FROM schema_version ORDER BY version").all().map(r => r.version);
       const version = versions.length ? versions[versions.length - 1] : 0;
-      const gaps = [];
-      for (let v = 1; v <= version; v++) if (!versions.includes(v)) gaps.push(v);
+      const gaps = historyGaps(versions);
       if (!versions.length || gaps.length)
         return { ok: false, integrity, version,
                  why: !versions.length

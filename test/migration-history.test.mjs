@@ -12,11 +12,15 @@
 // it this file proves only that the new check refuses something, which a check
 // that refuses everything also does. With it, it proves the OLD check would have
 // passed this exact hub.
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { openHub, completedVersion, missingMigrations, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
+// DERIVED, so a fixture cannot be written at a path the binary does not read.
+import { hubPathFor } from "../src/paths.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -94,6 +98,122 @@ openHub(path).close();
   const e = missingMigrations(empty);
   check(e.readable === true && e.missing.length === HUB_SCHEMA_VERSION,
     "and every migration is reported missing, rather than none", JSON.stringify(e));
+}
+
+// ── A HOLE AND A TAIL ARE DIFFERENT FAULTS, and only one of them migrates ───
+//
+// Both reach a caller as a non-empty `missing`, and one remedy was named for
+// both: run the writing command to migrate. That is right for a history that is
+// merely short and wrong for a holed one -- `openHub` refuses a hole outright,
+// because a migration beneath an applied one cannot be re-run over a store that
+// has already moved past it. An operator with a holed hub was sent to a second
+// refusal, and the second refusal was the one naming the actual repair.
+//
+// THE DISCRIMINATION IS MEASURED AGAINST `openHub`, not against the message. A
+// fixture built from what I believe the command prints would agree with the
+// command and with nothing else.
+const refusal = (p) => { try { openHub(p).close(); return null; } catch (e) { return String(e.message); } };
+// A REAL hub with one version row removed, so the store's shape and its recorded
+// history disagree exactly as they do after a hand-repair or a bad restore.
+const holeAt = (p, v) => {
+  openHub(p).close();
+  const q = new DatabaseSync(p);
+  q.exec(`DELETE FROM schema_version WHERE version = ${v}`);
+  q.close();
+};
+{
+  // THE FIXTURE HAS TO BE ABLE TO EXHIBIT BOTH FAULTS. With a single migration
+  // there is no version beneath a higher one, so every assertion below would be
+  // about the same case while reading as two.
+  check(HUB_SCHEMA_VERSION >= 2,
+    "precondition: this binary carries at least two migrations, so a hole and a tail are distinguishable",
+    String(HUB_SCHEMA_VERSION));
+
+  // DERIVED FROM THE VERSION, never written as 2 and 3. A sibling test already
+  // carried `/migration 2 is missing/` beside a fixture that stopped containing
+  // a 2 the moment the schema moved, and a constant that no longer describes its
+  // own fixture is an assertion about nothing.
+  const holed = join(dir, "hole-vs-tail-holed.db");
+  holeAt(holed, HUB_SCHEMA_VERSION - 1);
+  const hh = missingMigrations(holed);
+  check(hh.missing.length > 0 && hh.holed === true,
+    "a hub missing a version BENEATH one it carries is reported as holed", JSON.stringify(hh));
+  const holedWhy = refusal(holed);
+  check(holedWhy !== null && /missing migration/.test(holedWhy),
+    "control: openHub really does refuse that file for its hole, so migrating is not a remedy it can perform",
+    String(holedWhy));
+
+  const tail = join(dir, "hole-vs-tail-short.db");
+  holeAt(tail, HUB_SCHEMA_VERSION);
+  const th = missingMigrations(tail);
+  check(th.missing.length > 0 && th.holed === false,
+    "a hub missing only its TOP version is missing something and is NOT holed -- the exact pair the route branches on",
+    JSON.stringify(th));
+  // NOT "openHub succeeds". Re-running the top migration over a store that
+  // already carries its effects can fail for reasons of its own, and that is a
+  // different subject. What has to hold is that it is not refused for a HOLE,
+  // because that refusal is what makes migrating impossible. The control above
+  // is what stops this being satisfied by an openHub that refuses nothing.
+  const tailWhy = refusal(tail);
+  check(tailWhy === null || !/missing migration/.test(tailWhy),
+    "and openHub does not refuse it for a hole, so the migrate-and-retry advice is reachable",
+    String(tailWhy));
+}
+
+// ── AND THE ROUTE READS IT ──────────────────────────────────────────────────
+//
+// The rule being right is not the same as the command using it. This spawns
+// `reeve task file --dry-run` against both hubs and reads what an operator is
+// actually told, because that sentence is the whole of the finding.
+{
+  const HOME = join(dir, ".reeve");                // literally `.reeve`, as init's tests require
+  const repo = join(HOME, "repo");
+  mkdirSync(repo, { recursive: true });
+  mkdirSync(join(HOME, "state"), { recursive: true });
+  // A profile the SCHEMA ACCEPTS, not merely one that parses: the route
+  // validates it and exits BEFORE the hub check when it does not, so a thinner
+  // fixture would exercise the profile failure while claiming to test this one.
+  writeFileSync(join(repo, "p.json"), JSON.stringify({
+    schemaVersion: 1, project: { kind: "product" },
+    identity: { key: "o/a", defaultBranch: "main", visibility: "private" },
+    authority: { permission: "admin", policy: "propose_and_merge", profileLocation: "committed" },
+    state: { mode: "in-repo" },
+    units: [{ id: "root", root: ".", language: "typescript", packageManager: "pnpm" }],
+    ci: { provider: "github-actions" }, merge: { method: "squash", enforcement: "enforced" },
+  }) + "\n");
+  writeFileSync(join(HOME, "projects.json"), JSON.stringify({
+    alpha: { nwo: "o/a", repoPath: repo, profilePath: join(repo, "p.json") },
+  }) + "\n");
+
+  const ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..");
+  const hub = hubPathFor(HOME);
+  const dryRun = () => {
+    const r = spawnSync(process.execPath,
+      [join(ROOT, "bin", "reeve"), "task", "file", "--project", "alpha",
+       "--title", "t", "--territory", "packages/x", "--dry-run"],
+      { encoding: "utf8", env: { ...process.env, REEVE_HOME: HOME } });
+    return { status: r.status, out: (r.stdout ?? "") + (r.stderr ?? "") };
+  };
+
+  rmSync(hub, { force: true });
+  holeAt(hub, HUB_SCHEMA_VERSION - 1);
+  const holedRun = dryRun();
+  check(holedRun.status === 1 && /\bHOLE\b/.test(holedRun.out) && /restore a snapshot/i.test(holedRun.out),
+    "the route tells an operator with a HOLED hub to restore a snapshot", holedRun.out.slice(0, 500));
+  check(!/without --dry-run/.test(holedRun.out),
+    "and does not send them to the writing command, which openHub would refuse for the same hole",
+    holedRun.out.slice(0, 500));
+
+  rmSync(hub, { force: true });
+  holeAt(hub, HUB_SCHEMA_VERSION);
+  const tailRun = dryRun();
+  // THE CONTROL FOR THE PAIR. Without it, advice that said "restore a snapshot"
+  // unconditionally would pass every assertion above.
+  check(tailRun.status === 1 && /without --dry-run/.test(tailRun.out),
+    "control: a hub that is merely SHORT is still told to migrate -- the advice was not replaced, it was split",
+    tailRun.out.slice(0, 500));
+  check(!/\bHOLE\b/.test(tailRun.out),
+    "and a short history is not called a hole", tailRun.out.slice(0, 500));
 }
 
 rmSync(dir, { recursive: true, force: true });

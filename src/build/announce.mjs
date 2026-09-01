@@ -532,7 +532,7 @@ export function announce(db, {
     // is the command that finds it. Nothing accepted is still a refusal.
     const accepted = (result?.channels ?? []).filter(c => c.ok);
     if (result?.ok || accepted.length)
-      return { why, count, kind, body: body ?? null, channels: result.channels ?? [],
+      return { why, count, kind, body: body ?? null, channels: result?.channels ?? [],
                partial: !result?.ok };
     declined.push({ why, count, kind, body: body ?? null,
       not_sent: failure ?? result?.why ?? "the sender returned no reason" });

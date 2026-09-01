@@ -1198,7 +1198,7 @@ export const STUBS = [
     name: "artifact-citation-extension-is-not-length-capped",
     why: "cap a citation's file extension at six characters, so src/x.markdown:12 is not a citation and a correctly cited claim is REFUSED for having a long filename. What distinguishes a file reference from a URL port is the dot, not how many letters follow it, and a bound nobody chose deliberately becomes a rule nobody can find",
     test: "test/artifact.test.mjs",
-    expectRed: "src/x.markdown:12 is a citation",
+    expectRed: "the bare filename x.markdown:12 is a citation",
     edits: [{ file: "src/build/artifact.mjs",
               find: "[\\w-]+\\.[A-Za-z][\\w-]*):\\d+/;",
               replace: "[\\w-]+\\.[A-Za-z][\\w]{0,5}):\\d+/;" }],

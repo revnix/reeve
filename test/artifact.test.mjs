@@ -760,9 +760,16 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 
   // A CITATION'S EXTENSION IS NOT LENGTH-CAPPED. `{0,5}` refused a correctly
   // cited claim for having a long filename.
-  for (const cite of ["src/x.markdown:12", "a.config.mjs:3", "x.yml:1", "deep/path/to/thing.mts:99"])
+  // BARE FILENAMES, because that is the only form the cap ever broke. A token
+  // containing a slash matched the path alternative whatever its extension, so
+  // `src/x.markdown:12` passed even while capped -- a fixture that cannot
+  // exhibit the defect it was written for, and the sweep said so.
+  for (const cite of ["x.markdown:12", "thing.typescript:9", "a.config.mjs:3", "x.yml:1"])
     check(g("RESEARCH", `# r\n\n## Findings\n\n- a claim (${cite})\n`, {}).ok === true,
-      `${cite} is a citation`);
+      `the bare filename ${cite} is a citation`);
+  // And the pathed form still works, which is the control for the above.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (deep/path/to/thing.mts:99)\n", {}).ok === true,
+    "control: and a pathed citation still is");
   check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim at 12:30\n", {}).ok === false,
     "control: and a bare time is still not one");
 

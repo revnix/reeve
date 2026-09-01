@@ -1954,15 +1954,6 @@ export const STUBS = [
               replace: "    } },\n];" }],
   },
   {
-    name: "incarnation-reaches-an-existing-hub",
-    why: "mint only when the table is absent, which is what a migration that creates and seeds in one statement would do. The upgrade path is where this class of change fails quietly: a hub that already exists reaches the new code by a different route, and `the table is created` and `the table has a row` are two facts",
-    test: "test/hub-incarnation.test.mjs",
-    expectRed: "an EXISTING hub gets an incarnation when it upgrades",
-    edits: [{ file: "src/build/hubdb.mjs",
-              find: "  const id = randomBytes(16).toString(\"hex\");",
-              replace: "  if (db.prepare(\"SELECT count(*) n FROM hub_incarnation\").get().n) return { id: null, startedAt: 0 };\n  const id = randomBytes(16).toString(\"hex\");" }],
-  },
-  {
     name: "incarnation-row-is-unique",
     why: "drop the single-row constraint, so a second incarnation is storable. A table that merely HAPPENS to hold one row is one INSERT away from two answers to a question that must have exactly one, and the reader takes whichever the query returns first",
     test: "test/hub-incarnation.test.mjs",

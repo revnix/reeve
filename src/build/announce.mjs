@@ -413,8 +413,20 @@ export const ACTION_FOR = Object.freeze({
     "reeve backup --hub — there is no working snapshot until this succeeds",
 });
 
-/** The action for a concrete key, or null where nothing is declared. */
-export const actionFor = (key) => ACTION_FOR[shapeOf(key)] ?? null;
+/**
+ * The action for a concrete key, with the task substituted, or null.
+ *
+ * `<id>` IS REPLACED. The shapes carry the placeholder because they are shapes,
+ * and an alert that tells the founder to run `reeve task why <id>` hands them a
+ * command they cannot paste -- under a shell `<id>` is input redirection -- and
+ * makes them reconstruct the very identifier the alert is holding.
+ */
+export const actionFor = (key) => {
+  const action = ACTION_FOR[shapeOf(key)] ?? null;
+  if (action === null) return null;
+  const subject = subjectOf(key);
+  return subject === null ? action : action.replaceAll("<id>", subject);
+};
 
 /**
  * Record every escalation, and interrupt a human about the few that earn it.
@@ -472,13 +484,20 @@ export function announce(db, {
     // can only file away -- and a channel whose alerts cannot be acted on is one
     // that gets muted, which is the outcome the closed page list exists to avoid.
     const action = actionFor(why);
+    // THE ACTION GOES ABOVE THE DETAIL, and that ordering is load-bearing rather
+    // than cosmetic. `redact` caps a message at its own limit and truncates the
+    // TAIL, so an action appended after an externally supplied body is the first
+    // thing a long CI error deletes -- producing exactly the actionless alert
+    // this exists to prevent, and only for the alerts whose detail is longest.
+    // Reordering removes the dependency; reserving a byte count would inherit a
+    // constant from another module and drift from it.
     const raw = isCleared
       ? `CLEARED — ${why} is no longer standing.`
       // The count is the shape of a shared cause, and it is only worth saying
       // when it is more than one.
       : `${why}${count > 1 ? ` (${count} subjects)` : ""}` +
-        `${body?.type ? ` [${body.type}]` : ""}${detail}` +
-        `${action ? `\n-> ${action}` : ""}`;
+        `${body?.type ? ` [${body.type}]` : ""}` +
+        `${action ? `\n-> ${action}` : ""}${detail}`;
     // SANITISED AT THE BOUNDARY, exactly as `buildAlert` does it. A body carries
     // externally sourced text -- CI output, a pathname, a validation error -- and
     // this is the last point before it leaves the machine. `notify` does not do
@@ -492,9 +511,29 @@ export function announce(db, {
     // THE SENDER'S OWN VERDICT, never an assumption. A throw and an `ok: false`
     // are the same fact to a reader who needs to know a human was not reached.
     let result = null, failure = null;
-    try { result = send({ title, message, kind, why, count, body: body ?? null, profile }); }
+    try {
+      result = send({ title, message, kind, why, count, body: body ?? null, profile,
+        // A PAGE IS AN INTERRUPTION, and it has to be sent as one. `notify`
+        // falls back to "default" when an alert names no priority, so the
+        // closed page list would have delivered ordinary notifications while
+        // promising a phone call. A CLEARING is deliberately not urgent: there
+        // is nothing to do about it, and waking someone to say a problem ended
+        // is how the channel earns being muted.
+        priority: isCleared ? "default" : "high",
+        tags: isCleared ? "white_check_mark" : "warning" });
+    }
     catch (e) { failure = e.message; }
-    if (result?.ok) return { why, count, kind, body: body ?? null, channels: result.channels ?? [] };
+    // DELIVERED MEANS A HUMAN WAS REACHED, not that every channel worked.
+    // `notify` reports `ok: false` when ANY configured channel fails while the
+    // healthy one has already delivered -- so treating that as undelivered
+    // re-pages the working channel on every pass until the broken one recovers,
+    // which is the alert fatigue the page list exists to prevent. The failed
+    // channel is not hidden: it rides on `channels`, and `reeve notify --test`
+    // is the command that finds it. Nothing accepted is still a refusal.
+    const accepted = (result?.channels ?? []).filter(c => c.ok);
+    if (result?.ok || accepted.length)
+      return { why, count, kind, body: body ?? null, channels: result.channels ?? [],
+               partial: !result?.ok };
     declined.push({ why, count, kind, body: body ?? null,
       not_sent: failure ?? result?.why ?? "the sender returned no reason" });
     return null;

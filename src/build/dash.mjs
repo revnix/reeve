@@ -30,6 +30,17 @@ const TERMINAL_SET = new Set(TERMINAL);
  * every project at once, so one map would report one project's settings under
  * another project's name.
  */
+/**
+ * A cursor is `<seq>.<at>` -- opaque to the operator, who copies what the digest
+ * printed. Two fields rather than one because the sequence alone cannot survive a
+ * restore; see the rewind check in `dashModel`.
+ */
+export const formatCursor = (seq, at) => `${seq}.${at}`;
+export function parseCursor(raw) {
+  const m = /^(\d+)\.(\d+)$/.exec(String(raw ?? ""));
+  return m ? { seq: Number(m[1]), at: Number(m[2]) } : null;
+}
+
 export function dashModel(db, { now, switchesFor, projects = [], since = null, isAlive }) {
   if (typeof isAlive !== "function")
     throw new Error("dashModel needs an isAlive predicate: an unexpired lease is not a running process, " +
@@ -58,11 +69,46 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
   const lease = db.prepare(
     `SELECT pid, lstart, acquired_at, expires_at FROM singleton_lease
       WHERE name = 'builder'`).get() ?? null;
+  // RUNNING IS THE PROCESS, NOT THE CLOCK. `build status` determines it from
+  // `isSameProcess(pid, lstart)` alone, and `acquireSingleton` refuses a takeover
+  // while the holder is alive EVEN AFTER EXPIRY -- "expired alone is not enough:
+  // a busy process can miss a heartbeat, and killing its authority while it is
+  // mid-effect is the race, not the fix." Requiring both would report a live
+  // builder as stopped whenever a tick blocks past the lease, and would disagree
+  // with the authority rule about who is holding the hub.
+  //
+  // The two facts stay apart: `running` answers "is anyone there", and
+  // `lease_unexpired` answers "is its claim still fresh". A live holder with a
+  // stale lease is a slow tick; a dead holder with a fresh one is a crash.
   const unexpired = !!lease && lease.expires_at > now;
-  const holderAlive = unexpired && isAlive(lease.pid, lease.lstart);
+  const holderAlive = !!lease && isAlive(lease.pid, lease.lstart);
 
-  const highWater = db.prepare("SELECT COALESCE(max(seq), 0) s FROM phase_event").get().s;
-  const rewound = since !== null && since > highWater;
+  // The moment of the last orderly shutdown, from the append-only log.
+  const released = db.prepare(
+    `SELECT at FROM hub_event WHERE kind = 'lease.singleton.released'
+      ORDER BY seq DESC LIMIT 1`).get()?.at ?? null;
+
+  const head = db.prepare(
+    "SELECT seq, at FROM phase_event ORDER BY seq DESC LIMIT 1").get() ?? null;
+  const highWater = head?.seq ?? 0;
+  // A CURSOR CARRIES THE EVENT IT NAMES, not just its number.
+  //
+  // `since > highWater` catches a restore only while the log is still SHORTER
+  // than the cursor. Restore to 50, let the builder write through 100, and
+  // sequence 100 exists again -- a different event wearing the same number, and
+  // events 51-100 of the new incarnation are skipped for ever with nothing
+  // reporting it.
+  //
+  // There is no incarnation id in the hub, and inventing one here would be a
+  // schema decision taken by a read surface. But one is not needed: a restored
+  // log is a PREFIX of the old one, so an event that survives the restore keeps
+  // its `at`, and an event written after it does not. So the cursor is
+  // `<seq>.<at>`, and the check is whether the row at that sequence is still the
+  // row the cursor was issued for. That is PROOF rather than inference, and it
+  // uses only what the log already records.
+  const atOf = (seq) => db.prepare("SELECT at FROM phase_event WHERE seq = ?").get(seq)?.at ?? null;
+  const rewound = since !== null &&
+    (since.seq > highWater || (since.seq > 0 && atOf(since.seq) !== since.at));
 
   const byProject = Object.create(null);
   for (const p of projects) byProject[p.name] = switchesFor(p.name);
@@ -75,7 +121,6 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
     // "which switches are in force", correct only while there is one project.
     switches: byProject,
     tasks,
-    since,
 
     // 1. IS IT ALIVE. A heartbeat and when it was last seen. `running` reads the
     // CLOCK, never the row's existence: a lease row outlives the process that
@@ -90,7 +135,15 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
       // distinction an operator needs at the moment it matters most.
       lease_unexpired: unexpired,
       pid: lease?.pid ?? null,
-      last_seen_seconds: lease ? Math.max(0, LEASE_SECONDS - (lease.expires_at - now)) : null,
+      // NEVER-SEEN AND CLEANLY-STOPPED ARE DIFFERENT FACTS. `releaseSingleton`
+      // DELETES the row on every orderly shutdown, so an absent lease was
+      // reporting "never seen" about a builder that exited five seconds ago. The
+      // append-only `lease.singleton.released` event outlives the row and is
+      // where that moment still lives.
+      last_seen_seconds: lease
+        ? Math.max(0, LEASE_SECONDS - (lease.expires_at - now))
+        : (released === null ? null : Math.max(0, now - released)),
+      last_seen_from: lease ? "lease" : (released === null ? null : "released_event"),
     },
 
     // 2. WHAT IS IT DOING. A live run, or a task that is moving under its own
@@ -118,7 +171,14 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
       .filter(t => t.waiting.first && HUMAN_WAITS.has(t.waiting.first))
       .map(t => ({ id: t.id, project: t.project, title: t.title,
                    waiting: t.waiting.first,
-                   capability: t.waiting.capability,
+                   // ONLY when the headline IS the capability wait. `waitingFor`
+                   // sets `capability` whenever the phase needs a switch, so
+                   // copying it unconditionally rendered
+                   // `WAITING_FOR_FOUNDER (observe)` -- pairing a founder hold
+                   // with a switch that belongs to a different condition, or is
+                   // merely unknown.
+                   capability: t.waiting.first === "WAITING_FOR_CAPABILITY"
+                     ? t.waiting.capability : null,
                    for_seconds: t.waiting.since !== null ? Math.max(0, now - t.waiting.since)
                                                          : (t.age?.seconds ?? null) }))
       // LONGEST FIRST. `for_seconds` exists to decide what to handle first, and
@@ -136,8 +196,8 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
     // that same whole second -- and loses it for ever, because the next cursor is
     // later still. `phase_event.seq` is lossless and monotonic, and
     // `next_cursor` is handed back so the operator never has to construct one.
-    since_you_looked: since === null || rewound ? [] : movedSince(db, since),
-    next_cursor: highWater,
+    since_you_looked: since === null || rewound ? [] : movedSince(db, since.seq),
+    next_cursor: formatCursor(highWater, head?.at ?? 0),
     // A RESTORE REWINDS THE LOG. `phase_event.seq` is monotonic within one hub,
     // not across a restore: replacing the store with an older snapshot can put
     // the high-water mark BELOW a cursor issued before it. Every later
@@ -148,6 +208,7 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
     // period, which is why it is reported rather than inferred: a cursor ahead of
     // the log is PROOF the log is not the one that issued it.
     cursor_rewound: rewound,
+    since: since === null ? null : formatCursor(since.seq, since.at),
 
     // 5. WHAT DID IT DECLINE, FAIL OR REFUSE. Standing escalations, beside the
     // task that raised them.
@@ -268,7 +329,13 @@ export function renderDash(m) {
     // an unexplained phase. Not-yours is not the same as not-diagnosable.
     out.push(`  ${t.id}  ${t.phase}  ${oneLine(t.title)}` +
              (t.waiting.first ? `  ${t.waiting.first}` : "") +
-             (t.waiting.capability ? ` (${t.waiting.capability})` : "") +
+             (t.waiting.first === "WAITING_FOR_CAPABILITY" && t.waiting.capability
+               ? ` (${t.waiting.capability})` : "") +
+             // AGE ON EVERY ROW. A task waiting on quota, the guardian or a
+             // reviewer is in neither list above, and those are exactly the rows
+             // where a brief wait and one that has lasted days look identical
+             // without it.
+             `  in state ${secs(t.age?.seconds)}` +
              (t.draining !== null ? `  draining ${t.draining}` : ""));
     for (const r of t.territory)
       out.push(`      territory ${r.kind} ${oneLine(r.path)}` +

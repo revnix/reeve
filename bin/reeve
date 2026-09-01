@@ -1158,7 +1158,7 @@ switch (cmd) {
       const { taskShow, taskList, renderShow, renderList, envelope,
               switchesResolver, projectsWithTasks, inSnapshot } = await import("../src/build/show.mjs");
       const { whyModel, renderWhy } = await import("../src/build/why.mjs");
-      const { dashModel, renderDash } = await import("../src/build/dash.mjs");
+      const { dashModel, renderDash, parseCursor } = await import("../src/build/dash.mjs");
       const { loadRegistry } = await import("../src/build/registryio.mjs");
 
       const hub = hubPathFor(HOME);
@@ -1280,11 +1280,14 @@ switch (cmd) {
           const raw = opt("since");
           let since = null;
           if (raw !== null) {
-            since = Number(raw);
-            if (!Number.isInteger(since) || since < 0)
+            // OPAQUE, and parsed by the module that formats it. A cursor is
+            // `<seq>.<at>` so a restore can be PROVED rather than guessed at; an
+            // operator copies what the digest printed and never builds one.
+            since = parseCursor(raw);
+            if (since === null)
               fail("usage",
                    `reeve task dash: --since expects a cursor from a previous digest's ` +
-                   `next_cursor, got ${JSON.stringify(raw)}`,
+                   `next_cursor (it looks like 1234.1800000000), got ${JSON.stringify(raw)}`,
                    { exit: EXITS.misuse });
           }
           let model;

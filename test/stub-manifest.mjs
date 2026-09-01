@@ -1502,4 +1502,16 @@ export const STUBS = [
               find: "  if (isObject) {",
               replace: "  if (isObject && schema.type === \"object\") {" }],
   },
+
+  {
+    name: "escalation-keys-are-declared-identities",
+    why: "let `escalationKey` mint any well-formed key. A key matching no declared shape is a situation nobody wrote down: the page list cannot decide about it, no announcer can name it and nothing can clear it, so the escalation is raised into a namespace nothing reads. Not hypothetical -- `transition.mjs`'s `blocked_other` branch takes an escalation key straight from its caller and writes it to the table with no check at all, which is the hole this closed set exists to close",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "and a well-formed key nothing declares, which would be raised where nothing reads",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  if (shapeOf(key) === null)",
+      replace: "  if (key === \"\")",
+    }],
+  },
 ];

@@ -96,7 +96,6 @@ export const GRANDFATHERED = [
   "test/guardian-hub-access.test.mjs",
   "test/guardian-hub-allowlist.test.mjs",
   "test/guardian-provider-lease.test.mjs",
-  "test/hub-backup-restore.test.mjs",
   "test/hub-derived-schema.test.mjs",
   "test/hub-doctor.test.mjs",
   "test/hub-drills.test.mjs",
@@ -1228,5 +1227,14 @@ export const STUBS = [
     edits: [{ file: "src/build/measurementdb.mjs",
               find: "        `SELECT provider, kind, result, evidence, measured_at FROM provider_measurement",
               replace: "        `SELECT provider, kind, measured_at FROM provider_measurement" }],
+  },
+  {
+    name: "restore-replays-the-post-snapshot-tail",
+    why: "drop ONE kind on the replay path, so a measurement written after the snapshot is skipped while every other table restores. The snapshot restores, the tail is replayed, the command exits 0, and the only thing missing is the row the arming gate reads -- a restore reporting success while silently returning that one answer to whenever the last snapshot was taken. Scoped to a single kind deliberately: making the lookup fail for EVERY event aborts the file long before the drill, and a stub that stops the run proves nothing about whether the drill would have noticed",
+    test: "test/hub-backup-restore.test.mjs",
+    expectRed: "provider_measurement matches the pre-drop export row for row",
+    edits: [{ file: "src/build/replay.mjs",
+              find: "      const h = HANDLERS[e.kind];",
+              replace: "      const h = e.kind === \"provider_measurement.recorded\" ? undefined : HANDLERS[e.kind];" }],
   },
 ];

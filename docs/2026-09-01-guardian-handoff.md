@@ -160,8 +160,10 @@ node -e 'import("./src/stubsweep.mjs").then(async S=>{
 
 ## 1. What this lane landed on 2026-09-01
 
-Nine pull requests merged. Measure the current list with section 0.1 rather than trusting
-this one; it is a record of what was done, not a claim about what is on the default branch
+SEVEN pull requests from this lane merged on 2026-09-01. Ten merged in total that day;
+three belong to the other two lanes, and counting those as this lane's was the first
+version of this sentence. Measure the current list with section 0.1 rather than trusting
+this one: it is a record of what was done, not a claim about what is on the default branch
 now.
 
 | what | why it mattered |

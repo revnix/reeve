@@ -235,6 +235,7 @@ const FLAGS = {
   tick:           { value: false, what: "run a single tick and exit" },
   write:          { value: false, what: "write the change rather than printing it" },
   "as-app":       { value: false, what: "act as the GitHub App rather than the user" },
+  test:           { value: false, what: "send a test alert through every configured channel" },
   help:           { value: false, what: "show this help" },
 };
 const VALUED = new Set(Object.entries(FLAGS).filter(([, f]) => f.value).map(([n]) => n));
@@ -921,6 +922,98 @@ switch (cmd) {
   // the daemon may act on the answer. The sandbox policy is generated from the
   // profile as it stands, so the record is the one `reeve doctor` R-14 reads and
   // the one the daemon's own cache will match.
+  // ── notify --test ─────────────────────────────────────────────────────────
+  //
+  // `notify.mjs` has promised since it was written that every decline is
+  // returned with a reason. Nothing could exercise that: reaching a channel
+  // required a real escalation, so an operator learned their phone was
+  // unreachable at the moment they most needed it to work. This is the command
+  // that asks the question at a time of the operator's choosing.
+  //
+  // It sends a message that says it is a test IN THE TITLE. A test alert
+  // indistinguishable from a real one teaches the reader to discount both.
+  case "notify": {
+    // --test IS the command. Requiring it means the bare word `notify` cannot
+    // send anything, so a mistyped or half-remembered invocation is inert rather
+    // than a page.
+    if (!flag("test"))
+      fail("usage",
+           `reeve notify: this command only sends a TEST alert, and it asks for --test so that a ` +
+           `half-typed command cannot put a message on your phone.\n` +
+           `-> usage: reeve notify --test [owner/repo] [--json]`,
+           { exit: EXITS.misuse });
+
+    const { notify } = await import("../src/notify.mjs");
+    // AT MOST ONE ARGUMENT, AND IT HAS TO LOOK LIKE A REPOSITORY. `positionals
+    // .find` scans for the first token that matches and discards the rest, so
+    // `notify --test owner/repo/` matched nothing, fell through to `detectNwo()`
+    // and sent through THIS checkout's profile instead of refusing -- and a
+    // second repository argument was dropped in silence. For the one route here
+    // that sends, a typo quietly becoming "the current repository" is the wrong
+    // default: it is the same mistake as the profile mismatch above, arriving
+    // through the argument rather than through the lookup.
+    const REPO = /^[\w.-]+\/[\w.-]+$/;
+    const stray = positionals.filter(a => !REPO.test(a));
+    if (stray.length || positionals.length > 1)
+      fail("usage",
+           `reeve notify: ${JSON.stringify(positionals)} is not a single owner/repo.\n` +
+           `-> refusing rather than falling back to this checkout: a mistyped repository would ` +
+           `otherwise send a test through a profile you did not name\n` +
+           `-> usage: reeve notify --test [owner/repo] [--json]`,
+           { exit: EXITS.misuse });
+    const nwo = positionals[0] || detectNwo();
+    if (!nwo)
+      fail("usage", "reeve notify: no repo. Pass owner/repo or run inside a git checkout.",
+           { exit: EXITS.misuse });
+    // A profile is where the channels are declared, so its absence is the answer
+    // rather than an error: there is nothing configured to test.
+    const profile = loadProfile(nwo) ?? {};
+    // THE PROFILE HAS TO BE THIS REPOSITORY'S. `loadProfile` prefers
+    // `./.ops/profile.json` over the sidecar and does not check whose it is, so
+    // `reeve notify --test owner/B` run inside repository A sent through A's
+    // channels while titling the alert B -- reporting B's setup healthy without
+    // having touched it, and putting an unexpected real alert on somebody's
+    // phone. `task file` already refuses this mismatch; a command whose entire
+    // job is to tell you the truth about a channel must not be the one that
+    // guesses. Refused rather than redirected: which of the two the operator
+    // meant is not something this can know.
+    const declared = profile?.identity?.key;
+    if (declared && declared !== nwo)
+      fail("usage",
+           `reeve notify: the profile found for this command declares identity.key ` +
+           `${JSON.stringify(declared)}, but you asked about ${JSON.stringify(nwo)}.\n` +
+           `-> refusing rather than sending through ${JSON.stringify(declared)}'s channels and ` +
+           `reporting them as ${JSON.stringify(nwo)}'s\n` +
+           `-> run it from ${JSON.stringify(declared)}'s checkout, or ask about ${JSON.stringify(declared)}`,
+           { exit: EXITS.misuse });
+    const at = new Date().toISOString();
+    const r = notify({ profile, alert: {
+      title: `reeve · ${nwo} · TEST`,
+      message: `reeve notification test, sent ${at}. Nothing is wrong and nothing needs you; ` +
+               `this message exists so you can find out whether this channel works before it has to.`,
+      priority: "default", tags: "white_check_mark" } });
+
+    if (flag("json")) {
+      console.log(JSON.stringify({ format_version: 1, kind: "notify.test", nwo, at, ...r }, null, 2));
+    } else {
+      console.log(r.ok ? `notify ${nwo}: every configured channel accepted the test`
+                       : `notify ${nwo}: ${r.why}`);
+      // PER CHANNEL, including the ones that worked. "It failed" without saying
+      // which channel is a report an operator cannot act on when two are
+      // configured, and a reference they can look up is the difference between
+      // believing a send and checking it.
+      for (const c of r.channels ?? [])
+        console.log(`  ${c.name}  ${c.ok ? "ok" : "FAILED"}  ${c.ok ? "" : c.why + "  "}` +
+                    `${c.ref ?? c.ref_why ?? ""}`.trim());
+      if (!r.channels?.length)
+        console.log(`  (no channel is configured in ${nwo}'s profile, so nothing was sent)`);
+    }
+    // DEGRADED, not a refusal. The command ran and answered; the answer is that
+    // the system is unwell, and a script polling this must be able to tell that
+    // from a command that could not run at all.
+    process.exit(r.ok ? EXITS.ok : EXITS.degraded);
+  }
+
   case "canary": {
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
     if (!nwo) { console.error("reeve canary: no repo. Pass owner/repo or run inside a git checkout."); process.exit(1); }
@@ -2345,6 +2438,8 @@ function usage() {
 
   canary [owner/repo]   measure the worker sandbox for real, without arming anything
                         (a throwaway worker, minutes, a real model call; 0 closed · 1 open)
+  notify --test         send a test alert through every configured channel
+                        (0 all accepted · 3 a channel is unreachable)
 
   status [owner/repo]   what is happening now  (--health measures clean-merge, --json)
   why <pr>              why reeve decided what it decided, newest first

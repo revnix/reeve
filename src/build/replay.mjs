@@ -89,6 +89,13 @@ const HANDLERS = {
   // for. Keyed on `why`, which is the table's primary key, so the upsert is
   // idempotent across a re-replay.
   "escalation.raised":        { table: "escalation", key: ["why"] },
+  // The ANNOUNCER's two mutations, which `escalation.raised` alone cannot carry.
+  // A snapshot whose tail spans a clear replayed the raise and resurrected the
+  // row, so an operator was paged again about something resolved before the
+  // restore; and a tail spanning an announcement restored `announced_count = 0`,
+  // so every already-delivered page went out a second time. Both are keyed on
+  // the primary key, so a re-replay is idempotent.
+  "escalation.cleared":       { table: "escalation", key: ["why"], delete: true },
   // A measurement recorded after the last snapshot exists ONLY in the tail, so
   // without this handler a normal restore drops it while reporting success --
   // and what it drops is the answer the arming gate reads, with its evidence.

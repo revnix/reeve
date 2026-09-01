@@ -308,12 +308,22 @@ export function classify({ controlExit, stubExit, stubOutput = "", hashChanged, 
   // remaining assertions would have said is unknown. A stub that legitimately
   // shortens its file cannot be compared against its control at all, which is a
   // reason to rewrite the entry rather than to widen the rule.
+  //
+  // THE REPAIR IS USUALLY IN THE TEST, NOT THE ENTRY. A test that CONSUMES the
+  // value it stubs will often die under its own stub rather than fail: "assert
+  // this is a string, then parse it", "assert this row exists, then read a
+  // column off it". The guard assertion goes red exactly as the entry intends,
+  // and the next line throws on the value the stub made wrong. That is a large
+  // class, not a badly chosen stub, so the message says where to look.
   if (controlObserved && seen < controlObserved.assertionsSeen)
     return { verdict: UNRUNNABLE,
              why: `the stubbed run reported ${seen} assertion(s) where the control reported ` +
                   `${controlObserved.assertionsSeen}, so the file stopped early and the ` +
                   `${controlObserved.assertionsSeen - seen} it did not reach are unmeasured — ` +
-                  "an assertion that never ran reads exactly like one that passed" };
+                  "an assertion that never ran reads exactly like one that passed. " +
+                  "Look at the line AFTER the named assertion before rewriting the entry: a test " +
+                  "that consumes the value it stubs usually dies on it rather than failing, and " +
+                  "the fix is to let that line survive a wrong value" };
   if (!namedFailed)
     return { verdict: WRONG_RED,
              why: `something failed, but not the named assertion — the property is still unmeasured. Failed: ` +

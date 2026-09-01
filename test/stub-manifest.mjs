@@ -1573,8 +1573,8 @@ export const STUBS = [
     expectRed: "a cause absent from a pass that did NOT examine its task is not retired",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "      const looked = task === null ? complete : (covered === null || covered.has(task));",
-      replace: "      const looked = true;",
+      find: "      if (subject === null || examined === null || !examined.has(subject)) continue;",
+      replace: "      if (false) continue;",
     }],
   },
   {
@@ -1607,8 +1607,8 @@ export const STUBS = [
     expectRed: "a refused send is not reported as paged",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "    if (result?.ok) return { why, count, kind, channels: result.channels ?? [] };",
-      replace: "    return { why, count, kind, channels: result?.channels ?? [] };",
+      find: "    if (result?.ok) return { why, count, kind, body: body ?? null, channels: result.channels ?? [] };",
+      replace: "    return { why, count, kind, body: body ?? null, channels: result?.channels ?? [] };",
     }],
   },
 
@@ -1621,6 +1621,51 @@ export const STUBS = [
       file: "src/notify.mjs",
       find: "  const referenced = channels.map(c => (typeof c.ref === \"string\" && c.ref !== \"\")",
       replace: "  const referenced = channels; const _unused = ((c) => (typeof c.ref === \"string\" && c.ref !== \"\")",
+    }],
+  },
+
+  {
+    name: "a-page-is-marked-announced-only-after-it-is-delivered",
+    why: "write announced_count at the moment the cause is raised. The row then says it has been announced before anything was sent, so a page the sender refused is never offered again: the next pass compares count against announced_count, finds them equal, produces no fresh item, and the operator is never told. The refusal is visible in `declined`, and a returned array scrolls past — the durable row is the only thing that survives the pass, and it was lying",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "the row is NOT marked announced, because nothing was announced",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "                    VALUES(?,?,?,?,0)`).run(why, count, at, at);",
+      replace: "                    VALUES(?,?,?,?,?)`).run(why, count, at, at, count);",
+    }],
+  },
+  {
+    name: "the-announcers-mutations-are-replayable",
+    why: "clear an escalation without appending an event. `escalation` is in the replayed set and `escalation.raised` was its only handler, so a restore whose tail spans a clear replays the raise and resurrects the row — and pages the founder again about something that was resolved before the restore. The durable store is what a restore reconstructs from, so a mutation with no event is a mutation the system forgets while believing it remembers",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "and clearing one appends escalation.cleared",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "      hubEvent(db, { kind: \"escalation.cleared\", task: /^bt:/.test(why) ? subject : null,\n                     payload: { why } });",
+      replace: "",
+    }],
+  },
+  {
+    name: "only-a-real-phase-reduces-to-a-phase",
+    why: "reduce any uppercase trailing component to <phase>. A detail component then masquerades as a phase: a key ending in a shouted word matches the declared blocked shape and therefore PAGES, and that is reachable today through `blocked_other`, which writes a caller-supplied escalation key with no validation at all. Membership of PHASES is the whole difference between a phase and a word that is shouting, and the closed page list is only closed if the reduction into it is",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "bt:7:phase:blocked:DETAIL reduces to nothing: DETAIL is not a phase",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  const shape = tail && PHASES.includes(tail[1])",
+      replace: "  const shape = tail",
+    }],
+  },
+  {
+    name: "notify-test-refuses-another-repositorys-profile",
+    why: "send the test through whatever profile `loadProfile` returns. It prefers ./.ops/profile.json over the sidecar and never checks whose it is, so `notify --test owner/B` run inside repository A sends through A's channels while titling the alert B — reporting B's notification setup healthy without having touched it, and putting an unexpected real alert on somebody's phone. A command whose entire purpose is to tell an operator the truth about a channel is the last one that may guess which channel it is talking about",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "asking about another repository from inside this one is refused, not answered",
+    edits: [{
+      file: "bin/reeve",
+      find: "    const declared = profile?.identity?.key;\n    if (declared && declared !== nwo)",
+      replace: "    const declared = null;\n    if (declared && declared !== nwo)",
     }],
   },
 ];

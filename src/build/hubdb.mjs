@@ -367,7 +367,7 @@ export function missingMigrations(path) {
   // ONE SHAPE FROM EVERY EXIT, `holed` included. A caller reading `.holed` off
   // an unreadable answer would otherwise get `undefined`, which is falsy, and
   // "this file cannot be read" would silently answer "no hole".
-  const unreadable = { readable: false, missing: [], have: [], holed: false, version: 0 };
+  const unreadable = { readable: false, missing: [], have: [], holed: false, version: 0, invalid: [] };
   if (!existsSync(path)) return unreadable;
   let q;
   try { q = new DatabaseSync(path, { readOnly: true, timeout: HUB_BUSY_TIMEOUT_MS }); }
@@ -376,11 +376,20 @@ export function missingMigrations(path) {
     const have = new Set(q.prepare("SELECT version FROM schema_version").all().map((r) => r.version));
     const missing = [];
     for (let v = 1; v <= HUB_SCHEMA_VERSION; v++) if (!have.has(v)) missing.push(v);
-    const present = [...have].sort((a, b) => a - b);
+    // A RECORDED VERSION THAT IS NOT A VERSION IS ITS OWN FAULT, and it has to
+    // be reported rather than filtered away. `schema_version` is an INTEGER
+    // PRIMARY KEY, so `-1` is valid SQLite -- and every rule here quietly
+    // ignored it: `hasHistoryHole` skips anything below 1, so a store recording
+    // only `-1` looked un-holed and merely behind, and the CLI told the operator
+    // to migrate. `openHub` then refuses that same store, because `historyGaps`
+    // will not take a negative bound. The advertised remedy could not work.
+    const all = [...have];
+    const invalid = all.filter((v) => !Number.isSafeInteger(v) || v < 1).sort((a, b) => a - b);
+    const present = all.filter((v) => Number.isSafeInteger(v) && v >= 1).sort((a, b) => a - b);
     // COUNTED, NOT ENUMERATED. `historyGaps` would answer the same question and
     // would allocate one entry per absent version -- with the stored maximum as
     // its bound, which is exactly the untrusted number.
-    return { readable: true, missing, have: present, holed: hasHistoryHole(present),
+    return { readable: true, missing, have: present, holed: hasHistoryHole(present), invalid,
              version: present.length ? present[present.length - 1] : 0 };
   } catch { return unreadable; }
   finally { try { q.close(); } catch { /* already gone */ } }

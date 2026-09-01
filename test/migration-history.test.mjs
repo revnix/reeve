@@ -270,6 +270,76 @@ const holeAt = (p, v) => {
   check(digestOf(hub) === beforeHealthy,
     "and does not write to it -- the version checks stopped the migration, not the pragma",
     `${beforeHealthy.slice(0, 12)} -> ${digestOf(hub).slice(0, 12)}`);
+
+  // WHAT THE PROMISE DOES NOT COVER, asserted rather than left to a comment.
+  //
+  // Measured: a read-only open of a WAL hub CREATES hub.db-wal and hub.db-shm
+  // and leaves them behind. That is what reading a WAL database costs, and every
+  // read route in this binary pays it. `immutable=1` removes them and is wrong:
+  // with a live writer holding the WAL it reads the main file alone and reports
+  // `no such table: schema_version` for a healthy hub. So the promise is about
+  // the hub's CONTENT, and this records the boundary so nobody later reads the
+  // byte assertion above as "touches nothing at all".
+  // ON A WAL HUB, which is the state openHub leaves one in. The case above put
+  // the fixture into DELETE mode deliberately, so that the byte comparison could
+  // see a write -- and a DELETE-mode database has no sidecars at all, which is
+  // why this needs its own hub rather than sharing that one.
+  rmSync(hub, { force: true });
+  openHub(hub).close();                      // WAL, and no sidecars once closed
+  check(!existsSync(hub + "-wal") && !existsSync(hub + "-shm"),
+    "control: a closed WAL hub has no sidecars, so their appearance below is this run's",
+    `wal=${existsSync(hub + "-wal")} shm=${existsSync(hub + "-shm")}`);
+  const beforeWal = digestOf(hub);
+  dryRun();
+  check(existsSync(hub + "-wal") || existsSync(hub + "-shm"),
+    "the read leaves SQLite's sidecars, which is what reading a WAL database costs",
+    `wal=${existsSync(hub + "-wal")} shm=${existsSync(hub + "-shm")}`);
+  check(digestOf(hub) === beforeWal,
+    "and the hub's own bytes are still untouched, which is what the promise covers",
+    `${beforeWal.slice(0, 12)} -> ${digestOf(hub).slice(0, 12)}`);
+
+  // AN INVALID MARKER IS ITS OWN FAULT. schema_version is an INTEGER PRIMARY
+  // KEY, so -1 is valid SQLite: every expected version reads as missing and
+  // nothing reads as a hole, so the route would have said "migrate" -- and
+  // openHub refuses that same store, because historyGaps will not take a
+  // negative bound. The advertised remedy could not have worked.
+  rmSync(hub, { force: true }); rmSync(hub + "-wal", { force: true }); rmSync(hub + "-shm", { force: true });
+  openHub(hub).close();
+  {
+    const q = new DatabaseSync(hub);
+    q.exec("DELETE FROM schema_version");
+    q.exec("INSERT INTO schema_version(version, applied_at) VALUES(-1, unixepoch())");
+    q.close();
+  }
+  const bad = dryRun();
+  check(bad.status === 1 && /not a migration number/.test(bad.out),
+    "a marker that is not a version is named as the fault", bad.out.slice(0, 400));
+  check(/restore a snapshot/.test(bad.out) && !/without --dry-run/.test(bad.out),
+    "and the remedy is a snapshot, not the writing command that would refuse it", bad.out.slice(0, 400));
+  let openWhy = null;
+  try { openHub(hub).close(); } catch (e) { openWhy = String(e.message); }
+  check(openWhy !== null,
+    "control: and openHub really does refuse it, so migrating was never a remedy", String(openWhy).slice(0, 160));
+
+  // A FULL HISTORY IS NOT A HEALTHY SHAPE. The history says which migrations
+  // RAN; it does not say the tables they created are still there. The same
+  // hand-repaired store these checks exist for can carry a complete history over
+  // a dropped table, and `liveLeases` would then throw a bare `no such table`
+  // from inside a command that had already reported the hub healthy.
+  rmSync(hub, { force: true }); rmSync(hub + "-wal", { force: true }); rmSync(hub + "-shm", { force: true });
+  openHub(hub).close();
+  {
+    const q = new DatabaseSync(hub);
+    q.exec("DROP TABLE territory_lease");
+    q.close();
+  }
+  const shape = dryRun();
+  check(shape.status === 1 && /tables do not match it/.test(shape.out),
+    "a hub whose tables do not match its recorded version is refused before any application query",
+    shape.out.slice(0, 400));
+  check(!/no such table/.test(shape.out),
+    "and the operator gets that sentence rather than SQLite's bare no-such-table",
+    shape.out.slice(0, 400));
 }
 
 // ── THE RECORDED VERSION IS NOT A LOOP BOUND ────────────────────────────────

@@ -7,7 +7,7 @@
 // one; and the sha recorded must be the sha of the bytes that survived, not of
 // the buffer that was intended.
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, lstatSync,
-         readdirSync, utimesSync, chmodSync, openSync, closeSync } from "node:fs";
+         readdirSync, utimesSync, chmodSync, openSync, closeSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -565,6 +565,34 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   catch (e) { outside = String(e.message); }
   check(outside !== null && /is not inside/.test(outside),
     "a directory outside the anchor is refused rather than walked past it", String(outside));
+
+  // AND A SYMLINK BENEATH THE ANCHOR DOES NOT ESCAPE IT. The containment test
+  // was lexical, so a link anywhere under the anchor satisfied it while the
+  // write followed the link -- mkdir, the temporary and the rename all land
+  // wherever it points, and the rename would replace whatever artifact it found
+  // there.
+  {
+    const home2 = join(dir, "home2");
+    const elsewhere = join(dir, "outside-the-home");
+    mkdirSync(join(home2, "real"), { recursive: true });
+    mkdirSync(elsewhere, { recursive: true });
+    symlinkSync(elsewhere, join(home2, "tasks"));
+    let escaped = null;
+    try {
+      writeArtifact({ dir: join(home2, "tasks", "t1", "artifacts"), phase: "DESIGN",
+                      bytes: Buffer.from("# design\n"), anchor: home2 });
+    } catch (e) { escaped = String(e.message); }
+    check(escaped !== null && /not inside/.test(escaped),
+      "a symlinked component beneath the anchor is refused, not followed", String(escaped));
+    check(!existsSync(join(elsewhere, "t1", "artifacts", "design.md")),
+      "and nothing was written on the other side of the link",
+      (() => { try { return readdirSync(elsewhere).join(",") || "(empty)"; } catch { return "(gone)"; } })());
+    // CONTROL: the same write with no link in the path is accepted, so the
+    // refusal is about the link and not about the shape of the path.
+    const fine = writeArtifact({ dir: join(home2, "real", "t1", "artifacts"), phase: "DESIGN",
+                                 bytes: Buffer.from("# design\n"), anchor: home2 });
+    check(existsSync(fine.path), "control: and a real directory under the same anchor still writes", fine.path);
+  }
 }
 
 // ── A failed RENAME takes its temporary too ────────────────────────────────

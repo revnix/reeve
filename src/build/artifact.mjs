@@ -6,7 +6,7 @@
 // in memory certifies what was INTENDED, not what survived.
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, openSync, writeSync, fsyncSync, closeSync, renameSync, readFileSync,
-         rmSync, existsSync, readdirSync, statSync } from "node:fs";
+         rmSync, existsSync, readdirSync, statSync, realpathSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { ARTIFACT_FILE } from "../paths.mjs";
 
@@ -89,10 +89,34 @@ export function writeArtifact({ dir, phase, bytes, anchor = null }) {
   if (anchor === null) {
     for (let d = dir; d !== dirname(d); d = dirname(d)) chain.push(d);
   } else {
-    const top = resolve(anchor);
-    const start = resolve(dir);
+    // RESOLVED ON THE FILESYSTEM, not lexically. `resolve` only normalises the
+    // text, so a SYMLINK anywhere beneath the anchor satisfies `startsWith` while
+    // the write lands wherever the link points -- `mkdirSync`, the temporary and
+    // the rename all follow it. An anchored path under `home/tasks` writes
+    // outside the home the moment `home/tasks` is a link, and the rename would
+    // replace whatever design.md it found there.
+    //
+    // The anchor must exist to be resolved at all; `dir` usually does not yet, so
+    // its DEEPEST EXISTING ancestor is resolved instead and the remainder is
+    // appended. That is the part the filesystem can answer -- a component that
+    // does not exist cannot be a link to anywhere.
+    const realOf = (p) => {
+      let head = resolve(p);
+      const tail = [];
+      for (;;) {
+        try { return join(realpathSync(head), ...tail.reverse()); }
+        catch { /* keep climbing */ }
+        const up = dirname(head);
+        if (up === head) return resolve(p);        // nothing on this path exists
+        tail.push(head.slice(up.length + 1));
+        head = up;
+      }
+    };
+    const top = realOf(anchor);
+    const start = realOf(dir);
     if (start !== top && !start.startsWith(top + sep))
-      throw new Error(`${dir} is not inside ${anchor}, so there is no anchor for the sync chain to stop at`);
+      throw new Error(`${dir} resolves to ${start}, which is not inside ${anchor} (${top}); ` +
+                      `the sync chain has no anchor to stop at, and a write there would leave the task tree`);
     for (let d = start; ; d = dirname(d)) { chain.push(d); if (d === top || d === dirname(d)) break; }
   }
   mkdirSync(dir, { recursive: true });

@@ -49,7 +49,7 @@ import { resolveHome } from "../src/home.mjs";
 import { DatabaseSync } from "node:sqlite";
 import { inapplicable, extraArgs, TASK_ARGS, EXITS, ERROR_KINDS } from "./reeve.flags.mjs";
 import { openHub, HUB_SCHEMA_VERSION, HUB_BUSY_TIMEOUT_MS, completedVersion, missingMigrations,
-         faultKind } from "../src/build/hubdb.mjs";
+         schemaDefectsAt, faultKind } from "../src/build/hubdb.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
 import { buildTick } from "../src/build/loop.mjs";
 import { readStart, isSameProcess } from "../src/supervisor.mjs";
@@ -1532,6 +1532,21 @@ switch (cmd) {
           console.error(`-> run the newer binary, or restore a snapshot taken at ${HUB_SCHEMA_VERSION}`);
           process.exit(1);
         }
+        // AN INVALID MARKER IS ITS OWN FAULT, and it comes BEFORE the missing
+        // check because it is invisible to it. `schema_version` is an INTEGER
+        // PRIMARY KEY, so a hand-edited `-1` is valid SQLite: every expected
+        // version reads as missing, nothing reads as a hole, and the branch
+        // below would tell the operator to migrate -- which `openHub` refuses,
+        // because `historyGaps` will not take a negative bound. Migrating cannot
+        // repair a marker that is not a version.
+        if (hist.invalid.length) {
+          console.error(`reeve task: the hub at ${hubPath} records ${hist.invalid.join(", ")} in ` +
+                        `schema_version, which is not a migration number this binary can act on ` +
+                        `(they run 1 through ${HUB_SCHEMA_VERSION}).`);
+          console.error(`-> the marker itself is wrong, so migrating cannot repair it: restore a snapshot ` +
+                        `(\`reeve restore --hub --force\`), then retry`);
+          process.exit(1);
+        }
         if (hist.missing.length) {
           console.error(`reeve task: the hub at ${hubPath} is missing migration(s) ` +
                         `${hist.missing.join(", ")} (it carries ${hist.have.join(", ") || "none"}, and this ` +
@@ -1565,7 +1580,55 @@ switch (cmd) {
         // A read-only handle also makes the promise ENFORCED rather than
         // reviewed: if a dry run ever tries to write, SQLite refuses it loudly
         // instead of the write succeeding and nobody noticing.
-        db = new DatabaseSync(hubPath, { readOnly: true, timeout: HUB_BUSY_TIMEOUT_MS });
+        // READING A WAL DATABASE COSTS SIDECARS, and the promise says so rather
+        // than pretending otherwise.
+        //
+        // Measured on node v24.17.0: a read-only open of a WAL hub CREATES
+        // `hub.db-wal` and `hub.db-shm` and leaves them behind after close. So
+        // `--dry-run` does touch the hub's directory, and it is not special in
+        // that -- every read route in this binary opens the same way, because
+        // SQLite needs shared memory to read a WAL database at all.
+        //
+        // `immutable=1` removes the sidecars and is WRONG here, measured the
+        // same way: with a live writer holding the WAL, an immutable open reads
+        // the main file alone and answers `no such table: schema_version` for a
+        // perfectly healthy hub. It does not go stale, it goes blind. A dry run
+        // that reported a healthy store as corrupt would be far worse than one
+        // that leaves two transient files behind.
+        //
+        // So the promise is exact: a dry run does not change the hub's CONTENT
+        // or its SCHEMA, which is what an operator is asking about, and the test
+        // asserts the file's bytes rather than the directory's listing.
+        try {
+          db = new DatabaseSync(hubPath, { readOnly: true, timeout: HUB_BUSY_TIMEOUT_MS });
+        } catch (e) {
+          // AND THE FAILURE IS EXPLAINED. Bare SQLite says "attempt to write a
+          // readonly database" for a READ, which sends an operator looking for a
+          // write that does not exist. The cause is the directory, not the file.
+          console.error(`reeve task: the hub at ${hubPath} could not be opened for reading ` +
+                        `(${e.message}).`);
+          console.error(`-> reading a WAL database creates ${basename(hubPath)}-wal and -shm beside it, so ` +
+                        `the directory holding the hub has to be writable even for a dry run; check the ` +
+                        `permissions on ${dirname(hubPath)}`);
+          process.exit(1);
+        }
+        // AND THE SHAPE IS CHECKED BEFORE ANY APPLICATION QUERY. A complete
+        // version history says which migrations RAN, not that the tables they
+        // create are still there -- and the same hand-repaired store these
+        // checks exist for can carry a full history over a dropped
+        // `territory_lease`. `fileTask` then reaches `liveLeases`, whose join
+        // throws a bare `no such table` from inside a command that had already
+        // reported the hub healthy.
+        const defects = schemaDefectsAt(db, hist.version);
+        if (defects.length) {
+          try { db.close(); } catch { /* already gone */ }
+          console.error(`reeve task: the hub at ${hubPath} records schema version ${hist.version} but its ` +
+                        `tables do not match it: ${defects.slice(0, 3).join("; ")}` +
+                        `${defects.length > 3 ? ` (and ${defects.length - 3} more)` : ""}.`);
+          console.error(`-> the history says the migrations ran, so this is damage after the fact rather ` +
+                        `than a missing migration: restore a snapshot (\`reeve restore --hub --force\`)`);
+          process.exit(1);
+        }
       }
     } else {
       db = openHub(hubPath);

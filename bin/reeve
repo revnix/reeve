@@ -1327,9 +1327,16 @@ switch (cmd) {
           fail("hub_unreadable",
                `reeve task ${sub}: the hub at ${hub} has no readable schema_version`,
                { exit: EXITS.refused, retryable: false });
+        // THE KIND IS A LITERAL, deliberately, and this cost a round to learn.
+        // `test/cli-flags.test.mjs` extracts every `fail("<kind>"` from this file
+        // by pattern and asserts the declared vocabulary against what the CLI can
+        // actually emit -- both directions. Computing the kind from `fault.kind`
+        // made `hub_incompatible` invisible to that extraction, so a declared kind
+        // read as one nothing produces. The guard is right: a kind that cannot be
+        // found statically cannot be checked against the declaration at all.
         const fault = historyFault(hist);
         if (fault)
-          fail(fault.kind === "unreadable" ? "hub_unreadable" : "hub_incompatible",
+          fail("hub_incompatible",
                `reeve task ${sub}: the hub at ${hub} — ${fault.detail}.\n-> ${fault.remedy}`,
                { exit: EXITS.refused });
       } finally { /* the outer finally closes db on every path below */ }

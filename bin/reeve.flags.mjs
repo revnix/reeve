@@ -57,7 +57,51 @@ export const APPLIES = Object.freeze({
   // at all -- `reeve task show <id> --project other` printed the task regardless,
   // which is the accepted-and-inert shape this whole file exists to refuse.
   project: Object.freeze(["task file", "task list"]),
+
+  // `--since` is the cursor a previous digest handed back, and only the digest
+  // answers "what moved since then".
+  since: Object.freeze(["task dash"]),
 });
+
+/**
+ * What each `task` read subcommand reads after its own name, and how it is typed.
+ *
+ * The parser refuses an unknown FLAG and `inapplicable` refuses a known flag on a
+ * command that cannot act on it; a bare word was governed by neither. Measured on
+ * all four: `task list` and `task dash` read no positional at all and `task show`
+ * and `task why` read exactly one, so `reeve task dash 1234.1800000000` exited 0
+ * having discarded the cursor -- the digest answered from the beginning of time
+ * and looked correct doing it -- and `reeve task show a b c` answered about `a`
+ * without saying it had ignored two arguments.
+ *
+ * THE WRITE ROUTE IS DELIBERATELY ABSENT. `task file` belongs to another lane and
+ * takes its inputs as flags; an entry here would change its refusals as a side
+ * effect of governing the readers.
+ *
+ * `usage` lives beside `takes` because the refusal has to say what the right
+ * shape is, and the route already printed these four lines from its own literals.
+ * One statement, read by both.
+ */
+export const TASK_ARGS = Object.freeze({
+  list: Object.freeze({ takes: 0, usage: "reeve task list [--project <p>] [--json]" }),
+  show: Object.freeze({ takes: 1, usage: "reeve task show <task-id> [--json]" }),
+  why:  Object.freeze({ takes: 1, usage: "reeve task why <task-id> [--json]" }),
+  dash: Object.freeze({ takes: 0, usage: "reeve task dash [--since <cursor>] [--json]" }),
+});
+
+/**
+ * The arguments a `task` subcommand was given and does not read.
+ *
+ * Returns null when there are none, so a caller reads as a guard. A subcommand
+ * with no entry is UNCONSTRAINED, for the same reason `APPLIES` is: the map can
+ * be widened one subcommand at a time without a flag day, and it must never claim
+ * a completeness it does not have.
+ */
+export function extraArgs(sub, rest) {
+  const spec = TASK_ARGS[sub];
+  if (!spec) return null;
+  return rest.length > spec.takes ? rest.slice(spec.takes) : null;
+}
 
 /**
  * The refusal for a known flag typed at a command that cannot act on it.

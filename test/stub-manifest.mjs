@@ -1611,4 +1611,16 @@ export const STUBS = [
       replace: "    return { why, count, kind, channels: result?.channels ?? [] };",
     }],
   },
+
+  {
+    name: "a-channel-reports-a-reference-or-a-reason-there-is-none",
+    why: "let an absent delivery reference be `undefined`. notify.mjs has promised since it was written that nothing declines silently, and a caller could not tell `delivered, this channel issues no id` from `the field was never populated` -- both read as absent, and the promise had never been checked because every path needed a real escalation and a real server. Folding the reason into `why` is the same defect wearing a value: `why` already means THIS CHANNEL FAILED, so one field answering both questions makes `ok` the only way to know which it answered, and a caller logging `why` reports a delivery failure that never happened",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "and the absent reference is null WITH a reason, never undefined",
+    edits: [{
+      file: "src/notify.mjs",
+      find: "  const referenced = channels.map(c => (typeof c.ref === \"string\" && c.ref !== \"\")",
+      replace: "  const referenced = channels; const _unused = ((c) => (typeof c.ref === \"string\" && c.ref !== \"\")",
+    }],
+  },
 ];

@@ -15,6 +15,7 @@ import { openHub } from "../src/build/hubdb.mjs";
 import { openHubAsGuest } from "../src/build/hubguest.mjs";
 import { open as openGuardianStore } from "../src/db/ops.mjs";
 import { announceable } from "../src/daemon.mjs";
+import { notify, readNtfyResponse } from "../src/notify.mjs";
 import {
   FAILURE_TYPES, IDENTITY_SHAPES, PAGES, escalationKey, shapeOf, body,
   assertHub, builderAnnounceable, pages, announce,
@@ -517,6 +518,83 @@ const freshHub = () => {
   check(sent[0]?.kind === "cleared" && sent[0]?.message?.includes(paging) === true,
     "and it is the one on the page list, marked as a clearing rather than a new alarm",
     JSON.stringify(sent[0] ?? null));
+}
+
+
+// ── a reference, or a sentence saying why there is none ────────────────────
+//
+// This file's header has promised since it was written that nothing declines
+// silently. Until now there was no way to check it: every path needed a real
+// escalation and a real server, so the promise was prose. And the reference the
+// promise implies was discarded before anything could read it -- `postViaCurl`
+// passed `-o /dev/null`, so the response body, the only place a message id
+// exists, never reached the caller.
+{
+  const R = readNtfyResponse;
+  check(R('{"id":"abc123","time":1}\n200').ref === "ntfy:abc123",
+    "the server's own id becomes the delivery reference",
+    JSON.stringify(R('{"id":"abc123","time":1}\n200')));
+  check(R('{"error":1}\n403').ok === false && /403/.test(R('{"error":1}\n403').why),
+    "a non-2xx status is a failure carrying the code", JSON.stringify(R('{"error":1}\n403')));
+
+  // A REFERENCE IS A BONUS, NEVER A CONDITION. Reporting a failure because the
+  // body could not be parsed would invent a failure that never happened -- the
+  // publish already succeeded.
+  for (const [out, label] of [['not json\n200', "an unparseable body"],
+                              ['\n200', "an empty body"],
+                              ['{"time":1}\n201', "a body with no id"],
+                              ['200', "no body at all"]]) {
+    check(R(out).ok === true && R(out).ref === undefined,
+      `${label} still reports delivery, without a reference`, JSON.stringify(R(out)));
+  }
+}
+
+{
+  const profile = { notify: { provider: "ntfy", url: "https://x", topic: "t", credentialFile: "/c" } };
+  const alert = { title: "t", message: "m" };
+  const call = (post) => notify({ profile, alert, readCredential: () => ":tk", post });
+
+  const withRef = call(() => ({ ok: true, ref: "ntfy:12345" }));
+  check(withRef.ok && withRef.channels[0].ref === "ntfy:12345",
+    "a channel that returns a reference carries it up", JSON.stringify(withRef.channels));
+  check(withRef.channels[0].ref_why === undefined,
+    "and carries no reason, because there is nothing to explain", JSON.stringify(withRef.channels[0]));
+
+  const noRef = call(() => ({ ok: true }));
+  check(noRef.ok === true, "a channel that returns no reference still succeeded", JSON.stringify(noRef));
+  check(noRef.channels[0].ref === null && typeof noRef.channels[0].ref_why === "string",
+    "and the absent reference is null WITH a reason, never undefined",
+    JSON.stringify(noRef.channels[0]));
+  check(noRef.channels[0].why === undefined,
+    "and `why` stays unset on a channel that did not fail, so it never has to be read " +
+    "through `ok` to know which question it answered",
+    JSON.stringify(noRef.channels[0]));
+
+  const failed = call(() => ({ ok: false, why: "HTTP 403" }));
+  check(failed.ok === false && failed.channels[0].why === "HTTP 403",
+    "a failed channel keeps its failure reason in `why`", JSON.stringify(failed.channels[0]));
+  check(failed.channels[0].ref === null && /did not succeed/.test(failed.channels[0].ref_why),
+    "and says separately that a send which did not succeed has no reference",
+    JSON.stringify(failed.channels[0]));
+
+  // A MISCONFIGURED channel never reaches the sender at all, and it must still
+  // answer the same two questions -- otherwise the one path that produces no
+  // entry shape is the one an operator hits on their first run.
+  const misconfigured = notify({ profile: { notify: { provider: "ntfy" } }, alert,
+                                 readCredential: () => ":tk" });
+  check(misconfigured.channels[0].ref === null &&
+        typeof misconfigured.channels[0].ref_why === "string",
+    "a channel refused before the send still reports a null reference with a reason",
+    JSON.stringify(misconfigured.channels[0]));
+
+  // THE INVARIANT, over every shape above: a reference or a reason, never both
+  // and never neither. Stated once here so a new channel cannot introduce a
+  // third answer without this going red.
+  const every = [withRef, noRef, failed, misconfigured].flatMap(r => r.channels);
+  check(every.length === 4, "control: four channel results to check", String(every.length));
+  check(every.every(c => (c.ref === null) === (typeof c.ref_why === "string")),
+    "every channel result carries a reference or a reason there is none, and exactly one of them",
+    JSON.stringify(every));
 }
 
 hub.close();

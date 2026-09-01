@@ -950,6 +950,24 @@ switch (cmd) {
     // A profile is where the channels are declared, so its absence is the answer
     // rather than an error: there is nothing configured to test.
     const profile = loadProfile(nwo) ?? {};
+    // THE PROFILE HAS TO BE THIS REPOSITORY'S. `loadProfile` prefers
+    // `./.ops/profile.json` over the sidecar and does not check whose it is, so
+    // `reeve notify --test owner/B` run inside repository A sent through A's
+    // channels while titling the alert B -- reporting B's setup healthy without
+    // having touched it, and putting an unexpected real alert on somebody's
+    // phone. `task file` already refuses this mismatch; a command whose entire
+    // job is to tell you the truth about a channel must not be the one that
+    // guesses. Refused rather than redirected: which of the two the operator
+    // meant is not something this can know.
+    const declared = profile?.identity?.key;
+    if (declared && declared !== nwo)
+      fail("usage",
+           `reeve notify: the profile found for this command declares identity.key ` +
+           `${JSON.stringify(declared)}, but you asked about ${JSON.stringify(nwo)}.\n` +
+           `-> refusing rather than sending through ${JSON.stringify(declared)}'s channels and ` +
+           `reporting them as ${JSON.stringify(nwo)}'s\n` +
+           `-> run it from ${JSON.stringify(declared)}'s checkout, or ask about ${JSON.stringify(declared)}`,
+           { exit: EXITS.misuse });
     const at = new Date().toISOString();
     const r = notify({ profile, alert: {
       title: `reeve · ${nwo} · TEST`,
@@ -2215,9 +2233,9 @@ function usage() {
       --write               apply  (exit 0 no-op · 2 changed · 1 needs an answer)
 
   canary [owner/repo]   measure the worker sandbox for real, without arming anything
+                        (a throwaway worker, minutes, a real model call; 0 closed · 1 open)
   notify --test         send a test alert through every configured channel
                         (0 all accepted · 3 a channel is unreachable)
-                        (a throwaway worker, minutes, a real model call; 0 closed · 1 open)
 
   status [owner/repo]   what is happening now  (--health measures clean-merge, --json)
   why <pr>              why reeve decided what it decided, newest first

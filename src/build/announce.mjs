@@ -12,7 +12,7 @@
  * not, a count or a duration or a path or a sha, rides in the body.
  */
 import { HOLD_ESCALATION, PHASES } from "./phases.mjs";
-import { hubTx } from "./hubdb.mjs";
+import { hubTx, hubEvent } from "./hubdb.mjs";
 import { assertWritable } from "./locks.mjs";
 
 /**
@@ -77,6 +77,23 @@ export const IDENTITY_SHAPES = Object.freeze([...new Set([
  */
 export const PAGES = Object.freeze(["builder:backup:failed", "bt:<id>:phase:blocked:<phase>"]);
 
+/**
+ * The row image for a raise or a count change, IN THE CALLER'S TRANSACTION.
+ *
+ * `escalation` is replayed from `escalation.raised`, so a mutation this module
+ * makes without one is a mutation a restore silently undoes. The ROW, never
+ * just the key: `{ why }` alone loses the counters and timestamps the statement
+ * just changed, so the log would record that something happened and not what it
+ * now says.
+ */
+const raised = (db, why) => hubEvent(db, {
+  kind: "escalation.raised",
+  task: /^bt:/.test(why) ? subjectOf(why) : null,
+  payload: db.prepare(
+    "SELECT why, count, first_seen_at, last_seen_at, announced_count FROM escalation WHERE why = ?")
+    .get(why),
+});
+
 /** A refusal that says WHICH rule it broke, so a caller can tell them apart. */
 const refuse = (kind, message) => Object.assign(new Error(message), { kind });
 
@@ -94,10 +111,32 @@ const TASK = /^bt:[0-9A-Za-z]+$/;
  * reduced by replacing exactly those two and nothing else.
  */
 export const shapeOf = (key) => {
-  const shape = String(key ?? "")
-    .replace(/^bt:[0-9A-Za-z]+:/, "bt:<id>:")
-    .replace(/:[A-Z][A-Z_]*$/, ":<phase>");
+  const withTask = String(key ?? "").replace(/^bt:[0-9A-Za-z]+:/, "bt:<id>:");
+  // ONLY AN ACTUAL PHASE. Reducing any uppercase tail let a detail component
+  // masquerade as one: `bt:7:phase:blocked:DETAIL` reduced to the declared
+  // blocked shape and therefore PAGED, and that is reachable today through the
+  // `blocked_other` branch, which writes a caller-supplied key with no check at
+  // all. Membership of `PHASES` is the whole difference between a phase and a
+  // word that is shouting.
+  const tail = /:([A-Z][A-Z_]*)$/.exec(withTask);
+  const shape = tail && PHASES.includes(tail[1])
+    ? withTask.slice(0, tail.index) + ":<phase>"
+    : withTask;
   return IDENTITY_SHAPES.includes(shape) ? shape : null;
+};
+
+/**
+ * What a cause is ABOUT, so a pass can say whether it looked at it.
+ *
+ * A task identity is about its task; a process identity is about the SUBSYSTEM
+ * that raises it -- `builder:backup:failed` is about `builder:backup`, and only
+ * a backup can say anything about whether it recovered.
+ */
+export const subjectOf = (why) => {
+  const task = /^(bt:[0-9A-Za-z]+):/.exec(String(why ?? ""));
+  if (task) return task[1];
+  const proc = /^(builder:[a-z][a-z0-9-]*)/.exec(String(why ?? ""));
+  return proc ? proc[1] : null;
 };
 
 /**
@@ -227,7 +266,7 @@ export function assertHub(db) {
  * @returns {{fresh: {why: string, count: number}[], cleared: string[]}}
  */
 export function builderAnnounceable(db, escalations, {
-  at = Math.floor(Date.now() / 1000), isAlive, covered = null, complete = true } = {}) {
+  at = Math.floor(Date.now() / 1000), isAlive, examined = null } = {}) {
   assertHub(db);
   // EXPLICIT, never defaulted. `assertWritable` reads the restore lock and asks
   // whether its holder is alive; a predicate that always answered true would
@@ -248,31 +287,52 @@ export function builderAnnounceable(db, escalations, {
     for (const [why, count] of escalations) {
       const prev = standing.get(why);
       if (!prev) {
+        // ANNOUNCED_COUNT 0: RAISED, NOT YET ANNOUNCED. Writing `count` here
+        // claimed the announcement before anything had been sent, so a page the
+        // sender refused was never retried -- the next pass saw an unchanged
+        // `announced_count`, produced no `fresh` item, and the operator was
+        // never told, while `declined` had already scrolled past. 0 is also what
+        // `applyTransition` raises with, so a cause raised by a transition and
+        // one raised here are the same row to this function.
         db.prepare(`INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count)
-                    VALUES(?,?,?,?,?)`).run(why, count, at, at, count);
+                    VALUES(?,?,?,?,0)`).run(why, count, at, at);
+        raised(db, why);
         fresh.push({ why, count });
       } else {
         db.prepare("UPDATE escalation SET count=?, last_seen_at=? WHERE why=?").run(count, at, why);
+        raised(db, why);
         // The count is the SHAPE of a shared cause: one task blocked at RESEARCH
         // and four blocked there are different situations, and both deserve
         // saying. Comparing against `announced_count` rather than against
-        // `count` is what makes a repeat silent and a change loud.
-        if (prev.announced_count !== count) {
-          db.prepare("UPDATE escalation SET announced_count=? WHERE why=?").run(count, why);
-          fresh.push({ why, count });
-        }
+        // `count` is what makes a repeat silent and a change loud -- and it is
+        // now also what makes an undelivered page come back.
+        if (prev.announced_count !== count) fresh.push({ why, count });
       }
     }
 
     for (const why of standing.keys()) {
       if (escalations.has(why)) continue;
-      // The subject is the TASK where there is one. A task id is already two
-      // colon-separated components, so the subject is the first two and the
-      // cause is the rest.
-      const task = /^(bt:[0-9A-Za-z]+):/.exec(why)?.[1] ?? null;
-      const looked = task === null ? complete : (covered === null || covered.has(task));
-      if (!looked) continue;
+      // POSITIVE EVIDENCE, OR THE CAUSE STANDS. Not "the pass finished", not
+      // "no coverage was claimed" -- the subject of THIS cause has to have been
+      // re-examined, and `examined` is the only thing that says so.
+      //
+      // Both weaker readings were wrong in the same direction. A pass that made
+      // no coverage claim retired every task cause, which is the false-clear
+      // cycle this function exists to prevent, arriving through the default. And
+      // a COMPLETE pass retired `builder:backup:failed` even though an ordinary
+      // pass runs no backup: the guardian holds those failures on `ctx` and
+      // re-emits them every tick for exactly this reason, and only a snapshot
+      // actually TAKEN clears one.
+      const subject = subjectOf(why);
+      if (subject === null || examined === null || !examined.has(subject)) continue;
       db.prepare("DELETE FROM escalation WHERE why=?").run(why);
+      // THE CLEARING IS LOGGED, in the same transaction that performs it.
+      // `escalation` is in the replayed set and `escalation.raised` is its only
+      // event, so a snapshot whose tail spans a clear replayed the raise and
+      // resurrected the row -- and an operator was paged again about something
+      // that had been resolved before the restore.
+      hubEvent(db, { kind: "escalation.cleared", task: /^bt:/.test(why) ? subject : null,
+                     payload: { why } });
       cleared.push(why);
     }
     return { fresh, cleared };
@@ -311,35 +371,74 @@ export const pages = (key) => PAGES.includes(shapeOf(key));
  */
 export function announce(db, {
   escalations, at = Math.floor(Date.now() / 1000), isAlive, send,
-  profile = null, covered = null, complete = true } = {}) {
+  profile = null, examined = null, bodies = null } = {}) {
   if (typeof send !== "function")
     throw refuse("not_writable",
       "announce needs a send function: whether a page reached anyone is the one thing this " +
       "cannot infer, and a default that silently succeeded would report delivery it never made.");
 
-  const { fresh, cleared } = builderAnnounceable(db, escalations, { at, isAlive, covered, complete });
+  const { fresh, cleared } = builderAnnounceable(db, escalations, { at, isAlive, examined });
   const paged = [], digested = [], declined = [];
 
-  const dispatch = (why, count, kind) => {
+  /**
+   * Record that a cause has been SURFACED at this count, so the next pass is
+   * silent about it. Deliberately not part of raising: a page the sender refused
+   * has not been surfaced, and marking it before the send is what made an
+   * undelivered page unretryable.
+   */
+  const markAnnounced = (why, count) => hubTx(db, () => {
+    assertWritable(db, { isAlive, at, inTx: true });
+    db.prepare("UPDATE escalation SET announced_count=? WHERE why=?").run(count, why);
+    raised(db, why);
+  });
+
+  const dispatch = (why, count, kind, body) => {
+    const isCleared = kind === "cleared";
+    // THE TRANSITION IS IN THE TEXT, not in a metadata field. `notify` renders
+    // title, message, priority and tags and nothing else, so a clearing that
+    // said only `kind: "cleared"` reached the phone reading exactly like a fresh
+    // incident -- and its body said "(x0)", which is worse than saying nothing.
+    const detail = body
+      ? Object.entries(body).filter(([k]) => k !== "type")
+          .map(([k, v]) => `\n${k}: ${v}`).join("")
+      : "";
+    const title = isCleared ? `reeve: CLEARED ${why}` : `reeve: ${why}`;
+    const message = isCleared
+      ? `CLEARED — ${why} is no longer standing.`
+      // The count is the shape of a shared cause, and it is only worth saying
+      // when it is more than one.
+      : `${why}${count > 1 ? ` (${count} subjects)` : ""}` +
+        `${body?.type ? ` [${body.type}]` : ""}${detail}`;
+
     // THE SENDER'S OWN VERDICT, never an assumption. A throw and an `ok: false`
     // are the same fact to a reader who needs to know a human was not reached.
     let result = null, failure = null;
-    try { result = send({ title: `reeve: ${why}`, message: `${why} (x${count})`, kind, profile }); }
+    try { result = send({ title, message, kind, why, count, body: body ?? null, profile }); }
     catch (e) { failure = e.message; }
-    if (result?.ok) return { why, count, kind, channels: result.channels ?? [] };
-    declined.push({ why, count, kind,
+    if (result?.ok) return { why, count, kind, body: body ?? null, channels: result.channels ?? [] };
+    declined.push({ why, count, kind, body: body ?? null,
       not_sent: failure ?? result?.why ?? "the sender returned no reason" });
     return null;
   };
 
   for (const f of fresh) {
-    if (!pages(f.why)) { digested.push(f); continue; }
-    const sent = dispatch(f.why, f.count, "raised");
-    if (sent) paged.push(sent);
+    const body = bodies?.get(f.why) ?? null;
+    if (!pages(f.why)) {
+      // THE DIGEST CANNOT DECLINE. It is the durable row itself, which is
+      // already written, so surfacing there is complete the moment it exists.
+      digested.push({ ...f, body });
+      markAnnounced(f.why, f.count);
+      continue;
+    }
+    const sent = dispatch(f.why, f.count, "raised", body);
+    // ONLY ON SUCCESS. A refused page leaves `announced_count` where it was, so
+    // the next pass raises it again rather than treating silence as delivery.
+    if (sent) { paged.push(sent); markAnnounced(f.why, f.count); }
   }
+
   for (const why of cleared) {
     if (!pages(why)) continue;
-    const sent = dispatch(why, 0, "cleared");
+    const sent = dispatch(why, 0, "cleared", bodies?.get(why) ?? null);
     if (sent) paged.push(sent);
   }
   return { paged, digested, declined, cleared };

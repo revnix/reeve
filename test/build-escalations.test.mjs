@@ -5,7 +5,7 @@
 // that re-announces itself is how an unattended system trains its owner to
 // ignore it. So the key carries only what says WHICH situation this is, and
 // everything that changes while the situation does not rides in the body.
-import { readFileSync, mkdtempSync, rmSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,7 +19,7 @@ import { announceable } from "../src/daemon.mjs";
 import { notify, readNtfyResponse } from "../src/notify.mjs";
 import {
   FAILURE_TYPES, IDENTITY_SHAPES, PAGES, escalationKey, shapeOf, body,
-  assertHub, builderAnnounceable, pages, announce,
+  assertHub, builderAnnounceable, pages, announce, subjectOf,
 } from "../src/build/announce.mjs";
 
 let fail = 0;
@@ -224,10 +224,27 @@ const guardian = openGuardianStore(join(dir, "guardian.db"));
 // assertion about "two paged" quietly became an assertion about execution order,
 // and it would have passed or failed on where the block was moved to.
 let hubSeq = 0;
+// EVERY TASK AN ESCALATION NAMES EXISTS. `hub_event.task` references `task(id)`,
+// so an event about a task nobody filed is refused by the database -- correctly,
+// because an escalation about a task that does not exist is not a state
+// production can reach. Written directly rather than through `fileTask`: what is
+// under test is the announcer, and admission would drag the registry, profiles
+// and territory leasing into a test about reducing a map.
+const TASK_IDS = ["bt:01AA", "bt:01BB", "bt:0A", "bt:0B", "bt:0C", "bt:0D"];
+const seedTasks = (db) => {
+  const ins = db.prepare(`INSERT INTO task(
+      id, project, repo_id, nwo_snapshot, title, phase, source_kind, source_key,
+      repo_path, profile_path, profile_hash, default_branch, visibility,
+      registry_version, created_at, updated_at)
+    VALUES(?, 'alpha', 42, 'o/a', 'a task', 'ESCALATED', 'founder', ?, '/repo',
+           '/p.json', 'ph-1', 'main', 'private', 1, ?, ?)`);
+  for (const id of TASK_IDS) ins.run(id, `src-${id}`, NOW, NOW);
+  return db;
+};
 const freshHub = () => {
   const d = join(dir, `h${++hubSeq}`);
   mkdirSync(d, { recursive: true });
-  return openHub(join(d, "hub.db"));
+  return seedTasks(openHub(join(d, "hub.db")));
 };
 
 {
@@ -278,24 +295,68 @@ const freshHub = () => {
 }
 
 // ── arrival, change, and silence in between ────────────────────────────────
+//
+// Driven through `announce` rather than the reducer, because a cause is marked
+// announced only once something has actually surfaced it. That is the whole
+// point of the split: the reducer says what is worth saying, delivery says what
+// was said.
 {
   const hub = freshHub();
+  const sent = [];
+  const send = (a) => { sent.push(a); return { ok: true, channels: [] }; };
   const key = escalationKey({ task: "bt:01AA", kind: "phase:blocked", phase: "RESEARCH" });
-  const first = builderAnnounceable(hub, new Map([[key, 1]]), { at: NOW, isAlive: ALIVE });
-  check(first.fresh.length === 1 && first.fresh[0].why === key,
-    "a cause is announced when it arrives", JSON.stringify(first));
+  const run = (count, at) => announce(hub, {
+    escalations: new Map([[key, count]]), at, isAlive: ALIVE, send });
 
-  const again = builderAnnounceable(hub, new Map([[key, 1]]), { at: NOW + 60, isAlive: ALIVE });
-  check(again.fresh.length === 0,
+  const first = run(1, NOW);
+  check(first.paged.length === 1 && first.paged[0].why === key,
+    "a cause is announced when it arrives", JSON.stringify(first.paged));
+  check(hub.prepare("SELECT announced_count c FROM escalation WHERE why=?").get(key).c === 1,
+    "and is marked announced at that count once the send succeeded");
+
+  const again = run(1, NOW + 60);
+  check(again.paged.length === 0 && again.digested.length === 0,
     "and NOT announced again while its shape is unchanged, or the channel earns being muted",
     JSON.stringify(again));
   check(hub.prepare("SELECT last_seen_at FROM escalation WHERE why=?").get(key).last_seen_at === NOW + 60,
     "control: though the row was touched, so silence is a decision and not a skipped write");
 
-  const changed = builderAnnounceable(hub, new Map([[key, 4]]), { at: NOW + 120, isAlive: ALIVE });
-  check(changed.fresh.length === 1 && changed.fresh[0].count === 4,
+  const changed = run(4, NOW + 120);
+  check(changed.paged.length === 1 && changed.paged[0].count === 4,
     "and announced again when the count changes: one task blocked and four are different situations",
-    JSON.stringify(changed));
+    JSON.stringify(changed.paged));
+}
+
+// ── a page the sender refused comes back ───────────────────────────────────
+//
+// `declined` makes an undelivered page visible in the RESULT, and a result
+// scrolls past. Marking the row announced before the send meant the next pass
+// saw nothing to say, so a page that was owed was owed for ever in silence.
+{
+  const hub = freshHub();
+  const key = escalationKey({ task: "bt:0A", kind: "phase:blocked", phase: "SIZING" });
+  const refuse = () => ({ ok: false, why: "no credential on this machine" });
+
+  const first = announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send: refuse });
+  check(first.declined.length === 1 && first.paged.length === 0,
+    "control: the send was refused", JSON.stringify(first.declined));
+  check(hub.prepare("SELECT announced_count c FROM escalation WHERE why=?").get(key).c === 0,
+    "the row is NOT marked announced, because nothing was announced",
+    JSON.stringify(hub.prepare("SELECT * FROM escalation WHERE why=?").get(key)));
+
+  const sent = [];
+  const accept = (a) => { sent.push(a); return { ok: true, channels: [] }; };
+  const second = announce(hub, { escalations: new Map([[key, 1]]), at: NOW + 60,
+                                 isAlive: ALIVE, send: accept });
+  check(second.paged.length === 1,
+    "so the next pass offers it again rather than treating silence as delivery",
+    JSON.stringify(second));
+  check(hub.prepare("SELECT announced_count c FROM escalation WHERE why=?").get(key).c === 1,
+    "and only now is it marked announced");
+  const third = announce(hub, { escalations: new Map([[key, 1]]), at: NOW + 120,
+                                isAlive: ALIVE, send: accept });
+  check(third.paged.length === 0, "control: and it goes quiet once it has actually landed",
+    JSON.stringify(third));
 }
 
 // ── absence is not success ─────────────────────────────────────────────────
@@ -310,35 +371,53 @@ const freshHub = () => {
   check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 1,
     "control: the cause is standing");
 
-  const blind = builderAnnounceable(hub, new Map(), { at: NOW + 60, isAlive: ALIVE, covered: new Set() });
+  const blind = builderAnnounceable(hub, new Map(), { at: NOW + 60, isAlive: ALIVE, examined: new Set() });
   check(blind.cleared.length === 0,
     "a cause absent from a pass that did NOT examine its task is not retired", JSON.stringify(blind));
   check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 1,
     "and the row still stands, so nothing was announced as resolved");
 
   const looked = builderAnnounceable(hub, new Map(), {
-    at: NOW + 120, isAlive: ALIVE, covered: new Set(["bt:01BB"]) });
+    at: NOW + 120, isAlive: ALIVE, examined: new Set(["bt:01BB"]) });
+
+  // AND A PASS THAT MAKES NO CLAIM RETIRES NOTHING. `examined: null` used to
+  // mean "no claim" and then clear every task cause anyway, which is the false
+  // clear this block exists to prevent, arriving through the default.
+  const noClaim = builderAnnounceable(hub, new Map(), { at: NOW + 180, isAlive: ALIVE });
+  check(noClaim.cleared.length === 0,
+    "control: and a pass that claims no coverage at all retires nothing",
+    JSON.stringify(noClaim));
   check(looked.cleared.includes(key),
     "and IS retired by a pass that examined it, so clearing still works", JSON.stringify(looked));
   check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 0,
     "control: the row is gone");
 }
 
-// ── a process-scoped cause needs a COMPLETE pass ───────────────────────────
+// ── a process failure clears only when its own subsystem says so ──────────
+//
+// A complete pass is not evidence about a backup: an ordinary pass runs no
+// backup at all, so treating one as proof of recovery deletes the row and
+// announces CLEARED while no snapshot has succeeded. The guardian holds these
+// failures on `ctx` and re-emits them every tick for exactly this reason, and
+// only a snapshot actually TAKEN clears one.
 {
   const hub = freshHub();
   const key = escalationKey({ kind: "backup:failed" });
   builderAnnounceable(hub, new Map([[key, 1]]), { at: NOW, isAlive: ALIVE });
-  const partial = builderAnnounceable(hub, new Map(), {
-    at: NOW + 60, isAlive: ALIVE, complete: false, covered: new Set() });
-  check(partial.cleared.length === 0,
-    "a `builder:` cause names no task, so an incomplete pass may not retire it",
-    JSON.stringify(partial));
-  const done = builderAnnounceable(hub, new Map(), {
-    at: NOW + 120, isAlive: ALIVE, complete: true, covered: new Set() });
-  check(done.cleared.includes(key),
-    "and a complete pass does, because that is a positive fact about the whole pass",
-    JSON.stringify(done));
+  check(subjectOf(key) === "builder:backup",
+    "control: the cause is about the backup subsystem, not about the pass", subjectOf(key));
+
+  const ordinary = builderAnnounceable(hub, new Map(), {
+    at: NOW + 60, isAlive: ALIVE, examined: new Set(["bt:0A", "bt:0B"]) });
+  check(ordinary.cleared.length === 0,
+    "a pass that examined only tasks does not retire a backup failure",
+    JSON.stringify(ordinary));
+
+  const backupRan = builderAnnounceable(hub, new Map(), {
+    at: NOW + 120, isAlive: ALIVE, examined: new Set(["builder:backup"]) });
+  check(backupRan.cleared.includes(key),
+    "and a pass in which the backup itself ran does retire it",
+    JSON.stringify(backupRan));
 }
 
 // ── it writes, so it asks whether the hub is being replaced ────────────────
@@ -408,6 +487,21 @@ const freshHub = () => {
     "control: failed is not blocked, and the two are one word apart in the shape list");
   check(!pages("bt:7:phase:blocked"),
     "control: and a shape missing its phase does not match, which a startsWith would");
+
+  // AN UPPERCASE WORD IS NOT A PHASE. Reducing any uppercase tail let a detail
+  // component masquerade as one, so a key ending in a shouted word matched the
+  // blocked shape and PAGED -- reachable today through `blocked_other`, which
+  // writes a caller-supplied key with no validation at all.
+  for (const notAPhase of ["DETAIL", "ZZZ", "FAILED_BADLY"]) {
+    check(shapeOf(`bt:7:phase:blocked:${notAPhase}`) === null,
+      `bt:7:phase:blocked:${notAPhase} reduces to nothing: ${notAPhase} is not a phase`,
+      String(shapeOf(`bt:7:phase:blocked:${notAPhase}`)));
+    check(!pages(`bt:7:phase:blocked:${notAPhase}`), `and therefore does not page`);
+  }
+  // CONTROL: the check is membership of PHASES, not a hand-written deny list.
+  check(PHASES.every(ph => shapeOf(`bt:7:phase:blocked:${ph}`) === "bt:<id>:phase:blocked:<phase>"),
+    "control: and every real phase still reduces, so this is membership and not a blocklist",
+    PHASES.join(","));
 }
 
 // ── every identity is durable; only the page list is dispatched ────────────
@@ -508,7 +602,7 @@ const freshHub = () => {
   sent.length = 0;
 
   const r = announce(hub, { escalations: new Map(), at: NOW4 + 60, isAlive: ALIVE, send,
-                            covered: new Set(["bt:0D"]) });
+                            examined: new Set(["bt:0D"]) });
   check(r.cleared.includes(paging) && r.cleared.includes(quiet),
     "control: both causes cleared, because the pass examined their task", JSON.stringify(r.cleared));
   check(sent.length === 1, "exactly one clearing was dispatched", JSON.stringify(sent.map(x => x.message)));
@@ -653,6 +747,177 @@ const freshHub = () => {
   check(/notify --test/.test(help.stdout),
     "and the command appears in --help, so it can be found without reading the source",
     (help.stdout.match(/.*notify.*/) ?? [""])[0]);
+
+  // AND ITS ENTRY DOES NOT STEAL THE LINE ABOVE IT. Help is a table read by
+  // position: a continuation line inserted between a command and its own
+  // description reattributes that description to the wrong command, and the
+  // canary's line -- the one that says it costs a real model call -- is the
+  // worst one to move.
+  const lines = help.stdout.split("\n");
+  const canaryAt = lines.findIndex(l => /^\s{2}canary\s/.test(l));
+  check(canaryAt > -1, "control: the canary entry is in the help", String(canaryAt));
+  check(/real model call/.test(lines[canaryAt + 1] ?? ""),
+    "the canary's cost line sits directly under the canary, not under notify",
+    JSON.stringify(lines[canaryAt + 1] ?? null));
+  const notifyAt = lines.findIndex(l => /^\s{2}notify\s/.test(l));
+  check(notifyAt > canaryAt,
+    "control: and notify is listed after it, so this is ordering and not absence",
+    `canary@${canaryAt} notify@${notifyAt}`);
+}
+
+// ── the profile has to belong to the repository that was asked about ───────
+//
+// `loadProfile` prefers `./.ops/profile.json` over the sidecar and does not
+// check whose it is, so `notify --test owner/B` run inside repository A sent
+// through A's channels while titling the alert B -- reporting B's setup healthy
+// without having touched it, and putting an unexpected real alert on a phone.
+{
+  const BIN = fileURLToPath(new URL("../bin/reeve", import.meta.url));
+  const repoA = join(dir, "repoA");
+  mkdirSync(join(repoA, ".ops"), { recursive: true });
+  const home = join(dir, "cli2", ".reeve");
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(repoA, ".ops", "profile.json"), JSON.stringify({
+    schemaVersion: 1, project: { kind: "product" },
+    identity: { key: "owner/A", defaultBranch: "main", visibility: "private" },
+    authority: { permission: "admin", policy: "propose_and_merge", profileLocation: "committed" },
+    state: { mode: "in-repo" },
+    units: [{ id: "root", root: ".", language: "typescript", packageManager: "pnpm" }],
+    ci: { provider: "github-actions" }, merge: { method: "squash", enforcement: "enforced" },
+    // A channel that CANNOT succeed: the credential path does not exist, so the
+    // send is refused before any request is made. The assertion below is that
+    // the mismatch is caught before this is even consulted.
+    notify: { provider: "ntfy", url: "https://example.invalid", topic: "t",
+              credentialFile: join(dir, "no-such-credential") },
+  }) + "\n");
+  const inA = (...args) => {
+    const r = spawnSync(process.execPath, [BIN, ...args, "--home", home],
+      { encoding: "utf8", cwd: repoA, timeout: 60_000 });
+    return { status: r.status, out: (r.stdout ?? "") + (r.stderr ?? "") };
+  };
+
+  const wrong = inA("notify", "--test", "owner/B");
+  check(wrong.status === 2,
+    "asking about another repository from inside this one is refused, not answered",
+    `rc=${wrong.status} ${wrong.out.slice(0, 200)}`);
+  check(/owner\/A/.test(wrong.out) && /owner\/B/.test(wrong.out),
+    "and the refusal names both, so the operator can see which profile was found",
+    wrong.out.slice(0, 240));
+
+  // CONTROL: the guard is about IDENTITY, not about refusing everything. Asking
+  // about the repository whose profile this is reaches the send path and reports
+  // the channel's own answer.
+  const right = inA("notify", "--test", "owner/A");
+  check(right.status === 3,
+    "control: asking about this repository reaches the channel and reports it degraded",
+    `rc=${right.status} ${right.out.slice(0, 200)}`);
+  check(/no credential/.test(right.out),
+    "control: with the channel's own reason, so the send path really was entered",
+    right.out.slice(0, 200));
+}
+
+
+// ── a clearing reads as a clearing on the phone ────────────────────────────
+//
+// `notify` renders title, message, priority and tags and nothing else, so a
+// clearing distinguished only by a `kind` property arrived looking exactly like
+// a fresh incident -- and its body said "(x0)", which is worse than saying
+// nothing at all.
+{
+  const hub = freshHub();
+  const sent = [];
+  const send = (a) => { sent.push(a); return { ok: true, channels: [] }; };
+  const key = escalationKey({ task: "bt:0B", kind: "phase:blocked", phase: "DESIGN" });
+
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send });
+  sent.length = 0;
+  announce(hub, { escalations: new Map(), at: NOW + 60, isAlive: ALIVE, send,
+                  examined: new Set(["bt:0B"]) });
+
+  check(sent.length === 1, "control: one clearing was dispatched", String(sent.length));
+  check(/CLEARED/.test(sent[0]?.title ?? ""),
+    "the TITLE says CLEARED, which is the part a phone shows first",
+    JSON.stringify(sent[0]?.title ?? null));
+  check(/CLEARED/.test(sent[0]?.message ?? ""),
+    "and so does the message", JSON.stringify(sent[0]?.message ?? null));
+  check(!/\(0\)|x0/.test(sent[0]?.message ?? ""),
+    "and it does not report a count of zero, which described nothing",
+    JSON.stringify(sent[0]?.message ?? null));
+}
+
+// ── the body reaches the human ─────────────────────────────────────────────
+//
+// `body()` is where every changing fact goes once the key refuses it. Carrying
+// it no further than the function that builds it means a backup failure pages
+// with its identity and without the path or the error that says what to do.
+{
+  const hub = freshHub();
+  const sent = [];
+  const send = (a) => { sent.push(a); return { ok: true, channels: [] }; };
+  const key = escalationKey({ kind: "backup:failed" });
+  const b = body({ type: "FAILED", store: "/var/reeve/o-a.db", detail: "checksum mismatch" });
+
+  const r = announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                            bodies: new Map([[key, b]]) });
+  check(r.paged.length === 1 && r.paged[0].body === b,
+    "the announcement carries the typed body it was given", JSON.stringify(r.paged[0]?.body));
+  check(/checksum mismatch/.test(sent[0]?.message ?? "") &&
+        /var\/reeve\/o-a\.db/.test(sent[0]?.message ?? ""),
+    "and the detail reaches the message, which is the only part a human reads",
+    JSON.stringify(sent[0]?.message ?? null));
+  check(/FAILED/.test(sent[0]?.message ?? ""),
+    "with the failure type, because 'it stopped' and 'it may have stopped' want different answers",
+    JSON.stringify(sent[0]?.message ?? null));
+
+  // CONTROL: a cause with no body still announces, rather than being skipped or
+  // rendering the word undefined.
+  const k2 = escalationKey({ task: "bt:0C", kind: "phase:blocked", phase: "SIZING" });
+  const r2 = announce(hub, { escalations: new Map([[k2, 1]]), at: NOW, isAlive: ALIVE, send });
+  check(r2.paged.length === 1 && !/undefined/.test(sent[1]?.message ?? "undefined"),
+    "control: and a cause with no body announces without printing undefined",
+    JSON.stringify(sent[1]?.message ?? null));
+}
+
+// ── every mutation is replayable ───────────────────────────────────────────
+//
+// `escalation` is in the replayed set and `escalation.raised` was its only
+// event. A snapshot whose tail spanned a clear replayed the raise and
+// resurrected the row, so an operator was paged again about something resolved
+// before the restore; one spanning an announcement restored `announced_count`
+// to 0 and re-sent every delivered page.
+{
+  const hub = freshHub();
+  const sent = () => ({ ok: true, channels: [] });
+  const key = escalationKey({ task: "bt:0D", kind: "phase:blocked", phase: "RESEARCH" });
+  const kinds = () => hub.prepare("SELECT kind FROM hub_event ORDER BY seq").all().map(r => r.kind);
+
+  const before = kinds().length;
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send: sent });
+  const afterRaise = kinds().slice(before);
+  check(afterRaise.filter(k => k === "escalation.raised").length >= 1,
+    "raising an escalation appends escalation.raised", JSON.stringify(afterRaise));
+
+  const row = hub.prepare("SELECT payload FROM hub_event WHERE kind='escalation.raised' ORDER BY seq DESC LIMIT 1").get();
+  const image = JSON.parse(row.payload);
+  check(image.why === key && typeof image.count === "number" &&
+        typeof image.announced_count === "number",
+    "carrying the ROW, not just the key, so a replay restores what it now says",
+    JSON.stringify(image));
+
+  const atClear = kinds().length;
+  announce(hub, { escalations: new Map(), at: NOW + 60, isAlive: ALIVE, send: sent,
+                  examined: new Set(["bt:0D"]) });
+  const afterClear = kinds().slice(atClear);
+  check(afterClear.includes("escalation.cleared"),
+    "and clearing one appends escalation.cleared", JSON.stringify(afterClear));
+
+  // THE HANDLER EXISTS, or the event is a row nothing reads back.
+  const replaySrc = readFileSync(fileURLToPath(new URL("../src/build/replay.mjs", import.meta.url)), "utf8");
+  check(/"escalation\.cleared":\s*\{[^}]*delete:\s*true/.test(replaySrc),
+    "and replay handles it as a DELETE, so a restore does not resurrect the row",
+    (replaySrc.match(/.*escalation\.cleared.*/) ?? [""])[0]);
+  check(/"escalation\.raised":\s*\{/.test(replaySrc),
+    "control: and the raise handler it sits beside is still there");
 }
 
 hub.close();

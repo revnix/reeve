@@ -1555,6 +1555,15 @@ export const STUBS = [
               replace: "    bound_app_id: required ? (expectedAppId ?? null) : null," }],
   },
   {
+    name: "sweep-refuses-an-orphan-test-file",
+    why: "stop reading the orphan count, which is the state this file was in. `coverage` has always classified a test file that is neither covered by an entry nor grandfathered as an orphan, and its own comment calls that the failure -- a test nobody has shown can fail, and that nobody declared. Nothing read it: the exit was the entry verdicts alone, so a new test file arrived with no entry, the ratio moved by one, and no gate said anything. A rule stated in a comment and not wired is the exact shape this instrument exists to find, which is a poor shape for the instrument",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "a test file with no entry and no grandfathering FAILS the sweep",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: "  if (whole && cov.orphans.length) {",
+              replace: "  if (false) {" }],
+  },
+  {
     name: "migration-history-is-not-a-maximum",
     why: "ask whether the HIGHEST recorded migration is the current one instead of whether every migration is present. A hub recording 1 and 3 with 2 absent answers 3, satisfies the equality, and then fails on a table migration 2 was supposed to create -- the uncaught trace the guard exists to replace, arriving through the guard itself. The control is what makes this measurable: completedVersion answers the CURRENT version for that same holed file, so the old check provably would have passed it",
     test: "test/migration-history.test.mjs",

@@ -1300,7 +1300,7 @@ export const STUBS = [
     expectRed: "historyGaps refuses to enumerate up to a version this binary does not know",
     edits: [{ file: "src/build/hubdb.mjs",
               find: "  if (!Number.isSafeInteger(upTo) || upTo < 0 || upTo > HUB_SCHEMA_VERSION)",
-              replace: "  if (false && !Number.isSafeInteger(upTo) || upTo < 0 || upTo > HUB_SCHEMA_VERSION)" }],
+              replace: "  if (false)" }],
   },
   {
     name: "task-file-dry-run-refuses-a-newer-hub-unopened",

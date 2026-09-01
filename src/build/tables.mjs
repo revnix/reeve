@@ -64,6 +64,13 @@ export const TABLE_OWNERS = {
   territory_lease: { writer: "intake.mjs, transition.mjs",  reader: "the overlap check",                  replayed: true,  section: "10.2" },
   provider_lease:  { writer: "provider.mjs (both daemons)", reader: "admission, reaper, restore refusal", replayed: false, section: "10.4" },
   provider_state:  { writer: "provider.mjs, measure-provider", reader: "admission, doctor H-5",           replayed: false, section: "10.4" },
+  // REPLAYED, unlike the two provider tables above it. Those are process-scoped:
+  // restoreHub clears them, so there is no image to restore. This one is durable
+  // and a restore rebuilds everything after the snapshot from the event tail
+  // alone -- so a measurement taken since the last snapshot exists only there,
+  // and without a handler a NORMAL restore drops it while reporting success.
+  provider_measurement:
+                   { writer: "measure-provider", reader: "the arming gate, doctor",                replayed: true,  section: "10.4" },
 };
 
 export const PROSE_TABLES = [
@@ -74,8 +81,8 @@ export const PROSE_TABLES = [
   "gate_request", "approval", "notice_receipt", "task_pr", "attested_push", "guardian_receipt",
   "ownership_check", "harness_acceptance", "pr_hold", "project_authority", "repo_gate_state",
   "inbox", "outbox", "merge_decision", "singleton_lease", "writer_lease", "maintenance_lock",
-  "directory_lease", "territory_lease", "provider_lease", "provider_state", "intake_event",
-  "escalation", "schema_version",
+  "directory_lease", "territory_lease", "provider_lease", "provider_state", "provider_measurement",
+  "intake_event", "escalation", "schema_version",
 ];
 // task_drain is in TABLE_OWNERS and NOT in PROSE_TABLES: section 11.2 carries
 // drain_set as a column on task, and this plan makes it a child table instead

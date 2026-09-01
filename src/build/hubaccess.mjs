@@ -11,6 +11,7 @@ import { openHubAsGuest, ALLOWED } from "./hubguest.mjs";
 import { SCHEDULER_MIN_HUB_VERSION, HUB_SCHEMA_VERSION, HUB_BUSY_TIMEOUT_MS } from "./hubdb.mjs";
 import { SCHEDULER_COLUMNS } from "./providerdb.mjs";
 import { HOLD_COLUMNS } from "./holds.mjs";
+import { IDENTITY_COLUMNS } from "./repoid.mjs";
 import { LOCK_COLUMNS } from "./locks.mjs";
 
 /**
@@ -117,7 +118,8 @@ export function hubAccess(hubPath) {
       // columns are the ones the scheduler's SQL names. One home each.
       const present = new Set(q.prepare(
         `SELECT name FROM sqlite_master WHERE type = 'table'`).all().map(r => r.name));
-      const needCols = { ...SCHEDULER_COLUMNS, pr_hold: HOLD_COLUMNS, maintenance_lock: LOCK_COLUMNS };
+      const needCols = { ...SCHEDULER_COLUMNS, pr_hold: HOLD_COLUMNS, maintenance_lock: LOCK_COLUMNS,
+                         project_identity: IDENTITY_COLUMNS };
       // NAME AND DECLARED TYPE. Reducing `pragma_table_info` to names made this
       // gate a fail-open: every one of these tables is STRICT, so a column whose
       // declared type is wrong passes the check and then REFUSES THE WRITE. A hub

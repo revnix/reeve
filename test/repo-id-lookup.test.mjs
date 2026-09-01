@@ -42,6 +42,37 @@ const PROJECT = { name: "o/r", nwo: "o/r" };
     "control: a hub holding the id answers with it");
 }
 
+// ── a hub BELOW migration 5 still answers ─────────────────────────────────
+// A guardian can meet a hub no builder has migrated yet -- this lookup
+// deliberately does not migrate a store out from under a running older builder.
+// Versions 1..4 have no `project_identity`, and treating that as a fault refused
+// every dispatch for as long as the builder stayed old.
+{
+  const p = join(dir, "prev5.db");
+  const h = openHub(p);
+  // The identity table is dropped to produce EXACTLY the pre-migration shape:
+  // a real hub, holding the id in `task`, with the newer table absent.
+  h.exec("PRAGMA foreign_keys = OFF");
+  h.exec("DROP TABLE project_identity");
+  h.exec(`INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,generation,source_kind,source_key,
+            repo_path,profile_path,profile_hash,default_branch,visibility,registry_version,created_at,updated_at)
+          VALUES('bt:old','o/r',4242,'o/r','t','FILED',1,'founder','k','/p','/f','h','main','private',1,
+                 unixepoch(),unixepoch())`);
+  h.close();
+  // The version is reported as pre-5 for the lookup to branch on. Injected
+  // rather than faked in the file, so the branch is taken for the reason the
+  // production path would take it.
+  check(await resolveRepoIdAt(p, PROJECT, { versionAt: () => 4 }) === 4242,
+    "a hub below the identity migration answers from `task`");
+  // CONTROL: the same store at the CURRENT version is a fault, not a fallback.
+  // A missing identity table on a v5 hub is damage, and reading `task` there
+  // would hide it behind an answer.
+  const err = await threw(() => resolveRepoIdAt(p, PROJECT, { versionAt: () => 5 }));
+  check(err != null && /no such table/i.test(err?.message ?? ""),
+    "control: the same store at the current version PROPAGATES instead of falling back",
+    String(err?.message));
+}
+
 // ── a hub that was never built is BENIGN ──────────────────────────────────
 // `project_identity` arrives with migration 5, so `no such table` on a store
 // recording no completed migration is a machine with no builder on it -- an

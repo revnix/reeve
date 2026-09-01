@@ -18,6 +18,31 @@ import { statSync } from "node:fs";
 import { completedVersion, HUB_BUSY_TIMEOUT_MS } from "./hubdb.mjs";
 
 /**
+ * The identity table's columns and their DECLARED types, for the guardian's
+ * runtime schema gate.
+ *
+ * Adding a table to the guest allowlist puts it in that gate, and a table with
+ * no entry here is checked only for EXISTENCE. `project_identity` is STRICT, so
+ * a hub whose `repo_id` is declared TEXT passes an existence check, and the
+ * write that follows is refused by the column rather than by the gate -- which
+ * is the route `provider_lease.token INTEGER` took to being reported usable
+ * while `claimProvider` threw and the daemon dispatched work UNSCHEDULED,
+ * outside the shared limit. The gate exists to be failed, not passed.
+ */
+export const IDENTITY_COLUMNS = Object.freeze({
+  project: "TEXT", repo_id: "INTEGER", learned_at: "INTEGER",
+});
+
+/**
+ * The migration that introduces `project_identity`.
+ *
+ * Named rather than written as a bare 5 at the comparison, because the lookup
+ * and the compatibility path below must agree about which hubs have the table,
+ * and two spellings of one number is the shape this repository keeps finding.
+ */
+export const IDENTITY_SINCE = 5;
+
+/**
  * The numeric repository id the hub already knows for a project.
  *
  * READ FROM `project_identity`, not from `task`. Both are written at admission
@@ -62,6 +87,28 @@ export function repoIdFromHub(hub, project) {
 }
 
 /**
+ * The same answer from a hub that PREDATES the identity table.
+ *
+ * A guardian can legitimately meet a hub no builder has migrated yet: this
+ * lookup deliberately does not migrate a store out from under a running older
+ * builder, so versions 1 to 4 are an ordinary state and not a fault. Without
+ * this, `no such table: project_identity` propagated on every tick and the
+ * guardian refused every dispatch for as long as the builder stayed old.
+ *
+ * This is the query the lookup used before migration 5, kept for exactly the
+ * window it applies to. It reads `task`, which the guardian's GUEST connection
+ * may not -- so on a pre-v5 hub the guardian resolves only through a connection
+ * that can, and the refusal it gets otherwise is the honest answer rather than a
+ * silent null. The window closes the first time the builder migrates.
+ */
+export function legacyRepoIdFromHub(hub, project) {
+  if (!hub || !project?.name) return null;
+  return hub.prepare(
+    `SELECT repo_id FROM task WHERE project = ? ORDER BY updated_at DESC, id DESC LIMIT 1`)
+    .get(project.name)?.repo_id ?? null;
+}
+
+/**
  * The repository id for a project: the hub first, then GitHub.
  *
  * THREE OUTCOMES, and they are not two. A number is an id reeve knows. `null`
@@ -85,8 +132,14 @@ export function repoIdFromHub(hub, project) {
  * window before there is any work. Callers that want to avoid re-asking within
  * that window hold the answer for their own process lifetime.
  */
-export async function resolveRepoId(hub, project, { fetchRepoId = null } = {}) {
-  const known = repoIdFromHub(hub, project);
+export async function resolveRepoId(hub, project, { fetchRepoId = null, fromHub = repoIdFromHub } = {}) {
+  // THE HUB READER IS INJECTABLE so the pre-migration path can reuse the rules
+  // below rather than restate them. A caller that has already established the
+  // hub cannot answer -- because the table it reads does not exist at that
+  // schema version -- still needs the GitHub fallback and, more importantly,
+  // still needs the refusal of a fabricated id. Two copies of that refusal is
+  // one copy too many for a value every authority-bearing row is keyed on.
+  const known = fromHub(hub, project);
   if (known != null) return known;
   if (!fetchRepoId || !project?.nwo) return null;
   const got = await fetchRepoId(project.nwo);
@@ -149,7 +202,22 @@ export async function resolveRepoIdAt(hubPath, project, {
     db = connect(hubPath);
     return await resolveRepoId(db, project, { fetchRepoId });
   } catch (err) {
-    if (/no such table/i.test(err?.message ?? "") && versionAt(hubPath) < 1) return null;
+    if (!/no such table/i.test(err?.message ?? "")) throw err;
+    const v = versionAt(hubPath);
+    // A store with no completed migration is a machine with no builder on it.
+    if (v < 1) return null;
+    // A store BELOW the identity migration is an ordinary state too, and a
+    // different one: the hub is real, it holds the id, and the table this
+    // lookup prefers does not exist yet. Answering null here would refuse every
+    // dispatch for as long as the builder stayed old; throwing would do the same
+    // and call it a fault. Neither is true, so ask the older question.
+    if (v < IDENTITY_SINCE && db) {
+      const legacy = legacyRepoIdFromHub(db, project);
+      if (legacy != null) return legacy;
+      // Still nothing, and the id may yet be gettable from GitHub -- the same
+      // fallback a v5 hub with no identity row gets, for the same reason.
+      return fetchRepoId ? await resolveRepoId(db, project, { fetchRepoId, fromHub: () => null }) : null;
+    }
     throw err;
   } finally {
     try { db?.close(); } catch {}

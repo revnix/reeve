@@ -61,6 +61,39 @@ export const HUB_SCHEMA_VERSION = 5;
  * deadline whose lease has one, so a v3 tail -- whose claim image already
  * carries the value -- matches nothing.
  */
+/**
+ * Derive every project's identity from the tasks the store holds.
+ *
+ * Used by migration 5 and again by `restoreHub` AFTER the tail is replayed, for
+ * the same reason `backfillPinDeadlines` is: a repair of a projection against
+ * the rows that are already the authority for it, deterministic from data the
+ * store already has.
+ *
+ * THE REPLAY CALL IS NOT OPTIONAL. Migration 5 runs BEFORE `replayHub`, so it
+ * sees only the tasks inside the snapshot. A tail written by a pre-v5 binary
+ * carries `task.filed` and no `project_identity.learned`, so every project
+ * admitted since that snapshot replays its task and gets no identity -- and the
+ * restore reports success while the guardian cannot scope a lease for it.
+ *
+ * AN UPSERT, not a fill. `task.repo_id` and the identity are written from the
+ * same snapshot at the same admission, so the newest task always agrees with the
+ * identity the modern path would have written -- and where a legacy tail carries
+ * a repository recreated under the same key, the newest task is the only record
+ * of the new id. Filling gaps only would leave the old one standing.
+ */
+export function backfillProjectIdentities(db) {
+  db.exec(`
+    INSERT INTO project_identity (project, repo_id, learned_at)
+    SELECT project, repo_id, unixepoch() FROM (
+      SELECT project, repo_id,
+             ROW_NUMBER() OVER (PARTITION BY project ORDER BY updated_at DESC, id DESC) rn
+        FROM task WHERE repo_id IS NOT NULL AND repo_id > 0
+    ) WHERE rn = 1
+    ON CONFLICT(project) DO UPDATE SET repo_id = excluded.repo_id, learned_at = excluded.learned_at
+     WHERE project_identity.repo_id <> excluded.repo_id;
+  `);
+}
+
 export function backfillPinDeadlines(db) {
   db.exec(`
     UPDATE task_territory AS t
@@ -291,19 +324,10 @@ const MIGRATIONS = [
       // local read into a network dependency at exactly the moment the operator
       // upgraded.
       //
-      // The row chosen is the one `repoIdFromHub` would have returned: newest by
-      // `updated_at`, then by `id`. Stated as a window rather than a correlated
-      // subquery so the tie-break is the same expression, not a second one that
-      // has to be kept in step.
-      db.exec(`
-        INSERT INTO project_identity (project, repo_id, learned_at)
-        SELECT project, repo_id, unixepoch() FROM (
-          SELECT project, repo_id,
-                 ROW_NUMBER() OVER (PARTITION BY project ORDER BY updated_at DESC, id DESC) rn
-            FROM task WHERE repo_id IS NOT NULL AND repo_id > 0
-        ) WHERE rn = 1
-        ON CONFLICT(project) DO NOTHING;
-      `);
+      // The same function `restoreHub` runs after replaying a tail. One copy,
+      // because a migration and a restore disagreeing about how an identity is
+      // derived is a defect nothing would report.
+      backfillProjectIdentities(db);
     } },
 ];
 

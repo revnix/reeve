@@ -28,7 +28,8 @@ import { open as openStore, exportJsonl } from "./db/ops.mjs";
 // `restoreHub` needs them, and not before -- ESM resolves at instantiation, so
 // naming a module that does not exist yet breaks every import of this file.
 import { openHub, isOperational, faultKind, HUB_SCHEMA_VERSION, HUB_TABLES, tablesAt,
-         schemaDefectsAt, isKnownVersion, backfillPinDeadlines } from "./build/hubdb.mjs";
+         schemaDefectsAt, isKnownVersion, backfillPinDeadlines,
+         backfillProjectIdentities } from "./build/hubdb.mjs";
 // Task 9's additions. `restoreHub` takes the maintenance lock before it refuses,
 // enumerates live writers to name them, and replays the tail -- and it needs
 // `replayableKinds`/`NON_REPLAYED_KINDS` to refuse a tail exported by a NEWER
@@ -1919,6 +1920,24 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         // store holds, and it matches nothing when the tail was written by a
         // binary that records the deadline on the claim.
         backfillPinDeadlines(back);
+        // AND THE IDENTITIES, but only for a tail that cannot carry them.
+        //
+        // Migration 5 runs BEFORE this replay, so it saw only the tasks inside
+        // the snapshot. A tail written by a pre-v5 binary carries `task.filed`
+        // and no `project_identity.learned`, so every project admitted since
+        // that snapshot comes back with its task and without its identity --
+        // and the restore reports success while the guardian cannot scope a
+        // provider lease for it.
+        //
+        // CONDITIONED ON THE TAIL, not on a version number, because the tail is
+        // the thing that either carries the identities or does not. Running it
+        // unconditionally also repairs states no admission produces -- a task
+        // whose project never had an identity at all -- and a restore that adds
+        // rows the snapshot never held is no longer restoring it. The drill that
+        // compares row for row is what said so.
+        const legacyTail = tail.some(e => e.kind === "task.filed")
+          && !tail.some(e => e.kind === "project_identity.learned");
+        if (legacyTail) backfillProjectIdentities(back);
         releaseMaintenanceLock(back, { pid, lstart });
       } finally { back.close(); }
     }

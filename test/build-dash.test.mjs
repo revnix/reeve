@@ -668,95 +668,323 @@ const T = {};
 // see. A guard narrower than its class is a guard the next instance walks around.
 {
   liveBuilder();
+  // A LIVE RUN, INSIDE THIS BLOCK. Without one every `running` on the model is
+  // null, so the walk below returns `doing[].running` as a single null leaf and
+  // never reaches `since`, `attempt`, `slice` or `drift` -- four values the
+  // renderer is answerable for, exempt because the fixture could not produce
+  // them rather than because anyone decided they were.
+  db.prepare(`INSERT INTO phase_run(task,generation,phase,slice,attempt,status,pid,lstart,started_at,
+                                    heartbeat_at,lease_expires_at,out_path,err_path,contract_drift)
+              VALUES(?,1,'SIZING',0,2,'live',400,'L',?,?,?,'/o','/e','drift-guard')`)
+    .run(T.moving, NOW - 90, NOW - 5, NOW + 600);
+  // A DIRECT ESCALATION, with NO hold row. `phases.mjs` moves a task straight to
+  // ESCALATED on retry exhaustion and on the gate's revision cap, and neither
+  // writes `hold_reason` -- so the founder wait is inferred from the phase and
+  // carries no moment. Without one here, every wait in the fixture had a
+  // timestamp and the branch that has none was never rendered.
+  const escOnly = (await file({ title: "escalated with no hold row", territory: ["packages/eo"] })).task;
+  setPhase(escOnly, "ESCALATED");
+  // WITH THE TRANSITION IN THE LOG, because production writes one on every phase
+  // move and `setPhase` is a bare UPDATE. Without it the age falls back to
+  // `created_at` and the fallback under test would be reading the wrong clock
+  // while still producing a plausible number.
+  db.prepare(`INSERT INTO phase_event(task,at,op,from_phase,to_phase,from_generation,to_generation,detail)
+              VALUES(?,?,'phase.failed','SIZING','ESCALATED',1,1,'{}')`).run(escOnly, NOW - 3600);
+  // AND A TASK WAITING ON TWO THINGS AT ONCE. Every other task in this fixture
+  // waits on exactly one, so `waiting.all` and `waiting.first` were the same
+  // single value and a render that printed only the headline was indistinguishable
+  // from one that printed the set.
+  const twoWaits = (await file({ title: "held and queued at once", territory: ["packages/tw"] })).task;
+  setPhase(twoWaits, "ESCALATED");
+  db.prepare(`INSERT INTO provider_lease(owner,repo_id,run_ref,pid,lstart,status,requested_at,expires_at)
+              VALUES('builder',1,?,779,'L','queued',?,?)`)
+    .run(builderRunRef(twoWaits, "SIZING"), NOW - 100, NOW + 300);
   const m = dash({ since: cur(0, 0) });
   const text = renderDash(m);
+  // ONE WALK, OVER THE WHOLE MODEL, FROM THE ROOT.
+  //
+  // The sections this guard walked used to be a hand-written list, so a
+  // top-level key absent from that list was exempt without ever being named:
+  // `alive`, `switches` and `projects` were never walked at all. That is how a
+  // stale lease and a live attempt's start time reached the JSON and not the
+  // text, in the same review round, after this guard had already been widened
+  // three times for the same shape. Deriving the walk from the VALUE means a
+  // sixth question, or a new field on an existing one, arrives inside the guard
+  // rather than beside it.
+  //
+  // Exclusions are dotted paths from the root, naming LEAVES and never
+  // containers -- excluding `doing.running` is what once hid `running.drift`.
+  // `[]` is an array element and `*` is exactly one segment, for a map keyed by
+  // something the data chooses rather than the code: `switches` is keyed by
+  // project name.
   const EXCLUDED = {
-    waiting_on_you: { project: "the row names the task; the project is on its `tasks` entry" },
-    doing: { project: "same",
-             "running.slice": "rendered as part of `phase/slice`, not on its own",
-             "age.from": "which clock produced the figure; `show` and `why` carry the provenance" },
-    declined: { last_seen_at: "a timestamp the render formats elsewhere",
-                scope: "rendered as the key's own shape: a `builder:` prefix or a task id",
-                project: "the row names the task" },
-    since_you_looked: { seq: "the cursor, handed back as `next_cursor` rather than per row" },
-    tasks: {
-      generation: "the run lines carry it; the task header names phase and title",
-      priority: "not part of the digest's five questions",
-      created_at: "a timestamp; the row shows age in state instead",
-      nwo: "the projects block names it once per project",
-      project: "same", cli_version: "shown by `task show`, not the digest",
-      "waiting.since": "rendered as the elapsed figure in waiting_on_you",
-      "waiting.capability_known": "rendered as UNKNOWN where it is false",
-      "running.slice": "rendered as part of `phase/slice`",
-      "age.from": "which clock produced the figure; `show` and `why` carry the provenance",
-      "switches.observe": "the PROJECT's map, rendered once in the switches block as on/off",
-      "switches.draftSpec": "the PROJECT's map, rendered once in the switches block as on/off",
-      "switches.implementLocal": "the PROJECT's map, rendered once in the switches block as on/off",
-      "switches.publishPr": "the PROJECT's map, rendered once in the switches block as on/off",
-      "switches.mergeBuilderPr": "the PROJECT's map, rendered once in the switches block as on/off",
-      "prs[].created_at": "a timestamp; the row presents the same three facts `show` does, " +
-        "kind, number and head, and the digest reports elapsed figures rather than clock values",
-      depth: "shown by `task show`, not the digest",
-      model: "shown by `task show`, not the digest",
-    },
-  };
-  // DESCENDS into nested objects, naming leaves by dotted path. A container in
-  // the exclusion list exempts everything inside it, which is precisely how
-  // `running.drift` stayed invisible: `doing.running` was excused as "rendered as
-  // phase/slice/attempt" and the drift warning rode along inside the excuse.
-  const leaves = (obj, prefix = "") => Object.entries(obj).flatMap(([k, v]) => {
-    const path = prefix ? `${prefix}.${k}` : k;
-    if (Array.isArray(v)) return v.flatMap(el => el && typeof el === "object"
-      ? leaves(el, `${path}[]`)
-      : [[`${path}[]`, el]]);
-    if (v && typeof v === "object") return leaves(v, path);
-    return [[path, v]];
-  });
-  const missing = [];
-  for (const section of Object.keys(EXCLUDED))
-    for (const row of m[section])
-      for (const [k, v] of leaves(row)) {
-        if (k in EXCLUDED[section]) continue;
-        if (v === null || v === undefined || v === "" || typeof v === "object") continue;
-        if (!text.includes(String(v))) missing.push(`${section}.${k}=${JSON.stringify(v)}`);
-      }
-
-  // AND THE TOP-LEVEL SCALARS. The guard walked row-shaped sections only, so a
-  // scalar the model promises -- `next_cursor`, which the operator needs to make
-  // the very next call -- could be carried in JSON and absent from the text with
-  // nothing noticing.
-  const TOP_EXCLUDED = {
     format_version: "the envelope's, not the digest's; `--json` carries it",
     generated_at: "a timestamp the render does not repeat",
     since: "echoed only when it is a rewound cursor, where it is the finding",
     cursor_rewound: "rendered as the words CURSOR REWOUND",
+
+    "alive.running": "rendered as the words RUNNING and NOT RUNNING",
+
+    "switches.*.*": "a boolean rendered as on/off in the switches block, beside its project",
+    "alive.last_seen_from": "which clock produced the figure; `show` and `why` carry the provenance",
+    "alive.lease_unexpired": "a boolean rendered as the words LEASE STALE when it is false, " +
+      "asserted in both directions below rather than left to this exclusion",
+    "projects[].nwo": "the registry's name for the project; the digest identifies a project by NAME, " +
+      "which every row it appears on uses",
+
+    "doing[].running.slice": "rendered as part of `phase/slice`, not on its own",
+    "doing[].age.from": "which clock produced the figure; `show` and `why` carry the provenance",
+    "doing[].running.since": "rendered as the attempt's elapsed time; the digest reports elapsed " +
+      "figures rather than clock values",
+
+    "waiting_on_you[].for_from": "which moment produced the figure; `show` and `why` carry the provenance",
+
+    "declined[].last_seen_at": "a timestamp the render formats elsewhere",
+    "declined[].scope": "rendered as the key's own shape: a `builder:` prefix or a task id",
+    "declined[].project": "the row names the task, and the tasks block names its project",
+
+    "since_you_looked[].seq": "the cursor, handed back as `next_cursor` rather than per row",
+
+    "tasks[].generation": "the run lines carry it; the task header names phase and title",
+    "tasks[].priority": "not part of the digest's five questions",
+    "tasks[].created_at": "a timestamp; the row shows age in state instead",
+    "tasks[].nwo": "the projects block names it once per project",
+    "tasks[].cli_version": "shown by `task show`, not the digest",
+    "tasks[].depth": "shown by `task show`, not the digest",
+    "tasks[].model": "shown by `task show`, not the digest",
+    "tasks[].waiting.since": "rendered as the elapsed figure beside the wait",
+    "tasks[].waiting.capability_known": "rendered as UNKNOWN where it is false",
+    "tasks[].running.*": "a live run is rendered in the `doing` block, which every running task is " +
+      "in by construction -- asserted below rather than assumed here",
+    "tasks[].escalations[].*": "rendered in the `declined` block, which unions the task-scoped " +
+      "escalations with the builder's own -- asserted below rather than assumed here",
+    "tasks[].age.from": "which clock produced the figure; `show` and `why` carry the provenance",
+    "tasks[].switches.*": "the PROJECT's map, rendered once in the switches block as on/off",
+    "tasks[].prs[].created_at": "a timestamp; the row presents the same three facts `show` does, " +
+      "kind, number and head, and the digest reports elapsed figures rather than clock values",
   };
-  const topMissing = [];
-  for (const [k, v] of Object.entries(m)) {
-    if (k in TOP_EXCLUDED || Array.isArray(v) || (v && typeof v === "object")) continue;
+  const leaves = (v, path = "") => {
+    if (Array.isArray(v)) return v.flatMap(el => leaves(el, `${path}[]`));
+    if (v && typeof v === "object")
+      return Object.entries(v).flatMap(([k, val]) => leaves(val, path ? `${path}.${k}` : k));
+    return [[path, v]];
+  };
+  const matches = (pat, path) => {
+    const a = pat.split("."), b = path.split(".");
+    return a.length === b.length && a.every((seg, i) => seg === "*" || seg === b[i]);
+  };
+  // SCOPED TO THE SECTION THE VALUE BELONGS TO, not to the whole document.
+  //
+  // A whole-document `includes` is satisfied by text belonging to a different
+  // row: every task carries a `project`, and the project NAME is printed in the
+  // switches block, so "the digest renders each task's project" passed while no
+  // task row named one and an operator could not tell which repository any task
+  // belonged to. A value must appear where its own row is rendered, or it has not
+  // been rendered for that row.
+  const SECTION_OF = {
+    waiting_on_you: "waiting on you", doing: "doing", declined: "declined",
+    since_you_looked: "since you looked", tasks: "tasks", switches: "switches",
+  };
+  const BLOCKS = Object.fromEntries(text.split("\n\n").flatMap(b => {
+    const head = /^(switches|waiting on you|doing|declined|since you looked|tasks)\b/.exec(b.split("\n")[0]);
+    return head ? [[head[1], b]] : [];
+  }));
+  for (const [key, name] of Object.entries(SECTION_OF))
+    check(typeof BLOCKS[name] === "string" && BLOCKS[name].length > 0,
+      `control: the render emits a \`${name}\` block for \`${key}\`, so scoping to it is not vacuous`,
+      Object.keys(BLOCKS).join(" | "));
+  const scopeFor = (path) => BLOCKS[SECTION_OF[path.split(/[.[]/)[0]]] ?? text;
+
+  const all = leaves(m);
+  const used = new Set();
+  const missing = [];
+  for (const [k, v] of all) {
+    const pat = Object.keys(EXCLUDED).find(p => matches(p, k));
+    if (pat) { used.add(pat); continue; }
     if (v === null || v === undefined || v === "") continue;
-    if (!text.includes(String(v))) topMissing.push(`${k}=${JSON.stringify(v)}`);
+    if (!scopeFor(k).includes(String(v))) missing.push(`${k}=${JSON.stringify(v)}`);
   }
-  check(topMissing.length === 0,
-    "every top-level scalar the digest carries reaches the human render",
-    `not rendered: ${topMissing.join(", ")}`);
   check(missing.length === 0,
-    "every value a digest row carries into the model reaches the human render",
+    "every value the digest carries into the model reaches the human render",
     `not rendered: ${missing.join(", ")}\n        ` +
     "Either render it, or name it in EXCLUDED with the reason it is deliberately absent.");
-  check(Object.keys(EXCLUDED).every(sec => m[sec].length > 0),
-    "control: every section this walks has a row, so none of it is vacuous",
-    JSON.stringify(Object.fromEntries(Object.keys(EXCLUDED).map(x => [x, m[x].length]))));
+
+  // CONTROLS. The walk must reach every section, and every exclusion must still
+  // describe something -- an exclusion matching nothing is a rule kept alive past
+  // the field it was written for, and it silently widens the next time a path of
+  // that shape appears.
+  check(all.length > 100, "control: the walk reaches the whole model, not a corner of it",
+    `${all.length} leaves`);
+  for (const sec of ["waiting_on_you", "doing", "declined", "since_you_looked", "tasks",
+                     "projects", "switches", "alive"])
+    check(all.some(([k]) => k === sec || k.startsWith(`${sec}.`) || k.startsWith(`${sec}[`)),
+      `control: the walk reaches \`${sec}\``);
+  const stale = Object.keys(EXCLUDED).filter(p => !used.has(p));
+  check(stale.length === 0,
+    "control: every exclusion still names a value this model carries",
+    `matching nothing: ${stale.join(", ")}`);
 
   // COUNTER-CONTROL: the walk can FAIL. A value the text does not contain must be
   // reported, or the loop passes on any render at all.
   const probe = [];
-  for (const [k, v] of Object.entries({ ...m.waiting_on_you[0], ghost_field: "ghost-zq" })) {
-    if (k in EXCLUDED.waiting_on_you || v === null || v === undefined || typeof v === "object") continue;
+  for (const [k, v] of leaves({ ...m.waiting_on_you[0], ghost_field: "ghost-zq" }, "waiting_on_you[]")) {
+    if (Object.keys(EXCLUDED).some(p => matches(p, k))) continue;
+    if (v === null || v === undefined || typeof v === "object") continue;
     if (!text.includes(String(v))) probe.push(k);
   }
-  check(probe.length === 1 && probe[0] === "ghost_field",
+  check(probe.length === 1 && probe[0] === "waiting_on_you[].ghost_field",
     "counter-control: a value the render does NOT contain is reported missing", JSON.stringify(probe));
+  db.prepare("DELETE FROM phase_run WHERE task = ?").run(T.moving);
+  noBuilder();
+}
+
+// ── the facts the guard excuses, asserted where they are actually rendered ──
+//
+// Two exclusions above say a value is rendered in another block rather than on
+// the row that carries it. An exclusion is a claim about the render, and a claim
+// nothing checks is how `prs` stayed invisible behind an excuse for a whole
+// review round. These are those claims, made falsifiable.
+{
+  liveBuilder();
+  db.prepare(`INSERT INTO phase_run(task,generation,phase,slice,attempt,status,pid,lstart,started_at,
+                                    heartbeat_at,lease_expires_at,out_path,err_path,contract_drift)
+              VALUES(?,1,'SIZING',0,2,'live',400,'L',?,?,?,'/o','/e',NULL)`)
+    .run(T.moving, NOW - 90, NOW - 5, NOW + 600);
+  const m = dash();
+  const text = renderDash(m);
+
+  const running = m.tasks.filter(t => t.running);
+  check(running.length > 0, "control: a task in this fixture carries a live run",
+    running.map(t => t.id).join(","));
+  check(running.every(t => m.doing.some(d => d.id === t.id)),
+    "every task carrying a live run is in `doing`, which is what lets the tasks block omit it",
+    running.map(t => `${t.id}:${m.doing.some(d => d.id === t.id)}`).join(" "));
+
+  const escalated = m.tasks.filter(t => t.escalations.length);
+  check(escalated.length > 0, "control: a task in this fixture carries an escalation",
+    escalated.map(t => t.id).join(","));
+  check(escalated.every(t => t.escalations.every(e =>
+        m.declined.some(d => d.id === t.id && d.why === e.why))),
+    "every task-scoped escalation reaches `declined`, which is what lets the tasks block omit it");
+
+  noBuilder();
+  db.prepare("DELETE FROM phase_run WHERE task = ?").run(T.moving);
+}
+
+// ── a wait inferred from a held phase still says how long ──────────────────
+//
+// Retry exhaustion and the gate's revision cap move a task straight to ESCALATED
+// and write no `hold_reason`, so the founder wait has no moment of its own.
+// Reporting nothing for it put the OLDEST escalation last in the list whose only
+// job is to say what to look at first.
+{
+  const m = dash();
+  const esc = m.waiting_on_you.find(w => w.title === "escalated with no hold row");
+  check(esc, "control: the directly-escalated task is in waiting_on_you",
+    m.waiting_on_you.map(w => w.title).join(" | "));
+  check(typeof esc.for_seconds === "number" && esc.for_seconds > 0,
+    "a founder wait inferred from a held phase reports how long, not UNKNOWN",
+    JSON.stringify(esc));
+  check(esc.for_from === "phase_event",
+    "and says which clock answered, because two of them could have", String(esc.for_from));
+
+  // A CAPABILITY WAIT STILL REPORTS NOTHING: a switch being off is a state with
+  // no event behind it, and the phase age answers a different question.
+  const cap = m.waiting_on_you.filter(w => w.waiting === "WAITING_FOR_CAPABILITY");
+  check(cap.every(w => w.for_seconds === null && w.for_from === null),
+    "control: a capability wait still reports no elapsed figure at all",
+    JSON.stringify(cap));
+
+  // AND IT SORTS BY IT. The figure exists to order the list; computing it and
+  // leaving the row last is the same defect with a number printed on it.
+  const idx = m.waiting_on_you.findIndex(w => w.id === esc.id);
+  const shorter = m.waiting_on_you.findIndex(w =>
+    w.for_seconds !== null && w.for_seconds < esc.for_seconds);
+  check(shorter === -1 || idx < shorter,
+    "and it outranks every shorter wait rather than being buried under them",
+    m.waiting_on_you.map(w => `${w.title}=${w.for_seconds}`).join(" | "));
+}
+
+// ── clearing the headline can leave the task blocked ───────────────────────
+{
+  const m = dash();
+  const two = m.tasks.find(t => t.title === "held and queued at once");
+  check(two && two.waiting.all.length > 1,
+    "control: a task in this fixture waits on two things at once",
+    JSON.stringify(two?.waiting));
+  const row = renderDash(m).split("\n").find(l => l.includes(two.id) && l.includes(two.phase));
+  for (const w of two.waiting.all)
+    check(row.includes(w),
+      `the task row names ${w}, so acting on the headline is not presented as enough`,
+      JSON.stringify(row));
+}
+
+// ── which repository a row belongs to ──────────────────────────────────────
+{
+  liveBuilder();
+  const m = dash();
+  const text = renderDash(m);
+  const blockOf = (head) => text.split("\n\n").find(b => b.startsWith(head));
+  for (const [name, rows] of [["waiting on you", m.waiting_on_you], ["doing", m.doing],
+                              ["tasks", m.tasks]]) {
+    const b = blockOf(name);
+    check(typeof b === "string", `control: the render emits a ${name} block`, String(b).slice(0, 40));
+    for (const r of rows) {
+      const line = b.split("\n").find(l => l.includes(r.id));
+      check(line && line.includes(r.project),
+        `${name}: the row for ${r.id} names its project, so an operator can tell which repository it is`,
+        JSON.stringify(line));
+    }
+  }
+  // A project name is NOT enough on its own: `beta` is a substring of nothing
+  // here, but the control that matters is that two projects are actually present,
+  // or every row could name the same one and pass.
+  check(new Set(m.tasks.map(t => t.project)).size > 1,
+    "control: the digest spans more than one project, so naming one is not enough",
+    [...new Set(m.tasks.map(t => t.project))].join(","));
+  noBuilder();
+}
+
+// ── a live holder past its lease is not a healthy builder ──────────────────
+{
+  db.prepare(`INSERT OR REPLACE INTO singleton_lease(name,pid,lstart,command,acquired_at,expires_at)
+              VALUES('builder',424242,'L','reeve build run',?,?)`).run(NOW - 300, NOW - 10);
+  const stale = dash();
+  check(stale.alive.running === true && stale.alive.lease_unexpired === false,
+    "control: the holder is alive and its lease has expired", JSON.stringify(stale.alive));
+  const head = renderDash(stale).split("\n")[0];
+  check(/RUNNING/.test(head) && /LEASE STALE/.test(head),
+    "the first line says RUNNING and says the lease is stale, because both are true", head);
+
+  liveBuilder();
+  const fresh = dash();
+  check(fresh.alive.lease_unexpired === true,
+    "control: a fresh lease is not stale", JSON.stringify(fresh.alive));
+  check(!/LEASE STALE/.test(renderDash(fresh).split("\n")[0]),
+    "and a healthy builder carries no warning, or the warning is decoration",
+    renderDash(fresh).split("\n")[0]);
+  noBuilder();
+}
+
+// ── a fresh attempt inside an old phase ────────────────────────────────────
+{
+  liveBuilder();
+  db.prepare(`INSERT INTO phase_run(task,generation,phase,slice,attempt,status,pid,lstart,started_at,
+                                    heartbeat_at,lease_expires_at,out_path,err_path,contract_drift)
+              VALUES(?,1,'SIZING',0,3,'live',400,'L',?,?,?,'/o','/e',NULL)`)
+    .run(T.quota, NOW - 30, NOW - 5, NOW + 600);
+  const m = dash();
+  const d = m.doing.find(x => x.id === T.quota);
+  check(d?.running?.since === NOW - 30, "control: the model carries the attempt's own start",
+    JSON.stringify(d?.running));
+  check(d.age.seconds > (NOW - d.running.since) * 10,
+    "control: and the phase is far older than the attempt, or the two figures cannot be told apart",
+    `phase=${d.age.seconds}s attempt=${NOW - d.running.since}s`);
+  const line = renderDash(m).split("\n").find(l => l.includes(T.quota) && /running/.test(l));
+  check(line && /attempt started 30s ago/.test(line),
+    "the row reports the attempt's own age, not the phase's, for the run it is describing",
+    JSON.stringify(line));
+  db.prepare("DELETE FROM phase_run WHERE task = ?").run(T.quota);
   noBuilder();
 }
 

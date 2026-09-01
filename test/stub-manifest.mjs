@@ -1003,6 +1003,39 @@ export const STUBS = [
     }],
   },
   {
+    name: "dash-names-the-project-on-every-row",
+    why: "drop `project` from the rows that name a task. The digest spans every project on the machine and the switches block lists project names without associating any task with one, so an operator reading a row cannot tell which repository it belongs to -- in the list that tells them what to act on. It passed a structural render guard for a full round because the guard matched values against the WHOLE document, and the project name appears in the switches block: text belonging to one row satisfied a claim about another",
+    test: "test/build-dash.test.mjs",
+    expectRed: "every value the digest carries into the model reaches the human render",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "    out.push(`  ${t.id}  ${oneLine(t.project)}  ${t.phase}  ${oneLine(t.title)}` +",
+      replace: "    out.push(`  ${t.id}  ${t.phase}  ${oneLine(t.title)}` +",
+    }],
+  },
+  {
+    name: "dash-names-every-wait-not-just-the-headline",
+    why: "print only `waiting.first` on a task row. The read model keeps the whole set because clearing the headline can leave the task blocked on something else, so a row naming one condition tells an operator that acting on it is enough -- and they act, and find the task exactly where they left it. Every task in the fixture waited on exactly one thing before this, so `all` and `first` were the same single value and a render that printed the headline was indistinguishable from one that printed the set",
+    test: "test/build-dash.test.mjs",
+    expectRed: "the task row names WAITING_FOR_QUOTA, so acting on the headline is not presented as enough",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "             (t.waiting.all.length > 1\n               ? `  also ${t.waiting.all.filter(w => w !== t.waiting.first).join(\" \")}` : \"\") +",
+      replace: "             \"\" +",
+    }],
+  },
+  {
+    name: "dash-says-when-a-live-holder-has-outrun-its-lease",
+    why: "say only RUNNING when the holder process is alive past `expires_at`. The two facts are kept apart in the model precisely because collapsing them loses this one: a wedged or very slow tick presents exactly like a healthy builder, and an operator would have to know the lease interval and infer the condition from the last-seen figure. The JSON exposed it as `lease_unexpired: false` while the default rendering -- the one an operator reads -- did not",
+    test: "test/build-dash.test.mjs",
+    expectRed: "the first line says RUNNING and says the lease is stale, because both are true",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "      (m.alive.lease_unexpired ? \"\" : \"  LEASE STALE: this tick has outrun its lease\")",
+      replace: "      \"\"",
+    }],
+  },
+  {
     name: "task-readers-refuse-an-argument-they-do-not-read",
     why: "let a bare word typed at a task reader be discarded in silence. The argv walk refuses an unknown flag and `inapplicable` refuses a known flag on a command that cannot act on it; a POSITIONAL was governed by neither, so `reeve task dash <cursor>` dropped the cursor, answered from the beginning of the log, printed an empty movement list and exited 0 -- which is byte-identical to a genuinely quiet period and is the one combination nothing downstream can detect. `task show a b c` answered about `a` on the same terms",
     test: "test/build-dash.test.mjs",

@@ -87,6 +87,25 @@ snapshot() {
   case "$threads" in OPEN*|CLOSED*|MERGED*) ;; *) return 1 ;; esac
   ci=$(gh pr view "$n" --repo "$REPO" --json statusCheckRollup \
         -q '[.statusCheckRollup[]? | "\(.name // .context)=\(.conclusion // .state)"] | join(",")' 2>/dev/null) || return 1
+  # AN EMPTY ROLLUP IS THREE DIFFERENT FACTS and only one of them is about CI.
+  #
+  # A pull request GitHub cannot merge produces NO workflow runs at all -- not
+  # queued, not failed, none -- because a `pull_request` workflow runs against a
+  # merge ref that cannot be built for a conflicted branch. So `ci=` reads
+  # identically for "Actions is down", "the run has not been created yet" and
+  # "this branch no longer merges", and the last is the only one the watcher's
+  # reader can act on. Reported for half an hour as an Actions outage once.
+  #
+  # The merge state is only asked for when the rollup is EMPTY: it costs a second
+  # request, and when checks exist their own conclusions are the better answer.
+  if [ -z "$ci" ]; then
+    local ms
+    ms=$(gh pr view "$n" --repo "$REPO" --json mergeStateStatus -q '.mergeStateStatus' 2>/dev/null) || return 1
+    # An unreadable merge state is a failed probe, not "no reason". Every other
+    # read here refuses rather than inventing, and this must too.
+    [ -n "$ms" ] || return 1
+    ci="none/$ms"
+  fi
   printf '%s ci=%s\n' "$threads" "$ci"
 }
 

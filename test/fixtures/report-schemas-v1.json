@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "schemas": {
+    "BUILD_SIZE": "763d4efc4c599f9da1e25dfaba4cd0e45a1187eed80dae3e3dcebd8085b44064",
+    "BUILD_RESEARCH": "112eb99c433541c29e7d1f90bd3eabccf743840596b9c4e7e4f7c69fd09b20d4",
+    "BUILD_DESIGN": "2fadd8f99c8a2432c9734bf67e44e2edef5a7917aaf9ad8afa26f21f54b7528a"
+  },
+  "evidence_map": "0393df44a666bfd04e72c0805abf6d532f6d59f66ba3abc01d61e3d51a2663b9",
+  "frozen_at": "2026-09-01",
+  "note": "a change here changes what every dispatched worker is asked for"
+}

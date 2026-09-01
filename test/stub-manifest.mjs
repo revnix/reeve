@@ -1233,4 +1233,22 @@ export const STUBS = [
               find: "    return { kind: \"hold\", reason: \"blocked_other\", detail: report.reason, escalation: report.escalation };",
               replace: "    return { kind: \"hold\", reason: \"blocked_other\", detail: report.reason, escalation: \"bt:manufactured\" };" }],
   },
+  {
+    name: "report-schema-freeze-notices-a-declared-property",
+    why: "add a property to build_size.json without anyone noticing. The schema files are what every dispatched worker is ASKED for -- they go to the CLI as --json-schema -- so a change here changes the contract for work already in flight. This stub is chosen because no other assertion in the file catches it: `refuses a property the schema does not declare` still passes, since the fixture's value is fractional and the new property is an integer. The freeze is the only thing that sees it, which is the whole reason a freeze exists",
+    test: "test/phase-report.test.mjs",
+    expectRed: "BUILD_SIZE's schema is frozen",
+    edits: [{ file: "src/build/schemas/build_size.json",
+              find: "    \"rationale\": { \"type\": \"string\", \"minLength\": 1 }",
+              replace: "    \"rationale\": { \"type\": \"string\", \"minLength\": 1 },\n    \"confidence\": { \"type\": \"integer\" }" }],
+  },
+  {
+    name: "report-evidence-map-freeze-notices-a-new-field",
+    why: "add a field to the evidence a SIZING success produces. The outcome-to-evidence map is the half a JSON freeze cannot see, and this is a change no named assertion covers: the evidence still carries the right kind, phase and depth, so every behavioural assertion stays green while what reaches applyTransition has quietly changed shape. A freeze over the schema files alone would report the contract intact",
+    test: "test/phase-report.test.mjs",
+    expectRed: "and so is the outcome-to-evidence map, which the JSON freeze cannot see",
+    edits: [{ file: "src/build/report.mjs",
+              find: "    ? { kind: \"phase.succeeded\", phase, depth: report.depth }",
+              replace: "    ? { kind: \"phase.succeeded\", phase, depth: report.depth, source: \"worker\" }" }],
+  },
 ];

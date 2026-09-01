@@ -7,7 +7,7 @@
 // one; and the sha recorded must be the sha of the bytes that survived, not of
 // the buffer that was intended.
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, lstatSync,
-         readdirSync, utimesSync } from "node:fs";
+         readdirSync, utimesSync, chmodSync, openSync, closeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -478,6 +478,53 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   check(existsSync(w.path), "an artifact written into a chain of new directories exists", w.path);
   const back = readArtifact({ dir: deep, phase: "DESIGN", expectSha: w.sha256 });
   check(back.ok === true, "and reads back with the sha it was written under", JSON.stringify(back.why));
+}
+
+// ── The sync chain stops at the caller's own root ───────────────────────────
+//
+// Every ancestor of the reeve home belongs to the operator or the OS. This write
+// changes none of their entries, and one of them being execute-only -- or on a
+// filesystem whose directories cannot be opened -- made the parent-sync loop
+// RETHROW, reporting a failure for an artifact that was written and renamed
+// successfully. `anchor` bounds the walk by OWNERSHIP rather than by depth, so a
+// deeper tree is still synced to the top and nothing above it is touched.
+{
+  const outer = join(dir, "sealed");
+  const home = join(outer, "home");
+  const adir = join(home, "tasks", "t1", "artifacts");
+  mkdirSync(adir, { recursive: true });
+  // THE FIXTURE HAS TO ACTUALLY BE UNOPENABLE, or both branches below pass for
+  // the same uninteresting reason. Running as root, chmod buys nothing -- so the
+  // precondition is measured rather than assumed, and the block is skipped
+  // honestly if the environment cannot produce the condition.
+  chmodSync(outer, 0o111);
+  let sealed = false;
+  try { closeSync(openSync(outer, "r")); } catch { sealed = true; }
+  if (!sealed) {
+    check(true, "SKIPPED: this environment can open an execute-only directory, so the case cannot be built");
+  } else {
+    const body = Buffer.from("# design\n\n## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n");
+    let anchored = null, why = null;
+    try { anchored = writeArtifact({ dir: adir, phase: "DESIGN", bytes: body, anchor: home }); }
+    catch (e) { why = String(e.message); }
+    check(anchored !== null && existsSync(anchored.path),
+      "a write anchored at the home succeeds with an unopenable directory above it", why ?? "(threw)");
+    // THE CONTROL, and it is what makes the assertion above mean something: the
+    // same write with no anchor walks past the home and fails on that directory.
+    let unbounded = null, unboundedWhy = null;
+    try { unbounded = writeArtifact({ dir: adir, phase: "DESIGN", bytes: body }); }
+    catch (e) { unboundedWhy = String(e.message); }
+    check(unbounded === null && unboundedWhy !== null,
+      "control: and the same write walking to the root fails on it", unboundedWhy ?? "(succeeded)");
+  }
+  chmodSync(outer, 0o755);
+  // AND THE ANCHOR IS CHECKED, not trusted. A dir outside it would silently walk
+  // to the root again, which is the bug this parameter exists to remove.
+  let outside = null;
+  try { writeArtifact({ dir: join(dir, "elsewhere"), phase: "DESIGN", bytes: Buffer.from("x"), anchor: home }); }
+  catch (e) { outside = String(e.message); }
+  check(outside !== null && /is not inside/.test(outside),
+    "a directory outside the anchor is refused rather than walked past it", String(outside));
 }
 
 // ── A failed RENAME takes its temporary too ────────────────────────────────
@@ -954,6 +1001,15 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   // for a fence that could start lines above where it actually did.
   check(g("DESIGN", sl + "  ```bash\n  pnpm test\n  ```\n", { requireDoneCondition: true }).ok === true,
     "control: and an indented fence is still a fence");
+  // AND THE COMMAND IS NOT ITSELF A DELIMITER. An EMPTY block -- an opener and
+  // an immediate closer -- put that closing delimiter in the command position,
+  // and the lazy scan then found a LATER delimiter to close on. The gate reported
+  // a machine-checkable done condition whose command is three backticks, over an
+  // empty block, with the final delimiter left opening a block that never closes.
+  check(g("DESIGN", sl + "```\n```\nprose\n```\n", { requireDoneCondition: true }).ok === false,
+    "an empty fenced block is not a done condition, whatever follows it");
+  check(g("DESIGN", sl + "```\n```\n", { requireDoneCondition: true }).ok === false,
+    "control: and an empty block on its own is refused too");
 }
 
 // ── A temporary goes when close itself throws ──────────────────────────────

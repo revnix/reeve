@@ -7,7 +7,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, openSync, writeSync, fsyncSync, closeSync, renameSync, readFileSync,
          rmSync, existsSync, readdirSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { ARTIFACT_FILE } from "../paths.mjs";
 
 const sha = (buf) => createHash("sha256").update(buf).digest("hex");
@@ -47,7 +47,7 @@ function reapStaleTemporaries(dir, name, now) {
 }
 
 /** tmp + fsync + rename + fsync of the directory. Every step, in that order. */
-export function writeArtifact({ dir, phase, bytes }) {
+export function writeArtifact({ dir, phase, bytes, anchor = null }) {
   const name = ARTIFACT_FILE[phase];
   if (!name) throw new Error(`${phase} produces no artifact; use reviewDiff's path`);
   // THE DIRECTORY MAY NOT EXIST YET, and whether it did decides what has to be
@@ -68,15 +68,33 @@ export function writeArtifact({ dir, phase, bytes }) {
   //
   // Syncing an already-durable directory costs one fsync and answers the
   // question the caller actually asked, which is whether the artifact survives.
-  // The chain stops at the reeve home rather than walking to the filesystem
-  // root, because directories this code did not make are not its to reason about.
-  // WALKED TO THE FILESYSTEM ROOT, not to a count I picked. The cap was eight,
-  // which meant a deeper tree silently stopped being synced above that level --
+  //
+  // NOT A COUNT, AND NOT THE FILESYSTEM ROOT EITHER. The cap was eight, which
+  // meant a deeper tree silently stopped being synced above that level --
   // durability reported for entries never flushed, by a bound chosen to stop a
-  // loop rather than because eight meant anything. The loop already terminates
-  // at the root; the count added nothing but a place to be wrong.
+  // loop rather than because eight meant anything. Removing it walked to `/`,
+  // which is the opposite mistake: every ancestor of the home belongs to the
+  // operator or the OS, this write changes none of their entries, and one of
+  // them being execute-only or on a filesystem whose directories cannot be
+  // opened made the parent-sync loop RETHROW -- reporting a failure for an
+  // artifact that was written and renamed successfully.
+  //
+  // `anchor` is the caller's own root, and the chain stops there. It bounds the
+  // walk by OWNERSHIP rather than by depth, so a deeper tree is still synced to
+  // the top and nothing above the anchor is touched. The race that makes the
+  // whole chain worth syncing -- another process created the tree and has not
+  // flushed its entries yet -- can only involve directories reeve creates, and
+  // every one of those is below the anchor.
   const chain = [];
-  for (let d = dir; d !== dirname(d); d = dirname(d)) chain.push(d);
+  if (anchor === null) {
+    for (let d = dir; d !== dirname(d); d = dirname(d)) chain.push(d);
+  } else {
+    const top = resolve(anchor);
+    const start = resolve(dir);
+    if (start !== top && !start.startsWith(top + sep))
+      throw new Error(`${dir} is not inside ${anchor}, so there is no anchor for the sync chain to stop at`);
+    for (let d = start; ; d = dirname(d)) { chain.push(d); if (d === top || d === dirname(d)) break; }
+  }
   mkdirSync(dir, { recursive: true });
   const path = join(dir, name);
   reapStaleTemporaries(dir, name, Date.now());
@@ -498,29 +516,42 @@ export function reviewArtifact({ phase, dir, expect }) {
           // document is then inside it, so what the slice actually asks for is
           // whatever happens to follow.
           const within = after.slice(0, nextBoundary(rows, at));
-          // THE CLOSER MUST BE AT LEAST AS LONG AS THE OPENER, which is what
-          // CommonMark says and what a renderer does. Matching a bare ``` at
-          // both ends let a block opened with four backticks be "closed" by a
-          // line of three: the greedy prefix took three, the fourth was read as
-          // the info string, and the gate reported a machine-checkable done
-          // condition for a block that is still open -- with the whole remainder
-          // of design.md inside it. The backreference is the fix; the trailing
-          // `* allows the longer closer CommonMark also permits.
+          // A REGEX CANNOT PAIR FENCES, so this scans lines instead.
           //
-          // AND THE INFO STRING CARRIES NO BACKTICKS, which is also
-          // CommonMark's rule and is what makes the backreference bite.
-          // Written as `[^\n]*`, the greedy prefix simply BACKTRACKED: it
-          // gave back the fourth opening backtick, matched three, read the
-          // one it surrendered as the start of the info string, and closed
-          // the block on three again -- the defect intact, with the
-          // backreference still in the pattern. Measured: the four-open,
-          // three-close fixture stayed green until this class was narrowed.
+          // Three defects in one expression, each fixed and the next one
+          // appearing behind it. A bare ``` at both ends let four backticks be
+          // closed by three. A backreference fixed that until the greedy prefix
+          // BACKTRACKED and read the surrendered backtick as the info string.
+          // Narrowing the info string fixed that, and then an EMPTY block --
+          // opener, immediate closer, prose, another delimiter -- matched
+          // starting at the CLOSER, taking it for an opener and the prose for a
+          // command.
           //
-          // And the leading whitespace is spaces and tabs, not \s: `\s` matches
-          // newlines, so `^\s*` could start a "fence" several blank lines above
-          // the backticks it then matched.
-          const fence = /^[ \t]*(`{3,})[^`\n]*\n[ \t]*(\S[^\n]*)[\s\S]*?^[ \t]*\1`*[ \t]*$/m.exec(within);
-          if (!fence) findings.push(`${heading} has no machine-checkable done condition: ` +
+          // That last one is not a pattern bug. Which delimiters open and which
+          // close is decided by everything before them, and `m` lets a match
+          // begin anywhere; no amount of lookahead recovers the state a scan
+          // from the start carries for free. So the fourth attempt is not
+          // another expression.
+          //
+          // The rules are CommonMark's: a closer is at least as long as its
+          // opener and carries no info string, an empty block holds no command,
+          // and a block that never closes is not a done condition however much
+          // text follows it.
+          const doneCommand = (within) => {
+            let open = null, first = null;
+            for (const line of within.split("\n")) {
+              const m = /^[ \t]*(`{3,})([^`\n]*)$/.exec(line);
+              if (open === null) { if (m) { open = m[1]; first = null; } continue; }
+              if (m && m[1].length >= open.length && m[2].trim() === "") {
+                if (first !== null) return first;
+                open = null; first = null; continue;
+              }
+              if (first === null && line.trim() !== "") first = line.trim();
+            }
+            return null;
+          };
+          const fence = doneCommand(within);
+          if (fence === null) findings.push(`${heading} has no machine-checkable done condition: ` +
             `the contract asks for a fenced block, opened AND closed, whose first line is a command`);
         }
       }

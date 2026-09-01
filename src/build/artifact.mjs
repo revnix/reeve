@@ -276,13 +276,32 @@ export function reviewArtifact({ phase, dir, expect }) {
         // string passes the gate and then produces a comparison nobody can
         // reason about. The kinds here are the ones the fields' own names imply,
         // and each is stated once.
+        // THE TYPES ARE THE SCHEMA'S, not this file's recollection of them.
+        // `build_size.json` declares all four counts as `{"type": "integer",
+        // "minimum": 0}`. Three of them were checked here with `Number.isFinite`
+        // and one with `Number.isInteger` -- so `est_files: 0.5` passed this
+        // gate and was durably approved, while the same document validated
+        // against the schema is refused. One artifact, two verdicts, and the
+        // gate is the one that says the work may proceed.
+        //
+        // The divergence WAS the three copies: a predicate written out four
+        // times, corrected in one of them. It is spelled once now, so the next
+        // correction cannot land in three places out of four.
+        const count = (v) => Number.isInteger(v) && v >= 0;
         const KIND = {
           depth: ["a name", (v) => typeof v === "string" && v.trim() !== ""],
-          est_files: ["a number", (v) => Number.isFinite(v) && v >= 0],
-          est_weighted_files: ["a number", (v) => Number.isFinite(v) && v >= 0],
-          est_packages: ["a number", (v) => Number.isFinite(v) && v >= 0],
-          est_slices: ["a whole number", (v) => Number.isInteger(v) && v >= 0],
-          risk_paths_touched: ["a list", (v) => Array.isArray(v)],
+          est_files: ["a whole number", count],
+          est_weighted_files: ["a whole number", count],
+          est_packages: ["a whole number", count],
+          est_slices: ["a whole number", count],
+          // THE ITEMS, not just the container. `Array.isArray` alone admitted
+          // `[3]` and `[""]`, and this list is intersected against the profile's
+          // risk paths to decide whether the sizing floor fires. A non-string
+          // matches no path, so an artifact naming its risk paths as numbers
+          // reads as touching none -- and the floor that exists for exactly that
+          // case does not fire, silently, on the artifact that most needed it.
+          risk_paths_touched: ["a list of non-empty paths",
+            (v) => Array.isArray(v) && v.every((p) => typeof p === "string" && p.trim() !== "")],
           rationale: ["a non-empty string", (v) => typeof v === "string" && v.trim() !== ""],
         };
         for (const [field, [kind, ok]] of Object.entries(KIND)) {

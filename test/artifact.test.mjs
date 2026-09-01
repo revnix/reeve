@@ -397,6 +397,51 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   check(good.ok === true, "control: an object carrying the full contract passes", JSON.stringify(good.findings));
 }
 
+// ── The counts are INTEGERS, because the schema says they are ──────────────
+//
+// `build_size.json` declares est_files, est_weighted_files, est_packages and
+// est_slices as `{"type": "integer", "minimum": 0}`. Three of the four were
+// checked here with `Number.isFinite`, so `est_files: 0.5` was durably approved
+// by this gate and refused by the schema -- one artifact, two verdicts, and the
+// gate is the one that says the work may proceed.
+//
+// EVERY COUNT IS EXERCISED, not the one that was reported. The defect was a
+// predicate written out four times and corrected in one of them, so a test
+// naming only est_files would pass against a fix applied only to est_files.
+{
+  const adir = join(dir, "sizing-counts");
+  const FULL = { depth: "standard", est_files: 3, est_weighted_files: 4, est_packages: 1,
+                 est_slices: 2, risk_paths_touched: ["packages/x"], rationale: "x" };
+  const gate = (over) => {
+    writeArtifact({ dir: adir, phase: "SIZING", bytes: Buffer.from(JSON.stringify({ ...FULL, ...over })) });
+    return reviewArtifact({ phase: "SIZING", dir: adir, expect: { depth: "standard" } });
+  };
+  // THE CONTROL FIRST, so every refusal below is caused by the field it changes
+  // rather than by the fixture being wrong in some way none of them names.
+  const base = gate({});
+  check(base.ok === true, "control: the sizing fixture passes untouched", JSON.stringify(base.findings));
+  for (const field of ["est_files", "est_weighted_files", "est_packages", "est_slices"]) {
+    const r = gate({ [field]: 0.5 });
+    check(r.ok === false, `a fractional ${field} is refused`, JSON.stringify(r.findings));
+    check(r.findings.some(f => f.includes(field)),
+      `and the finding names ${field}, so an operator is told which count is wrong`,
+      JSON.stringify(r.findings));
+  }
+  // AND THE ITEMS OF THE LIST, not only the container. `Array.isArray` alone
+  // admitted both of these, and the sizing floor intersects this list against
+  // the profile's risk paths: a non-string matches nothing, so an artifact
+  // naming its risk paths as numbers reads as touching none, and the floor that
+  // exists for exactly that case does not fire.
+  const numeric = gate({ risk_paths_touched: [3] });
+  check(numeric.ok === false, "a risk path that is not a string is refused", JSON.stringify(numeric.findings));
+  const blank = gate({ risk_paths_touched: ["  "] });
+  check(blank.ok === false, "and so is a blank one, which matches no path either", JSON.stringify(blank.findings));
+  // AND THE EMPTY LIST STILL PASSES. Touching no risk path is an answer, and a
+  // check that refused it would refuse most of the sizings this gate exists for.
+  const empty = gate({ risk_paths_touched: [] });
+  check(empty.ok === true, "control: an empty risk-path list still passes", JSON.stringify(empty.findings));
+}
+
 // ── Every slice, not the document ──────────────────────────────────────────
 //
 // The same per-unit distinction the citation check makes, which was missing
@@ -574,6 +619,28 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
     const r = g(missing);
     check(r.ok === false && r.findings.some(f => f.includes(field)),
       `a sizing omitting ${field} is refused, and the finding names it`, JSON.stringify(r.findings));
+  }
+  // AND IT IS REPORTED AS ABSENT, not as a value of the wrong type.
+  //
+  // Every assertion above survives the presence check being removed: `undefined`
+  // then reaches the kind predicate, which refuses it and names the field, so
+  // the artifact is refused for the right reason by the wrong check. That is a
+  // redundant guard reading as a load-bearing one -- and it is measurable only
+  // here, in the WORDING, because the wording is the only thing the presence
+  // check uniquely produces.
+  //
+  // It is not a cosmetic difference to the person reading it: `est_files is
+  // undefined, not a whole number` sends a worker looking for a value they never
+  // wrote, and `omits est_files` tells them what to add.
+  {
+    const gone = { ...full }; delete gone.est_files;
+    const r = g(gone);
+    check(r.findings.some(f => /omits est_files/.test(f)),
+      "an omitted field is reported as omitted, not as a value of the wrong type",
+      JSON.stringify(r.findings));
+    check(!r.findings.some(f => /est_files is undefined/.test(f)),
+      "control: and the kind check does not ALSO describe the value that is not there",
+      JSON.stringify(r.findings));
   }
 }
 

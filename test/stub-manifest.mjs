@@ -98,7 +98,6 @@ export const GRANDFATHERED = [
   "test/guardian-provider-lease.test.mjs",
   "test/hub-derived-schema.test.mjs",
   "test/hub-doctor.test.mjs",
-  "test/hub-drills.test.mjs",
   "test/hub-locks.test.mjs",
   "test/hub-outbox.test.mjs",
   "test/hub-phases.test.mjs",
@@ -2232,8 +2231,8 @@ export const STUBS = [
     test: "test/hub-incarnation.test.mjs",
     expectRed: "reading a hub that predates the table does not throw",
     edits: [{ file: "src/build/hubdb.mjs",
-              find: "    if (/no such table/i.test(e?.message ?? \"\")) return null;",
-              replace: "    if (false) return null;" }],
+              find: "    if (!/no such table/i.test(e?.message ?? \"\")) throw e;",
+              replace: "    throw e;" }],
   },
   {
     name: "both-damage-refusals-name-the-snapshot",
@@ -2243,5 +2242,14 @@ export const STUBS = [
     edits: [{ file: "src/build/hubdb.mjs",
               find: "          (newestHubSnapshot(path)",
               replace: "          (false" }],
+  },
+  {
+    name: "a-damaged-v6-hub-is-not-an-old-one",
+    why: "answer null for ANY missing table, which renders a v6 hub that has LOST `hub_incarnation` as an ordinary older store and suppresses the only evidence a caller has that it is gone. The null this function promises is for a hub that PREDATES the table, and telling the two apart needs a positive reading of `schema_version` rather than the absence of the table. Review found this in the FIXTURE: the test asserting the null dropped the table from a v6 hub, so it built the damaged case and certified it as the old one",
+    test: "test/hub-incarnation.test.mjs",
+    expectRed: "a v6 hub that has LOST the table propagates",
+    edits: [{ file: "src/build/hubdb.mjs",
+              find: "    if (predatesTheTable) return null;",
+              replace: "    if (true) return null;" }],
   },
 ];

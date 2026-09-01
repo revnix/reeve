@@ -514,7 +514,18 @@ export function historyGaps(versions, upTo) {
 // A factory rather than a shared constant: the arrays are the caller's, and one
 // frozen object handed to every caller is a different promise from the one this
 // has always made.
-const unreadableHistory = () => ({ readable: false, missing: [], have: [], holed: false, version: 0, invalid: [] });
+// CARRYING THE CAUSE, because "unreadable" alone throws away WHICH failure.
+//
+// A caller refusing on this has to tell an operator whether to retry, and that is
+// `faultKind`'s question about the original exception: a store held by another
+// process past the busy timeout answers SQLITE_BUSY and is worth retrying, while a
+// damaged one never is. Returning a bare `readable: false` made every caller
+// either guess or re-read the same statement to recover what this already knew.
+//
+// `cause` is null on the paths that never had an exception -- an absent file is
+// not a failed read -- so a caller cannot mistake "there was nothing to read" for
+// "the read failed and here is why".
+const unreadableHistory = (cause = null) => ({ readable: false, missing: [], have: [], holed: false, version: 0, invalid: [], cause });
 
 /**
  * The migration history recorded on a connection the CALLER owns.
@@ -546,14 +557,14 @@ export function migrationStateOf(db) {
     // its bound, which is exactly the untrusted number.
     return { readable: true, missing, have: present, holed: hasHistoryHole(present), invalid,
              version: present.length ? present[present.length - 1] : 0 };
-  } catch { return unreadableHistory(); }
+  } catch (e) { return unreadableHistory(e); }
 }
 
 export function missingMigrations(path) {
   if (!existsSync(path)) return unreadableHistory();
   let q;
   try { q = new DatabaseSync(path, { readOnly: true, timeout: HUB_BUSY_TIMEOUT_MS }); }
-  catch { return unreadableHistory(); }
+  catch (e) { return unreadableHistory(e); }
   try { return migrationStateOf(q); }
   finally { try { q.close(); } catch { /* already gone */ } }
 }

@@ -1312,13 +1312,13 @@ export const STUBS = [
               replace: "        if (false && hist.version > HUB_SCHEMA_VERSION) {" }],
   },
   {
-    name: "artifact-nesting-is-relative-to-the-parent",
-    why: "close list levels only at column zero instead of at the level's own content column. Nesting is measured from the item above, not from the left margin -- a list that starts indented nests relative to its own first item, and a sibling appearing to the left of an open level closes it. Read as `indent === 0`, an indented list never closes a level, so every bullet after the first nested one is treated as nested and the citation rule stops running for the rest of the document",
+    name: "artifact-nested-levels-close",
+    why: "never close an open list level. A sibling appearing to the LEFT of an open level ends it; without that, every bullet after the first nested one is treated as nested and the citation rule stops running for the rest of the document -- an artifact whose second finding is uncited passes because its first finding had a sub-bullet",
     test: "test/artifact.test.mjs",
     expectRed: "a top-level bullet AFTER a nested one is top-level again",
     edits: [{ file: "src/build/artifact.mjs",
               find: "      while (open.length && indent < open[open.length - 1]) open.pop();",
-              replace: "      while (open.length && indent === 0) open.pop();" }],
+              replace: "      while (false) open.pop();" }],
   },
   {
     name: "artifact-endpoint-with-a-path-is-not-a-citation",
@@ -1328,5 +1328,14 @@ export const STUBS = [
     edits: [{ file: "src/build/artifact.mjs",
               find: "  /\\b[\\w-]+(?:\\.[\\w-]+)+:\\d+\\/\\S*/g,          // host:port followed by a path",
               replace: "  // the host-with-path strip removed" }],
+  },
+  {
+    name: "artifact-nesting-boundary-is-the-content-column",
+    why: "close a level only at column zero, which is right for a list that starts at the left margin and wrong for every other case. The boundary is the enclosing item's CONTENT column: under `- ` it is 2, so one space is a sibling and two is nested; under `1.  ` it is 4, so two spaces is still a sibling. A rule written as a fixed number of spaces is correct for one marker width and silently wrong for the others",
+    test: "test/artifact.test.mjs",
+    expectRed: "a bullet indented one space under a `- ` parent is a SIBLING, and is still required to cite",
+    edits: [{ file: "src/build/artifact.mjs",
+              find: "      while (open.length && indent < open[open.length - 1]) open.pop();",
+              replace: "      while (open.length && indent === 0) open.pop();" }],
   },
 ];

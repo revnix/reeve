@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BUILD_SIZE",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["outcome", "reason"],
+  "properties": {
+    "outcome": { "enum": ["ok", "blocked", "infeasible"] },
+    "reason": { "type": "string", "minLength": 1 },
+    "escalation": { "type": "string", "minLength": 1 },
+    "depth": { "enum": ["trivial", "standard", "deep"] },
+    "est_files": { "type": "integer", "minimum": 0 },
+    "est_weighted_files": { "type": "integer", "minimum": 0 },
+    "est_packages": { "type": "integer", "minimum": 0 },
+    "est_slices": { "type": "integer", "minimum": 0 },
+    "risk_paths_touched": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "rationale": { "type": "string", "minLength": 1 }
+  }
+}

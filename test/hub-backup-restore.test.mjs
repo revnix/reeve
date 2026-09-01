@@ -605,6 +605,14 @@ const POST_SNAPSHOT = {
       provider: "claude", kind: "pool-relationship", result: "SHARED",
       evidence: "drill: a measurement written after the snapshot", measured_at: 1,
     }),
+  // Values spelled out for the same reason as above: the table constrains
+  // `repo_id` and `learned_at` to be positive, and `minimalRow`'s generic filler
+  // would produce a row the CHECKs reject -- which fails as a broken fixture
+  // rather than as the broken replay this drill exists to detect.
+  project_identity: (db, t) =>
+    writeRow("project_identity", "project_identity.learned")(db, t, {
+      project: "drill-project", repo_id: 424242, learned_at: 1,
+    }),
 };
 
 function writeAuthority(db, project) {
@@ -695,6 +703,8 @@ function writeAuthority(db, project) {
     // Free for the same reason: its primary key is (provider, kind, measured_at)
     // and no table references it.
     "provider_measurement",
+    // Free too: keyed on the project, and nothing declares a foreign key to it.
+    "project_identity",
   ];
   check(WRITE_ORDER.length === COMPARISON_SET.length
         && WRITE_ORDER.every(t => COMPARISON_SET.includes(t))

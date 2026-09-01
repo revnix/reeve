@@ -211,8 +211,12 @@ check(parse({}).error === null && parse({}).projects.length === 0,
   const registry = { version: 7, projects: { nextly: entry } };
 
   const db = openHub(hubPathFor(home));
-  // A real admitted task, so the hub HAS an id to answer with. That is the
-  // positive control which makes "nothing changed" mean something.
+  // A real admitted task AND its identity, because the lookup reads the identity
+  // now. The task alone left `repoId` null here -- the positive control that
+  // makes "nothing changed" mean something had stopped answering, and "no row
+  // changed" is equally true of a lookup that never opened the hub.
+  db.prepare(`INSERT INTO project_identity(project, repo_id, learned_at)
+              VALUES('nextly', 77, unixepoch())`).run();
   db.prepare(
     `INSERT INTO task(id, project, repo_id, nwo_snapshot, title, phase, generation,
                       source_kind, source_key, repo_path, profile_path, profile_hash,

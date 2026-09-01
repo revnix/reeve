@@ -36,6 +36,7 @@ export const COMPARISON_SET = [
   // thing that proves the handler above actually restores the row rather than
   // merely being registered.
   "provider_measurement",
+  "project_identity",
 ];
 
 /**
@@ -93,6 +94,12 @@ const HANDLERS = {
   // and what it drops is the answer the arming gate reads, with its evidence.
   // Keyed on the primary key so a re-replay is idempotent.
   "provider_measurement.recorded": { table: "provider_measurement", key: ["provider","kind","measured_at"] },
+  // The identity is written at admission and read by the guardian on every
+  // tick. A snapshot predating an admission would replay the task and leave the
+  // project with no identity -- and the guardian then falls through to GitHub
+  // for a value the hub had, turning a local read into a network dependency at
+  // the moment the operator restored.
+  "project_identity.learned": { table: "project_identity", key: ["project"] },
   // A PARTIAL row image, and legitimately so: the upsert is by primary key, so
   // replaying it sets `depth` and leaves every other column as the last full
   // image left it. S2-B's depth override writes this on both the accepted-and-

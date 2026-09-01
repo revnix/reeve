@@ -315,12 +315,31 @@ export function classify({ controlExit, stubExit, stubOutput = "", hashChanged, 
   // column off it". The guard assertion goes red exactly as the entry intends,
   // and the next line throws on the value the stub made wrong. That is a large
   // class, not a badly chosen stub, so the message says where to look.
+  // THE TOTAL DECIDES; THE NAMES EXPLAIN.
+  //
+  // Deciding by name is tempting and wrong. A stub may legitimately change WHICH
+  // assertion runs -- a fixture whose guard picks one branch or the other
+  // reports a different name under the stub and still runs to its end, and
+  // refusing that would turn a correct WRONG_RED into UNRUNNABLE and send the
+  // author to fix a file that is fine. `sweep-onlypass` in the suite is exactly
+  // that shape, which is how this was caught.
+  //
+  // A shorter run is the thing that cannot be explained away: a failing `check`
+  // returns rather than throws, so a stub makes assertions FAIL, never fewer of
+  // them. Names are still worth carrying, because "four fewer" sends a reader
+  // hunting where "these four never ran" does not.
+  const missing = (controlObserved?.names && observed?.names
+                   && !controlObserved.namesTruncated && !observed.namesTruncated)
+    ? [...controlObserved.names].filter(([n, c]) => (observed.names.get(n) ?? 0) < c).map(([n]) => n)
+    : [];
   if (controlObserved && seen < controlObserved.assertionsSeen)
     return { verdict: UNRUNNABLE,
              why: `the stubbed run reported ${seen} assertion(s) where the control reported ` +
                   `${controlObserved.assertionsSeen}, so the file stopped early and the ` +
                   `${controlObserved.assertionsSeen - seen} it did not reach are unmeasured — ` +
-                  "an assertion that never ran reads exactly like one that passed. " +
+                  "an assertion that never ran reads exactly like one that passed" +
+                  (missing.length ? `. Never reached: ${missing.slice(0, 5).map(n => JSON.stringify(n)).join(", ")}` +
+                                    (missing.length > 5 ? ` and ${missing.length - 5} more` : "") : "") + ". " +
                   "Look at the line AFTER the named assertion before rewriting the entry: a test " +
                   "that consumes the value it stubs usually dies on it rather than failing, and " +
                   "the fix is to let that line survive a wrong value" };

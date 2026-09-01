@@ -17,7 +17,7 @@ import { open as openGuardianStore } from "../src/db/ops.mjs";
 import { announceable } from "../src/daemon.mjs";
 import {
   FAILURE_TYPES, IDENTITY_SHAPES, PAGES, escalationKey, shapeOf, body,
-  assertHub, builderAnnounceable,
+  assertHub, builderAnnounceable, pages, announce,
 } from "../src/build/announce.mjs";
 
 let fail = 0;
@@ -216,6 +216,18 @@ const hubPath = join(dir, "state", "hub.db");
 const hub = openHub(hubPath);
 const guardian = openGuardianStore(join(dir, "guardian.db"));
 
+// A HUB PER BLOCK. Sharing one made every block's meaning depend on the block
+// before it: a cause already standing is correctly not re-announced, and a pass
+// that makes no coverage claim correctly retires everything absent -- so an
+// assertion about "two paged" quietly became an assertion about execution order,
+// and it would have passed or failed on where the block was moved to.
+let hubSeq = 0;
+const freshHub = () => {
+  const d = join(dir, `h${++hubSeq}`);
+  mkdirSync(d, { recursive: true });
+  return openHub(join(d, "hub.db"));
+};
+
 {
   // --- the guardian half: already true, asserted rather than built ----------
   const guest = openHubAsGuest(hubPath);
@@ -265,6 +277,7 @@ const guardian = openGuardianStore(join(dir, "guardian.db"));
 
 // ── arrival, change, and silence in between ────────────────────────────────
 {
+  const hub = freshHub();
   const key = escalationKey({ task: "bt:01AA", kind: "phase:blocked", phase: "RESEARCH" });
   const first = builderAnnounceable(hub, new Map([[key, 1]]), { at: NOW, isAlive: ALIVE });
   check(first.fresh.length === 1 && first.fresh[0].why === key,
@@ -289,6 +302,7 @@ const guardian = openGuardianStore(join(dir, "guardian.db"));
 // examine a task produces no escalation for it, and retiring the cause on that
 // silence announces "resolved" for something nobody looked at.
 {
+  const hub = freshHub();
   const key = escalationKey({ task: "bt:01BB", kind: "infeasible" });
   builderAnnounceable(hub, new Map([[key, 1]]), { at: NOW, isAlive: ALIVE });
   check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 1,
@@ -310,6 +324,7 @@ const guardian = openGuardianStore(join(dir, "guardian.db"));
 
 // ── a process-scoped cause needs a COMPLETE pass ───────────────────────────
 {
+  const hub = freshHub();
   const key = escalationKey({ kind: "backup:failed" });
   builderAnnounceable(hub, new Map([[key, 1]]), { at: NOW, isAlive: ALIVE });
   const partial = builderAnnounceable(hub, new Map(), {
@@ -326,6 +341,7 @@ const guardian = openGuardianStore(join(dir, "guardian.db"));
 
 // ── it writes, so it asks whether the hub is being replaced ────────────────
 {
+  const hub = freshHub();
   let noPredicate = null;
   try { builderAnnounceable(hub, new Map(), { at: NOW }); } catch (e) { noPredicate = e.kind; }
   check(noPredicate === "not_writable",
@@ -354,6 +370,153 @@ const guardian = openGuardianStore(join(dir, "guardian.db"));
     JSON.stringify(reaped));
   check(hub.prepare("SELECT count(*) c FROM maintenance_lock WHERE name='restore'").get().c === 0,
     "control: the stale lock is gone");
+}
+
+
+// ── an escalation is not a page ────────────────────────────────────────────
+//
+// Fail-closed is never fail-quiet, and those are two different sentences. Every
+// identity stays a durable row that stops work and is read by dash and why;
+// only the page list interrupts a human. Escalating everything is not the safe
+// end of the trade -- it is measurably worse than the optimum, and it is
+// attackable, because a channel that pushes for everything is muted within days
+// and is then worse than none.
+{
+  check(PAGES.every(p => IDENTITY_SHAPES.includes(p)),
+    "every page names a declared identity, so a page cannot fire for a situation nothing raises",
+    PAGES.join(", "));
+
+  const PAGED_KEYS = ["builder:backup:failed", "bt:7:phase:blocked:RESEARCH"];
+  for (const k of PAGED_KEYS) check(pages(k), `${k} pages`, k);
+
+  // ENUMERATED from IDENTITY_SHAPES rather than retyped, so an identity added
+  // without a decision about paging shows up here as a failure and not as
+  // silence.
+  const asKey = (sh) => sh.replace("<id>", "7").replace("<phase>", "RESEARCH");
+  const notPaged = IDENTITY_SHAPES.map(asKey).filter(k => !PAGED_KEYS.includes(k));
+  check(notPaged.length === 8, `and eight do not (got ${notPaged.length})`, notPaged.join(", "));
+  for (const k of notPaged) check(!pages(k), `${k} does not page`, k);
+
+  // The templated entry matches by SHAPE. A page list of literal keys would fire
+  // for exactly one task id and send every other blocked task to the digest in
+  // silence.
+  check(pages("bt:99:phase:blocked:SIZING") && pages("bt:1:phase:blocked:DESIGN"),
+    "the templated entry pages for any task and any phase");
+  check(!pages("bt:7:phase:failed:RESEARCH"),
+    "control: failed is not blocked, and the two are one word apart in the shape list");
+  check(!pages("bt:7:phase:blocked"),
+    "control: and a shape missing its phase does not match, which a startsWith would");
+}
+
+// ── every identity is durable; only the page list is dispatched ────────────
+{
+  const hub = freshHub();
+  const sent = [];
+  const send = (a) => { sent.push(a); return { ok: true, channels: [{ name: "test", ok: true, ref: "r1" }] }; };
+  const NOW2 = 1_800_002_000;
+
+  const esc = new Map([
+    [escalationKey({ task: "bt:0A", kind: "phase:blocked", phase: "RESEARCH" }), 1],  // pages
+    [escalationKey({ kind: "backup:failed" }), 1],                                    // pages
+    [escalationKey({ task: "bt:0A", kind: "infeasible" }), 3],                        // digest
+    [escalationKey({ task: "bt:0B", kind: "spec:reopened" }), 1],                     // digest
+  ]);
+  const r = announce(hub, { escalations: esc, at: NOW2, isAlive: ALIVE, send, profile: {} });
+
+  check(hub.prepare("SELECT count(*) c FROM escalation").get().c === 4,
+    "all four identities become durable rows: nothing stops being recorded",
+    JSON.stringify(hub.prepare("SELECT why FROM escalation").all().map(x => x.why)));
+  check(r.paged.length === 2, `two paged (got ${r.paged.length})`, JSON.stringify(r.paged));
+  check(r.digested.length === 2, `and two digested (got ${r.digested.length})`, JSON.stringify(r.digested));
+  check(r.declined.length === 0, "and none declined, because the sender accepted both",
+    JSON.stringify(r.declined));
+  check(sent.length === 2, "the sender was called exactly twice", String(sent.length));
+  check(sent.every(a => /blocked|backup/.test(a.message)),
+    "for the two on the page list and no others", JSON.stringify(sent.map(a => a.message)));
+
+  // CONTROL: "not paged" must not mean "not reported". That would be fail-quiet,
+  // which is the one outcome this design may not produce.
+  const durable = hub.prepare("SELECT why FROM escalation").all().map(x => x.why);
+  // ONE assertion over the whole set rather than one per row. A loop over a
+  // RESULT costs a different number of assertions when the result changes, and a
+  // run that reports fewer assertions than its control is indistinguishable from
+  // one that died half way -- which is precisely the reading the stub sweep uses
+  // to decide whether a measurement happened at all.
+  check(r.digested.length > 0 && r.digested.every(d => durable.includes(d.why)),
+    "every digested identity is in the store for dash and why to read, so not-paged " +
+    "never means not-reported",
+    `digested ${JSON.stringify(r.digested.map(d => d.why))} / durable ${durable.join(",")}`);
+}
+
+// ── a page that could not be delivered is neither paged nor silent ─────────
+{
+  const hub = freshHub();
+  const NOW3 = 1_800_003_000;
+  const key = escalationKey({ task: "bt:0C", kind: "phase:blocked", phase: "SIZING" });
+
+  const refusing = () => ({ ok: false, why: "no ntfy credential on this machine" });
+  const r = announce(hub, { escalations: new Map([[key, 1]]), at: NOW3, isAlive: ALIVE,
+                            send: refusing });
+  check(r.paged.length === 0, "a refused send is not reported as paged", JSON.stringify(r.paged));
+  check(r.declined.length === 1 && r.declined[0].why === key,
+    "it is DECLINED, so a page that was owed and did not go out is visible",
+    JSON.stringify(r.declined));
+  check(/ntfy credential/.test(r.declined[0]?.not_sent ?? ""),
+    "carrying the sender's own reason rather than a generic one",
+    JSON.stringify(r.declined[0] ?? null));
+  check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 1,
+    "and the escalation still stands in the store, because recording never depended on the send");
+
+  // A THROWN sender is the same fact to a reader who needs to know a human was
+  // not reached, and it must not escape as an exception that loses the rest.
+  const hub2 = freshHub();
+  const key2 = escalationKey({ kind: "backup:failed" });
+  const throwing = () => { throw new Error("osascript is not on this host"); };
+  const r2 = announce(hub2, { escalations: new Map([[key2, 1]]), at: NOW3, isAlive: ALIVE,
+                             send: throwing });
+  check(r2.declined.length === 1 && /osascript/.test(r2.declined[0]?.not_sent ?? ""),
+    "a sender that throws is declined with its message, not propagated",
+    JSON.stringify(r2.declined));
+  check(hub2.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key2).c === 1,
+    "control: and that row stands too");
+
+  let noSend = null;
+  try { announce(hub, { escalations: new Map(), at: NOW3, isAlive: ALIVE }); }
+  catch (e) { noSend = e.kind; }
+  check(noSend === "not_writable",
+    "announce refuses without a sender rather than defaulting one that silently succeeds",
+    String(noSend));
+}
+
+// ── clearing is dispatched too, for the identities that page ───────────────
+//
+// An operator who is only ever told about problems cannot tell "resolved" from
+// "reeve stopped looking". Computing `cleared` and never sending it implements
+// half of that sentence.
+{
+  const hub = freshHub();
+  const NOW4 = 1_800_004_000;
+  const sent = [];
+  const send = (a) => { sent.push(a); return { ok: true, channels: [] }; };
+  const paging = escalationKey({ task: "bt:0D", kind: "phase:blocked", phase: "DESIGN" });
+  const quiet = escalationKey({ task: "bt:0D", kind: "infeasible" });
+
+  announce(hub, { escalations: new Map([[paging, 1], [quiet, 1]]), at: NOW4,
+                  isAlive: ALIVE, send });
+  sent.length = 0;
+
+  const r = announce(hub, { escalations: new Map(), at: NOW4 + 60, isAlive: ALIVE, send,
+                            covered: new Set(["bt:0D"]) });
+  check(r.cleared.includes(paging) && r.cleared.includes(quiet),
+    "control: both causes cleared, because the pass examined their task", JSON.stringify(r.cleared));
+  check(sent.length === 1, "exactly one clearing was dispatched", JSON.stringify(sent.map(x => x.message)));
+  // OPTIONAL READS. The assertion above proves how many were sent; this one must
+  // still RUN when that number is zero, or a stub that stops the dispatch kills
+  // the file instead of failing this line, and the run reports fewer assertions
+  // than it has.
+  check(sent[0]?.kind === "cleared" && sent[0]?.message?.includes(paging) === true,
+    "and it is the one on the page list, marked as a clearing rather than a new alarm",
+    JSON.stringify(sent[0] ?? null));
 }
 
 hub.close();

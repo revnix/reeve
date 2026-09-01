@@ -120,8 +120,13 @@ by testing the claim.
   top-level keys and silently drops every nested one.
 - **S3-C.** If `runWorker` rejects rather than returning an outcome, the `finally` clears the
   heartbeat but never settles the run row.
-- **S3-C.** The unique-violation regex matches `index 'one_live_run'`; SQLite reports the
-  constrained columns instead, so the branch never fires.
+- **S3-C. NO LONGER AN ARGUMENT — MEASURED, and worse than stated.** The unique-violation
+  regex matches `index 'one_live_run'`; SQLite reports the constrained columns instead, so
+  the branch never fires. Confirmed on node v24.17.0 against the shipped `hub.sql`. What the
+  claim did not say: the PRIMARY KEY violation carries the SAME errcode 2067 and a message
+  CONTAINING `phase_run.task`, so matching the column instead of the index name conflates a
+  second live run with a re-recorded attempt — opposite remedies. The discriminator is the
+  anchored full column list, and each branch needs its own test. See trackers/s3.md §5.
 - **S3-D.** The done-condition regex accepts any fenced block, so a slice carrying a
   configuration snippet and no `Done when` reports a machine-checkable done-condition.
 - **S3-F.** A `phase_run` fixture inserts rows for a task the database has no parent row for,

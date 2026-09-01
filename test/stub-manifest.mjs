@@ -1374,9 +1374,9 @@ export const STUBS = [
   },
   {
     name: "task-file-dry-run-refuses-a-newer-hub-unopened",
-    why: "fall through to `openHub` for a hub whose contiguous history is NEWER than this binary. It is missing none of what this binary expects and has no hole, so `missing` and `holed` both say nothing is wrong -- and openHub's first acts are `PRAGMA journal_mode = WAL` and the schema_version DDL. Both are writes, to a database written by a newer binary, from the command whose entire promise here is that it writes nothing. openHub does refuse it, but only afterwards",
+    why: "let a hub whose contiguous history is NEWER than this binary through the dry-run guard. It is missing none of what this binary expects and has no hole, so `missing` and `holed` both say nothing is wrong. The write that used to follow is now prevented by the read-only handle, so what this guard uniquely does is REFUSE: without it the command proceeds against a store written by a binary whose migrations it cannot interpret, and the operator is told nothing about why the answer is wrong",
     test: "test/migration-history.test.mjs",
-    expectRed: "and leaves it byte-identical, which is the whole promise of --dry-run",
+    expectRed: "the route refuses a hub NEWER than this binary and names the remedy",
     edits: [{ file: "bin/reeve",
               find: "        if (hist.version > HUB_SCHEMA_VERSION) {",
               replace: "        if (false && hist.version > HUB_SCHEMA_VERSION) {" }],

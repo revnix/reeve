@@ -943,7 +943,24 @@ switch (cmd) {
            { exit: EXITS.misuse });
 
     const { notify } = await import("../src/notify.mjs");
-    const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
+    // AT MOST ONE ARGUMENT, AND IT HAS TO LOOK LIKE A REPOSITORY. `positionals
+    // .find` scans for the first token that matches and discards the rest, so
+    // `notify --test owner/repo/` matched nothing, fell through to `detectNwo()`
+    // and sent through THIS checkout's profile instead of refusing -- and a
+    // second repository argument was dropped in silence. For the one route here
+    // that sends, a typo quietly becoming "the current repository" is the wrong
+    // default: it is the same mistake as the profile mismatch above, arriving
+    // through the argument rather than through the lookup.
+    const REPO = /^[\w.-]+\/[\w.-]+$/;
+    const stray = positionals.filter(a => !REPO.test(a));
+    if (stray.length || positionals.length > 1)
+      fail("usage",
+           `reeve notify: ${JSON.stringify(positionals)} is not a single owner/repo.\n` +
+           `-> refusing rather than falling back to this checkout: a mistyped repository would ` +
+           `otherwise send a test through a profile you did not name\n` +
+           `-> usage: reeve notify --test [owner/repo] [--json]`,
+           { exit: EXITS.misuse });
+    const nwo = positionals[0] || detectNwo();
     if (!nwo)
       fail("usage", "reeve notify: no repo. Pass owner/repo or run inside a git checkout.",
            { exit: EXITS.misuse });

@@ -1651,7 +1651,7 @@ export const STUBS = [
     expectRed: "and clearing one appends escalation.cleared",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "      hubEvent(db, { kind: \"escalation.cleared\", task: /^bt:/.test(why) ? subject : null,\n                     payload: { why } });",
+      find: "  hubEvent(db, { kind: \"escalation.cleared\",\n                 task: /^bt:/.test(why) ? subjectOf(why) : null, payload: { why } });",
       replace: "",
     }],
   },
@@ -1675,6 +1675,51 @@ export const STUBS = [
       file: "bin/reeve",
       find: "    const declared = profile?.identity?.key;\n    if (declared && declared !== nwo)",
       replace: "    const declared = null;\n    if (declared && declared !== nwo)",
+    }],
+  },
+
+  {
+    name: "a-clearing-waits-for-its-notification",
+    why: "delete a paged cause's row before its recovery has been delivered. The raise path was already taught to hold `announced_count` until a send landed; the clear path destroyed the only durable record that a clearing was owed, so a channel down for a single pass lost the recovery permanently — the next pass had no standing cause left to classify as cleared. An operator who is only ever told about problems cannot tell resolved from stopped-looking, which is the whole reason clearing is announced at all",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "control: and the row still stands, because nothing has been told yet",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "      if (pages(why)) { clearable.push(why); continue; }",
+      replace: "      if (false) { clearable.push(why); continue; }",
+    }],
+  },
+  {
+    name: "an-alert-is-sanitised-before-it-leaves-the-machine",
+    why: "interpolate an escalation body into the outbound message unsanitised. A body carries externally sourced text — CI output, a pathname, a validation error — and the dispatcher is the last point before it leaves the host. `buildAlert` applies redact(printable(...)) and `notify` itself does not, so a second producer of alerts is a second place the boundary has to be applied: without it a control character can forge a rendered alert and an echoed credential leaves the machine",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "control characters are neutralised before the message leaves",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    const message = redact(printable(raw));",
+      replace: "    const message = raw;",
+    }],
+  },
+  {
+    name: "every-alert-names-the-action-that-changes-it",
+    why: "send a page carrying only the identity. The design requires every alert to name the single founder action needed, and a page read at night without the one command that changes it is a notification the reader can only file away — a channel whose alerts cannot be acted on is one that gets muted, which is the outcome the closed page list exists to avoid",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "and the rendered alert carries it, which is the only place a phone shows it",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "        `${action ? `\\n-> ${action}` : \"\"}`;",
+      replace: "        \"\";",
+    }],
+  },
+  {
+    name: "notify-test-refuses-a-malformed-repository",
+    why: "scan the positionals for the first token that looks like a repository and discard the rest. A typo then matches nothing, falls through to detectNwo() and sends the test through whatever checkout the operator is standing in — and a second repository argument is dropped in silence. For the one route here that SENDS, a mistyped repository quietly becoming 'the current one' is the same defect as the profile mismatch, arriving through the argument instead of through the lookup",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "notify --test owner/repo/ is refused rather than falling back to this checkout",
+    edits: [{
+      file: "bin/reeve",
+      find: "    if (stray.length || positionals.length > 1)",
+      replace: "    if (false)",
     }],
   },
 ];

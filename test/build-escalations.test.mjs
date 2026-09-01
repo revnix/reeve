@@ -19,7 +19,7 @@ import { announceable } from "../src/daemon.mjs";
 import { notify, readNtfyResponse } from "../src/notify.mjs";
 import {
   FAILURE_TYPES, IDENTITY_SHAPES, PAGES, escalationKey, shapeOf, body,
-  assertHub, builderAnnounceable, pages, announce, subjectOf,
+  assertHub, builderAnnounceable, pages, announce, subjectOf, ACTION_FOR, actionFor,
 } from "../src/build/announce.mjs";
 
 let fail = 0;
@@ -415,9 +415,14 @@ const freshHub = () => {
 
   const backupRan = builderAnnounceable(hub, new Map(), {
     at: NOW + 120, isAlive: ALIVE, examined: new Set(["builder:backup"]) });
-  check(backupRan.cleared.includes(key),
-    "and a pass in which the backup itself ran does retire it",
+  // CLEARABLE, NOT CLEARED. This identity pages, so its row stands until the
+  // recovery has actually been delivered; the reducer says it is retirable and
+  // `announce` retires it when the send lands.
+  check(backupRan.clearable.includes(key) && !backupRan.cleared.includes(key),
+    "and a pass in which the backup itself ran marks it retirable",
     JSON.stringify(backupRan));
+  check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 1,
+    "control: and the row still stands, because nothing has been told yet");
 }
 
 // ── it writes, so it asks whether the hub is being replaced ────────────────
@@ -736,6 +741,20 @@ const freshHub = () => {
 
   // The flag is scoped to this command. A flag whose entire meaning is "do not
   // treat this as real" is the most expensive one to accept and ignore.
+  // A MALFORMED REPOSITORY IS NOT "THIS ONE". `positionals.find` scanned for the
+  // first token matching the repo shape and discarded everything else, so a typo
+  // matched nothing, fell through to detectNwo() and sent through whatever
+  // checkout the operator happened to be standing in. For the one route that
+  // sends, that is the wrong default.
+  for (const bad of [["owner/repo/"], ["not-a-repo"], ["o/a", "o/b"]]) {
+    const r = cli("notify", "--test", ...bad);
+    check(r.status === 2,
+      `notify --test ${bad.join(" ")} is refused rather than falling back to this checkout`,
+      `rc=${r.status} ${r.out.slice(0, 160)}`);
+  }
+  check(cli("notify", "--test", "owner/repo").status === 3,
+    "control: one well-formed repository is accepted and reaches the channel check");
+
   const elsewhere = cli("task", "list", "--test", "--json");
   check(elsewhere.status === 2 && parse(elsewhere.stdout)?.kind === "flag_not_applicable",
     "--test is refused on a command that sends nothing, rather than ignored",
@@ -918,6 +937,98 @@ const freshHub = () => {
     (replaySrc.match(/.*escalation\.cleared.*/) ?? [""])[0]);
   check(/"escalation\.raised":\s*\{/.test(replaySrc),
     "control: and the raise handler it sits beside is still there");
+}
+
+
+// ── a clearing waits for its notification too ──────────────────────────────
+//
+// The raise path was taught to hold `announced_count` until a send landed, and
+// the clear path still deleted the row before dispatching. A channel down for a
+// single pass therefore lost the recovery permanently: the next pass had no
+// standing cause left to classify as cleared. The same rule belongs on both
+// sides — the durable state changes when the notification lands, not before.
+{
+  const hub = freshHub();
+  const key = escalationKey({ task: "bt:0A", kind: "phase:blocked", phase: "SIZING" });
+  const ok = () => ({ ok: true, channels: [] });
+  const refuse = () => ({ ok: false, why: "the channel is down" });
+
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send: ok });
+  check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 1,
+    "control: the cause is standing and has been paged");
+
+  const lost = announce(hub, { escalations: new Map(), at: NOW + 60, isAlive: ALIVE,
+                               send: refuse, examined: new Set(["bt:0A"]) });
+  check(lost.declined.length === 1 && lost.declined[0].kind === "cleared",
+    "a clearing whose send is refused is declined", JSON.stringify(lost.declined));
+  check(lost.cleared.length === 0, "and is NOT reported as cleared", JSON.stringify(lost.cleared));
+  check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 1,
+    "and the row still stands, so the recovery is still owed");
+
+  const landed = announce(hub, { escalations: new Map(), at: NOW + 120, isAlive: ALIVE,
+                                 send: ok, examined: new Set(["bt:0A"]) });
+  check(landed.cleared.includes(key),
+    "the next pass offers it again and retires it once the send lands",
+    JSON.stringify(landed.cleared));
+  check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 0,
+    "control: and only now is the row gone");
+}
+
+// ── every alert says what to do about it ───────────────────────────────────
+//
+// An identity says what happened. A page read at night without the one command
+// that changes it is a notification the reader can only file away, and a channel
+// whose alerts cannot be acted on is one that gets muted.
+{
+  check(IDENTITY_SHAPES.every(sh => typeof ACTION_FOR[sh] === "string" && ACTION_FOR[sh].length > 0),
+    "every declared identity names the single action that changes it",
+    IDENTITY_SHAPES.filter(sh => !ACTION_FOR[sh]).join(", "));
+  check(Object.keys(ACTION_FOR).every(k => IDENTITY_SHAPES.includes(k)),
+    "and the action map names no identity that does not exist",
+    Object.keys(ACTION_FOR).filter(k => !IDENTITY_SHAPES.includes(k)).join(", "));
+  check(actionFor("bt:7:phase:blocked:RESEARCH") === ACTION_FOR["bt:<id>:phase:blocked:<phase>"],
+    "control: a concrete key resolves to its shape's action", String(actionFor("bt:7:phase:blocked:RESEARCH")));
+  check(actionFor("bt:7:not:declared") === null,
+    "and an undeclared key resolves to none rather than to something near it");
+
+  const hub = freshHub();
+  const sent = [];
+  const send = (a) => { sent.push(a); return { ok: true, channels: [] }; };
+  const key = escalationKey({ task: "bt:0B", kind: "phase:blocked", phase: "RESEARCH" });
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send });
+  check(/reeve task why/.test(sent[0]?.message ?? ""),
+    "and the rendered alert carries it, which is the only place a phone shows it",
+    JSON.stringify(sent[0]?.message ?? null));
+}
+
+// ── nothing leaves the machine unsanitised ─────────────────────────────────
+//
+// A body carries externally sourced text — CI output, a pathname, a validation
+// error — and the dispatcher is the last point before it leaves. `buildAlert`
+// applies `redact(printable(...))`; `notify` itself does not, so a second
+// producer of alerts is a second place the boundary has to be applied.
+{
+  const hub = freshHub();
+  const sent = [];
+  const send = (a) => { sent.push(a); return { ok: true, channels: [] }; };
+  const key = escalationKey({ kind: "backup:failed" });
+  const nasty = body({ type: "FAILED",
+    // A control character that forges a line, and a credential shape.
+    detail: "line one\u0007\u001b[2Kforged: OK  token ghp_" + "A".repeat(24) });
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                  bodies: new Map([[key, nasty]]) });
+
+  const msg = sent[0]?.message ?? "";
+  check(msg.length > 0, "control: an alert was produced", JSON.stringify(msg.slice(0, 60)));
+  check(!new RegExp("[\\u0000-\\u0008\\u000b-\\u001f]").test(msg),
+    "control characters are neutralised before the message leaves",
+    JSON.stringify(msg));
+  check(!/ghp_A{20,}/.test(msg) && /redacted/.test(msg),
+    "and a credential shape is redacted rather than sent", JSON.stringify(msg));
+  // CONTROL: sanitising is not deleting. The parts that are not dangerous still
+  // arrive, or an operator gets a clean message that says nothing.
+  check(/line one/.test(msg) && /FAILED/.test(msg),
+    "control: and the legitimate detail still arrives", JSON.stringify(msg));
 }
 
 hub.close();

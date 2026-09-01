@@ -9,7 +9,8 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { openHub } from "../src/build/hubdb.mjs";
+import { openHub, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
+import { DatabaseSync } from "node:sqlite";
 import { fileTask } from "../src/build/taskfile.mjs";
 import { isSameProcess, readStart } from "../src/supervisor.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
@@ -209,7 +210,7 @@ const T = {};
   const FIVE = ["alive", "doing", "waiting_on_you", "since_you_looked", "declined"];
   for (const k of FIVE) check(k in m, `the digest answers "${k}"`, Object.keys(m).join(","));
   const SUPPORTING = ["format_version", "generated_at", "projects", "switches", "tasks",
-                      "since", "next_cursor"];
+                      "since", "next_cursor", "cursor_rewound"];
   const extra = Object.keys(m).filter(k => !FIVE.includes(k) && !SUPPORTING.includes(k));
   check(extra.length === 0,
     "and nothing else, so the digest cannot grow a sixth question quietly", extra.join(","));
@@ -607,21 +608,51 @@ const T = {};
   const text = renderDash(m);
   const EXCLUDED = {
     waiting_on_you: { project: "the row names the task; the project is on its `tasks` entry" },
-    doing: { project: "same", running: "rendered as its phase/slice/attempt, not as an object",
-             age: "rendered as `in state Ns`, not as an object" },
+    doing: { project: "same",
+             "running.slice": "rendered as part of `phase/slice`, not on its own",
+             "age.from": "which clock produced the figure; `show` and `why` carry the provenance" },
     declined: { last_seen_at: "a timestamp the render formats elsewhere",
                 scope: "rendered as the key's own shape: a `builder:` prefix or a task id",
                 project: "the row names the task" },
     since_you_looked: { seq: "the cursor, handed back as `next_cursor` rather than per row" },
   };
+  // DESCENDS into nested objects, naming leaves by dotted path. A container in
+  // the exclusion list exempts everything inside it, which is precisely how
+  // `running.drift` stayed invisible: `doing.running` was excused as "rendered as
+  // phase/slice/attempt" and the drift warning rode along inside the excuse.
+  const leaves = (obj, prefix = "") => Object.entries(obj).flatMap(([k, v]) => {
+    const path = prefix ? `${prefix}.${k}` : k;
+    if (v && typeof v === "object" && !Array.isArray(v)) return leaves(v, path);
+    return [[path, v]];
+  });
   const missing = [];
   for (const section of Object.keys(EXCLUDED))
     for (const row of m[section])
-      for (const [k, v] of Object.entries(row)) {
+      for (const [k, v] of leaves(row)) {
         if (k in EXCLUDED[section]) continue;
         if (v === null || v === undefined || v === "" || typeof v === "object") continue;
         if (!text.includes(String(v))) missing.push(`${section}.${k}=${JSON.stringify(v)}`);
       }
+
+  // AND THE TOP-LEVEL SCALARS. The guard walked row-shaped sections only, so a
+  // scalar the model promises -- `next_cursor`, which the operator needs to make
+  // the very next call -- could be carried in JSON and absent from the text with
+  // nothing noticing.
+  const TOP_EXCLUDED = {
+    format_version: "the envelope's, not the digest's; `--json` carries it",
+    generated_at: "a timestamp the render does not repeat",
+    since: "echoed only when it is a rewound cursor, where it is the finding",
+    cursor_rewound: "rendered as the words CURSOR REWOUND",
+  };
+  const topMissing = [];
+  for (const [k, v] of Object.entries(m)) {
+    if (k in TOP_EXCLUDED || Array.isArray(v) || (v && typeof v === "object")) continue;
+    if (v === null || v === undefined || v === "") continue;
+    if (!text.includes(String(v))) topMissing.push(`${k}=${JSON.stringify(v)}`);
+  }
+  check(topMissing.length === 0,
+    "every top-level scalar the digest carries reaches the human render",
+    `not rendered: ${topMissing.join(", ")}`);
   check(missing.length === 0,
     "every value a digest row carries into the model reaches the human render",
     `not rendered: ${missing.join(", ")}\n        ` +
@@ -639,6 +670,82 @@ const T = {};
   }
   check(probe.length === 1 && probe[0] === "ghost_field",
     "counter-control: a value the render does NOT contain is reported missing", JSON.stringify(probe));
+}
+
+
+// ── a cursor from a hub that no longer exists ──────────────────────────────
+//
+// `phase_event.seq` is monotonic WITHIN one hub, not across a restore. Replacing
+// the store with an older snapshot puts the high-water mark below a cursor issued
+// before it, and every later transition is then `seq <= since` -- reading as
+// "nothing moved" for ever, while the digest hands back a smaller cursor the
+// client dutifully saves. Nothing readable after the fact distinguishes that from
+// a genuinely quiet period, which is why it is reported rather than inferred.
+{
+  const high = dash({ since: 0 }).next_cursor;
+  check(high > 0, "control: the log has a high-water mark", String(high));
+
+  const ok = dash({ since: high - 1 });
+  check(ok.cursor_rewound === false,
+    "control: a cursor within the log is not rewound", JSON.stringify(ok.cursor_rewound));
+  check(ok.since_you_looked.length > 0,
+    "and it returns what moved after it", String(ok.since_you_looked.length));
+
+  const ahead = dash({ since: high + 1000 });
+  check(ahead.cursor_rewound === true,
+    "a cursor AHEAD of the log is reported rewound, not answered with an empty list",
+    JSON.stringify({ since: high + 1000, next: ahead.next_cursor }));
+  check(ahead.since_you_looked.length === 0,
+    "the movement list is empty, because it cannot be computed", JSON.stringify(ahead.since_you_looked));
+  check(ahead.next_cursor === high,
+    "and the cursor handed back is this hub's own high-water mark, to resync from",
+    String(ahead.next_cursor));
+  check(/CURSOR REWOUND/.test(renderDash(ahead)),
+    "and the text says so rather than printing a silent zero",
+    renderDash(ahead).split("\n").find(l => /since you looked/.test(l)));
+
+  // A cursor EXACTLY at the high-water mark is not rewound: nothing has moved,
+  // which is a real answer and must not be confused with the broken one.
+  const level = dash({ since: high });
+  check(level.cursor_rewound === false && level.since_you_looked.length === 0,
+    "control: a cursor exactly at the mark is quiet, not rewound",
+    JSON.stringify({ rewound: level.cursor_rewound, n: level.since_you_looked.length }));
+}
+
+// ── the cursor an operator needs next is in the TEXT ───────────────────────
+{
+  const m = dash();
+  check(m.since === null, "control: this digest was given no cursor", String(m.since));
+  check(renderDash(m).includes(`--since ${m.next_cursor}`),
+    "the first invocation prints the cursor to use next, so the follow-up call needs no JSON",
+    renderDash(m).split("\n").filter(l => /next:/.test(l)).join(" | "));
+}
+
+// ── a drifted run is not an ordinary one, in the digest either ─────────────
+{
+  const dr = (await file({ title: "a drifted run", territory: ["packages/dr"] })).task;
+  setPhase(dr, "RESEARCH");
+  db.prepare(`INSERT INTO phase_run(task,generation,phase,slice,attempt,status,pid,lstart,started_at,
+                                    heartbeat_at,lease_expires_at,out_path,err_path,contract_drift)
+              VALUES(?,1,'RESEARCH',0,1,'live',400,'L',?,?,?,'/o','/e','drift-zq')`)
+    .run(dr, NOW - 100, NOW - 10, NOW + 600);
+
+  const m = dash();
+  const row = m.doing.find(x => x.id === dr);
+  check(row?.running?.drift === "drift-zq",
+    "control: the model carries the drift on the running object", JSON.stringify(row?.running));
+  const line = renderDash(m).split("\n").find(l => l.includes(dr) && /running/.test(l));
+  check(line && /DRIFT/.test(line),
+    "and the digest's own row says DRIFT, so a drifted run is not presented as current",
+    JSON.stringify(line));
+
+  // CONTROL: a run whose contract matched says nothing, or DRIFT is decoration
+  // rather than a warning.
+  db.prepare("UPDATE phase_run SET contract_drift = NULL WHERE task = ?").run(dr);
+  const clean = renderDash(dash()).split("\n").find(l => l.includes(dr) && /running/.test(l));
+  check(clean && !/DRIFT/.test(clean),
+    "control: and a run whose contract matched does not", JSON.stringify(clean));
+  db.prepare("DELETE FROM phase_run WHERE task = ?").run(dr);
 }
 
 // ── the CLI ──────────────────────────────────────────────────────────────────
@@ -678,6 +785,56 @@ const T = {};
       (help.stdout.match(/.*task .*/g) ?? []).slice(0, 6).join(" | "));
   check(help.stdout.includes("--since"),
     "and names --since, which nothing else advertises", (help.stdout.match(/.*--since.*/) ?? [""])[0]);
+
+  // A HUB THAT FAILS AT QUERY TIME IS A TYPED REFUSAL, not a stack trace. The
+  // schema-version guard reads `schema_version` and nothing else, so a store
+  // whose other tables are gone passes it and dies on the first real query --
+  // which for this route is the project prefilter, before the model is built.
+  {
+    const rotten = join(dir, "rotten", ".reeve");
+    mkdirSync(join(rotten, "state"), { recursive: true });
+    const r0 = new DatabaseSync(join(rotten, "state", "hub.db"));
+    r0.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, at INTEGER NOT NULL)");
+    for (let v = 1; v <= HUB_SCHEMA_VERSION; v++)
+      r0.prepare("INSERT INTO schema_version(version,at) VALUES(?,1)").run(v);
+    r0.close();
+
+    const r = spawnSync(process.execPath, [BIN, "task", "dash", "--home", rotten, "--json"],
+      { encoding: "utf8", timeout: 60_000 });
+    const both = (r.stdout ?? "") + (r.stderr ?? "");
+    check(parse(r.stdout ?? "")?.kind === "hub_unreadable",
+      "a hub that fails at query time is a typed refusal from the dash too", both.slice(0, 260));
+    check(!/ at .*\.mjs:/.test(both) && !/^\s*(Error|TypeError)\b/m.test(both),
+      "and no stack trace reaches the operator", both.slice(0, 260));
+    // CONTROL: the healthy hub still answers, so the refusal is about the store
+    // rather than about the route being broken.
+    check(parse(cli("task", "dash", "--json").stdout)?.kind === "task.dash",
+      "control: a healthy hub still answers");
+  }
+
+  // A REWOUND CURSOR EXITS DEGRADED. The answer is still printed -- it carries
+  // the cursor to resync from -- but a script polling this must not read a
+  // restore as a quiet period, and the exit status is what it can branch on.
+  const rew = cli("task", "dash", "--since", "999999999", "--json");
+  check(parse(rew.stdout)?.data?.cursor_rewound === true,
+    "the CLI reports a rewound cursor", rew.out.slice(0, 200));
+  check(rew.status === 3,
+    "and exits DEGRADED, so a poller cannot mistake a restore for nothing having moved",
+    `rc=${rew.status}`);
+  check(cli("task", "dash", "--json").status === 0,
+    "control: an ordinary digest still exits ok");
+
+  // The local usage line and the global help must name the same thing. Advertising
+  // `<unix>` invited passing a timestamp, which is a valid integer far above any
+  // sequence -- so the digest answered "nothing moved" and looked correct.
+  const localHelp = cli("task", "nonsense");
+  check(/--since <cursor>/.test(localHelp.out) && !/--since <unix>/.test(localHelp.out),
+    "the local usage line calls --since a cursor, not a timestamp",
+    (localHelp.out.match(/.*--since.*/) ?? [""])[0]);
+  const g = cli("--help");
+  check(/--since <cursor>/.test(g.stdout),
+    "and the global help says the same word for the same thing",
+    (g.stdout.match(/.*--since.*/) ?? [""])[0]);
 
   const wrong = cli("task", "list", "--since", String(NOW), "--json");
   check(parse(wrong.stdout)?.kind === "flag_not_applicable" && wrong.status === 2,

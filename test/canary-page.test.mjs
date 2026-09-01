@@ -1,0 +1,113 @@
+// A sandbox canary that failed must reach a phone, and must keep standing.
+//
+// The founder's page list names three identities that may interrupt a human. Two
+// are raised somewhere. `builder:sandbox:canary-failed` existed only inside a
+// comment in `build/dash.mjs`: nothing minted it, so the one condition under
+// which NOTHING may dispatch reached the daily digest and never a phone.
+//
+// The assertions here are about the tick, driven through the real `tick()` with
+// a real store, because the defect was never in a function that could be called
+// in isolation -- it was that no caller raised anything. A unit test over a
+// helper would have passed against the broken tree.
+//
+// THE STANDING HALF IS THE HALF THAT IS EASY TO GET WRONG. Containment is
+// measured only when a worker task actually wants dispatching, so a quiet tick
+// runs no canary at all -- and `announceable` treats an escalation absent from a
+// complete tick as resolved. An escalation raised only where the measurement
+// happens would therefore announce CLEARED on the next quiet tick, for a sandbox
+// nobody re-measured. That is why several of these run more than one tick.
+import { run } from "./fixtures/tick-harness.mjs";
+
+let fail = 0;
+const check = (ok, name, detail) => {
+  console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+  if (!ok) { if (detail) console.log("        " + detail); fail++; }
+};
+
+const PAGE = "builder:sandbox:canary-failed";
+// The verdict shape the daemon really receives: `measureContainment` returns the
+// canary's own result beside the credential answer. A fixture carrying only
+// `credentialRead` cannot exhibit anything here.
+const openWith = (canary) => ({ credentialRead: "open", why: `sandbox canary ${canary.id} failed: ${canary.why}`,
+                                canary, keychain: { measured: true, items: [], why: null } });
+// Takes either a run() result or a single tick's result, so a multi-tick
+// scenario can ask the same question of one tick as of the last.
+const has = (x, key) => [...((x.r ?? x).escalations?.keys?.() ?? [])].some(k => k.startsWith(key));
+
+// ── the control comes first ───────────────────────────────────────────────────
+//
+// Its expected answer is an ABSENCE, and an absence proves nothing on its own:
+// a harness that never reaches the canary branch at all would satisfy it. It is
+// here so the positive cases below are known to be measuring the difference
+// between a passing canary and a failing one, rather than the difference between
+// a wired fixture and an unwired one.
+{
+  const out = await run({ containment: { credentialRead: "closed", why: "contained",
+                                         canary: { ok: true, id: "cn-1", why: null },
+                                         keychain: { measured: true, items: [], why: null } } });
+  check(!has(out, PAGE), "control: a canary that PASSED raises no page",
+    `escalations were: ${out.esc}`);
+}
+
+// ── a canary that ran and failed pages ────────────────────────────────────────
+{
+  const out = await run({ containment: openWith({ ok: false, id: "cn-2", why: "the worker read the decoy" }) });
+  check(has(out, PAGE), "a canary that ran and FAILED raises the page identity",
+    `escalations were: ${out.esc}`);
+  check(out.esc.includes("cn-2"),
+    "the page names WHICH canary failed, so a second failure under a new policy is a new page",
+    `escalations were: ${out.esc}`);
+  check(out.log.includes("the worker read the decoy"),
+    "the REASON is in the log rather than in the key, because the key is what the phone renders",
+    "a reason that moves between runs of one broken sandbox would retire and re-raise the same fault");
+}
+
+// ── and it STANDS across a tick that measured nothing ─────────────────────────
+{
+  // Two ticks against one ctx. The second carries no canary in its verdict --
+  // exactly what a tick that wanted no worker produces -- so it re-raises from
+  // the standing value or it does not raise at all.
+  const out = await run({ containment: openWith({ ok: false, id: "cn-3", why: "no sandbox" }), ticks: 2 });
+  check(out.all.length === 2, "control: two ticks really ran", `ran ${out.all.length}`);
+  check(has(out, PAGE),
+    "the page still stands on a second tick, so a quiet tick cannot announce it CLEARED",
+    `second tick's escalations were: ${out.esc}`);
+}
+
+// ── a canary that PASSES afterwards clears it ─────────────────────────────────
+//
+// Clearing has to be possible, or the identity is a latch a human can only
+// silence by restarting the daemon -- and an operator who is never told a fault
+// is over cannot tell "resolved" from "reeve stopped looking".
+{
+  const failed = { ok: false, id: "cn-4", why: "the worker read the decoy" };
+  const contained = { credentialRead: "closed", why: "contained",
+                      canary: { ok: true, id: "cn-4", why: null },
+                      keychain: { measured: true, items: [], why: null } };
+  // ONE VERDICT PER TICK: it fails, then the same canary passes.
+  const out = await run({ containment: [openWith(failed), contained], ticks: 2 });
+  check(has(out.all[0], PAGE), "control: the first tick really did raise it, so the clear below is a change",
+    `first tick's escalations were: ${[...(out.all[0].escalations?.keys?.() ?? [])].join(" | ")}`);
+  check(!has(out, PAGE), "a canary that passes afterwards clears the page",
+    `escalations after the passing tick were: ${out.esc}`);
+}
+
+// ── the two cases that are NOT a failed sandbox ───────────────────────────────
+{
+  const skipped = await run({ containment: openWith({ ok: false, id: "cn-5", why: "not run: containment is already open for a cheaper reason", skipped: true }) });
+  check(!has(skipped, PAGE),
+    "a SKIPPED canary raises no page: it never ran, and the fault is the cheaper reason",
+    `escalations were: ${skipped.esc}`);
+
+  const noId = await run({ containment: openWith({ ok: false, id: null, why: "no CLI version or sandbox block to run a canary under" }) });
+  check(!has(noId, PAGE),
+    "a canary with no id raises no page: there was nothing to run one under, which is not a sandbox that stopped containing",
+    `escalations were: ${noId.esc}`);
+  // ...and the generic identity still covers both, so neither goes unsaid.
+  check([...(noId.r.escalations?.keys?.() ?? [])].some(k => k === "guardian:containment:open"),
+    "control: dispatch is still refused and said, by the generic containment identity",
+    `escalations were: ${noId.esc}`);
+}
+
+console.log(fail ? `\nfailed=${fail}` : "\nall green");
+process.exit(fail ? 1 : 0);

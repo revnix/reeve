@@ -2224,6 +2224,50 @@ export async function tick(ctx) {
       if (canaryLease) releaseWithRetry(`canary:${nwo}`, canaryLease);
     }
   }
+  // A FAILED CANARY IS ITS OWN PAGE, and it stands until one passes.
+  //
+  // `guardian:containment:open` below says dispatch is blocked. It does not say
+  // WHY, and the reasons take different remedies: a GitHub credential in the
+  // login keychain is removed by hand, a host that is not isolated is a profile
+  // change, and a canary that RAN and failed means the sandbox policy no longer
+  // contains a worker on this machine. The founder's page list names the third
+  // separately for that reason, and until now nothing minted it -- the identity
+  // existed only in a comment in `build/dash.mjs`, so the condition under which
+  // nothing may dispatch reached the digest rather than a phone.
+  //
+  // ON ctx, not only in this tick's map. Containment is measured only when a
+  // worker task actually wants dispatching, so a quiet tick runs no canary and
+  // produces no escalation -- and `announceable` reads absence within a complete
+  // tick as resolved, so the next quiet tick would announce CLEARED for a sandbox
+  // nobody re-measured. The same shape as the backup failure below, for the same
+  // reason. It stands until a canary actually PASSES.
+  //
+  // SKIPPED IS NOT FAILED, and NO ID IS NOT FAILED EITHER. `skipped` means
+  // containment was already open for a cheaper reason, so the canary never ran;
+  // a null id means there was no CLI version or sandbox block to run one under.
+  // Both block dispatch and both are covered by the identity below. Neither is a
+  // sandbox that stopped containing a worker, and paging as though it were would
+  // send the founder to the policy over a missing binary.
+  //
+  // THE KEY IS THE PAGE. `buildAlert` renders the escalation key itself as the
+  // message body, so the key has to read as a sentence to a human holding a
+  // phone -- and it has to be STABLE, because `announceable` retires a key that
+  // changes and raises the new one, which is two pushes for one unchanged fault.
+  // The canary's `why` moves between runs of the same broken sandbox; its id does
+  // not, and it changes exactly when the CLI, the binary or the policy does,
+  // which is a genuinely new measurement worth saying again. So the id is in the
+  // key and the reason is in the log, the same split the backup path makes.
+  const canary = containment?.canary ?? null;
+  if (canary?.ok) ctx.canaryFailure = null;
+  else if (canary && !canary.skipped && canary.id != null) {
+    ctx.canaryFailure = `builder:sandbox:canary-failed: ${canary.id}`;
+    log(logPath, `containment: canary ${canary.id} FAILED — ${canary.why ?? "no reason recorded"}; nothing may dispatch until one passes`);
+  }
+  // RE-RAISED EVERY TICK while it stands, including on ticks that measured no
+  // canary at all. Raising it only where the measurement happens is what makes
+  // absence within a tick read as repair.
+  if (ctx.canaryFailure) raise(ctx.canaryFailure);
+
   if (execute && wanted.length && !skipDispatch && containment.credentialRead !== "closed") {
     log(logPath, `execute: NOT dispatching ${wanted.length} worker task(s) — worker containment is open: ${containment.why}`);
     raise("guardian:containment:open");

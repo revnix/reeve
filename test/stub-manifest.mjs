@@ -97,7 +97,6 @@ export const GRANDFATHERED = [
   "test/guardian-hub-allowlist.test.mjs",
   "test/guardian-provider-lease.test.mjs",
   "test/hub-backup-restore.test.mjs",
-  "test/hub-crosscheck.test.mjs",
   "test/hub-derived-schema.test.mjs",
   "test/hub-doctor.test.mjs",
   "test/hub-drills.test.mjs",
@@ -1202,5 +1201,14 @@ export const STUBS = [
     edits: [{ file: "src/build/providerdb.mjs",
               find: "  if (typeof evidence !== \"string\" || evidence.trim() === \"\")",
               replace: "  if (false)" }],
+  },
+  {
+    name: "hub-tables-covers-every-live-table",
+    why: "drop a table from the derived HUB_TABLES, so the set a snapshot is validated against is smaller than the set the store actually has. `backup.mjs` validates a snapshot by checking the tables in HUB_TABLES, so a table missing from it is a table nobody checks -- the snapshot passes validation while carrying a table that could be absent or malformed, and the failure surfaces at restore, which is the one moment there is no fallback. This is the cross-check the whole file exists for: three inventories of the schema, and the guard is that they agree",
+    test: "test/hub-crosscheck.test.mjs",
+    expectRed: "HUB_TABLES equals the live table set exactly, so snapshot validation checks every table",
+    edits: [{ file: "src/build/hubdb.mjs",
+              find: "  return Object.freeze(Object.keys(shapeAt(version).tables).sort());",
+              replace: "  return Object.freeze(Object.keys(shapeAt(version).tables).sort().slice(1));" }],
   },
 ];

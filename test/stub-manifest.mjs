@@ -539,8 +539,8 @@ export const STUBS = [
     test: "test/stubsweep.test.mjs",
     expectRed: "a stubbed run reporting only PASSes is WRONG_RED rather than CRASHED",
     edits: [{ file: "src/stubsweep.mjs",
-              find: "  const anyAssertion = observed ? observed.anyAssertionSeen : reportedAnyAssertion(stubOutput);",
-              replace: "  const anyAssertion = reportedAnyAssertion(stubOutput);" }],
+              find: "  const seen = observed ? observed.assertionsSeen : (reportedAnyAssertion(stubOutput) ? 1 : 0);",
+              replace: "  const seen = reportedAnyAssertion(stubOutput) ? 1 : 0;" }],
   },
   {
     // COMPOUND, and it has to be. Two independent defences stop a PASS from
@@ -1300,5 +1300,14 @@ export const STUBS = [
     edits: [{ file: "src/build/measurementdb.mjs",
               find: "  const body = () => {\n    assertWritable(db, { isAlive, inTx: true });",
               replace: "  const body = () => {" }],
+  },
+  {
+    name: "sweep-refuses-a-run-shorter-than-its-control",
+    why: "drop the comparison between the stubbed run's assertion count and the control's, which is the state this file was in before. A stub does not merely make an assertion fail -- it changes what the code does, so the file's later steps can stop being reachable. When one aborts after printing the NAMED failure, the text says the right assertion went red and the exit code is non-zero, so every other input to the verdict says CAUGHT while the assertions after the abort never ran. In a log an assertion that never ran is indistinguishable from one that passed, which is how three entries in one morning reported a property measured while proving a fraction of it. The TIMED_OUT branch already refuses a run that did not finish on exactly this reasoning; an abort is the same fact through a different exit",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "a file that aborts after printing the named failure is UNRUNNABLE end to end, not CAUGHT",
+    edits: [{ file: "src/stubsweep.mjs",
+              find: "  if (controlObserved && seen < controlObserved.assertionsSeen)",
+              replace: "  if (false)" }],
   },
 ];

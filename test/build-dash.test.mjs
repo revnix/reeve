@@ -22,7 +22,8 @@ import {
   READ_FORMAT_VERSION, UNKNOWN, HUMAN_WAITS, WAITING, NEEDS_SWITCH, ageInState,
   taskShow, switchesResolver, switchesFrom, builderRunRef,
 } from "../src/build/show.mjs";
-import { dashModel, renderDash } from "../src/build/dash.mjs";
+import { dashModel, renderDash, parseCursor, formatCursor } from "../src/build/dash.mjs";
+const atOfSeq = (seq) => db.prepare("SELECT at FROM phase_event WHERE seq = ?").get(seq)?.at ?? 0;
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -82,6 +83,8 @@ const file = async (over) => fileTask({
 });
 const setPhase = (id, phase) => db.prepare("UPDATE task SET phase = ? WHERE id = ?").run(phase, id);
 const ALIVE = () => true, DEAD = () => false;
+const cur = (seq, at) => ({ seq, at });
+const headAt = () => db.prepare("SELECT at FROM phase_event ORDER BY seq DESC LIMIT 1").get()?.at ?? 0;
 const dash = (over = {}) =>
   dashModel(db, { now: NOW, switchesFor: resolver(), projects: PROJECTS, since: null,
                   isAlive: ALIVE, ...over });
@@ -128,11 +131,12 @@ const T = {};
   // so "computes nothing show cannot see" is structural rather than hoped for.
   const SRC = readFileSync(new URL("../src/build/dash.mjs", import.meta.url), "utf8");
   const prepares = [...SRC.matchAll(/db\.prepare\(/g)].length;
-  check(prepares === 4,
-    `the dash prepares exactly the four statements it declares (${prepares})`,
-    "the singleton lease, the builder-scoped escalations, the event log for --since, and the " +
-    "cursor high-water mark. NOTHING per task: every task fact comes from taskList, and a fifth " +
-    "statement here means a question the dash is answering that `task show` cannot.");
+  check(prepares === 6,
+    `the dash prepares exactly the six statements it declares (${prepares})`,
+    "the singleton lease, the last orderly release, the builder-scoped escalations, the log head, " +
+    "the cursor's own row, and the event log for --since. NOTHING per task: every task fact comes " +
+    "from taskList, and a seventh statement here means a question the dash is answering that " +
+    "`task show` cannot.");
   check(/db\.prepare\(/.test('x db.prepare( y'),
     "counter-control: the extraction matches a literal containing the call");
 }
@@ -206,7 +210,7 @@ const T = {};
 
 // ── the five questions, and the sixth that cannot arrive quietly ─────────────
 {
-  const m = dash({ since: NOW - 3600 });
+  const m = dash({ since: cur(0, 0) });
   const FIVE = ["alive", "doing", "waiting_on_you", "since_you_looked", "declined"];
   for (const k of FIVE) check(k in m, `the digest answers "${k}"`, Object.keys(m).join(","));
   const SUPPORTING = ["format_version", "generated_at", "projects", "switches", "tasks",
@@ -332,8 +336,16 @@ const T = {};
   // An EXPIRED row is not a live builder. The row outlives the process -- that is
   // what makes it a lease -- so `running` reads the clock, not the row.
   db.prepare("UPDATE singleton_lease SET expires_at = ? WHERE name = 'builder'").run(NOW - 1);
-  check(dash().alive.running === false,
-    "control: an expired lease row is not a running builder", JSON.stringify(dash().alive));
+  const stale = dash();
+  check(stale.alive.running === true,
+    "an EXPIRED lease whose holder is alive is still running: a slow tick is not a stopped builder",
+    JSON.stringify(stale.alive));
+  check(stale.alive.lease_unexpired === false,
+    "and the stale claim is reported as its own fact, not folded into `running`",
+    JSON.stringify(stale.alive));
+  check(dash({ isAlive: DEAD }).alive.running === false,
+    "control: the same expired lease with a DEAD holder is not running, so liveness is the process",
+    JSON.stringify(dash({ isAlive: DEAD }).alive));
 
   // AN UNEXPIRED LEASE IS NOT A RUNNING BUILDER. A crash inside the 120-second
   // window leaves the row intact, so reading only the clock reports work
@@ -457,14 +469,17 @@ const T = {};
   // committed in the same whole second as the cursor, and loses it for ever
   // because the next cursor is later still. `next_cursor` is handed back so the
   // operator never constructs one by hand.
-  const all = dash({ since: 0 });
+  const all = dash({ since: cur(0, 0) });
   check(all.since_you_looked.length > 1,
     `control: from cursor 0 the whole log is listed (${all.since_you_looked.length})`);
-  check(typeof all.next_cursor === "number" && all.next_cursor > 0,
-    "the digest hands back a cursor for next time", String(all.next_cursor));
+  check(parseCursor(all.next_cursor) !== null,
+    "the digest hands back a parseable cursor for next time", String(all.next_cursor));
+  check(all.next_cursor === formatCursor(parseCursor(all.next_cursor).seq,
+                                         parseCursor(all.next_cursor).at),
+    "and it round-trips through the pair that formats and reads it", String(all.next_cursor));
 
   const mid = all.since_you_looked[1].seq;
-  const recent = dash({ since: mid });
+  const recent = dash({ since: cur(mid, atOfSeq(mid)) });
   check(recent.since_you_looked.every(e => e.seq > mid),
     "with a cursor, only what came AFTER it is listed",
     JSON.stringify(recent.since_you_looked.map(e => e.seq)));
@@ -478,16 +493,17 @@ const T = {};
   for (const op of ["same-second-a", "same-second-b"])
     db.prepare(`INSERT INTO phase_event(task,at,op,from_phase,to_phase,from_generation,to_generation,detail)
                 VALUES(?,?,?,'SIZING','SIZING',1,1,'{}')`).run(T.moving, NOW - 7, op);
-  const both = dash({ since: t0 }).since_you_looked;
+  const both = dash({ since: cur(t0, atOfSeq(t0)) }).since_you_looked;
   check(both.filter(e => /same-second/.test(e.op)).length === 2,
     "two transitions sharing one second are BOTH returned, which a timestamp cursor cannot do",
     JSON.stringify(both.map(e => e.op)));
-  const afterFirst = dash({ since: both[both.length - 1].seq }).since_you_looked;
+  const firstOfPair = both[both.length - 1];
+  const afterFirst = dash({ since: cur(firstOfPair.seq, firstOfPair.at) }).since_you_looked;
   check(afterFirst.some(e => e.op === "same-second-b") &&
         !afterFirst.some(e => e.op === "same-second-a"),
     "and a cursor at the first of them still returns the second, rather than skipping the whole second",
     JSON.stringify(afterFirst.map(e => e.op)));
-  check(dash({ since: dash({ since: 0 }).next_cursor }).since_you_looked.length === 0,
+  check(dash({ since: parseCursor(dash({ since: cur(0, 0) }).next_cursor) }).since_you_looked.length === 0,
     "control: a cursor at the high-water mark returns nothing, so the bound is real");
 }
 
@@ -604,7 +620,7 @@ const T = {};
 // and dropped from the text -- the same shape, in a place the guard could not
 // see. A guard narrower than its class is a guard the next instance walks around.
 {
-  const m = dash({ since: 0 });
+  const m = dash({ since: cur(0, 0) });
   const text = renderDash(m);
   const EXCLUDED = {
     waiting_on_you: { project: "the row names the task; the project is on its `tasks` entry" },
@@ -615,6 +631,24 @@ const T = {};
                 scope: "rendered as the key's own shape: a `builder:` prefix or a task id",
                 project: "the row names the task" },
     since_you_looked: { seq: "the cursor, handed back as `next_cursor` rather than per row" },
+    tasks: {
+      generation: "the run lines carry it; the task header names phase and title",
+      priority: "not part of the digest's five questions",
+      created_at: "a timestamp; the row shows age in state instead",
+      nwo: "the projects block names it once per project",
+      project: "same", cli_version: "shown by `task show`, not the digest",
+      "waiting.since": "rendered as the elapsed figure in waiting_on_you",
+      "waiting.capability_known": "rendered as UNKNOWN where it is false",
+      "running.slice": "rendered as part of `phase/slice`",
+      "age.from": "which clock produced the figure; `show` and `why` carry the provenance",
+      "switches.observe": "the PROJECT's map, rendered once in the switches block as on/off",
+      "switches.draftSpec": "the PROJECT's map, rendered once in the switches block as on/off",
+      "switches.implementLocal": "the PROJECT's map, rendered once in the switches block as on/off",
+      "switches.publishPr": "the PROJECT's map, rendered once in the switches block as on/off",
+      "switches.mergeBuilderPr": "the PROJECT's map, rendered once in the switches block as on/off",
+      depth: "shown by `task show`, not the digest",
+      model: "shown by `task show`, not the digest",
+    },
   };
   // DESCENDS into nested objects, naming leaves by dotted path. A container in
   // the exclusion list exempts everything inside it, which is precisely how
@@ -682,22 +716,22 @@ const T = {};
 // client dutifully saves. Nothing readable after the fact distinguishes that from
 // a genuinely quiet period, which is why it is reported rather than inferred.
 {
-  const high = dash({ since: 0 }).next_cursor;
+  const high = db.prepare("SELECT COALESCE(max(seq),0) s FROM phase_event").get().s;
   check(high > 0, "control: the log has a high-water mark", String(high));
 
-  const ok = dash({ since: high - 1 });
+  const ok = dash({ since: cur(high - 1, atOfSeq(high - 1)) });
   check(ok.cursor_rewound === false,
     "control: a cursor within the log is not rewound", JSON.stringify(ok.cursor_rewound));
   check(ok.since_you_looked.length > 0,
     "and it returns what moved after it", String(ok.since_you_looked.length));
 
-  const ahead = dash({ since: high + 1000 });
+  const ahead = dash({ since: cur(high + 1000, 0) });
   check(ahead.cursor_rewound === true,
     "a cursor AHEAD of the log is reported rewound, not answered with an empty list",
     JSON.stringify({ since: high + 1000, next: ahead.next_cursor }));
   check(ahead.since_you_looked.length === 0,
     "the movement list is empty, because it cannot be computed", JSON.stringify(ahead.since_you_looked));
-  check(ahead.next_cursor === high,
+  check(ahead.next_cursor === `${high}.${headAt()}`,
     "and the cursor handed back is this hub's own high-water mark, to resync from",
     String(ahead.next_cursor));
   check(/CURSOR REWOUND/.test(renderDash(ahead)),
@@ -706,7 +740,7 @@ const T = {};
 
   // A cursor EXACTLY at the high-water mark is not rewound: nothing has moved,
   // which is a real answer and must not be confused with the broken one.
-  const level = dash({ since: high });
+  const level = dash({ since: cur(high, headAt()) });
   check(level.cursor_rewound === false && level.since_you_looked.length === 0,
     "control: a cursor exactly at the mark is quiet, not rewound",
     JSON.stringify({ rewound: level.cursor_rewound, n: level.since_you_looked.length }));
@@ -748,6 +782,102 @@ const T = {};
   db.prepare("DELETE FROM phase_run WHERE task = ?").run(dr);
 }
 
+
+// ── a restore that catches up is still a restore ───────────────────────────
+//
+// `since > highWater` catches a rewind only while the log is still SHORTER than
+// the cursor. Restore to 50, let the builder write through 100, and sequence 100
+// exists again -- a DIFFERENT event wearing the same number -- and every event of
+// the new incarnation is skipped for ever with nothing reporting it.
+//
+// A restored log is a PREFIX of the old one, so an event that survives keeps its
+// `at` and one written afterwards does not. The cursor therefore carries the
+// event it names, and the check is proof rather than inference.
+{
+  const high = db.prepare("SELECT COALESCE(max(seq),0) s FROM phase_event").get().s;
+  const at = db.prepare("SELECT at FROM phase_event WHERE seq = ?").get(high).at;
+
+  check(dash({ since: cur(high, at) }).cursor_rewound === false,
+    "control: a cursor naming the event that is actually there is not rewound");
+
+  // THE CASE THE SEQUENCE-ONLY CHECK CANNOT SEE: the number still exists, and the
+  // row wearing it is a different event.
+  const caughtUp = dash({ since: cur(high, at + 1) });
+  check(caughtUp.cursor_rewound === true,
+    "a cursor whose sequence EXISTS but names a different event is rewound",
+    JSON.stringify({ seq: high, expected: at + 1, actual: at }));
+  check(caughtUp.since_you_looked.length === 0,
+    "and the movement list is empty because it cannot be computed, not because nothing moved");
+  check(/CURSOR REWOUND/.test(renderDash(caughtUp)),
+    "and the text says so", renderDash(caughtUp).split("\n").find(l => /since you looked/.test(l)));
+
+  // A sequence-only check would have passed this: `high > high` is false.
+  check(!(high > high),
+    "control: the old sequence-only rule would have called this cursor valid",
+    `since.seq ${high} vs highWater ${high}`);
+
+  // And cursor 0 is always valid: there is no event zero to disagree with.
+  check(dash({ since: cur(0, 0) }).cursor_rewound === false,
+    "control: the zero cursor is never rewound, so a first poll is not a false alarm");
+}
+
+// ── a clean shutdown is not a machine that never ran ───────────────────────
+{
+  db.prepare("DELETE FROM singleton_lease WHERE name = 'builder'").run();
+  db.prepare("DELETE FROM hub_event WHERE kind = 'lease.singleton.released'").run();
+  const never = dash();
+  check(never.alive.last_seen_seconds === null && never.alive.last_seen_from === null,
+    "control: with no lease and no release event, never-seen is null",
+    JSON.stringify(never.alive));
+  check(/never seen/.test(renderDash(never)), "and the text says never seen",
+    renderDash(never).split("\n")[0]);
+
+  // `releaseSingleton` DELETES the row on every orderly shutdown, so the row's
+  // absence was reporting "never seen" about a builder that exited seconds ago.
+  // The append-only event outlives the row.
+  db.prepare(`INSERT INTO hub_event(at,kind,payload)
+              VALUES(?, 'lease.singleton.released', '{}')`).run(NOW - 45);
+  const stopped = dash();
+  check(stopped.alive.last_seen_seconds === 45,
+    "after a clean release, last-seen comes from the event the shutdown wrote",
+    JSON.stringify(stopped.alive));
+  check(stopped.alive.last_seen_from === "released_event",
+    "and it names which source, because a lease figure and an event figure mean different things",
+    JSON.stringify(stopped.alive));
+  check(/last seen 45s ago/.test(renderDash(stopped)),
+    "and the text carries it", renderDash(stopped).split("\n")[0]);
+  db.prepare("DELETE FROM hub_event WHERE kind = 'lease.singleton.released'").run();
+}
+
+// ── a capability label belongs to the capability wait ──────────────────────
+{
+  // A founder hold AND a switch that is off: `waitingFor` reports FOUNDER as the
+  // headline and still names the switch, so copying it unconditionally paired a
+  // founder hold with a capability that belongs to a different condition.
+  writeProfiles({ ...ALL_ON, observe: false }, ALL_ON);
+  const m = dash();
+  const held = m.waiting_on_you.find(x => x.id === T.held);
+  check(held?.waiting === "WAITING_FOR_FOUNDER",
+    "control: this task's headline is the founder hold", JSON.stringify(held));
+  const full = m.tasks.find(t => t.id === T.held);
+  check(full.waiting.capability === "observe",
+    "control: and the underlying model still knows which switch is off",
+    JSON.stringify(full.waiting));
+  check(held?.capability === null,
+    "yet the digest row does not label a founder hold with a capability that is not its reason",
+    JSON.stringify(held));
+  const line = renderDash(m).split("\n").find(l => l.includes(T.held) && /WAITING_FOR_FOUNDER/.test(l));
+  check(line && !/observe/.test(line),
+    "and the text does not render WAITING_FOR_FOUNDER (observe)", JSON.stringify(line));
+
+  // CONTROL: a task whose headline IS the capability wait still names it, or the
+  // change has removed the label rather than scoped it.
+  const cap = m.waiting_on_you.find(x => x.waiting === "WAITING_FOR_CAPABILITY");
+  check(cap?.capability === "observe",
+    "control: a genuine capability wait still names its switch", JSON.stringify(cap));
+  writeProfiles(ALL_ON, ALL_ON);
+}
+
 // ── the CLI ──────────────────────────────────────────────────────────────────
 {
   db.close();
@@ -769,7 +899,9 @@ const T = {};
   check(human.stdout.includes("builder") && parse(human.stdout) === null,
     "the human render is text, not JSON", human.stdout.slice(0, 160));
 
-  const since = cli("task", "dash", "--since", String(NOW - 100), "--json");
+  const baseline = parse(cli("task", "dash", "--json").stdout)?.data?.next_cursor;
+  check(typeof baseline === "string", "control: the CLI printed a cursor to reuse", String(baseline));
+  const since = cli("task", "dash", "--since", baseline, "--json");
   check(Array.isArray(parse(since.stdout)?.data?.since_you_looked),
     "--since is accepted by the digest", since.out.slice(0, 200));
   const bad = cli("task", "dash", "--since", "not-a-number", "--json");
@@ -815,7 +947,7 @@ const T = {};
   // A REWOUND CURSOR EXITS DEGRADED. The answer is still printed -- it carries
   // the cursor to resync from -- but a script polling this must not read a
   // restore as a quiet period, and the exit status is what it can branch on.
-  const rew = cli("task", "dash", "--since", "999999999", "--json");
+  const rew = cli("task", "dash", "--since", "999999999.1", "--json");
   check(parse(rew.stdout)?.data?.cursor_rewound === true,
     "the CLI reports a rewound cursor", rew.out.slice(0, 200));
   check(rew.status === 3,

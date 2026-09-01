@@ -1552,8 +1552,15 @@ const filed = {};
     // Both halves, because the direction is the whole point: it must send the
     // operator at the BINARY and must not suggest changing the store, which for a
     // forward-only history would be a downgrade that cannot be undone.
+    // THE ACT, not the word. This asserted `!/downgrad/i` and passed against a
+    // remedy that said "run the newer binary, or restore a snapshot taken at N" --
+    // which recommends the downgrade without using the word, and would destroy a
+    // healthy forward-version store. Review caught what the assertion could not.
+    // A snapshot restore is the right remedy for every OTHER fault here, so this
+    // is the one case where its absence is the property worth asserting.
     check(aj?.kind === "hub_incompatible" && /newer binary/.test(aj?.message ?? "")
-          && !/\bdowngrad/i.test(aj?.message ?? ""),
+          && !/\bdowngrad/i.test(aj?.message ?? "")
+          && !/restore a snapshot(?! over it)/i.test(aj?.message ?? ""),
       "a hub newer than this binary is refused too, and says to upgrade reeve rather than the store",
       String(aj?.message));
 
@@ -1659,7 +1666,10 @@ const filed = {};
       // assertion about the bit's VALUE while telling a client not to retry a hub
       // another process was holding past the busy timeout. The observable that
       // only exists when the cause survives is the cause itself, in the message.
-      const noHist = mkdtempSync(join(tmpdir(), "reeve-nohist-"));
+      // UNDER `dir`, so the teardown at the end of this file removes it. A fixture
+      // in its own `tmpdir()` tree outlives every run and accumulates one SQLite
+      // database per invocation, for ever.
+      const noHist = mkdtempSync(join(dir, "nohist-"));
       mkdirSync(join(noHist, "state"), { recursive: true });
       const nh = new DatabaseSync(join(noHist, "state", "hub.db"));
       nh.exec("CREATE TABLE placeholder (x INTEGER)");

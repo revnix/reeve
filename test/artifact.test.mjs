@@ -848,9 +848,67 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n- another, uncited\n", {}).ok === false,
     "control: a second TOP-LEVEL bullet is, and is still required to cite");
 
+  // NESTING IS RELATIVE, NOT "ANY LEADING SPACE". Markdown keeps a list item
+  // top-level at up to three spaces of indent and nests one only when it reaches
+  // the content column of the item above it. Read as `/^\s+/`, a single space
+  // turned the citation rule off for that line -- and with one cited claim
+  // elsewhere satisfying minClaims, the artifact passed.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n - unsupported\n", {}).ok === false,
+    "a bullet indented one space under a `- ` parent is a SIBLING, and is still required to cite");
+  // AND THE BOUNDARY IS THE PARENT'S CONTENT COLUMN, not a fixed number of
+  // spaces. Under a `1.  ` marker the content starts at column 4, so two and
+  // three spaces are siblings there while they are nested under `- `. A rule
+  // written as "up to three spaces" is right for one marker and wrong for the
+  // other, which is the same near-miss as a derived list that is correct for two
+  // entries out of three.
+  for (const pad of ["  ", "   "]) {
+    check(g("RESEARCH", `# r\n\n## Findings\n\n1.  a claim (src/x.mjs:1)\n${pad}1.  unsupported\n`, {}).ok === false,
+      `under a wide marker, ${pad.length} spaces is still a sibling and must cite`);
+    check(g("RESEARCH", `# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n${pad}- elaboration\n`, {}).ok === true,
+      `control: and the same ${pad.length} spaces under a narrow marker is nested`);
+  }
+  // AND THE ELABORATION CASE STILL HOLDS at every depth it can be written at:
+  // a bullet AT OR BEYOND its parent's content column is nested.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n  - elaboration\n    - deeper\n", {}).ok === true,
+    "control: a bullet at its parent's content column is nested, and so is one below that");
+  // A LEVEL CLOSES WHEN A BULLET APPEARS TO ITS LEFT. Without that, the first
+  // nested bullet would make every later bullet nested too, and the gate would
+  // stop checking the rest of the document.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n  - elaboration\n- uncited sibling\n", {}).ok === false,
+    "a top-level bullet AFTER a nested one is top-level again");
+  // AND AN INDENTED LIST NESTS RELATIVE TO ITSELF, not to column zero.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n   - a claim (src/x.mjs:1)\n     - elaboration\n", {}).ok === true,
+    "control: a list that starts indented still nests relative to its own first item");
+
   // minCitationsPerClaim IS APPLIED. It was accepted and ignored, so a claim with
   // one citation satisfied a caller asking for two -- an argument read but not
   // applied, which is worse than absent because the caller believes it took hold.
+  // A SCHEME-LESS ENDPOINT IS NOT A CITATION EITHER. The URL strip only removed
+  // `scheme://...`, so each of these survived it and its PORT read as a line
+  // number -- the gate accepting precisely the unsupported claim it exists to
+  // reject.
+  for (const [label, token] of [["a host:port with a path", "api.internal:3000/health"],
+                                ["a protocol-relative authority", "//api.internal:3000"],
+                                ["a userinfo endpoint", "git@example.internal:22"]]) {
+    check(g("RESEARCH", `# r\n\n## Findings\n\n- a claim about ${token}\n`, {}).ok === false,
+      `${label} is not a citation`, token);
+  }
+  // CONTROL: the same line WITH a real citation passes, so the strip removes the
+  // endpoint rather than the whole line.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim about api.internal:3000/health (src/x.mjs:1)\n", {}).ok === true,
+    "control: and a claim carrying both an endpoint and a real citation passes");
+  // THE RESIDUAL, RECORDED AS AN ASSERTION RATHER THAN A COMMENT. A bare
+  // `api.internal:3000` is the same SHAPE as `package.json:3000` -- a dotted
+  // name, a colon, digits -- and no regex separates them. Accepting it lets one
+  // claim through uncited; refusing it would refuse every citation of a
+  // root-level file. The choice is deliberate, so it is asserted: if someone
+  // later decides the other way, this line is where the decision is recorded and
+  // it will fail rather than the behaviour changing quietly.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim about api.internal:3000\n", {}).ok === true,
+    "a BARE host:port is accepted, deliberately: it is indistinguishable from package.json:3000");
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (package.json:3000)\n", {}).ok === true,
+    "control: and that is the citation the strict reading would have refused");
+
   check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n", { minCitationsPerClaim: 2 }).ok === false,
     "a caller asking for two citations is not satisfied by one");
   check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1) (src/y.mjs:2)\n", { minCitationsPerClaim: 2 }).ok === true,

@@ -180,7 +180,10 @@ export function readArtifact({ dir, phase, expectSha }) {
 // `1)` were not, so an uncited claim written with either was not a claim at all
 // and slipped past the citation rule entirely -- the check silently narrowing
 // its own input rather than failing.
-const CLAIM = /^\s*(?:[-*+]|\d+[.)])\s+\S/;
+// CAPTURING, because nesting is measured from the parts. `\s` also matches a
+// newline, which is meaningless on a single line and makes the indent it reports
+// wrong; `[ \t]` is what a Markdown indent is made of.
+const CLAIM = /^([ \t]*)([-*+]|\d+[.)])([ \t]+)\S/;
 // A CITATION IS A PATH AND A LINE, not any token with a colon in it.
 // `[\w./-]+:\d+` matched `12:30` and `issue:42` as readily as
 // `src/build/hubaccess.mjs:170`, so a claim mentioning a time or a ticket read
@@ -198,8 +201,30 @@ const CITATION = /(?:[\w.-]*\/[\w./-]*|[\w-]+\.[A-Za-z][\w-]*):\d+/;
 // precisely the unsupported claims it exists to reject. URLs are removed before
 // the test rather than excluded inside it, because a pattern that has to
 // describe what a URL is not becomes a second, worse URL parser.
-const URLS = /\b[a-z][a-z0-9+.-]*:\/\/\S+/gi;
-const withoutUrls = (line) => line.replace(URLS, " ");
+// AND A SCHEME-LESS ENDPOINT IS NOT ONE EITHER. The URL strip only removes
+// `scheme://...`, so `api.internal:3000/health`, `//api.internal:3000` and
+// `git@host:22` all survived it and their PORT read as a line number. Each of
+// these carries a syntactic marker that a file reference does not -- a
+// protocol-relative prefix, a userinfo `@`, or a path after the port -- so each
+// is removable without guessing.
+//
+// WHAT REMAINS, AND DELIBERATELY. A bare `api.internal:3000`, with no scheme, no
+// userinfo and no path, is byte-for-byte the same SHAPE as `package.json:3000`:
+// a dotted name, a colon, digits. No regex separates them, and the two errors are
+// not symmetric -- accepting the endpoint lets one claim through uncited, while
+// refusing the filename refuses every citation of a root-level file and fails the
+// whole report. This file has already been corrected once for refusing correct
+// work over a rule nobody chose deliberately, so the ambiguity is resolved
+// towards accepting. The durable answer is not syntactic: a phase task holds the
+// repository and can ask whether the cited path EXISTS, which is the only thing
+// that actually tells the two apart.
+const ENDPOINTS = [
+  /\b[a-z][a-z0-9+.-]*:\/\/\S+/gi,             // a full URL
+  /(?:^|[\s(<[])\/\/[\w.-]+:\d+\S*/g,          // a protocol-relative authority
+  /\b[\w.-]+@[\w.-]+:\d+\S*/g,                // userinfo@host:port
+  /\b[\w-]+(?:\.[\w-]+)+:\d+\/\S*/g,          // host:port followed by a path
+];
+const withoutEndpoints = (line) => ENDPOINTS.reduce((s, re) => s.replace(re, " "), line);
 
 /**
  * The gate for a report phase's product. The SIBLING of `reviewDiff`, never a
@@ -344,19 +369,37 @@ export function reviewArtifact({ phase, dir, expect }) {
       return rows.slice(at + 1, end === -1 ? rows.length : end);
     })();
     let claims = 0;
+    // NESTING IS RELATIVE, not "carries a leading space".
+    //
+    // A nested bullet elaborating a cited claim must not be counted as a claim of
+    // its own -- the more carefully a finding is broken down, the more the gate
+    // would penalise it. But `/^\s+/` answers a different question: Markdown
+    // keeps a list item TOP-LEVEL at up to three spaces of indent, and nests one
+    // only when it reaches the CONTENT column of the item above it. So ` - an
+    // unsupported claim`, indented by a single space, was skipped entirely -- and
+    // with one properly cited claim elsewhere satisfying `minClaims`, the
+    // artifact passed. One space nobody would notice turned the citation rule off
+    // for that line.
+    //
+    // `open` holds the content column of each list level currently open. A bullet
+    // at or beyond the innermost of them is nested; one to its left closes levels
+    // until it is not.
+    const open = [];
     for (const line of scope) {
-      // TOP-LEVEL, as the contract says. A nested bullet elaborating a cited
-      // claim was counted as a claim of its own and required its own citation,
-      // so the more carefully a finding was broken down the more likely the
-      // artifact was refused -- the gate penalising exactly the structure it
-      // wants.
-      if (!CLAIM.test(line) || /^\s+/.test(line)) continue;
+      const m = CLAIM.exec(line);
+      if (!m) continue;
+      const width = (s) => s.replace(/\t/g, "    ").length;
+      const indent = width(m[1]);
+      while (open.length && indent < open[open.length - 1]) open.pop();
+      const nested = open.length > 0;
+      open.push(indent + m[2].length + width(m[3]));
+      if (nested) continue;
       claims++;
       // THE COUNT THE CALLER ASKED FOR. `minCitationsPerClaim` was read and
       // ignored, so a claim with one citation satisfied a caller asking for two.
       // An argument accepted and not applied is worse than one absent, because
       // the caller believes it took effect.
-      const cites = (withoutUrls(line).match(new RegExp(CITATION.source, "g")) ?? []).length;
+      const cites = (withoutEndpoints(line).match(new RegExp(CITATION.source, "g")) ?? []).length;
       if (cites < minCites)
         findings.push(cites === 0 ? `no file:line citation: ${line.trim()}`
           : `${cites} citation(s) against a minimum of ${minCites}: ${line.trim()}`);

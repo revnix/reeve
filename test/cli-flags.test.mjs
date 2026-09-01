@@ -773,6 +773,21 @@ check(existsSync(join(repo, ".git")),
     builder: ["builder", "doctor"],
     build: ["build", "status"],
     task: ["task", "list"],
+    notify: ["notify", "--test", "revnix/reeve"],
+  };
+
+  // RUN FROM A DIRECTORY WITH NO REPOSITORY IN IT, and that is load-bearing for
+  // one of these. `loadProfile` reads `./.ops/profile.json` BEFORE the sidecar
+  // and returns it for any nwo, so `notify --test` invoked from a checkout that
+  // configures a channel would send a real notification every time this suite
+  // ran -- on the machine of whoever happened to have one. There is no such file
+  // in this repository today, and relying on that is relying on an absence that
+  // a contributor can end without knowing. The temp directory cannot contain
+  // one, so the send path is unreachable by construction rather than by luck.
+  const runIsolated = (...args) => {
+    const r = spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
+      { encoding: "utf8", cwd: dir, env: { ...process.env, REEVE_HOME: join(dir, "envhome") } });
+    return { status: r.status, out: (r.stdout ?? "") + (r.stderr ?? ""), stdout: r.stdout ?? "" };
   };
   const missing = APPLIES.json.filter(c => !INVOCATION[c]);
   check(missing.length === 0,
@@ -781,7 +796,7 @@ check(existsSync(join(repo, ".git")),
 
   let checked = 0;
   for (const c of APPLIES.json.filter(c => INVOCATION[c])) {
-    const r = run(...INVOCATION[c], "--json");
+    const r = runIsolated(...INVOCATION[c], "--json");
     let ok = false; try { JSON.parse(r.stdout); ok = true; } catch { /* stays false */ }
     // `task list` in a home with no hub answers a TYPED REFUSAL, which is JSON and
     // is the contract: what is asserted here is the SHAPE, not the verdict.
@@ -790,6 +805,15 @@ check(existsSync(join(repo, ".git")),
   }
   check(checked === APPLIES.json.length,
     `all ${checked} read commands were exercised, not a subset`, String(checked));
+
+  // AND THE ISOLATION IS ASSERTED, not assumed. `notify --test` is the one
+  // invocation above that would SEND if it found a channel, so the run that
+  // exercises it must be one where no channel can be found.
+  const isolated = runIsolated("notify", "--test", "revnix/reeve", "--json");
+  let iso = null; try { iso = JSON.parse(isolated.stdout); } catch { /* stays null */ }
+  check(iso?.channels?.length === 0 && iso?.ok === false,
+    "control: the isolated run finds no channel at all, so nothing was ever sent",
+    JSON.stringify(iso?.channels ?? isolated.out.slice(0, 160)));
 
   // CONTROL: the loop can fail. A command known to emit prose, run through the
   // same parse, must NOT parse -- otherwise every check above passes on any

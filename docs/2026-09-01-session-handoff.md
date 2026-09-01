@@ -3,8 +3,15 @@
 Written for a session that has none of this context. Read section 0 first and RUN it;
 everything below section 0 is commentary that was true when it was written.
 
-There is a separate builder-lane handoff for the same day. This one covers the guardian
-lane only: the stub sweep, the watcher, the merge gates, and the hub identity work.
+This covers the GUARDIAN lane: the stub sweep, the watcher, the merge gates, and the hub
+identity work. The builder lane keeps its own handoff for the same day under `tasks/`.
+
+The name matters and is not cosmetic. `test/newest-doc.mjs` decides which handoff and which
+prompt the two documentation guards police, and it recognises exactly
+`YYYY-MM-DD-session-handoff[-N].md` and `YYYY-MM-DD-resume-prompt[-N].md`. The first
+version of these files carried a `guardian-` prefix, so the resolver skipped them, both
+guards ran happily against the PREVIOUS day's pair, and every green they reported was about
+a document nobody had touched. If a same-day revision is needed, use the numeric suffix.
 
 ## 0. STATE -- MEASURE first, then read what only a person can tell you
 
@@ -15,6 +22,12 @@ within the hour. The block below is the authority; prose defers to it.
 ### 0.1 Facts to MEASURE -- never trust a file for these, this one included
 
 ```bash
+# PIPEFAIL FIRST, or the guards below are decorative. `grep X file | tail -1 || handler`
+# takes the pipeline's status from `tail`, which exits 0 on empty input -- so a missing
+# log, an unreadable one, or one with no such record runs NO handler and prints a blank
+# line that reads as a measurement. Measured 2026-09-01: without this line the handler
+# does not run; with it, it does. The `||` was added first and was inert.
+set -o pipefail
 export PATH="$HOME/.nvm/versions/node/v24.17.0/bin:$PATH"   # node 24 is a floor
 cd ~/Work/Products/reeve || exit 1
 
@@ -112,11 +125,28 @@ node scripts/verify-merge.mjs "$merged_pr"            # did that merge carry eve
 # ~4ms; every anchor still resolves. IN FLIGHT when this was written, so check it
 # exists first: a missing file exits MODULE_NOT_FOUND, which is not the same answer
 # as "no anchors rotted".
-[ -f test/anchors-resolve.test.mjs ] && node test/anchors-resolve.test.mjs
+# ABSENT IS NOT CLEAN. `[ -f x ] && node x` skips silently when the file is not there,
+# and the sweep below then runs as though no anchor had failed -- the two outcomes the
+# comment above says must differ, rendered identically.
+if [ -f test/anchors-resolve.test.mjs ]; then node test/anchors-resolve.test.mjs
+else echo "anchors-resolve is ABSENT -- this checkout cannot answer the anchor question"; exit 1; fi
 # ~20 minutes, and run it in an ISOLATED detached worktree at a COMMITTED head. It
 # writes stubbed source and restores a startup snapshot, so an edit made while it runs
 # is silently overwritten — and this checkout is shared by three sessions.
-node scripts/stub-sweep.mjs
+# IN A DETACHED WORKTREE, not this checkout. The sweep edits files for twenty minutes and
+# refuses a tree that changed under it; three sessions share this repository, and this
+# checkout is also deliberately stale. A copy at one commit is the only thing it can
+# measure. The logs go OUTSIDE the copy, or the sweep refuses its own output as dirt.
+# AT THE FETCHED DEFAULT BRANCH, never at HEAD. This block runs in the daemon's checkout,
+# whose HEAD is deliberately stale -- measured 2026-09-01 at twenty commits behind. A copy
+# made from HEAD sweeps that stale tree and reports a verdict about a commit nobody is
+# working on. Verified 2026-09-01 by making the copy both ways: `HEAD` produced a tree
+# missing entries that exist on the default branch.
+sweepdir=$(mktemp -d) && git worktree add -q --detach "$sweepdir" origin/main \
+  || { echo "could not make an isolated copy; do not sweep the shared checkout"; exit 1; }
+( cd "$sweepdir" && node scripts/stub-sweep.mjs ) ; sweeprc=$?
+git worktree remove --force "$sweepdir"
+echo "sweep exit: $sweeprc"
 
 # COVERAGE, not just verdicts. The sweep prints `N entries over M of K test file(s)`
 # and refuses an ORPHAN -- a test file with no entry and not grandfathered. The entry
@@ -174,7 +204,7 @@ now.
 | the watcher names why there are no checks | an unmergeable branch and an outage rendered identically |
 | UNKNOWN is not-decided-yet, not cannot-merge | a transient state would have read as blocked once per push |
 | the premerge entry runs to the end | it had been proving 8 of 78 assertions |
-| the refusal must not advise stashing | the stash is shared across every worktree of a repository |
+| the refusal must not advise stashing | the stash is shared repository-wide, not per checkout |
 
 Two remain open at the time of writing: the hub identity table, and the orphan gate. Their
 numbers and state are section 0.1 facts.
@@ -201,8 +231,9 @@ because the instances matter, but because the next one will not look like any of
    the repair never ran.
 8. A fixture asserted a tick fails when a table is missing, after the code stopped reading
    that table. It would have passed for ever against an undamaged store.
-9. A positive control passed for the wrong reason: `gh pr list --author @me` exits ZERO on
-   an unresolvable repository, where the same query without `--author` exits 1.
+9. A positive control passed for the wrong reason. Measured 2026-09-01: the same listing
+   exits ZERO on an unresolvable repository when `--author @me` is given, and 1 without it,
+   because the flag routes through a search reporting no matches rather than an error.
 10. An identity event was gated on a read after the write rather than on the write, so
     every unchanged regenerate logged that something had changed.
 11. Three of this lane's own test fixtures depended on an earlier step having been
@@ -222,13 +253,14 @@ inferred. Confirm ownership by asking rather than by reading this table; lanes m
   `src/prompts.mjs`, `src/premerge.mjs`, `tools/**`, `scripts/stub-sweep.mjs`,
   `src/stubsweep.mjs`, `test/stubsweep.test.mjs`.
 - **builder lane** -- artifacts, phase reports, the task file and dry-run route.
-- **operator lane** -- the dash, escalations, notify and the doctor rows.
+- **operator lane** -- the dash, escalations, notify, and the health rows (as of
+  2026-09-01).
 
 Two seam rulings were made by measurement rather than by the territory list, because the
 list was wrong about both. `src/notify.mjs` is imported only by `src/daemon.mjs`, so it is
 this lane's by the seam and nobody's by the list; the operator lane writes the additive
 field and this lane owns the line that PERSISTS it. `src/doctor.mjs` had zero changes from
-this lane, so it was handed over outright.
+this lane when measured on 2026-09-01, so it was handed over outright.
 
 ## 4. THE FINDING THAT MATTERS MOST FOR THE NEXT SESSION
 
@@ -268,7 +300,7 @@ worth the most to find.
 
 ## 6. What is genuinely left
 
-**Arming `--execute`.** Section 0 owns its state. Three things gate it and none are code:
+**Arming.** Section 0 owns whether it is on. Three things gate it and none are code:
 the V6 measurement, an authority baseline, and the worker isolation setting. The last two
 are one command and one profile edit, and BOTH need the founder: capturing a baseline
 freezes today's authority as the reference, and changing isolation removes a standing
@@ -296,14 +328,15 @@ readers sending a holed hub history to the wrong remedy. Both were filed by othe
 - **Measure, do not assume, and measure the CURRENT tree.** A verification is a statement
   about a tree and expires the moment the tree moves. One went stale in forty minutes, in
   the direction that reports success.
-- **The daemon's checkout is not the repository.** It is deliberately never pulled. Read
-  `git show origin/main:<path>` or a worktree made from `origin/main`.
+- **The daemon's checkout is not the repository.** It is deliberately never pulled, and on
+  2026-09-01 it was twenty commits behind. Read the default branch through `git show`, or
+  work in an isolated copy made from it; §0.1 measures the difference.
 - **Sweep what your CODE can break, not what you wrote.** Those are different sets and
   only the first is the question.
 - **A fixture step must never assume the step before it failed.** That refusal is the thing
   under test.
-- **Never advise `git stash` in this repository.** The stash is shared by every worktree,
-  and hooks write to it.
+- **Never advise `git stash` in this repository.** The stash is shared repository-wide
+  rather than per checkout, and hooks write to the same stack.
 - **zsh does not word-split an unquoted variable.** It produced four separate inert checks
   in one day, each printing something plausible. Use `while read`, or quote and split
   explicitly.

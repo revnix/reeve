@@ -214,18 +214,41 @@ const MIGRATIONS = [
           evidence    TEXT    NOT NULL,
           measured_at INTEGER NOT NULL,
           PRIMARY KEY (provider, kind, measured_at),
-          -- EVIDENCE IS NOT OPTIONAL. A recorded result with no provenance is a
-          -- claim, and a claim that outlives the person who made it reads as a
-          -- measurement. The column that would be skipped under time pressure is
-          -- the one that makes the row worth keeping.
-          CHECK (evidence <> ''),
-          CHECK (result   <> ''),
-          CHECK (kind     <> ''),
+          -- EVIDENCE IS NOT OPTIONAL, and TRIM because whitespace is not
+          -- provenance. A recorded result with nothing behind it is a claim, and
+          -- a claim that outlives the person who made it reads as a measurement.
+          CHECK (trim(evidence) <> ''),
+          -- THE VOCABULARY, not merely non-emptiness. The writer already refuses
+          -- an undeclared kind or an unrecognised result, but the writer is not
+          -- the only way into the table -- and a caller reaching the store
+          -- directly is exactly the case it cannot see. A row saying 'BAD' would
+          -- be returned by the next read as the newest apparently-current answer
+          -- and consumed by the arming gate.
+          --
+          -- This restates MEASUREMENT_KINDS, which is a second inventory of one
+          -- rule. A test asserts the two agree, because two inventories are only
+          -- safe when something fails loudly the moment they diverge.
+          CHECK (kind IN ('pool-relationship')),
+          CHECK (kind <> 'pool-relationship'
+                 OR result IN ('SHARED','SEPARATE','INCONCLUSIVE')),
           CHECK (measured_at > 0)
         ) STRICT;
         CREATE INDEX IF NOT EXISTS provider_measurement_latest
           ON provider_measurement(provider, kind, measured_at DESC);
       `);
+      // NO TRIGGER for the future-timestamp rule, deliberately. SQLite forbids
+      // non-deterministic functions in CHECK, so `unixepoch()` can only be
+      // reached from a trigger -- and this schema declares NONE, which is what
+      // lets snapshot validation treat any trigger at all as unexpected. Adding
+      // two to guard one column would trade a schema-wide tampering signal for a
+      // narrower guarantee.
+      //
+      // The rule is enforced where it actually matters instead: `recordMeasurement`
+      // refuses to write one, and `latestMeasurement` refuses to RETURN one. The
+      // read guard is the stronger of the two, because a future-dated row is only
+      // dangerous when something consumes it as the newest current answer -- and
+      // it catches rows this database never validated, such as one replayed from
+      // a snapshot written by an older binary.
     } },
 ];
 

@@ -995,7 +995,7 @@ export const STUBS = [
     name: "dash-renders-the-pull-requests-it-carries",
     why: "finish a task row without reading `t.prs`. The model carries every open pull request and --json hands them over, so the machine shape stays right while the DEFAULT rendering -- the one an operator actually reads -- shows a task waiting on a review that already exists as a task waiting on nothing. This is the ninth instance of one shape on this surface, a value carried in the model and dropped by the renderer, and it survived the structural guard built to close that shape: the walk descended objects and treated every ARRAY as an opaque leaf, so each list a row carried was exempt without ever being named as an exception",
     test: "test/build-dash.test.mjs",
-    expectRed: "every value a digest row carries into the model reaches the human render",
+    expectRed: "every value the digest carries into the model reaches the human render",
     edits: [{
       file: "src/build/dash.mjs",
       find: "    for (const p of t.prs)\n      out.push(`      pull request ${p.kind} #${p.pr}  ${p.head_sha}`);\n",

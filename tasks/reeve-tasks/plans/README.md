@@ -282,6 +282,19 @@ produce, because the earlier rounds read plans rather than running them.
 | `evidenceFor` maps `infeasible`, then `blocked`, then returns `phase.succeeded` | anything that is not one of those two becomes a SUCCESS. A report that skipped validation, or one validated against a different action, therefore **advances the task**. Failing open in the one function whose output moves a task forward | `evidenceFor({action:"BUILD_SIZE", report:{outcome:"nonsense"}})` returns `kind: "phase.succeeded"` |
 | S3-B: `validateReport(action, value) -> {ok:true, report} \| {ok:false, errors}` | S3-D's consumed table names `{ok:false, kind:"BAD_REPORT", errors}` and dispatches on `kind`. The producer's clause omits the field the consumer branches on | S3-B `:1703`; S3-D `:50` |
 
+**And one that belongs to S3-C, found by executing S3-B.** PR-B3's produces
+clause says S3-C Task 1 passes `schemaFor(action)` to `workerArgs`'s
+`jsonSchema`. `workerArgs` pushes that value straight into the argv array
+(`src/supervisor.mjs:149`) and its tested contract is serialized JSON text
+(`test/worker-args.test.mjs`, `'{"type":"object"}'`), while `schemaFor` returns a
+parsed OBJECT. Following the handoff as written, all three phase dispatches would
+spawn a worker whose `--json-schema` argument is the literal string
+`[object Object]` — an argument that is syntactically fine and semantically
+nothing, and which fails no check anywhere. **S3-C must use `schemaTextFor`,
+which T5 now exports**; it returns the file's text rather than a
+re-serialization, so what the worker is asked for is byte-identical to what the
+freeze hashes.
+
 **Stale anchors in PR-B3's consumed list**, all in `src/build/phases.mjs`:
 `PHASES` is cited at `:42` and is at `:66`; `HOLD_ESCALATION` at `:89` and is at
 `:113`; `holdReasonRefusal` at `:132` and is at `:144`. The fourth, `nextPhase`

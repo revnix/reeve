@@ -27,6 +27,14 @@ const check = (ok, name, detail) => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
   if (!ok) { if (detail) console.log("        " + detail); fail++; }
 };
+// READING AN ELEMENT AFTER ASSERTING HOW MANY THERE ARE is how four assertions
+// in this file have killed the run instead of failing it: the size assertion
+// goes red, the next line indexes past the end, and the file dies with its
+// remaining assertions unreported -- which is indistinguishable, to the stub
+// sweep, from a run that was never a measurement. `nth` never throws, so a wrong
+// size fails exactly the assertions that are about size.
+const nth = (arr, i) => (Array.isArray(arr) ? arr[i] : undefined) ?? "";
+
 const refused = (args) => {
   try { escalationKey(args); return "returned"; } catch (e) { return e.kind ?? "threw"; }
 };
@@ -403,7 +411,11 @@ const freshHub = () => {
 {
   const hub = freshHub();
   const key = escalationKey({ kind: "backup:failed" });
-  builderAnnounceable(hub, new Map([[key, 1]]), { at: NOW, isAlive: ALIVE });
+  // ANNOUNCED, not merely raised. A cause nobody was told about is retired
+  // without a recovery notice, so a block about WHEN a cause retires has to page
+  // it first or it is measuring the undelivered path instead.
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                  send: () => ({ ok: true, channels: [{ name: "t", ok: true }] }) });
   check(subjectOf(key) === "builder:backup",
     "control: the cause is about the backup subsystem, not about the pass", subjectOf(key));
 
@@ -1135,6 +1147,94 @@ const freshHub = () => {
     "control: a send no channel accepted is still declined", JSON.stringify(dead.declined));
   check(hub2.prepare("SELECT announced_count c FROM escalation WHERE why=?").get(key).c === 0,
     "control: and is not marked announced, so it comes back");
+}
+
+
+// ── the alert's own line breaks are real ───────────────────────────────────
+//
+// `printable` escapes every control character and a line feed is one, so
+// sanitising the FINISHED message turned this surface's own separators into a
+// literal backslash-n and delivered identity, action and detail as a single
+// run-on line with visible escapes. The layout the action line depends on was
+// destroyed by the boundary added to protect it — and an assertion that the
+// action is PRESENT cannot see the difference, which is why this asserts the
+// STRUCTURE instead.
+{
+  const hub = freshHub();
+  const sent = [];
+  const send = (a) => { sent.push(a); return { ok: true, channels: [{ name: "t", ok: true }] }; };
+  const key = escalationKey({ task: "bt:0A", kind: "phase:blocked", phase: "RESEARCH" });
+  const b = body({ type: "FAILED", detail: "line one\nFORGED: everything is fine", store: "/var/x" });
+
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                  bodies: new Map([[key, b]]) });
+  const msg = sent[0]?.message ?? "";
+  const lines = msg.split("\n");
+
+  check(lines.length >= 3,
+    "the message is rendered as separate lines, not one run-on string",
+    JSON.stringify(msg));
+  check(!/\\n/.test(nth(lines, 0)) && nth(lines, 0).includes(key),
+    "the first line is the identity, with no escape sequence in it",
+    JSON.stringify(nth(lines, 0)));
+  check(nth(lines, 1).startsWith("-> ") && nth(lines, 1).includes("reeve task why bt:0A"),
+    "the second is the action, on its own line where a phone shows it",
+    JSON.stringify(nth(lines, 1)));
+
+  // AND THE UNTRUSTED NEWLINE IS STILL ESCAPED. That is the property the
+  // boundary exists for: our separators are real, a body's are not, so a detail
+  // cannot forge a line that looks like ours.
+  const forged = lines.find(l => l.startsWith("detail:"));
+  check(typeof forged === "string" && /\\n/.test(forged),
+    "a newline inside the body is escaped, so a detail cannot forge a line",
+    JSON.stringify(forged ?? null));
+  check(!lines.some(l => l.startsWith("FORGED:")),
+    "control: and the forged line never becomes a line of its own",
+    JSON.stringify(lines));
+}
+
+// ── no recovery notice for an incident nobody heard about ──────────────────
+//
+// A cause every channel declined still has `announced_count` 0. Sending its
+// CLEARED notice tells the reader a situation they were never informed of has
+// ended, which is worse than silence: it invites them to go looking for an alert
+// that does not exist.
+{
+  const hub = freshHub();
+  const sent = [];
+  const refuse = (a) => { sent.push(a); return { ok: false, why: "the channel is down" }; };
+  const accept = (a) => { sent.push(a); return { ok: true, channels: [{ name: "t", ok: true }] }; };
+  const key = escalationKey({ task: "bt:0B", kind: "phase:blocked", phase: "SIZING" });
+
+  const raised = announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                                 send: refuse });
+  check(raised.declined.length === 1, "control: the page was declined by every channel",
+    JSON.stringify(raised.declined));
+  check(hub.prepare("SELECT announced_count c FROM escalation WHERE why=?").get(key).c === 0,
+    "control: so nothing was ever announced about it");
+
+  sent.length = 0;
+  const gone = announce(hub, { escalations: new Map(), at: NOW + 60, isAlive: ALIVE,
+                               send: accept, examined: new Set(["bt:0B"]) });
+  check(sent.length === 0,
+    "the cause is retired without a recovery notice, because none was owed",
+    JSON.stringify(sent.map(x => x.title)));
+  check(gone.cleared.includes(key),
+    "and it IS retired, rather than standing for ever because it was never delivered",
+    JSON.stringify(gone.cleared));
+  check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 0,
+    "control: the row is gone");
+
+  // CONTROL: a cause that WAS announced still gets its recovery, or this rule
+  // would silence every clearing.
+  const k2 = escalationKey({ task: "bt:0C", kind: "phase:blocked", phase: "DESIGN" });
+  announce(hub, { escalations: new Map([[k2, 1]]), at: NOW, isAlive: ALIVE, send: accept });
+  sent.length = 0;
+  announce(hub, { escalations: new Map(), at: NOW + 60, isAlive: ALIVE, send: accept,
+                  examined: new Set(["bt:0C"]) });
+  check(sent.length === 1 && /CLEARED/.test(sent[0]?.title ?? ""),
+    "control: a cause that was announced still gets its recovery",
+    JSON.stringify(sent.map(x => x.title)));
 }
 
 hub.close();

@@ -2137,4 +2137,27 @@ export const STUBS = [
       replace: "    const accepted = [];",
     }],
   },
+
+  {
+    name: "an-alerts-own-line-breaks-are-real",
+    why: "sanitise the FINISHED message rather than its parts. `printable` escapes every control character and a line feed is one, so this surface's own separators become a literal backslash-n and the identity, the action and the detail arrive as a single run-on line with visible escape sequences. The boundary added to protect the alert destroys the layout the action line depends on, and an assertion that the action is PRESENT cannot see the difference — only one about the STRUCTURE can. Sanitising the parts keeps the property that mattered: a newline inside a body is still escaped and cannot forge a line",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "the message is rendered as separate lines, not one run-on string",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    const message = redact(raw);",
+      replace: "    const message = redact(printable(raw));",
+    }],
+  },
+  {
+    name: "no-recovery-notice-for-an-alarm-nobody-heard",
+    why: "queue a clearing for a cause whose page every channel declined. Its `announced_count` is still zero, so the CLEARED notice tells the reader that a situation they were never informed of has ended — which is worse than silence, because it sends them looking for an alert that does not exist. The cause must still be RETIRED, or an undelivered page stands for ever precisely because it was never delivered",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "the cause is retired without a recovery notice, because none was owed",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "      if (pages(why) && standing.get(why).announced_count > 0) {",
+      replace: "      if (pages(why)) {",
+    }],
+  },
 ];

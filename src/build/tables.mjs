@@ -61,7 +61,7 @@ export const TABLE_OWNERS = {
   writer_lease:    { writer: "locks.mjs per CLI command",   reader: "restore refusal",                    replayed: false, section: "11.4" },
   maintenance_lock:{ writer: "restoreHub only",             reader: "every writer's assertWritable",      replayed: false, section: "11.4" },
   directory_lease: { writer: "worktree.mjs",                reader: "the reaper, dispatch guard",         replayed: false, section: "10.2" },
-  territory_lease: { writer: "intake.mjs, transition.mjs",  reader: "the overlap check",                  replayed: true,  section: "10.2" },
+  territory_lease: { writer: "intake.mjs, transition.mjs",  reader: "the overlap check, the dash",        replayed: true,  section: "10.2" },
   provider_lease:  { writer: "provider.mjs (both daemons)", reader: "admission, reaper, restore refusal", replayed: false, section: "10.4" },
   provider_state:  { writer: "provider.mjs, measure-provider", reader: "admission, doctor H-5",           replayed: false, section: "10.4" },
   // REPLAYED, unlike the two provider tables above it. Those are process-scoped:

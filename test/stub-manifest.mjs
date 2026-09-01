@@ -959,6 +959,39 @@ export const STUBS = [
     }],
   },
   {
+    name: "dash-waiting-on-you-is-only-what-a-human-can-clear",
+    why: "let `waiting_on_you` mean every waiting task. A quota frees itself, a guardian finishes, a reviewer answers -- so listing those beside a founder hold turns the one line an operator scans into a list of everything, which is the same as not having the line. The degradation is silent, because a surface nobody reads still renders perfectly, and the measured mechanism is that acceptance of a repeated alert drops about a third each time it repeats",
+    test: "test/build-dash.test.mjs",
+    expectRed: "control: a task waiting on QUOTA is not waiting on you",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "      .filter(t => t.waiting.first && HUMAN_WAITS.has(t.waiting.first))",
+      replace: "      .filter(t => t.waiting.first !== null)",
+    }],
+  },
+  {
+    name: "dash-age-comes-from-the-event-log",
+    why: "read age-in-state from `task.updated_at`, which every transition compensation moves whether or not it changed a phase -- so a task stuck for ten minutes reports zero seconds the moment anything unrelated touches its row. The measured instance of the class is that a pull request's updated_at does not move when a review thread is resolved; the class is general, and a column touched by writes unrelated to the change being measured is not a change signal",
+    test: "test/build-dash.test.mjs",
+    expectRed: "age-in-state is 600s, from the phase_event that entered this phase",
+    edits: [{
+      file: "src/build/show.mjs",
+      find: "  const entered = db.prepare(\n    `SELECT max(at) at FROM phase_event WHERE task = ? AND to_phase = ?`).get(row.id, row.phase)?.at;",
+      replace: "  const entered = row.updated_at;",
+    }],
+  },
+  {
+    name: "dash-aliveness-reads-the-clock-not-the-row",
+    why: "report the builder as running because a `singleton_lease` row exists. The row OUTLIVES the process that took it -- that is what makes it a lease -- so a crashed builder leaves a row behind and the digest's first line then tells an operator that work is proceeding while nothing is running at all. The one question a glance surface exists to answer, answered wrongly in the direction that stops anyone looking further",
+    test: "test/build-dash.test.mjs",
+    expectRed: "control: an expired lease row is not a running builder",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "      running: !!lease && lease.expires_at > now,",
+      replace: "      running: !!lease,",
+    }],
+  },
+  {
     name: "cli-task-reaches-its-own-body",
     why: "stop the `task` label from matching, so the command falls past its own body. This CLI's case labels share fall-through blocks and `task` sits directly above `build` -- the position that captured status, statusline and dash for a full day when `shadow` landed there. A route that does not reach its body does not error in an obvious way; it runs the NEXT command's body against the operator's arguments, which is how a read command became a write one",
     test: "test/cli-routing.test.mjs",

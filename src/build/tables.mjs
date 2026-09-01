@@ -71,6 +71,12 @@ export const TABLE_OWNERS = {
   // and without a handler a NORMAL restore drops it while reporting success.
   provider_measurement:
                    { writer: "measure-provider", reader: "the arming gate, doctor",                replayed: true,  section: "10.4" },
+  // THE ONE TABLE THE GUARDIAN MAY READ BESIDES ITS OWN. Written at admission
+  // from the API client's snapshot; read through the guest connection so the
+  // guardian never needs a privileged handle to learn the id it scopes every
+  // provider lease on.
+  project_identity:
+                   { writer: "registry.mjs at admission", reader: "repoid.mjs, the guardian tick",  replayed: true,  section: "10.2" },
 };
 
 export const PROSE_TABLES = [
@@ -82,7 +88,7 @@ export const PROSE_TABLES = [
   "ownership_check", "harness_acceptance", "pr_hold", "project_authority", "repo_gate_state",
   "inbox", "outbox", "merge_decision", "singleton_lease", "writer_lease", "maintenance_lock",
   "directory_lease", "territory_lease", "provider_lease", "provider_state", "provider_measurement",
-  "intake_event", "escalation", "schema_version",
+  "project_identity", "intake_event", "escalation", "schema_version",
 ];
 // task_drain is in TABLE_OWNERS and NOT in PROSE_TABLES: section 11.2 carries
 // drain_set as a column on task, and this plan makes it a child table instead

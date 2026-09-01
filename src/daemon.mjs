@@ -1020,6 +1020,40 @@ const REPO_ID_RETRY_SECONDS = 600;
 // profile key fails validation for anyone who tries to turn it.
 const RATE_LIMIT_COOLDOWN_SECONDS = 600;
 
+/**
+ * The page identity for a sandbox canary that RAN and failed, in THIS daemon.
+ *
+ * `guardian:`, not `builder:`, and the difference is ownership rather than
+ * spelling. The design states it twice: §4.4 says the raising daemon escalates in
+ * its OWN store -- `builder:sandbox:canary-failed` from the builder,
+ * `guardian:sandbox:canary-failed` from a guardian daemon -- and §11.7 says the
+ * guardian never writes a builder identity and the builder never writes a
+ * guardian one, because `announceable` runs in the process that owns the store it
+ * reads. The canary here is measured by the guardian tick and the row lands in the
+ * guardian's per-repo store, so the builder identity would have been a row no
+ * process that owns it can see, announce or retire.
+ *
+ * THE BARE IDENTITY, with no subject appended. §11.7 again: the key is the bare
+ * identity and the report rides in the alert body. There is no body field yet --
+ * `buildAlert` renders the key itself -- so until there is one, the detail lives
+ * in the log line beside the raise. Appending the canary id would have made the
+ * key move whenever the CLI, the binary or the policy changed, and `announceable`
+ * retires a key that moves and raises the new one: two pushes for one unchanged
+ * fault, which is how a channel earns being muted.
+ *
+ * Nothing is lost by dropping it. A canary that RUNS answers for the whole host,
+ * so a later measurement supersedes an earlier one by definition, and with one key
+ * that is simply the same row.
+ *
+ * At the top of the file with the other constants rather than beside its reader: a
+ * guard whose constant is declared below the code that consults it is one refactor
+ * away from a temporal dead zone, and this repository has paid for that once.
+ * EXPORTED so a page list or a matcher can ask this module for the identity rather
+ * than spelling it again; a second copy of an identity agrees on the day it is
+ * written and nothing fails when it stops agreeing.
+ */
+export const CANARY_PAGE = "guardian:sandbox:canary-failed";
+
 export async function tick(ctx) {
   const { nwo, profile, db, execute = false, shadow = true } = ctx;
   // Absolute, once, before ANYTHING derives from it. A relative `--log` made
@@ -2224,6 +2258,75 @@ export async function tick(ctx) {
       if (canaryLease) releaseWithRetry(`canary:${nwo}`, canaryLease);
     }
   }
+  // A FAILED CANARY IS ITS OWN PAGE, and it stands until one passes.
+  //
+  // `guardian:containment:open` below says dispatch is blocked. It does not say
+  // WHY, and the reasons take different remedies: a GitHub credential in the
+  // login keychain is removed by hand, a host that is not isolated is a profile
+  // change, and a canary that RAN and failed means the sandbox policy no longer
+  // contains a worker on this machine. The founder's page list names the third
+  // separately for that reason, and until now nothing minted it -- the identity
+  // existed only in a comment in `build/dash.mjs`, so the condition under which
+  // nothing may dispatch reached the digest rather than a phone.
+  //
+  // FROM THE STORE, not from this process's memory. Containment is measured only
+  // when a worker task actually wants dispatching, so a quiet tick runs no canary
+  // and produces no escalation -- and `announceable` reads an escalation absent
+  // from a complete tick as resolved, so an unrepeated raise would announce
+  // CLEARED for a sandbox nobody re-measured.
+  //
+  // The first version of this carried the standing failure on `ctx`, which is the
+  // shape the backup failure beside it uses. It is wrong HERE, and review caught
+  // it. `bin/reeve` builds a fresh context per process, so a daemon restart -- or
+  // a one-shot `reeve tick` -- arrives with an empty latch while the escalation
+  // ROW is still in the store; the next complete tick then finds it standing and
+  // absent, and retires it. A restart would have announced the sandbox repaired.
+  //
+  // The backup path survives that because a fresh process backs up on its first
+  // tick, so the fact is re-measured immediately. This one cannot: the canary is
+  // a paid model call that runs only under `execute` with work wanting dispatch,
+  // so after a restart it may be hours before anything asks the question again.
+  // The row is the latch, and reading it back is the only thing that is true
+  // across processes.
+  //
+  // A CANARY THAT RAN SUPERSEDES THE WHOLE STANDING SET. The id names the
+  // configuration in force -- CLI, binary, policy, instrument -- so a page about
+  // a configuration that is no longer running is not something anyone can act on,
+  // and a pass under the current one is the honest answer to "is this host
+  // contained". Re-raising a superseded id would make the page a latch that only
+  // a restart could clear, which is the failure this block exists to prevent,
+  // pointing the other way.
+  //
+  // SKIPPED IS NOT FAILED, and NO ID IS NOT FAILED EITHER. `skipped` means
+  // containment was already open for a cheaper reason, so the canary never ran;
+  // a null id means there was no CLI version or sandbox block to run one under.
+  // Both block dispatch and both are covered by the identity below. Neither is a
+  // sandbox that stopped containing a worker, and paging as though it were would
+  // send the founder to the policy over a missing binary. Neither RAN, so neither
+  // supersedes the standing set either.
+  //
+  // THE KEY IS THE PAGE. `buildAlert` renders the escalation key itself as the
+  // message body, so the key has to read as a sentence to a human holding a
+  // phone -- and it has to be STABLE, because `announceable` retires a key that
+  // changes and raises the new one, which is two pushes for one unchanged fault.
+  // The canary's `why` moves between runs of the same broken sandbox; its id does
+  // not, and it changes exactly when the CLI, the binary or the policy does,
+  // which is a genuinely new measurement worth saying again. So the id is in the
+  // key and the reason is in the log, the same split the backup path makes.
+  const canary = containment?.canary ?? null;
+  const canaryRan = Boolean(canary && !canary.skipped && canary.id != null);
+  if (canaryRan && !canary.ok) {
+    raise(CANARY_PAGE);
+    log(logPath, `containment: canary ${canary.id} FAILED — ${canary.why ?? "no reason recorded"}; nothing may dispatch until one passes`);
+  } else if (canaryRan) {
+    // A POSITIVE MEASUREMENT RETIRES IT, here rather than in `announceable`.
+    if (retireCanaryPage(db)) log(logPath, `CLEARED: ${CANARY_PAGE} — canary ${canary.id} passed`);
+  } else if (canaryPageStands(db)) {
+    // Nothing measured the sandbox this tick, so the page it is already carrying
+    // is still the best answer anyone has.
+    raise(CANARY_PAGE);
+  }
+
   if (execute && wanted.length && !skipDispatch && containment.credentialRead !== "closed") {
     log(logPath, `execute: NOT dispatching ${wanted.length} worker task(s) — worker containment is open: ${containment.why}`);
     raise("guardian:containment:open");
@@ -3270,6 +3373,39 @@ export async function tick(ctx) {
  * @param {Map<string, number>} escalations  cause -> how many PRs share it
  * @returns {{fresh: {why: string, count: number}[], cleared: string[]}}
  */
+/**
+ * Is this store already carrying a canary page?
+ *
+ * THE ROW IS THE LATCH. A standing escalation has to survive a restart and nothing
+ * on `ctx` does: `bin/reeve` builds a fresh context per process, so a latch kept in
+ * memory is empty after a restart while the row is still in the store -- and the
+ * next complete tick would find that row standing and absent from the tick and
+ * retire it, announcing that a sandbox nobody re-measured is fine.
+ */
+export function canaryPageStands(db) {
+  return Boolean(db.prepare("SELECT 1 FROM escalation WHERE why = ?").get(CANARY_PAGE));
+}
+
+/**
+ * Retire the canary page because a canary RAN and passed.
+ *
+ * DELIBERATELY NOT THROUGH `announceable`. That function retires a standing cause
+ * by inferring repair from ABSENCE, and it refuses to infer it on a tick that did
+ * not finish looking -- `complete` is false whenever a single pull request could
+ * not be read. That rule is right for causes derived from pull requests and wrong
+ * here: the canary is a repo-wide measurement that does not depend on evaluating
+ * any pull request, so one unreadable PR on the tick where the sandbox was proved
+ * healthy would leave the row standing, the next quiet tick would re-raise it from
+ * the store, and the page would never clear again. Review found exactly that.
+ *
+ * So this retires on a POSITIVE measurement rather than on an absence, which is
+ * the one thing `announceable` is built never to do. It returns whether a row was
+ * actually removed, so the caller says CLEARED only when something cleared.
+ */
+export function retireCanaryPage(db) {
+  return db.prepare("DELETE FROM escalation WHERE why = ?").run(CANARY_PAGE).changes > 0;
+}
+
 export function announceable(db, escalations, { covered = null, waiting = null, finished = null, complete = true, at = Math.floor(Date.now() / 1000) } = {}) {
   const fresh = [], cleared = [];
   const standing = new Map(

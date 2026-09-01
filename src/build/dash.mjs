@@ -99,13 +99,21 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
   // events 51-100 of the new incarnation are skipped for ever with nothing
   // reporting it.
   //
-  // There is no incarnation id in the hub, and inventing one here would be a
-  // schema decision taken by a read surface. But one is not needed: a restored
-  // log is a PREFIX of the old one, so an event that survives the restore keeps
-  // its `at`, and an event written after it does not. So the cursor is
-  // `<seq>.<at>`, and the check is whether the row at that sequence is still the
-  // row the cursor was issued for. That is PROOF rather than inference, and it
-  // uses only what the log already records.
+  // WHAT THIS CATCHES, AND WHAT IT DOES NOT. A restored log is a PREFIX of the
+  // old one, so an event that survives keeps its `at` and one written afterwards
+  // usually does not -- the cursor therefore carries the event it names, and a
+  // sequence wearing a different row is caught.
+  //
+  // It is NOT proof. `at` has integer-second resolution and is not unique, so a
+  // log restored and regrown to the same sequence WITHIN ONE SECOND presents an
+  // identical (seq, at) and this check accepts it. Closing that needs a durable
+  // hub incarnation -- a `hub.restored` event, or a column -- and neither is a
+  // decision a read surface may take: `restoreHub` records nothing today, and
+  // searching hub.sql for any per-incarnation value finds none.
+  //
+  // So the bound is stated rather than inferred away, and the remaining gap is
+  // carried to whoever owns the hub schema. A third guess at incarnation would be
+  // the third guess.
   const atOf = (seq) => db.prepare("SELECT at FROM phase_event WHERE seq = ?").get(seq)?.at ?? null;
   const rewound = since !== null &&
     (since.seq > highWater || (since.seq > 0 && atOf(since.seq) !== since.at));
@@ -154,9 +162,15 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
     // false and there is no headline wait -- not because the task is moving, but
     // because nobody could tell. Calling that "doing" reports progress on
     // evidence that is missing.
+    // A LIVE RUN IS OBSERVED; everything else here is INFERRED from having
+    // nothing against it, and that inference needs a builder to be running. With
+    // no process at all -- never started, or cleanly stopped -- a newly filed
+    // task has no wait recorded against it and was being described as doing work
+    // on a digest whose own first line said NOT RUNNING.
     doing: tasks
       .filter(t => t.running ||
-                   (!TERMINAL_SET.has(t.phase) && !t.waiting.first && t.waiting.capability_known))
+                   (holderAlive && !TERMINAL_SET.has(t.phase) &&
+                    !t.waiting.first && t.waiting.capability_known))
       .map(t => ({ id: t.id, phase: t.phase, project: t.project, title: t.title,
                    running: t.running, age: t.age })),
 
@@ -179,8 +193,15 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
                    // merely unknown.
                    capability: t.waiting.first === "WAITING_FOR_CAPABILITY"
                      ? t.waiting.capability : null,
-                   for_seconds: t.waiting.since !== null ? Math.max(0, now - t.waiting.since)
-                                                         : (t.age?.seconds ?? null) }))
+                   // UNKNOWN, NOT THE PHASE AGE. A switch has no recorded moment
+                   // of being turned off, and borrowing the age in state answers a
+                   // different question: a task that worked in SIZING for ten days
+                   // before `observe` was disabled a minute ago would report a
+                   // ten-day wait and outrank every genuine one. Nulls sort last,
+                   // so an unknown duration makes no claim on attention rather
+                   // than the strongest possible one.
+                   for_seconds: t.waiting.since !== null
+                     ? Math.max(0, now - t.waiting.since) : null }))
       // LONGEST FIRST. `for_seconds` exists to decide what to handle first, and
       // leaving the list in task-creation order means the number is printed and
       // not used. A null elapsed sorts last -- it is the weakest claim on

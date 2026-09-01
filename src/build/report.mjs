@@ -28,14 +28,43 @@ export const ACTIONS = BUILD_ACTIONS;
 export const PHASE_FOR_ACTION = Object.freeze(Object.fromEntries(
   Object.entries(BUILD_ACTION_FOR).map(([phase, action]) => [action, phase])));
 
+// DEEPLY FROZEN, because the cache is shared and its contents are handed to
+// every caller. One consumer mutating the object it was given would change what
+// every later validation enforces, and the freeze fixture would go on reporting
+// the contract intact -- it hashes the same mutated object.
+const deepFreeze = (v) => {
+  if (v && typeof v === "object") { for (const k of Object.keys(v)) deepFreeze(v[k]); Object.freeze(v); }
+  return v;
+};
 const CACHE = new Map();
-export function schemaFor(action) {
+function load(action) {
   if (!ACTIONS.includes(action)) throw new Error(`no report schema for ${JSON.stringify(action)}`);
-  if (!CACHE.has(action))
-    CACHE.set(action, JSON.parse(readFileSync(
-      new URL(`./schemas/${action.toLowerCase()}.json`, import.meta.url), "utf8")));
+  if (!CACHE.has(action)) {
+    const text = readFileSync(new URL(`./schemas/${action.toLowerCase()}.json`, import.meta.url), "utf8");
+    CACHE.set(action, { text, schema: deepFreeze(JSON.parse(text)) });
+  }
   return CACHE.get(action);
 }
+
+/** The parsed schema, for validating a report against it. */
+export const schemaFor = (action) => load(action).schema;
+
+/**
+ * The schema AS TEXT, which is what `--json-schema` takes.
+ *
+ * `workerArgs` pushes its `jsonSchema` straight into the argv array
+ * (`src/supervisor.mjs:149`) and its tested contract is serialized JSON
+ * (`test/worker-args.test.mjs`, `'{"type":"object"}'`). The documented handoff
+ * passes `schemaFor(action)` -- a parsed OBJECT -- so every phase dispatch
+ * following it would spawn a worker with the literal string `[object Object]`
+ * as its structured-output contract. Not a validation failure: an argument that
+ * is syntactically fine and semantically nothing, on all three phases at once.
+ *
+ * It returns the FILE'S TEXT rather than a re-serialization, so what the worker
+ * is asked for is byte-identical to what the freeze fixture hashes and what a
+ * reviewer read.
+ */
+export const schemaTextFor = (action) => load(action).text;
 
 // The subset of JSON Schema these three files use, and no more. A dependency is
 // not added for it, and a validator that silently ignores a keyword it does not
@@ -103,27 +132,50 @@ export function validateReport(action, value) {
  * the rule that a blocked_other must reach a founder has one home, and a default
  * supplied here would be a second copy of it that nobody could see.
  *
- * AN UNDECLARED OUTCOME THROWS rather than falling through to success. Written
- * as two `if`s and a trailing `return`, anything that is not `infeasible` or
- * `blocked` became a `phase.succeeded` -- so a report that skipped validation,
- * or one validated against the wrong action, ADVANCES the task. Failing open is
- * the wrong direction for the one function whose output moves a task forward,
- * and the list of outcomes is read from the schema rather than restated, so
- * this cannot disagree with what validation admits.
+ * THE REPORT IS VALIDATED AGAINST THIS ACTION, not merely checked for a known
+ * outcome word. Checking the word alone, `{outcome:"ok", reason:"researched",
+ * artifact:"research.md"}` -- a valid RESEARCH report -- produced a successful
+ * DESIGN evidence when handed in with `BUILD_DESIGN`, which `nextPhase` accepts
+ * while the task is in DESIGN. That is precisely the miswired or adopted-report
+ * case the phase-attribution guard exists for, defeated one layer above it. The
+ * validation is repeated rather than trusted from the caller: this is the
+ * function whose output moves a task forward, and it is cheap.
+ *
+ * EVERY DECLARED OUTCOME IS MAPPED, and the map is a table so that can be
+ * ASSERTED rather than hoped for. Written as two `if`s and a trailing `return`,
+ * anything not `infeasible` or `blocked` became a `phase.succeeded` -- so an
+ * outcome added to the schema later, `cancelled` or `partial`, would ADVANCE the
+ * task the day it was declared, and the freeze would not notice because it
+ * exercises the outcomes that exist. The completeness check lives in the test,
+ * where it fails at the moment the enum grows; the throw below is the backstop
+ * for a caller that reaches here anyway.
  */
+const EVIDENCE = {
+  infeasible: ({ report }) => ({ kind: "founder.infeasible", reason: report.reason }),
+  blocked: ({ report }) => ({ kind: "hold", reason: "blocked_other",
+                              detail: report.reason, escalation: report.escalation }),
+  // The depth is SIZING's alone: `nextPhase` requires it there and nowhere else.
+  ok: ({ action, phase, report }) => action === "BUILD_SIZE"
+    ? { kind: "phase.succeeded", phase, depth: report.depth }
+    : { kind: "phase.succeeded", phase },
+};
+
+/** The outcomes this map can turn into evidence. The test asserts it covers the schemas. */
+export const MAPPED_OUTCOMES = Object.freeze(Object.keys(EVIDENCE));
+
 export function evidenceFor({ action, report }) {
   const phase = PHASE_FOR_ACTION[action];
   if (!phase) throw new Error(`no phase for ${JSON.stringify(action)}`);
-  const declared = schemaFor(action).properties.outcome.enum;
-  if (!declared.includes(report?.outcome))
-    throw new Error(`${action} report has outcome ${JSON.stringify(report?.outcome)}; ` +
-                    `${JSON.stringify(declared)} are the ones its schema declares`);
-  if (report.outcome === "infeasible") return { kind: "founder.infeasible", reason: report.reason };
-  if (report.outcome === "blocked")
-    return { kind: "hold", reason: "blocked_other", detail: report.reason, escalation: report.escalation };
-  return action === "BUILD_SIZE"
-    ? { kind: "phase.succeeded", phase, depth: report.depth }
-    : { kind: "phase.succeeded", phase };
+  const v = validateReport(action, report);
+  if (!v.ok)
+    throw new Error(`this is not a valid ${action} report, so it cannot become ${action} evidence: ` +
+                    v.errors.join("; "));
+  const make = EVIDENCE[report.outcome];
+  if (!make)
+    throw new Error(`${action} declares the outcome ${JSON.stringify(report.outcome)} and this map has no ` +
+                    `evidence for it; every declared outcome needs one, because the alternative is advancing ` +
+                    `a task on a word nobody mapped`);
+  return make({ action, phase, report });
 }
 
 /**

@@ -2072,9 +2072,9 @@ export const STUBS = [
   },
   {
     name: "an-alert-is-sanitised-before-it-leaves-the-machine",
-    why: "interpolate an escalation body into the outbound message unsanitised. A body carries externally sourced text — CI output, a pathname, a validation error — and the dispatcher is the last point before it leaves the host. `buildAlert` applies redact(printable(...)) and `notify` itself does not, so a second producer of alerts is a second place the boundary has to be applied: without it a control character can forge a rendered alert and an echoed credential leaves the machine",
+    why: "assemble the outbound message without `redact`. The boundary is two properties, not one, and this is the half that neutralises SECRET SHAPES and applies the length cap — a credential echoed into CI output then leaves the machine in a notification. `buildAlert` applies it and `notify` itself does not, so a second producer of alerts is a second place it has to be applied. The control-character half lives in the per-part `clean`, which is why this entry names the redaction assertion and not the escaping one",
     test: "test/build-escalations.test.mjs",
-    expectRed: "control characters are neutralised before the message leaves",
+    expectRed: "and a credential shape is redacted rather than sent",
     edits: [{
       file: "src/build/announce.mjs",
       find: "    const message = redact(raw);",
@@ -2158,6 +2158,18 @@ export const STUBS = [
       file: "src/build/announce.mjs",
       find: "      if (pages(why) && standing.get(why).announced_count > 0) {",
       replace: "      if (pages(why)) {",
+    }],
+  },
+
+  {
+    name: "an-untrusted-part-cannot-forge-a-line",
+    why: "assemble the message from raw parts. `clean` is `printable` applied to each untrusted value BEFORE the trusted separators are added, and it is what stops a body from forging a line: a detail containing a line feed would otherwise render as its own line, indistinguishable from the identity or the action this surface writes. It is the half of the boundary that survived splitting the sanitisation, and it is asserted separately from the redaction half because a stub that removes one leaves the other standing",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a newline inside the body is escaped, so a detail cannot forge a line",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    const clean = (v) => printable(String(v ?? \"\"));",
+      replace: "    const clean = (v) => String(v ?? \"\");",
     }],
   },
 ];

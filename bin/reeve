@@ -1729,59 +1729,28 @@ switch (cmd) {
           stop();
         }
         const hist = migrationStateOf(db);
-        if (!hist.readable) {
-          console.error(`reeve task: the hub at ${hubPath} exists but its schema_version cannot be read, ` +
-                        `so which migrations it carries is unknown.`);
-          stop();
-        }
-        // NEWER BEFORE MISSING, and while still holding only the READ-ONLY
-        // probe. A hub carrying a contiguous 1 through 4 while this binary knows
-        // 3 is missing none of what this binary expects, so `missing` is empty
-        // and `holed` is false -- and the guard fell through to `openHub`, whose
-        // first acts are `PRAGMA journal_mode = WAL` and the `schema_version`
-        // DDL. Both are writes, to a database written by a NEWER binary, from
-        // the command whose entire purpose here is to write nothing. `openHub`
-        // does refuse the newer version, but only after those writes.
-        if (hist.version > HUB_SCHEMA_VERSION) {
-          console.error(`reeve task: the hub at ${hubPath} is schema version ${hist.version}, and this ` +
-                        `binary knows ${HUB_SCHEMA_VERSION}. Migrations are forward-only, so this binary ` +
-                        `cannot read it and a dry run will not open it.`);
-          console.error(`-> run the newer binary, or restore a snapshot taken at ${HUB_SCHEMA_VERSION}`);
-          stop();
-        }
-        // AN INVALID MARKER IS ITS OWN FAULT, and it comes BEFORE the missing
-        // check because it is invisible to it. `schema_version` is an INTEGER
-        // PRIMARY KEY, so a hand-edited `-1` is valid SQLite: every expected
-        // version reads as missing, nothing reads as a hole, and the branch
-        // below would tell the operator to migrate -- which `openHub` refuses,
-        // because `historyGaps` will not take a negative bound. Migrating cannot
-        // repair a marker that is not a version.
-        if (hist.invalid.length) {
-          console.error(`reeve task: the hub at ${hubPath} records ${hist.invalid.join(", ")} in ` +
-                        `schema_version, which is not a migration number this binary can act on ` +
-                        `(they run 1 through ${HUB_SCHEMA_VERSION}).`);
-          console.error(`-> the marker itself is wrong, so migrating cannot repair it: restore a snapshot ` +
-                        `(\`reeve restore --hub --force\`), then retry`);
-          stop();
-        }
-        if (hist.missing.length) {
-          console.error(`reeve task: the hub at ${hubPath} is missing migration(s) ` +
-                        `${hist.missing.join(", ")} (it carries ${hist.have.join(", ") || "none"}, and this ` +
-                        `binary expects 1 through ${HUB_SCHEMA_VERSION}). A dry run will not migrate it, ` +
-                        `because migrating is a write and this command promises none.`);
-          // THE REMEDY HAS TO BE ONE THAT WORKS ON THIS FAULT. Both faults
-          // arrive here as a non-empty `missing`, and only one of them
-          // migrates: `openHub` re-runs a missing TAIL, and refuses a HOLE
-          // outright, because a migration beneath an applied one cannot be
-          // re-run over a store that has already moved past it. Sending an
-          // operator with a holed hub to the writing command sends them to a
-          // second refusal -- and that second refusal is the one that names the
-          // repair, so the first message cost them a round trip to reach it.
-          console.error(hist.holed
-            ? `-> this is a HOLE, not a missing tail, so migrating cannot repair it: the migrations ` +
-              `beneath the ones already applied cannot be re-run. Restore a snapshot ` +
-              `(\`reeve restore --hub --force\`), then retry`
-            : `-> run a command that writes (for example \`reeve task file\` without --dry-run) to migrate, then retry`);
+        // THE SAME DECISION THE READ ROUTES MAKE, from the same function.
+        //
+        // This path had all four cases right and the read routes had one, which is
+        // why `historyFault` exists. It was extracted from HERE -- and then only
+        // the read routes were wired to it, leaving this site as the second copy
+        // of the ordering and the remedies while the module claimed to be the
+        // single decision. Review named that, and it is the same duplication the
+        // extraction was for, pointing the other way.
+        //
+        // The rendering stays this path's own: it prints to stderr and stops,
+        // where the read routes refuse through `fail()` with a machine kind. Only
+        // the decision is shared.
+        //
+        // One thing this fixed as a consequence rather than as a change: the
+        // forward-version remedy here used to offer `restore a snapshot taken at
+        // N` beside running the newer binary, which would destroy a healthy store
+        // that is merely ahead of this binary. `historyFault` refuses to suggest
+        // it, so both sites stopped saying it at once.
+        const fault = historyFault(hist, { migrateWith: "\`reeve task file\` without --dry-run" });
+        if (fault) {
+          console.error(`reeve task: the hub at ${hubPath} — ${fault.detail}.`);
+          console.error(`-> ${fault.remedy}`);
           stop();
         }
         // AND THE SHAPE IS CHECKED BEFORE ANY APPLICATION QUERY. A complete

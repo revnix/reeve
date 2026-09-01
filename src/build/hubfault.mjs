@@ -48,17 +48,33 @@ import { HUB_SCHEMA_VERSION } from "./hubdb.mjs";
  * @param {{readable:boolean, missing:number[], have:number[], holed:boolean, invalid:number[], version:number}} hist
  * @returns {{kind:string, detail:string, remedy:string}|null}
  */
-export function historyFault(hist, { expect = HUB_SCHEMA_VERSION } = {}) {
+export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
+                                    migrateWith = "`reeve build run`" } = {}) {
   if (!hist || hist.readable !== true)
     return { kind: "unreadable",
              detail: "its schema_version cannot be read, so which migrations it carries is unknown",
              remedy: "restore a snapshot (`reeve restore --hub --force`), then retry" };
 
+  // NO SNAPSHOT REMEDY FOR A NEWER HUB, and this is the one case where offering
+  // the usual repair is dangerous rather than merely unhelpful.
+  //
+  // Every other fault here describes a BROKEN store, where installing a snapshot
+  // trades lost recent state for a working hub. A forward-version store is not
+  // broken: it is healthy and this binary is old. Restoring a snapshot taken at
+  // this binary's version over it destroys everything the newer binary wrote --
+  // rows, and semantics that did not exist at that version -- to fix nothing.
+  //
+  // The message this replaced said `run the newer binary, or restore a snapshot
+  // taken at N`, which I carried over from the dry-run path when extracting this.
+  // Review caught it, and the assertion I had written could not: it tested for the
+  // WORD "downgrade" and the sentence recommends the ACT without using it.
   if (hist.version > expect)
     return { kind: "ahead",
              detail: `it is schema version ${hist.version}, and this binary knows ${expect}. ` +
                      "Migrations are forward-only, so this binary cannot read it",
-             remedy: `run the newer binary, or restore a snapshot taken at ${expect}` };
+             remedy: "run the newer binary. Do NOT restore a snapshot over it: this store is " +
+                     "healthy and this binary is old, so an older snapshot would discard whatever " +
+                     "the newer one wrote to fix nothing" };
 
   if (hist.invalid.length)
     return { kind: "invalid",
@@ -80,6 +96,21 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION } = {}) {
         remedy: "this is a HOLE, not a missing tail, so migrating cannot repair it: the migrations " +
                 "beneath the ones already applied cannot be re-run. Restore a snapshot " +
                 "(`reeve restore --hub --force`), then retry" }
+    // THE COMMAND IS THE CALLER'S, the DECISION is not -- and so are its backticks.
+    //
+    // The two hints are not the same shape: one is a bare command, the other is a
+    // command plus a flag to leave off. Wrapping both in one pair of quotes here
+    // rendered "`reeve task file` without --dry-run`", a stray backtick that every
+    // assertion about that text passed straight over, because they match words and
+    // not punctuation. I only saw it by printing the string.
+    //
+    // Which fault this is, and which CLASS of remedy it takes, is one rule and
+    // lives here. Which concrete command to name is context: `task file
+    // --dry-run` should tell an operator to re-run the command they are already
+    // running, and a read route has no writing command of its own to offer, so it
+    // names the builder. Hard-coding one of them here replaced the dry-run path's
+    // contextual advice with a generic instruction to run something else, which a
+    // control in `migration-history` caught immediately.
     : { kind: "tail", detail,
-        remedy: "run a command that writes (for example `reeve build run`) to migrate, then retry" };
+        remedy: `run a command that writes (for example ${migrateWith}) to migrate, then retry` };
 }

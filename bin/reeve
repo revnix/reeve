@@ -217,6 +217,7 @@ const FLAGS = {
   priority:           { value: true,  what: "p1 or p2" },
   "idempotency-key":  { value: true,  what: "a key that makes a re-run of this command inert" },
   "pin-territory":    { value: true,  what: "keep the territory while held, for a duration like 48h" },
+  since:              { value: true,  what: "a unix timestamp: what moved since you last looked" },
 
   hub:            { value: false, what: "operate on the builder hub rather than a repository" },
   anyway:         { value: false, what: "file a near-twin of an existing task anyway" },
@@ -1153,10 +1154,11 @@ switch (cmd) {
     // A HUB THAT IS NOT THERE IS AN ANSWER, not a crash. A machine with no builder
     // has no hub, and `DatabaseSync` on a missing path raises an open error whose
     // text is not an answer to "what are my tasks".
-    if (sub === "list" || sub === "show" || sub === "why") {
+    if (sub === "list" || sub === "show" || sub === "why" || sub === "dash") {
       const { taskShow, taskList, renderShow, renderList, envelope,
               switchesResolver, projectsWithTasks, inSnapshot } = await import("../src/build/show.mjs");
       const { whyModel, renderWhy } = await import("../src/build/why.mjs");
+      const { dashModel, renderDash } = await import("../src/build/dash.mjs");
       const { loadRegistry } = await import("../src/build/registryio.mjs");
 
       const hub = hubPathFor(HOME);
@@ -1261,6 +1263,30 @@ switch (cmd) {
         // ONE SNAPSHOT for the whole command, so a listing is a moment the hub
         // actually had rather than a row-by-row walk across a live builder's
         // writes.
+        // The digest reads every project, so the registry is what names them --
+        // and a project the registry has lost still has tasks in the hub, which
+        // is why the two are unioned rather than one being trusted.
+        if (sub === "dash") {
+          const known = [...new Set([...Object.keys(reg.registry.projects), ...projectsWithTasks(db)])].sort();
+          const named = known.map(n => ({ name: n, nwo: reg.registry.projects[n]?.nwo ?? null }));
+          const raw = opt("since");
+          let since = null;
+          if (raw !== null) {
+            since = Number(raw);
+            if (!Number.isFinite(since) || since < 0)
+              fail("usage", `reeve task dash: --since expects a unix timestamp, got ${JSON.stringify(raw)}`,
+                   { exit: EXITS.misuse });
+          }
+          let model;
+          try {
+            model = inSnapshot(db, () => dashModel(db, { now, switchesFor, projects: named, since }));
+          } catch (e) { queryFailed(e); }
+          console.log(flag("json")
+            ? JSON.stringify(envelope("task.dash", model), null, 2)
+            : renderDash(model));
+          process.exit(EXITS.ok);
+        }
+
         if (sub === "list") {
           const want = opt("project");
           // A --project that names nothing ANYWHERE is a refusal, not an empty
@@ -1313,10 +1339,11 @@ switch (cmd) {
     }
 
     if (sub !== "file") {
-      console.error("reeve task: subcommands are `file`, `list`, `show` and `why`");
+      console.error("reeve task: subcommands are `file`, `list`, `show`, `why` and `dash`");
       console.error('-> reeve task file --project <p> --title "..." --territory <path>');
       console.error("-> reeve task list [--project <p>] [--json]");
       console.error("-> reeve task show|why <task-id> [--json]");
+      console.error("-> reeve task dash [--since <unix>] [--json]");
       process.exit(1);
     }
     const { fileTask, pinSeconds } = await import("../src/build/taskfile.mjs");

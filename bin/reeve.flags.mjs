@@ -57,6 +57,10 @@ export const APPLIES = Object.freeze({
   // at all -- `reeve task show <id> --project other` printed the task regardless,
   // which is the accepted-and-inert shape this whole file exists to refuse.
   project: Object.freeze(["task file", "task list"]),
+
+  // `--since` is the operator's own mark for "what happened while I was away",
+  // and only the digest answers that question.
+  since: Object.freeze(["task dash"]),
 });
 
 /**

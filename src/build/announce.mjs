@@ -332,7 +332,15 @@ export function builderAnnounceable(db, escalations, {
       // one pass lost the recovery permanently, while the raise it is recovering
       // from had just been taught to wait. The same rule on both sides: the
       // durable state changes when the notification lands, not before.
-      if (pages(why)) { clearable.push(why); continue; }
+      // AND ONLY IF THE ALARM WAS EVER DELIVERED. A cause every channel declined
+      // still has `announced_count` 0, so a recovery sent for it tells the reader
+      // a situation they were never informed of has ended -- which is worse than
+      // silence, because it invites them to look for an alert that does not
+      // exist. An undelivered cause is retired without a word.
+      if (pages(why) && standing.get(why).announced_count > 0) {
+        clearable.push(why);
+        continue;
+      }
       clearOne(db, why);
       cleared.push(why);
     }
@@ -475,9 +483,21 @@ export function announce(db, {
     // title, message, priority and tags and nothing else, so a clearing that
     // said only `kind: "cleared"` reached the phone reading exactly like a fresh
     // incident -- and its body said "(x0)", which is worse than saying nothing.
+    // SANITISE THE PARTS, THEN ASSEMBLE. `printable` escapes every control
+    // character, and a line feed is one -- so passing the finished message
+    // through it turned this surface's own separators into a literal backslash-n
+    // and delivered the identity, the action and the detail as a single run-on
+    // line with visible escapes. The layout the action depends on was destroyed
+    // by the boundary added to protect it, and an assertion that the action is
+    // PRESENT could not see the difference.
+    //
+    // So each untrusted value is cleaned on its own, and the line breaks between
+    // them are this file's, never the body's: a detail containing a newline is
+    // still escaped and cannot forge a line, which is the property that mattered.
+    const clean = (v) => printable(String(v ?? ""));
     const detail = body
       ? Object.entries(body).filter(([k]) => k !== "type")
-          .map(([k, v]) => `\n${k}: ${v}`).join("")
+          .map(([k, v]) => `\n${clean(k)}: ${clean(v)}`).join("")
       : "";
     // THE ACTION, ON EVERY ALERT. An identity says what happened; without the one
     // command that changes it, a page read at night is a notification the reader
@@ -492,12 +512,12 @@ export function announce(db, {
     // Reordering removes the dependency; reserving a byte count would inherit a
     // constant from another module and drift from it.
     const raw = isCleared
-      ? `CLEARED — ${why} is no longer standing.`
+      ? `CLEARED — ${clean(why)} is no longer standing.`
       // The count is the shape of a shared cause, and it is only worth saying
       // when it is more than one.
-      : `${why}${count > 1 ? ` (${count} subjects)` : ""}` +
-        `${body?.type ? ` [${body.type}]` : ""}` +
-        `${action ? `\n-> ${action}` : ""}${detail}`;
+      : `${clean(why)}${count > 1 ? ` (${count} subjects)` : ""}` +
+        `${body?.type ? ` [${clean(body.type)}]` : ""}` +
+        `${action ? `\n-> ${clean(action)}` : ""}${detail}`;
     // SANITISED AT THE BOUNDARY, exactly as `buildAlert` does it. A body carries
     // externally sourced text -- CI output, a pathname, a validation error -- and
     // this is the last point before it leaves the machine. `notify` does not do
@@ -505,8 +525,12 @@ export function announce(db, {
     // alerts is a second place the boundary has to be applied, and skipping it
     // lets control characters forge a rendered alert and an echoed credential
     // leave the host.
-    const title = redact(printable(isCleared ? `reeve: CLEARED ${why}` : `reeve: ${why}`));
-    const message = redact(printable(raw));
+    // `redact` LAST and on the whole, because it neutralises secret SHAPES that
+    // can span the parts and applies the length cap once. It does not touch line
+    // feeds, so the assembled layout survives it -- which is the whole reason the
+    // two halves of the boundary are applied at different granularities.
+    const title = redact(clean(isCleared ? `reeve: CLEARED ${why}` : `reeve: ${why}`));
+    const message = redact(raw);
 
     // THE SENDER'S OWN VERDICT, never an assumption. A throw and an `ok: false`
     // are the same fact to a reader who needs to know a human was not reached.

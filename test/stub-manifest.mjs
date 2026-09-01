@@ -2066,18 +2066,18 @@ export const STUBS = [
     expectRed: "control: and the row still stands, because nothing has been told yet",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "      if (pages(why)) { clearable.push(why); continue; }",
-      replace: "      if (false) { clearable.push(why); continue; }",
+      find: "      if (pages(why) && standing.get(why).announced_count > 0) {",
+      replace: "      if (false) {",
     }],
   },
   {
     name: "an-alert-is-sanitised-before-it-leaves-the-machine",
-    why: "interpolate an escalation body into the outbound message unsanitised. A body carries externally sourced text — CI output, a pathname, a validation error — and the dispatcher is the last point before it leaves the host. `buildAlert` applies redact(printable(...)) and `notify` itself does not, so a second producer of alerts is a second place the boundary has to be applied: without it a control character can forge a rendered alert and an echoed credential leaves the machine",
+    why: "assemble the outbound message without `redact`. The boundary is two properties, not one, and this is the half that neutralises SECRET SHAPES and applies the length cap — a credential echoed into CI output then leaves the machine in a notification. `buildAlert` applies it and `notify` itself does not, so a second producer of alerts is a second place it has to be applied. The control-character half lives in the per-part `clean`, which is why this entry names the redaction assertion and not the escaping one",
     test: "test/build-escalations.test.mjs",
-    expectRed: "control characters are neutralised before the message leaves",
+    expectRed: "and a credential shape is redacted rather than sent",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "    const message = redact(printable(raw));",
+      find: "    const message = redact(raw);",
       replace: "    const message = raw;",
     }],
   },
@@ -2088,7 +2088,7 @@ export const STUBS = [
     expectRed: "and the rendered alert carries it, which is the only place a phone shows it",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "        `${action ? `\\n-> ${action}` : \"\"}${detail}`;",
+      find: "        `${action ? `\\n-> ${clean(action)}` : \"\"}${detail}`;",
       replace: "        `${detail}`;",
     }],
   },
@@ -2135,6 +2135,41 @@ export const STUBS = [
       file: "src/build/announce.mjs",
       find: "    const accepted = (result?.channels ?? []).filter(c => c.ok);",
       replace: "    const accepted = [];",
+    }],
+  },
+
+  {
+    name: "an-alerts-own-line-breaks-are-real",
+    why: "sanitise the FINISHED message rather than its parts. `printable` escapes every control character and a line feed is one, so this surface's own separators become a literal backslash-n and the identity, the action and the detail arrive as a single run-on line with visible escape sequences. The boundary added to protect the alert destroys the layout the action line depends on, and an assertion that the action is PRESENT cannot see the difference — only one about the STRUCTURE can. Sanitising the parts keeps the property that mattered: a newline inside a body is still escaped and cannot forge a line",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "the message is rendered as separate lines, not one run-on string",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    const message = redact(raw);",
+      replace: "    const message = redact(printable(raw));",
+    }],
+  },
+  {
+    name: "no-recovery-notice-for-an-alarm-nobody-heard",
+    why: "queue a clearing for a cause whose page every channel declined. Its `announced_count` is still zero, so the CLEARED notice tells the reader that a situation they were never informed of has ended — which is worse than silence, because it sends them looking for an alert that does not exist. The cause must still be RETIRED, or an undelivered page stands for ever precisely because it was never delivered",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "the cause is retired without a recovery notice, because none was owed",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "      if (pages(why) && standing.get(why).announced_count > 0) {",
+      replace: "      if (pages(why)) {",
+    }],
+  },
+
+  {
+    name: "an-untrusted-part-cannot-forge-a-line",
+    why: "assemble the message from raw parts. `clean` is `printable` applied to each untrusted value BEFORE the trusted separators are added, and it is what stops a body from forging a line: a detail containing a line feed would otherwise render as its own line, indistinguishable from the identity or the action this surface writes. It is the half of the boundary that survived splitting the sanitisation, and it is asserted separately from the redaction half because a stub that removes one leaves the other standing",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a newline inside the body is escaped, so a detail cannot forge a line",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    const clean = (v) => printable(String(v ?? \"\"));",
+      replace: "    const clean = (v) => String(v ?? \"\");",
     }],
   },
 ];

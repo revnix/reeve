@@ -64,18 +64,13 @@ export const TABLE_OWNERS = {
   territory_lease: { writer: "intake.mjs, transition.mjs",  reader: "the overlap check",                  replayed: true,  section: "10.2" },
   provider_lease:  { writer: "provider.mjs (both daemons)", reader: "admission, reaper, restore refusal", replayed: false, section: "10.4" },
   provider_state:  { writer: "provider.mjs, measure-provider", reader: "admission, doctor H-5",           replayed: false, section: "10.4" },
-  // NOT REPLAYED, because `replayed` means one specific thing here: replay.mjs
-  // reconstructs the table from event kinds. A measurement is not written
-  // through the event stream and has no such kinds, so claiming otherwise would
-  // assert a handler that does not exist.
-  //
-  // It survives a restore anyway, and by a different mechanism: restoreHub
-  // clears an explicit list of four process-scoped lease tables, and this is not
-  // one of them. That distinction matters -- a measurement is not about this
-  // machine or this run, it was true about the PROVIDER when it was taken, and
-  // losing it would silently re-open an arming question already answered.
+  // REPLAYED, unlike the two provider tables above it. Those are process-scoped:
+  // restoreHub clears them, so there is no image to restore. This one is durable
+  // and a restore rebuilds everything after the snapshot from the event tail
+  // alone -- so a measurement taken since the last snapshot exists only there,
+  // and without a handler a NORMAL restore drops it while reporting success.
   provider_measurement:
-                   { writer: "measure-provider", reader: "the arming gate, doctor",                replayed: false, section: "10.4" },
+                   { writer: "measure-provider", reader: "the arming gate, doctor",                replayed: true,  section: "10.4" },
 };
 
 export const PROSE_TABLES = [

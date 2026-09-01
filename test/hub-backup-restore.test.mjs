@@ -593,6 +593,18 @@ const POST_SNAPSHOT = {
   // No `task` column, like guardian_receipt and project_authority -- writeRow
   // already only sets one on tables that declare it.
   escalation:        writeRow("escalation", "escalation.raised"),
+  // EVERY VALUE SPELLED OUT, because this table constrains its own vocabulary:
+  // `minimalRow`'s generic filler produces a kind and a result the CHECKs reject,
+  // and a fixture that cannot insert would fail as a broken drill rather than as
+  // the broken replay it is meant to detect. `measured_at` is 1 rather than a
+  // clock read: the read path refuses a future-dated row, and a fixture that
+  // borrows the wall clock would start failing the moment one runs a second
+  // ahead of the other.
+  provider_measurement: (db, t) =>
+    writeRow("provider_measurement", "provider_measurement.recorded")(db, t, {
+      provider: "claude", kind: "pool-relationship", result: "SHARED",
+      evidence: "drill: a measurement written after the snapshot", measured_at: 1,
+    }),
 };
 
 function writeAuthority(db, project) {
@@ -680,6 +692,9 @@ function writeAuthority(db, project) {
     // No foreign keys of its own (`why` is the primary key and nothing
     // references it), so its position here is free.
     "escalation",
+    // Free for the same reason: its primary key is (provider, kind, measured_at)
+    // and no table references it.
+    "provider_measurement",
   ];
   check(WRITE_ORDER.length === COMPARISON_SET.length
         && WRITE_ORDER.every(t => COMPARISON_SET.includes(t))

@@ -1020,8 +1020,31 @@ console.log(`\n${s.caught}/${s.total} stub(s) caught by the assertion they name.
              .map(r => manifest.find(e => e.name === r.name))
              .filter(Boolean)
     : null;
-  console.log(coverageLine(coverage(manifest, testFiles, grandfathered, provenEntries),
-                           whole ? s.caught : null));
+  const cov = coverage(manifest, testFiles, grandfathered, provenEntries);
+  console.log(coverageLine(cov, whole ? s.caught : null));
+  // AN ORPHAN IS THE FAILURE, and until now it was only the printed number.
+  //
+  // `coverage` has always classified a test file that is neither covered nor
+  // grandfathered as an orphan, and its own comment calls that the failure -- a
+  // test nobody has shown can fail, and that nobody declared. Nothing read it.
+  // The exit was the entry verdicts alone, so a new test file with no entry
+  // arrived silently and the ratio moved by one where nobody was looking.
+  //
+  // A rule stated in a comment and not wired is the shape this instrument exists
+  // to find, so it should not have been the shape of the instrument.
+  //
+  // ONLY ON A WHOLE RUN. A targeted run knows the same fact, but failing it for
+  // a file the operator did not ask about turns `stub-sweep.mjs one-entry` into
+  // a gate that refuses for unrelated reasons -- which is how a tool people use
+  // while working becomes one they stop using. CI runs the whole manifest.
+  if (whole && cov.orphans.length) {
+    console.log("\nThese test files have no manifest entry and are not grandfathered:");
+    for (const f of cov.orphans) console.log(`  ${f}`);
+    console.log("\nA test nobody has shown can fail is a test that cannot report a defect.");
+    console.log("Add an entry naming one of its assertions and the edit that makes it fail.");
+    console.log("Grandfathering is for files that predate the rule; a NEW file does not qualify.");
+    process.exit(1);
+  }
 }
 if (!s.ok) {
   console.log("\nA stub that is not caught means the assertion it names cannot fail for that reason.");

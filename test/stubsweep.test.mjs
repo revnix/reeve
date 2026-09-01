@@ -1399,6 +1399,57 @@ const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.ur
     "control: with no control count the branch cannot fire, and absent is not treated as zero");
 }
 
+// --- an ORPHAN test file fails the sweep, END TO END -----------------------------
+{
+  // `coverage` has always classified a test file that is neither covered nor
+  // grandfathered as an orphan, and its own comment calls that the failure. The
+  // exit read the entry verdicts alone, so the number moved and nothing acted on
+  // it: a new test file with no entry arrived silently.
+  //
+  // END TO END rather than a unit call, because the defect was never in
+  // `coverage` -- it computed the right answer throughout. The defect was that
+  // nothing READ it, and only running the tool can show that changed.
+  const root = tmpRoot("sweep-orphan-");
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { guard } from "../src/thing.mjs";\n` +
+    `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
+    `process.exitCode = guard ? 0 : 1;\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n` +
+    `export const GRANDFATHERED = [];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+  const sweep = () => spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+
+  // CONTROL FIRST. A check that fires on everything would satisfy the assertion
+  // below while refusing every healthy tree, and this one gates CI.
+  const clean = sweep();
+  check(clean.status === 0, "control: a tree whose every test file is covered still passes",
+    `${clean.status}: ${(clean.stdout ?? "").slice(-200)}`);
+
+  writeFileSync(join(root, "test", "orphan.test.mjs"),
+    `console.log("PASS  nobody has shown this can fail");\n`);
+  git("add", "-A"); git("commit", "-q", "-m", "orphan");
+  const withOrphan = sweep();
+  const out = `${withOrphan.stdout ?? ""}${withOrphan.stderr ?? ""}`;
+  check(withOrphan.status !== 0, "a test file with no entry and no grandfathering FAILS the sweep",
+    `${withOrphan.status}: ${out.slice(-300)}`);
+  // NAMED, because "coverage is lower" sends a reader to count files by hand.
+  check(/test\/orphan\.test\.mjs/.test(out), "and the failure names the file",
+    out.slice(-300));
+  // The entries themselves still passed: this is a coverage failure, not a stub
+  // failure, and conflating the two would send the reader to the wrong repair.
+  check(/1\/1 stub\(s\) caught/.test(out),
+    "control: and it is a COVERAGE failure -- every entry still caught what it names",
+    out.slice(-300));
+}
+
 // --- an ABORTING run, END TO END: the counters are the only thing that can tell --
 {
   // The `classify` cases above pass their own counters, so they prove the branch

@@ -103,6 +103,19 @@ false: the guardian's announcer is called at `src/daemon.mjs:1608` and `:3244`. 
 narrower -- the **builder** announcer S3-E introduces is never wired. A finding recorded as
 stated would have sent someone to fix a call site that already exists.
 
+### Verified since: S3-C's unique-violation branch
+
+Moved out of the unverified list below, because it is no longer an argument. The code it needed
+exists now, so it was checked rather than carried.
+
+- **S3-C. MEASURED 2026-09-01**, evidence in `docs/measured/2026-09-01-phase-run-constraint-errcodes.md`.
+  The unique-violation regex matches `index 'one_live_run'`; SQLite reports the constrained
+  columns instead, so the branch never fires. **Read the errcode, not the message**: 787
+  no-such-task, 1555 duplicate-attempt, 2067 live-run-exists — three distinct and stable values,
+  where the primary-key MESSAGE contains `phase_run.task` and so cannot be told from the index's
+  by matching the column. Re-inserting an attempt whose row is still live violates both and
+  reports 2067, which is correct but must be asserted on purpose. Closed by `src/build/run.mjs`.
+
 ### Arguments, recorded unverified
 
 Each needs code that does not exist yet. They are listed so the task that reaches them starts
@@ -120,14 +133,6 @@ by testing the claim.
   top-level keys and silently drops every nested one.
 - **S3-C.** If `runWorker` rejects rather than returning an outcome, the `finally` clears the
   heartbeat but never settles the run row.
-- **S3-C. NO LONGER AN ARGUMENT — MEASURED.** The unique-violation regex matches
-  `index 'one_live_run'`; SQLite reports the constrained columns instead, so the branch never
-  fires. Confirmed on node v24.17.0 against the shipped `hub.sql`. **Read the errcode, not the
-  message**: 787 no-such-task, 1555 duplicate-attempt, 2067 live-run-exists — three distinct and
-  stable values, where the primary-key MESSAGE contains `phase_run.task` and so cannot be told
-  from the index's by matching the column. Re-inserting an attempt whose row is still live
-  violates both and reports 2067, which is the correct answer but must be tested explicitly.
-  See trackers/s3.md §5.
 - **S3-D.** The done-condition regex accepts any fenced block, so a slice carrying a
   configuration snippet and no `Done when` reports a machine-checkable done-condition.
 - **S3-F.** A `phase_run` fixture inserts rows for a task the database has no parent row for,

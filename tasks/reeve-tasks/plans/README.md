@@ -203,20 +203,23 @@ citation shape, the sizing contract's field presence, per-slice design minima, a
 `requireMeasuredContext`, `minSlices`, `minClaims` and `requireDoneCondition` when the caller
 supplies them.
 
-**Left, by founder decision, for the task that owns the contract:**
+**Fixed in the follow-up, not left for S3-D.** An earlier revision of this file said
+these were deferred to the task that owns the contract; that was a misrecording of the
+founder's decision, which was to fix everything after T4 merged. All of them are done:
 
-| what | why it is S3-D's |
+| what | now |
 |---|---|
-| `sizing.json` field TYPES — presence is checked, so `est_files: "lots"` passes | the floors that read those numbers are S3-D's, and they should state what they need |
-| claims restricted to TOP-LEVEL Findings bullets | nested items currently count as claims, so a sub-bullet elaborating a cited claim needs its own citation |
-| a CLOSING fence on the done condition | an unterminated fence satisfies the opening-fence test, and half a block is not a done condition |
-| the trivial-depth RESEARCH refusal keyed on a helper flag | it still reads `expect.depth`, which the helper does not supply, so that path is unreachable from the documented caller |
-| `minCitationsPerClaim` applied | it is accepted and ignored, and an argument read but not applied is worse than one absent, because the caller believes it took effect |
+| `sizing.json` field TYPES | each field has a declared kind, so `est_files: "lots"` is refused and the finding names the field |
+| claims restricted to TOP-LEVEL Findings bullets | a nested bullet elaborating a cited claim is no longer a claim of its own |
+| a CLOSING fence on the done condition | the fence must open AND close; half a block put the rest of the document inside it |
+| the trivial-depth RESEARCH refusal | reads the caller's `skipped` flag, with depth as the fallback, so the path is reachable from the documented caller |
+| `minCitationsPerClaim` applied | it was accepted and ignored, so a claim with one citation satisfied a caller asking for two |
 
-**And three defects of T4's own**, deferred to the same follow-up rather than to S3-D: the
-directory-sync chain stops at eight levels, the citation pattern rejects extensions longer than
-six characters (so `src/x.markdown:12` is refused), and a temporary survives when `closeSync`
-itself throws.
+**And T4's own three**, also fixed: the directory-sync chain now walks to the filesystem
+root rather than stopping at eight levels, the citation pattern no longer caps a file
+extension at six characters (so `src/x.markdown:12` is a citation), and a temporary is
+removed when `closeSync` itself throws — the third leak in that family, after the write
+and the rename.
 
 **One more, found by the T13 lane and inherited here:** `bin/reeve`'s `task file` route gates on
 `completedVersion(hub) === HUB_SCHEMA_VERSION`, and `completedVersion` returns `max(version)`.
@@ -347,3 +350,33 @@ validator gained `if`/`then`/`const` and `pattern` for it, and `pattern: "\\S"`
 on every non-empty string, because `minLength` counts CHARACTERS -- a reason of
 `" "` validated and was then refused by `nextPhase`, so validation and the
 transition disagreed and the BAD_REPORT retry path was never reached.
+## What the artifact gate cannot decide, and which plan can
+
+`reviewArtifact` is given a phase, a directory and a set of expectations. It has
+no repository root, and one of its rules needs one.
+
+**A bare `api.internal:3000` is the same TOKEN as `package.json:3000`** — a
+dotted name, a colon, digits — so no regular expression separates a host and
+port from a citation of a file at the repository root. Every syntactic
+discriminator tried and rejected: a length cap on the extension refuses
+`src/x.markdown:12` (and was removed for exactly that reason); an
+extension whitelist is an inventory that is wrong the first time someone cites a
+file type nobody listed; a TLD list is the same problem inverted, and `.md`,
+`.ts`, `.sh` and `.py` are all real top-level domains.
+
+The gate resolves it towards ACCEPTING, and the test records that as an
+assertion rather than a comment, so reversing it fails a named line. The reason
+is that the two errors are not symmetric: accepting the endpoint lets one claim
+through uncited, while refusing the dotted-name form refuses every citation of a
+root-level file and fails the whole report — and this file has already been
+corrected once for refusing correct work over a bound nobody chose deliberately.
+
+**The durable answer is not syntactic, and it belongs to S3-D.** A phase task
+holds the project checkout, so it can ask whether the cited path EXISTS, which is
+the only thing that actually tells `api.internal` from `package.json`. Any
+S3-D task that gates a research artifact should resolve citations against the
+task's territory rather than re-deriving a better regular expression here.
+
+The endpoint shapes that ARE separable — a protocol-relative `//host:port`, a
+userinfo `user@host:22`, and a `host:port/path` — are removed before the check,
+because each carries a marker no file reference has.

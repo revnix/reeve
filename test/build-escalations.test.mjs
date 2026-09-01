@@ -9,6 +9,7 @@ import { readFileSync, mkdtempSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 
 import { HOLD_ESCALATION, PHASES } from "../src/build/phases.mjs";
 import { openHub } from "../src/build/hubdb.mjs";
@@ -595,6 +596,63 @@ const freshHub = () => {
   check(every.every(c => (c.ref === null) === (typeof c.ref_why === "string")),
     "every channel result carries a reference or a reason there is none, and exactly one of them",
     JSON.stringify(every));
+}
+
+
+// ── reeve notify --test ────────────────────────────────────────────────────
+//
+// Driven through the CLI rather than through `notify`, because the library
+// agreeing with itself is exactly what a green stub looks like: every defect
+// this route can have is in the wiring. Nothing here sends anything -- the
+// fixture configures no channel, so the send path is never entered, which is
+// also the state a new operator is in on their first run.
+{
+  const BIN = fileURLToPath(new URL("../bin/reeve", import.meta.url));
+  const home = join(dir, "cli", ".reeve");
+  mkdirSync(home, { recursive: true });
+  const cli = (...args) => {
+    const r = spawnSync(process.execPath, [BIN, ...args, "--home", home],
+      { encoding: "utf8", timeout: 60_000 });
+    return { status: r.status, stdout: r.stdout ?? "", out: (r.stdout ?? "") + (r.stderr ?? "") };
+  };
+  const parse = (t) => { try { return JSON.parse(t); } catch { return null; } };
+
+  // --test IS the command. A bare `notify` that sent something would mean a
+  // half-typed command could put a message on somebody's phone.
+  const bare = cli("notify", "o/r");
+  check(bare.status === 2, "`reeve notify` without --test is a usage refusal, not a send",
+    `rc=${bare.status} ${bare.out.slice(0, 160)}`);
+  check(/--test/.test(bare.out), "and it says which flag makes it act", bare.out.slice(0, 200));
+
+  const test = cli("notify", "--test", "o/r");
+  check(test.status === 3,
+    "with no channel configured the test exits DEGRADED: it ran, and the answer is that " +
+    "nothing could be reached", `rc=${test.status} ${test.out.slice(0, 200)}`);
+  check(/no notify channel configured/.test(test.out),
+    "and says so rather than reporting success over a channel list of zero", test.out.slice(0, 200));
+
+  const asJson = cli("notify", "--test", "--json", "o/r");
+  const j = parse(asJson.stdout);
+  check(j?.kind === "notify.test", "--json emits the envelope under its own kind",
+    asJson.out.slice(0, 200));
+  check(Array.isArray(j?.channels) && j.ok === false,
+    "carrying the per-channel results a script would branch on", JSON.stringify(j?.channels));
+  check(asJson.status === 3, "and the same exit status as the human rendering",
+    `rc=${asJson.status}`);
+
+  // The flag is scoped to this command. A flag whose entire meaning is "do not
+  // treat this as real" is the most expensive one to accept and ignore.
+  const elsewhere = cli("task", "list", "--test", "--json");
+  check(elsewhere.status === 2 && parse(elsewhere.stdout)?.kind === "flag_not_applicable",
+    "--test is refused on a command that sends nothing, rather than ignored",
+    elsewhere.out.slice(0, 200));
+
+  // DISCOVERABLE. A command absent from --help ships to nobody; the read
+  // surface's own three commands shipped that way once.
+  const help = cli("--help");
+  check(/notify --test/.test(help.stdout),
+    "and the command appears in --help, so it can be found without reading the source",
+    (help.stdout.match(/.*notify.*/) ?? [""])[0]);
 }
 
 hub.close();

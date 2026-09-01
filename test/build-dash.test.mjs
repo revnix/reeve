@@ -84,6 +84,13 @@ const file = async (over) => fileTask({
 const setPhase = (id, phase) => db.prepare("UPDATE task SET phase = ? WHERE id = ?").run(phase, id);
 const ALIVE = () => true, DEAD = () => false;
 const cur = (seq, at) => ({ seq, at });
+// A LIVE BUILDER, because `doing` is an inference and the inference needs a
+// running process: with nothing running, a task with no wait against it is not
+// moving, it is simply unattended.
+const liveBuilder = () => db.prepare(
+  `INSERT OR REPLACE INTO singleton_lease(name,pid,lstart,command,acquired_at,expires_at)
+   VALUES('builder',424242,'L','reeve build run',?,?)`).run(NOW - 300, NOW + 60);
+const noBuilder = () => db.prepare("DELETE FROM singleton_lease WHERE name = 'builder'").run();
 const headAt = () => db.prepare("SELECT at FROM phase_event ORDER BY seq DESC LIMIT 1").get()?.at ?? 0;
 const dash = (over = {}) =>
   dashModel(db, { now: NOW, switchesFor: resolver(), projects: PROJECTS, since: null,
@@ -262,9 +269,16 @@ const T = {};
   const cap = off.waiting_on_you.find(x => x.id === T.quota);
   check(cap?.waiting === "WAITING_FOR_CAPABILITY" && cap?.capability === "observe",
     "a task behind a switch is waiting on you, and names the switch", JSON.stringify(cap));
-  check(typeof cap?.for_seconds === "number",
-    "with an elapsed figure taken from the age in state, since a switch has no moment",
+  // UNKNOWN, not the phase age. Nothing records when a switch was turned off, and
+  // borrowing the age in state answers a different question: a task that worked
+  // for ten days before the switch flipped a minute ago would report a ten-day
+  // wait and outrank every genuine one.
+  check(cap?.for_seconds === null,
+    "and an unknown duration, because nothing records when the switch was turned off",
     JSON.stringify(cap));
+  check(renderDash(off).includes("for UNKNOWN"),
+    "which the text says out loud rather than printing a borrowed number",
+    (renderDash(off).split("\n").find(l => l.includes(T.quota)) ?? ""));
   writeProfiles(ALL_ON, ALL_ON);
 }
 
@@ -423,11 +437,13 @@ const T = {};
   check(!blind.doing.some(t => active.some(a => a.id === t.id)),
     "a task whose capability is UNKNOWN is not reported as doing: that inference needs evidence",
     JSON.stringify(blind.doing.map(t => t.id)));
-  // CONTROL: with the switches readable, the same tasks ARE doing -- or the rule
-  // has simply emptied the list.
+  // CONTROL: with the switches readable AND a builder running, the same tasks ARE
+  // doing -- or the rule has simply emptied the list.
+  liveBuilder();
   check(dash().doing.length > 0,
-    "control: with readable switches the same tasks are doing again",
+    "control: with readable switches and a live builder the same tasks are doing again",
     JSON.stringify(dash().doing.map(t => t.id)));
+  noBuilder();
 }
 
 // ── the longest wait is first ────────────────────────────────────────────────
@@ -554,8 +570,29 @@ const T = {};
   check(m.tasks.some(x => x.id === T.beta),
     "but it is still in the model, because finished is a fact worth showing");
   setPhase(T.beta, "FILED");
+  liveBuilder();
   check(dash().doing.some(x => x.id === T.beta),
     "control: back in an active phase with nothing waiting, it is doing again");
+
+  // NOTHING RUNNING IS NOT EVIDENCE OF PROGRESS. With no builder the digest was
+  // describing newly filed tasks as doing work on a page whose own first line
+  // said NOT RUNNING.
+  noBuilder();
+  const stopped = dash();
+  check(stopped.alive.running === false,
+    "control: and with the builder gone the digest says NOT RUNNING", JSON.stringify(stopped.alive));
+  check(stopped.doing.length === 0,
+    "no task is `doing` when no process exists to advance it",
+    JSON.stringify(stopped.doing.map(x => x.id)));
+  // A task with a LIVE RUN is still doing: that one is observed, not inferred.
+  db.prepare(`INSERT INTO phase_run(task,generation,phase,slice,attempt,status,pid,lstart,started_at,
+                                    heartbeat_at,lease_expires_at,out_path,err_path)
+              VALUES(?,1,'SIZING',0,1,'live',900,'L',?,?,?,'/o','/e')`)
+    .run(T.beta, NOW - 50, NOW - 5, NOW + 300);
+  check(dash().doing.some(x => x.id === T.beta),
+    "control: a task with a LIVE RUN is still doing, because that is observed rather than inferred",
+    JSON.stringify(dash().doing.map(x => x.id)));
+  db.prepare("DELETE FROM phase_run WHERE task = ?").run(T.beta);
 }
 
 
@@ -620,6 +657,7 @@ const T = {};
 // and dropped from the text -- the same shape, in a place the guard could not
 // see. A guard narrower than its class is a guard the next instance walks around.
 {
+  liveBuilder();
   const m = dash({ since: cur(0, 0) });
   const text = renderDash(m);
   const EXCLUDED = {
@@ -704,6 +742,7 @@ const T = {};
   }
   check(probe.length === 1 && probe[0] === "ghost_field",
     "counter-control: a value the render does NOT contain is reported missing", JSON.stringify(probe));
+  noBuilder();
 }
 
 

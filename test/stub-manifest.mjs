@@ -2614,14 +2614,14 @@ export const STUBS = [
     }],
   },
   {
-    name: "a-pass-that-examined-nothing-retires-nothing",
-    why: "let the pass vouch for every cause it surveyed by passing the surveyed set as `examined`. The builder tick refreshes gate state and evaluates no task, so it examined none of them -- retiring on that silence announces `resolved` for something nobody looked at, and re-announces it on the next pass that did look",
+    name: "the-survey-covers-every-standing-cause",
+    why: "survey only the rows this pass has not yet announced, which reads like an optimisation and is not one. A cause becomes a CLEARING CANDIDATE by being absent from the pass's map while standing in the hub, so any filter here quietly turns already-announced causes into candidates -- and the only thing then between that and announcing `resolved` for something nobody examined is `examined: null`, one guard deep",
     test: "test/build-paging.test.mjs",
-    expectRed: "a pass that examined nothing retires nothing",
+    expectRed: "the pass surveys EVERY standing row, so no cause can quietly become a clearing candidate",
     edits: [{
       file: "src/build/paging.mjs",
-      find: "  const result = announce(db, { escalations, at, isAlive, send: sender, profile, examined: null });",
-      replace: "  const result = announce(db, { escalations, at, isAlive, send: sender, profile,\n    examined: new Set([...escalations.keys()].map(w => w.replace(/:.*$/, \"\"))) });",
+      find: "    db.prepare(\"SELECT why, count FROM escalation ORDER BY first_seen_at\")",
+      replace: "    db.prepare(\"SELECT why, count FROM escalation WHERE announced_count = 0 ORDER BY first_seen_at\")",
     }],
   },
   {

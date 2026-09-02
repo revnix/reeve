@@ -49,7 +49,10 @@ const TABLE = [
     kind: "unreadable-marker",
     why: "re-running cannot help because the value IS the fault, and restoreHub reads versions the same way" },
   { name: "an unreadable history is its own answer",
-    h: { readable: false, missing: [], have: [], holed: false, invalid: [], version: 0 }, kind: "unreadable" },
+    h: { readable: false, missing: [], have: [], holed: false, invalid: [], version: 0,
+         cause: Object.assign(new Error("no such table: schema_version"), { errcode: 1 }) },
+    kind: "unreadable",
+    why: "measured: a real missing-table read carries errcode 1, which faultKind calls damage" },
 ];
 for (const row of TABLE) {
   const got = kindOf(row.h);
@@ -88,13 +91,29 @@ check(new Set(TABLE.map(r => r.kind)).size === 8 && TABLE.length === 9,
     "control: and is NOT told to re-run, because the value is the fault rather than a moment in time",
     marker.remedy);
 
-  const unreadable = historyFault({ readable: false, missing: [], have: [], holed: false, invalid: [], version: 0 },
+  // THE CAUSE DECIDES, because persistence is not damage. A missing table carries
+  // errcode 1 and reads as damage; a lock carries 5 and reads as the situation
+  // failing. Telling the second to force-restore replaces a HEALTHY hub to fix a
+  // lock, and the refusal that renders this already derives `retryable` the same
+  // way -- so a remedy that ignored the cause contradicted the bit beside it.
+  const unreadable = historyFault({ readable: false, missing: [], have: [], holed: false, invalid: [], version: 0,
+                                    cause: Object.assign(new Error("no such table: schema_version"), { errcode: 1 }) },
                                   { expect: EXPECT });
   check(/re-run/i.test(unreadable.remedy),
     "an UNREADABLE history is told to look again before concluding damage",
     `openHub creates the file and then runs the DDL, so a reader in that window sees no schema_version on a healthy hub: ${unreadable.remedy}`);
   check(/if it persists/i.test(unreadable.remedy),
     "control: with a restore named only as what a PERSISTENT failure earns", unreadable.remedy);
+
+  const busy = historyFault({ readable: false, missing: [], have: [], holed: false, invalid: [], version: 0,
+                              cause: Object.assign(new Error("database is locked"), { errcode: 5 }) },
+                            { expect: EXPECT });
+  check(!/reeve restore --hub --force/.test(busy.remedy),
+    "a history unreadable because something HOLDS the file is never sent to a restore",
+    `persistence is not damage -- a lock persists for as long as the holder holds it: ${busy.remedy}`);
+  check(/Do NOT restore/.test(busy.remedy) && /another process/.test(busy.remedy),
+    "control: it names the holder as the thing to find, and says not to restore on this evidence",
+    busy.remedy);
 
   // A REMEDY HAS TO BE RUNNABLE. This one told the operator to `reeve restore --hub
   // --force`, and `restoreHub` refuses a live hub recording a newer version BEFORE

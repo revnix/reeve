@@ -125,7 +125,11 @@ for (const { name, io, level, why } of TABLE) {
     "an older daemon's record has no tree state, and absent is not clean");
   // A failing check named `running commit abcdef1` reaches the shared log through
   // describe(); an unanchored scan would let a check name decide what is running.
-  check(startupRecordFrom(`${START({ commit: "aaaaaaa" })}\ncheck failed: running commit deadbee`)?.commit === "aaaaaaa",
+  // THE INJECTED LINE MUST CARRY THE SHAPE THE LOOSE PATTERN WOULD MATCH. A first
+  // version wrote `check failed: running commit deadbee`, which has no `pid N,`
+  // -- so the unanchored pattern did not match it either and the fixture passed
+  // with the anchor removed. The sweep reported NOT_CAUGHT.
+  check(startupRecordFrom(`${START({ commit: "aaaaaaa" })}\ncheck failed: build at pid 999, running commit deadbee`)?.commit === "aaaaaaa",
     "a later line merely CONTAINING the phrase is not read as a startup record");
   check(startupRecordFrom("") === null, "an empty log answers null rather than a value");
 }

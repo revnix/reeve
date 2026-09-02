@@ -82,11 +82,39 @@ const LIVE = { cliVersion: "1.2.3", model: "claude-fable-4-5-20260101", effort: 
     "control: and only the fields that actually moved", JSON.stringify(moved));
 }
 
+// EVERY FIELD THE SNAPSHOT CARRIES, and the list is derived from the snapshot
+// rather than written again. A hand-kept list is a second spelling of
+// contractSnapshot's shape and had already drifted from it: a live profile
+// change to the worker's own limits reported a perfectly clean dispatch.
+{
+  const snap = contractSnapshot(LIVE);
+  for (const [field, value] of [["maxTurns", 1], ["maxBudgetUsd", 99],
+                                ["argvHash", "0".repeat(64)], ["promptHash", "0".repeat(64)],
+                                ["canaryId", "other"]]) {
+    const d = contractDrift(snap, { ...snap, [field]: value });
+    check(d !== null && d[field] && d[field].now === value,
+      `a changed ${field} is drift`, JSON.stringify(d));
+  }
+  // CONTROL, the other direction: the loop above would pass on a function that
+  // reported every field as drifted.
+  check(contractDrift(snap, { ...snap }) === null,
+    "control: and an identical environment still drifts by null, so the check is not just reporting everything",
+    JSON.stringify(contractDrift(snap, { ...snap })));
+  // And the coverage is COMPLETE rather than a longer list: every contract
+  // field the snapshot carries must be reachable by drift.
+  const uncovered = Object.keys(snap).filter((f) => f !== "ok" &&
+    contractDrift(snap, { ...snap, [f]: "changed-to-something-else" }) === null);
+  check(uncovered.length === 0,
+    "every field the snapshot carries is compared, so a field added to the contract cannot be silently unwatched",
+    JSON.stringify(uncovered));
+}
+
 // ── the row exists before the process, and is settled after it ───────────────
 const KEY = { task: "bt:d", generation: 1, phase: "RESEARCH", slice: 0, attempt: 1 };
+const DISPATCH_ARGV = ["-p", "go"];
 const base = (over = {}) => ({
-  ...KEY, home: dir, argv: ["-p", "go"], env: {}, cwd: dir,
-  snapshot: contractSnapshot(LIVE), drift: null, leaseSeconds: 400, budgetMs: 1000,
+  ...KEY, home: dir, argv: DISPATCH_ARGV, env: {}, cwd: dir,
+  snapshot: contractSnapshot({ ...LIVE, argv: DISPATCH_ARGV }), drift: null, leaseSeconds: 400, budgetMs: 1000,
   now: () => 1000, isAlive: alive,
   bind: () => KEY,
   ...over,
@@ -170,6 +198,94 @@ const base = (over = {}) => ({
   check(runStatus(db, K5) === null, "control: and no row appeared for the attempt that was refused");
 }
 
+// ── the argv that runs is the argv the snapshot names ────────────────────────
+{
+  const r = await dispatchPhase(db, base({ attempt: 7, argv: ["-p", "something-else"] }));
+  check(r.ok === false && r.reason === "argv-does-not-match-the-snapshot",
+    "argv the snapshot does not name is refused before anything is granted", JSON.stringify(r).slice(0, 150));
+  check(runStatus(db, { ...KEY, attempt: 7 }) === null,
+    "and no row was written for it, so nothing records a contract that was never run",
+    String(runStatus(db, { ...KEY, attempt: 7 })));
+}
+
+// ── a refused dispatch does not overwrite a settled attempt's argv record ────
+{
+  const argvPath = join(dir, "tasks", "bt:d", "runs", "g1-RESEARCH-s0-a1.argv.json");
+  const before = readFileSync(argvPath, "utf8");
+  // attempt 1 is settled, so this is a duplicate-attempt refusal.
+  const r = await dispatchPhase(db, base({ attempt: 1 }));
+  check(r.ok === false && r.reason === "duplicate-attempt", "control: the re-dispatch is refused", JSON.stringify(r));
+  check(readFileSync(argvPath, "utf8") === before,
+    "and the settled attempt's argv record is untouched: the row keeps its argv_hash, so a file holding other bytes would make the audit trail disagree with itself",
+    "the file changed");
+}
+
+// ── the session id is learned late, and is persisted ─────────────────────────
+{
+  const K8 = { ...KEY, attempt: 8 };
+  const r = await dispatchPhase(db, base({
+    attempt: 8,
+    // The real runWorker binds a null at onSpawn and learns the id from the
+    // worker's init event, so it arrives here and nowhere earlier.
+    run: async ({ onSpawn }) => { onSpawn({ pid: 1234, lstart: "1" });
+      return { outcome: OUTCOMES.OK, why: "done", truncated: false, sessionId: "sess-abc" }; },
+    bind: undefined,
+  }));
+  check(r.ok === true, "control: the dispatch succeeded", JSON.stringify(r).slice(0, 100));
+  const row = db.prepare("SELECT session_id FROM phase_run WHERE task='bt:d' AND attempt=8").get() ?? {};
+  check(row.session_id === "sess-abc",
+    "the session the worker reported is persisted, so --resume has something to resume",
+    JSON.stringify(row));
+}
+
+// ── a heartbeat that could not be written revokes the worker ─────────────────
+//
+// The failure is not self-correcting from the row's side: revocationProbe reads
+// a lease_expires_at still in the future -- precisely because nobody could move
+// it -- and answers null. Without this the worker acts for the rest of the lease
+// with a claim nobody renewed. A live maintenance lock is the case that matters:
+// writes are refused for the whole of a restore, which is exactly when a worker
+// must not still be acting.
+{
+  const K9 = { ...KEY, attempt: 9 };
+  let probes = 0, sawRevocation = null;
+  const r = await dispatchPhase(db, base({
+    attempt: 9,
+    // Real time, so the lease is genuinely live while this runs -- a frozen
+    // clock makes revocationProbe report an expiry and answer first, which
+    // would prove the ordering rather than this property.
+    now: () => Math.floor(Date.now() / 1000),
+    // 4s puts the heartbeat interval at its 1s floor, so a beat is attempted
+    // well before the lease could expire.
+    leaseSeconds: 4,
+    run: async ({ onSpawn, isRevoked }) => {
+      onSpawn({ pid: 4321, lstart: "1" });
+      // Taken AFTER the row exists, because insertRun refuses under it too --
+      // the point is a write that starts failing mid-run.
+      db.exec(`INSERT INTO maintenance_lock(name, pid, lstart, acquired_at)
+               VALUES('restore', ${process.pid}, 'x', unixepoch())`);
+      const until = Date.now() + 3000;
+      while (Date.now() < until && sawRevocation == null) {
+        probes++; sawRevocation = isRevoked();
+        if (sawRevocation == null) await new Promise((res) => setTimeout(res, 100));
+      }
+      db.exec("DELETE FROM maintenance_lock WHERE name='restore'");
+      return { outcome: sawRevocation ? OUTCOMES.LEASE_LOST : OUTCOMES.OK,
+               why: String(sawRevocation), truncated: false };
+    },
+    bind: undefined,
+    // The lock's holder reads ALIVE, so assertWritable refuses rather than
+    // reaping it -- which is what makes the write fail.
+    isAlive: () => true,
+  }));
+  check(probes > 0, "control: the seam was actually asked", String(probes));
+  check(typeof sawRevocation === "string" && /heartbeat/.test(sawRevocation),
+    "a heartbeat that could not be written revokes the worker rather than being swallowed",
+    String(sawRevocation));
+  check(r.ok === true && r.result.outcome === OUTCOMES.LEASE_LOST,
+    "control: and the run settles as a lost lease rather than a success", JSON.stringify(r?.result?.outcome));
+}
+
 // ── a cancelled task's worker process is DEAD, not merely marked dead ────────
 //
 // MEASURED at 16cd880: transition.mjs's `terminate-worker` marks
@@ -184,11 +300,12 @@ const base = (over = {}) => ({
 // dispatch seam handed runWorker an isRevoked that reads the row.
 {
   const K6 = { ...KEY, attempt: 6 };
+  const LIVE_ARGV = ["-e", "setInterval(() => {}, 1000)"];
   // Alive until killed, and it exits on SIGTERM by default -- which is what a
   // cooperative cancel is supposed to achieve.
   const pending = dispatchPhase(db, {
-    ...KEY, attempt: 6, home: dir, bin: process.execPath, argv: ["-e", "setInterval(() => {}, 1000)"],
-    env: {}, cwd: dir, snapshot: contractSnapshot(LIVE), drift: null,
+    ...KEY, attempt: 6, home: dir, bin: process.execPath, argv: LIVE_ARGV,
+    env: {}, cwd: dir, snapshot: contractSnapshot({ ...LIVE, argv: LIVE_ARGV }), drift: null,
     leaseSeconds: 400, budgetMs: 25000, isAlive: alive,
   });
 

@@ -57,10 +57,16 @@ export function runPathsFor(home, k) {
 }
 
 const INSERT_SQL =
-  `INSERT INTO phase_run(task,generation,phase,slice,attempt,status,started_at,heartbeat_at,
+  // `resume_seq` IS WRITTEN, not defaulted. A plain resume leaves the generation
+  // unchanged on purpose and resets the bounded attempt budget by counting runs
+  // under the NEW resume sequence -- so a row that defaults to 0 after a resume
+  // is counted with the attempts from before it. The budget then either
+  // re-exhausts immediately or never sees the new attempts at all, and the
+  // column exists for exactly this and was reading 0 on every row.
+  `INSERT INTO phase_run(task,generation,phase,slice,attempt,status,resume_seq,started_at,heartbeat_at,
      lease_expires_at,out_path,err_path,cli_version,model_id,effort,argv_hash,prompt_hash,
      settings_hash,tools_hash,agents_hash,max_turns,max_budget_usd,canary_id,snapshot_hash,contract_drift)
-   VALUES(?,?,?,?,?,'live',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`;
+   VALUES(?,?,?,?,?,'live',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`;
 
 export function insertRun(db, { task, generation, phase, slice = 0, attempt, outPath, errPath,
                                 snapshot, drift = null, startedAt, leaseSeconds,
@@ -79,7 +85,7 @@ export function insertRun(db, { task, generation, phase, slice = 0, attempt, out
     //
     // Read here rather than by the caller, because a check outside this
     // transaction is a read followed by a write with the same window in it.
-    const epoch = db.prepare("SELECT generation, phase FROM task WHERE id=?").get(task);
+    const epoch = db.prepare("SELECT generation, phase, resume_seq FROM task WHERE id=?").get(task);
     if (!epoch) return { ok: false, reason: "no-such-task" };
     if (epoch.generation !== generation || epoch.phase !== phase)
       return { ok: false, reason: "stale-epoch",
@@ -87,7 +93,8 @@ export function insertRun(db, { task, generation, phase, slice = 0, attempt, out
                        `and this run was chosen for generation ${generation} phase ${phase}` };
     try {
       db.prepare(INSERT_SQL)
-        .run(task, generation, phase, slice, attempt, startedAt, startedAt, startedAt + leaseSeconds,
+        .run(task, generation, phase, slice, attempt, epoch.resume_seq,
+             startedAt, startedAt, startedAt + leaseSeconds,
              outPath, errPath, snapshot.cliVersion, snapshot.modelId, snapshot.effort,
              snapshot.argvHash, snapshot.promptHash, snapshot.settingsHash, snapshot.toolsHash,
              snapshot.agentsHash, snapshot.maxTurns, snapshot.maxBudgetUsd, snapshot.canaryId,
@@ -134,7 +141,12 @@ export function bindRun(db, { task, generation, phase, slice = 0, attempt, pid, 
       .run(pid, lstart, sessionId, ...keyArgs(k));
     if (r.changes !== 1)
       throw new Error(`cannot bind a process to ${JSON.stringify(k)}: no live run row to bind it to`);
-    hubEvent(db, { kind: "phase_run.bound", task, payload: { ...k, pid, lstart, sessionId } });
+    // THE WHOLE ROW, for the same reason the other two carry it: the payload is
+    // replayed as a row image, and `sessionId` is not a column -- `session_id`
+    // is. A camelCase key cannot be upserted, and a partial image could not
+    // recreate a row that the snapshot predates.
+    hubEvent(db, { kind: "phase_run.bound", task,
+      payload: db.prepare(`SELECT * FROM phase_run WHERE ${KEY_SQL}`).get(...keyArgs(k)) });
     return k;
   });
 }

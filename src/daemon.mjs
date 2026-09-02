@@ -3472,6 +3472,23 @@ export function announceable(db, escalations, { covered = null, waiting = null, 
  * A commit that cannot be read is reported as unreadable, never guessed: an
  * invented value here is worse than the checkout reading it replaces.
  */
+/**
+ * Whether the tree this process is about to load from is CLEAN, recorded at
+ * startup beside the commit.
+ *
+ * The commit alone does not describe what a running process holds. A doctor
+ * reading the tree LATER sees a different thing: an edit made after startup
+ * produces a false alarm, and a daemon started from a dirty tree that was since
+ * reverted reads as clean while the process retains uncommitted code. Neither is
+ * recoverable after the fact, so the only moment this can be established is now.
+ */
+export function treeState(from = dirname(fileURLToPath(import.meta.url))) {
+  try {
+    return execFileSync("git", ["-C", from, ...GIT_NEUTRALISE, "status", "--porcelain"],
+                        { encoding: "utf8", timeout: 10_000 }).trim() ? "dirty" : "clean";
+  } catch { return "unreadable"; }
+}
+
 export function runningCommit(from = dirname(fileURLToPath(import.meta.url))) {
   try {
     return execFileSync("git", ["-C", from, ...GIT_NEUTRALISE, "rev-parse", "--short", "HEAD"],
@@ -3494,7 +3511,11 @@ export async function run(ctx) {
   //
   // A commit that cannot be read is recorded as unreadable, never guessed. An
   // invented value here would be worse than the checkout it replaces.
-  log(logPath, `reeve daemon starting — node ${process.version}, pid ${process.pid}, running commit ${runningCommit()}`);
+  // APPENDED, never inserted. `tree` goes after `running commit` so every reader
+  // written against the older line keeps matching; a reader that wants the tree
+  // state asks for it and treats its absence as "an older daemon wrote this".
+  log(logPath, `reeve daemon starting — node ${process.version}, pid ${process.pid}, ` +
+               `running commit ${runningCommit()}, tree ${treeState()}`);
 
   // Assert the floor rather than trusting the environment: node on this machine's
   // PATH is v22, and launchd never sources a shell profile.

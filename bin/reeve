@@ -1329,23 +1329,33 @@ switch (cmd) {
         // holding past the busy timeout -- a transient lock reported as permanent.
         // The state now carries its `cause`, and `faultKind` classifies it exactly
         // as the hand-rolled read this replaced did.
-        if (!hist.readable)
-          fail("hub_unreadable",
-               `reeve task ${sub}: the hub at ${hub} has no readable schema_version` +
-               (hist.cause ? ` — ${hist.cause.message}` : ""),
-               { exit: EXITS.refused, retryable: faultKind(hist.cause) === "operational" });
-        // THE KIND IS A LITERAL, deliberately, and this cost a round to learn.
+        // EVERY SHAPE THROUGH THE SHARED DECISION, including an unreadable one.
+        //
+        // This refused an unreadable history HERE, before `historyFault` ran -- so
+        // the branch that tells a marker no reader can represent from a hub being
+        // created for an instant was unreachable from the read routes, and the
+        // refusal carried neither its remedy nor the right retryability. An
+        // ERR_OUT_OF_RANGE carries no SQLite errcode, so `faultKind` calls it
+        // operational and the envelope said `retryable: true` for a failure that
+        // every retry reproduces.
+        //
+        // THE KINDS ARE LITERALS, deliberately, and that cost a round to learn.
         // `test/cli-flags.test.mjs` extracts every `fail("<kind>"` from this file
         // by pattern and asserts the declared vocabulary against what the CLI can
-        // actually emit -- both directions. Computing the kind from `fault.kind`
-        // made `hub_incompatible` invisible to that extraction, so a declared kind
-        // read as one nothing produces. The guard is right: a kind that cannot be
-        // found statically cannot be checked against the declaration at all.
+        // emit, in both directions. A computed kind is invisible to it.
         const fault = historyFault(hist);
-        if (fault)
-          fail("hub_incompatible",
-               `reeve task ${sub}: the hub at ${hub} — ${fault.detail}.\n-> ${fault.remedy}`,
-               { exit: EXITS.refused });
+        if (fault) {
+          const said = `reeve task ${sub}: the hub at ${hub} — ${fault.detail}.\n-> ${fault.remedy}`;
+          // NEVER retryable: the VALUE is the fault, so every read reproduces it.
+          if (fault.kind === "unreadable-marker")
+            fail("hub_unreadable", said, { exit: EXITS.refused, retryable: false });
+          // A transient view of a hub mid-creation IS worth retrying, and
+          // `faultKind` is what tells that from a damaged store.
+          if (fault.kind === "unreadable")
+            fail("hub_unreadable", said,
+                 { exit: EXITS.refused, retryable: faultKind(hist.cause) === "operational" });
+          fail("hub_incompatible", said, { exit: EXITS.refused });
+        }
       } finally { /* the outer finally closes db on every path below */ }
       // SQLITE READS LAZILY, so a hub whose corruption lies outside the pages the
       // open touches constructs a connection perfectly and fails at the first

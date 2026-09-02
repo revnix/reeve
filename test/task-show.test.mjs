@@ -1694,6 +1694,32 @@ const filed = {};
       check(typeof nj?.retryable === "boolean",
         "control: and it still carries a retryable bit", JSON.stringify(nj));
 
+      // AND A MARKER NO READER CAN REPRESENT. `schema_version` is an INTEGER
+      // PRIMARY KEY, so a value beyond JavaScript's safe range is valid SQLite and
+      // `node:sqlite` throws ERR_OUT_OF_RANGE reading it. That exception carries
+      // no SQLite errcode, so `faultKind` calls it operational -- which is why
+      // `retryable` is the assertion that matters here: every retry reproduces it.
+      const bigv = mkdtempSync(join(dir, "bigversion-"));
+      mkdirSync(join(bigv, "state"), { recursive: true });
+      {
+        const b = new DatabaseSync(join(bigv, "state", "hub.db"));
+        b.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, at INTEGER NOT NULL)");
+        b.prepare("INSERT INTO schema_version(version, at) VALUES (?, 1)").run(9223372036854775807n);
+        b.close();
+      }
+      const bv = spawnSync(process.execPath, [BIN, "task", "list", "--home", bigv, "--json"],
+        { encoding: "utf8", timeout: 60_000 });
+      const bj = parse(bv.stdout ?? "");
+      check(bj?.kind === "hub_unreadable",
+        "a schema_version value no reader can represent is a typed refusal",
+        ((bv.stdout ?? "") + (bv.stderr ?? "")).slice(0, 300));
+      check(bj?.retryable === false,
+        "and it is NOT retryable, because the value is the fault and every read reproduces it",
+        JSON.stringify(bj));
+      check(/move the hub aside/.test(bj?.message ?? ""),
+        "and the refusal carries the move-aside remedy, which is the one that can actually be run",
+        String(bj?.message));
+
       // THE PROJECT PREFILTER READS THE SAME BROKEN STORE. It ran outside the
       // guard, so `--project` was the one path that still escaped as a trace.
       const f = spawnSync(process.execPath, [BIN, "task", "list", "--project", "alpha", "--home", rotten, "--json"],

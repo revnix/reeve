@@ -113,7 +113,10 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
     return { kind: "unreadable-marker",
              detail: "its schema_version holds a value no reader can represent " +
                      `(${hist.cause.message}), so the migration history cannot be read at all`,
-             remedy: restoreAdvice(true) };
+             remedy: restoreAdvice(true),
+             // THE ONLY UNREADABLE CASE THAT IS NEVER WORTH RETRYING: the value
+             // itself is the fault, so every read reproduces it exactly.
+             retryable: false };
 
   if (!hist || hist.readable !== true)
     return { kind: "unreadable",
@@ -122,25 +125,44 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
              // again can help.
              detail: "its schema_version cannot be read, so which migrations it carries is unknown" +
                      (hist?.cause?.message ? ` — ${hist.cause.message}` : ""),
-             // PERSISTENCE IS NOT DAMAGE, and this said it was. A `SQLITE_BUSY`
-             // from another process holding the file persists for exactly as long
-             // as the holder holds it, and telling the operator to force-restore
-             // then replaces a HEALTHY hub to fix a lock. The refusal that renders
-             // this already knows better -- it derives `retryable` from
-             // `faultKind` -- so the remedy was contradicting the bit beside it.
+             // THREE KINDS, because `faultKind` RETURNS three and this asked a
+             // yes/no question of it. The fallback then caught everything it did
+             // not name -- so `SQLITE_FULL`, which the classifier reports as its
+             // own value precisely because it is resource exhaustion rather than
+             // damage, was told the store is damaged and to restore. `openHub`'s
+             // own full branch says the opposite in as many words: there is
+             // nothing wrong with the file, and a restore needs MORE room rather
+             // than less.
              //
-             // `faultKind` is the same classifier, asked here rather than
-             // re-derived: an error with no SQLite errcode is the situation
-             // failing, not the file, and `hubIntegrityError` says as much in its
-             // own could-not-check branch. Damage is the only verdict that earns a
-             // restore.
-             remedy: faultKind(hist?.cause) === "operational"
-               ? "another process may hold the file, or its permissions may be wrong. Find out which " +
-                 "and re-run. Do NOT restore over it on this evidence: nothing here says the store is " +
-                 "damaged, and a restore would replace a healthy hub to fix a lock"
-               : "re-run: a hub being created for the first time reads this way for an instant. " +
-                 "If it persists, the store is damaged and `reeve restore --hub --force` installs " +
-                 "the newest usable snapshot" };
+             // RETRYABILITY IS DECIDED HERE TOO, beside the sentence it has to
+             // agree with. The caller derived it from `faultKind` separately and
+             // the two disagreed: a hub read during its own creation answers
+             // errcode 1, which the classifier calls damage, so the envelope said
+             // `retryable: false` while the remedy said to look again. One
+             // decision, one place -- the same rule this module exists for.
+             //
+             // For every shape of an unreadable history, trying again CAN produce
+             // a different answer: the holder may release, room may be freed, and
+             // a hub mid-creation finishes. That is what `retryable` means, and it
+             // is why the marker branch above is the only unreadable case that is
+             // never retryable -- there the value itself is the fault.
+             ...(() => {
+               const kind = faultKind(hist?.cause);
+               if (kind === "operational")
+                 return { remedy: "another process may hold the file, or its permissions may be wrong. " +
+                                  "Find out which and re-run. Do NOT restore over it on this evidence: " +
+                                  "nothing here says the store is damaged, and a restore would replace a " +
+                                  "healthy hub to fix a lock" };
+               if (kind === "full")
+                 return { remedy: "the store ran out of room. Free space on the filesystem holding it, or " +
+                                  "check `PRAGMA max_page_count` against `PRAGMA page_count` if the database " +
+                                  "has hit its own limit, then re-run. Do NOT restore over it: nothing is " +
+                                  "wrong with the file, and a restore needs more room rather than less" };
+               return { remedy: "re-run: a hub being created for the first time reads this way for an " +
+                                "instant. If it persists, the store is damaged and `reeve restore --hub " +
+                                "--force` installs the newest usable snapshot" };
+             })(),
+             retryable: true };
 
   // AN INVALID MARKER COMES FIRST, before the version comparison. `schema_version`
   // is an INTEGER PRIMARY KEY, so a hand-edited `-1` is valid SQLite -- and a store

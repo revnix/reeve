@@ -1346,14 +1346,15 @@ switch (cmd) {
         const fault = historyFault(hist);
         if (fault) {
           const said = `reeve task ${sub}: the hub at ${hub} — ${fault.detail}.\n-> ${fault.remedy}`;
-          // NEVER retryable: the VALUE is the fault, so every read reproduces it.
-          if (fault.kind === "unreadable-marker")
-            fail("hub_unreadable", said, { exit: EXITS.refused, retryable: false });
-          // A transient view of a hub mid-creation IS worth retrying, and
-          // `faultKind` is what tells that from a damaged store.
-          if (fault.kind === "unreadable")
-            fail("hub_unreadable", said,
-                 { exit: EXITS.refused, retryable: faultKind(hist.cause) === "operational" });
+          // RETRYABILITY COMES FROM THE FAULT, not from a second reading of the
+          // cause. This derived it with `faultKind` while `historyFault` decided
+          // the sentence, and the two disagreed: a hub read during its own
+          // creation answers errcode 1, which the classifier calls damage, so the
+          // envelope said `retryable: false` beside a remedy that said to look
+          // again. The decision that writes the sentence is the one that knows
+          // whether trying again can change it.
+          if (fault.kind === "unreadable-marker" || fault.kind === "unreadable")
+            fail("hub_unreadable", said, { exit: EXITS.refused, retryable: fault.retryable });
           fail("hub_incompatible", said, { exit: EXITS.refused });
         }
       } finally { /* the outer finally closes db on every path below */ }

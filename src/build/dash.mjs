@@ -166,13 +166,43 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
     if (!e?.hubDamaged) throw e;
     incarnationDamaged = e.message;
   }
+  // TWO QUESTIONS, NOT ONE, and collapsing them is what the old rule did.
+  //
+  //   is this log the one that issued the cursor?   -- the INCARNATION answers it
+  //   does the cursor name an event this log has?   -- the (seq, at) pair does
+  //
+  // The first is a restore. The second is a corrupt cursor -- a digit changed in a
+  // paste, say. Both mean the movement list cannot be computed, and they are not
+  // the same fact: reporting a mistyped sequence as "the hub was restored" sends
+  // an operator looking for damage that is not there, and reporting a restore as
+  // a bad paste sends them to re-copy a cursor that will never work again.
+  //
+  // So identity REPLACES the timestamp for deciding a restore -- an implementation
+  // that ORed them reports a restore whenever the pair disagrees, which is the
+  // first error -- and the pair is STILL CHECKED, because dropping it lets an
+  // altered sequence through under an intact identity and `movedSince` then
+  // silently skips every transition between the real mark and the altered one,
+  // which is this surface's worst failure and the one it exists to prevent.
+  //
+  // `phase_event` is append-only, so the `at` recorded for a sequence never
+  // legitimately changes: under a matching identity, a mismatch IS corruption.
   const provable = since !== null && since.incarnation !== null && incarnation !== null;
   const atOf = (seq) => db.prepare("SELECT at FROM phase_event WHERE seq = ?").get(seq)?.at ?? null;
-  const rewound = since !== null &&
-    (since.seq > highWater ||
-     (provable
-       ? since.incarnation !== incarnation
-       : (since.seq > 0 && atOf(since.seq) !== since.at)));
+  const namesAKnownEvent = () => since.seq === 0 || atOf(since.seq) === since.at;
+  const verdict =
+    since === null ? null
+      : since.seq > highWater ? "ahead"
+      : provable
+        ? (since.incarnation !== incarnation ? "restored"
+           : namesAKnownEvent() ? "ok" : "unknown-event")
+        // WITHOUT AN IDENTITY THE TWO CANNOT BE TOLD APART, which is the whole of
+        // the defect this closes. A changed event is reported as exactly that --
+        // neither diagnosis claimed -- rather than asserted to be a restore.
+        : namesAKnownEvent() ? "ok" : "changed-event";
+  // UNCHANGED IN MEANING: do not trust the movement list. Every verdict but `ok`
+  // says the cursor cannot be resolved against this log, which is what the exit
+  // status and the withheld list have always keyed off.
+  const rewound = verdict !== null && verdict !== "ok";
 
   const byProject = Object.create(null);
   for (const p of projects) byProject[p.name] = switchesFor(p.name);
@@ -307,6 +337,11 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
     // period, which is why it is reported rather than inferred: a cursor ahead of
     // the log is PROOF the log is not the one that issued it.
     cursor_rewound: rewound,
+    // WHY it cannot be resolved, because the remedies differ. `restored` is proof
+    // the log changed underneath the cursor and the old one is dead; `ahead` and
+    // `unknown-event` mean the cursor does not describe this log; `changed-event`
+    // is the honest answer when no identity was available to tell those apart.
+    cursor_verdict: verdict,
     // WHICH CHECK ANSWERED, said out loud. `cursor_rewound: false` from an
     // identity comparison is proof; the same false from the timestamp fallback
     // is "no evidence of a restore", and the two are worth different amounts to
@@ -440,9 +475,23 @@ export function renderDash(m) {
   for (const e of m.declined)
     out.push(`  ${e.id}  ${oneLine(e.why)}  x${e.count}  since ${e.first_seen_at}`);
 
+  // THE REASON, NOT ONE SENTENCE FOR ALL OF THEM. Every unusable cursor used to
+  // be reported as "ahead of this hub's log (it was restored)", which is a false
+  // diagnosis for three of the four verdicts -- and the restore case this whole
+  // change exists to catch is precisely one where the cursor is NOT ahead.
+  const WHY_UNUSABLE = {
+    ahead: "is ahead of this hub's log, so the log is shorter than when the cursor was issued",
+    restored: "belongs to a PREVIOUS incarnation of this hub: it was restored, and the log that " +
+              "issued this cursor no longer exists",
+    "unknown-event": "does not name an event this hub has, though it carries this hub's identity — " +
+                     "the cursor itself is wrong rather than the log",
+    "changed-event": "names an event this hub does not have. It carries no incarnation, so whether " +
+                     "the hub was restored or the cursor is simply wrong cannot be told apart",
+  };
   out.push("", m.cursor_rewound
-    ? `since you looked  CURSOR REWOUND: --since ${m.since} is ahead of this hub's log ` +
-      "(it was restored). Resync from the cursor below."
+    ? `since you looked  CURSOR UNUSABLE: --since ${m.since} ` +
+      `${WHY_UNUSABLE[m.cursor_verdict] ?? "cannot be resolved against this hub's log"}. ` +
+      "Resync from the cursor below."
     : m.since === null
       ? "since you looked  (no --since given)"
       : `since you looked (${m.since_you_looked.length})`);

@@ -2406,7 +2406,6 @@ export const STUBS = [
               replace: "             retryable: false };" }],
   },
   {
-<<<<<<< HEAD
     name: "an-escalations-report-is-durable",
     why: "send the report and store nothing. The identity is the bare cause by design, so the report is what makes a bare key affordable rather than an addition to it — and until it is on the row, `task show` and `task why` cannot recover afterwards what an alert said, and a process-scoped cause cannot name the repository it is about, which is what decides whose channel pages for it. The detail reaching a phone and nothing else is the half that scrolls past",
     test: "test/build-escalations.test.mjs",
@@ -2591,7 +2590,9 @@ export const STUBS = [
       file: "src/build/announce.mjs",
       find: "    const out = Object.create(null);",
       replace: "    const out = {};",
-=======
+    }],
+  },
+  {
     name: "a-standing-cause-is-actually-paged",
     why: "remove the call from the heartbeat loop, which is the state this whole change ends. Every unit assertion about the pass still passes -- they call it directly -- while nothing in production invokes it, so escalations accumulate in the hub and reach nobody. An alarm system nothing reads is indistinguishable from a system with nothing to report",
     test: "test/build-paging.test.mjs",
@@ -2644,7 +2645,6 @@ export const STUBS = [
       file: "src/doctor.mjs",
       find: "      : { id: \"H-14\", severity: \"fail\", classification: \"configuration\",",
       replace: "      : { id: \"H-14\", severity: \"warn\", classification: \"configuration\",",
->>>>>>> 4b22a2f (feat(build): an escalation reaches a human, which none of them did before)
     }],
   },
   {

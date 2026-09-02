@@ -3495,9 +3495,24 @@ export function treeState(from = dirname(fileURLToPath(import.meta.url))) {
     // entirely, and `GIT_NEUTRALISE` only strips git's config-injection
     // variables.
     const { GIT_DIR, GIT_WORK_TREE, ...env } = process.env;
-    return execFileSync("git", ["-C", from, ...GIT_NEUTRALISE,
-                                "status", "--porcelain", "--untracked-files=all"],
-                        { encoding: "utf8", timeout: 10_000, env }).trim() ? "dirty" : "clean";
+    const git = (args) => execFileSync("git", ["-C", from, ...GIT_NEUTRALISE, ...args],
+                                       { encoding: "utf8", timeout: 10_000, env });
+    if (git(["status", "--porcelain", "--untracked-files=all"]).trim()) return "dirty";
+
+    // AN INDEX BIT CAN HIDE A MODIFIED FILE FROM `status` ENTIRELY. A tracked
+    // file marked `assume-unchanged` or `skip-worktree` reports nothing however
+    // it is edited, so a clean `status` over such a tree establishes nothing --
+    // and the daemon could load altered source while recording `tree clean`.
+    // `ls-files -v` is where those bits are visible: lowercase tags mark
+    // assume-unchanged, `S` marks skip-worktree.
+    //
+    // The answer is `unreadable` rather than `dirty`, because we do not know
+    // that anything WAS modified -- only that we cannot tell. R-17 turns that
+    // into "whether it loaded a clean tree is unknown", which is the true
+    // statement.
+    if (git(["ls-files", "-v"]).split("\n").some(l => /^[a-z]/.test(l) || l.startsWith("S ")))
+      return "unreadable";
+    return "clean";
   } catch { return "unreadable"; }
 }
 

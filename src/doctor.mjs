@@ -1226,7 +1226,12 @@ export function decodeXml(text) {
  * clean: it becomes null, and the caller must not claim what it does not have.
  */
 export function startupRecordFrom(logText) {
-  const re = /reeve daemon starting[^\n]*?\bpid (\d+), running commit (\S+?)(?:, tree (\w+))?\s*$/gm;
+  // ONE LINE, END TO END. Requiring the phrase was not anchoring: a decision
+  // line ENDING in `reeve daemon starting pid 5, running commit <sha>, tree
+  // clean` matched it. `log()` writes an ISO stamp first, so `^` alone is too
+  // strict; the record is `<stamp> reeve daemon starting — node <ver>, pid N,
+  // running commit <sha>[, tree <state>]` and nothing else is.
+  const re = /^\S+ reeve daemon starting — node \S+, pid (\d+), running commit (\S+?)(?:, tree (\w+))?$/gm;
   const hits = [...String(logText ?? "").matchAll(re)];
   if (!hits.length) return null;
   const [, pid, commit, tree] = hits[hits.length - 1];
@@ -1288,6 +1293,21 @@ export function daemonLogPath(args, env, fallbackHome) {
   return home ? join(home, "reeve.log") : null;
 }
 
+/**
+ * The job's working directory, as launchd holds it.
+ *
+ * `launchctl print` reports it as a TOP-LEVEL field -- measured:
+ *   working directory = /Users/mobeen/Work/Products/reeve
+ * and not inside the `environment` block, which is where a first version looked
+ * for a `PWD` that launchd does not set. A job configured as `node bin/reeve`
+ * with a WorkingDirectory would then resolve to nothing and a healthy
+ * deployment would be reported UNKNOWN.
+ */
+export function loadedWorkingDirectory(printOut) {
+  const m = /^\s*working directory\s*=\s*(.+)$/m.exec(String(printOut ?? ""));
+  return m ? m[1].trim() : null;
+}
+
 /** The live pid launchd reports for the job, or null when it holds none. */
 export function loadedPid(printOut) {
   const m = /^\s*pid\s*=\s*(\d+)/m.exec(String(printOut ?? ""));
@@ -1302,8 +1322,9 @@ export function loadedEnvironment(printOut) {
 }
 
 export function checkDaemonProvenance({ run = founderRun, plist = readInstalledPlist,
-                                        launchctl = null, readLog = null,
-                                        home = null } = {}) {
+                                        launchctl = null, readLog = null, home = null,
+                                        alive = (pid) => { try { process.kill(pid, 0); return true; }
+                                                           catch (e) { return e.code === "EPERM"; } } } = {}) {
   const id = "R-17", title = "daemon code provenance";
   const printed = launchctl ? launchctl() : null;
   const loaded = printed === null ? null : loadedArguments(printed);
@@ -1330,7 +1351,7 @@ export function checkDaemonProvenance({ run = founderRun, plist = readInstalledP
 
   const args = loaded;
   const env = loadedEnvironment(printed);
-  const root = checkoutFromArgs(args, { cwd: env.PWD ?? null });
+  const root = checkoutFromArgs(args, { cwd: loadedWorkingDirectory(printed) ?? env.PWD ?? null });
   if (!root) return { id, level: UNKNOWN, title,
     // `args ?? []` so a stub that removes the loaded-job guard FAILS the
     // assertion below rather than throwing here and taking the file with it --
@@ -1364,7 +1385,14 @@ export function checkDaemonProvenance({ run = founderRun, plist = readInstalledP
   // to the same log -- so the newest startup line can belong to something else
   // entirely, and attributing it to the launchd job can end in OK about a
   // process that is not there.
+  // A PID launchctl STILL REPORTS MAY BE DEAD. It retains the last one after a
+  // `bootout`, and the stale startup record naturally carries that same pid --
+  // so the pid match below would agree with itself and the rule would run on to
+  // OK about a daemon that does not exist. Signal 0 asks the kernel instead.
   const pid = loadedPid(printed);
+  if (pid !== null && !alive(pid)) return { id, level: DEGRADED, title,
+    lines: [...lines, `launchctl still reports pid ${pid}, but no such process is running`,
+            "-> the job was booted out and the record left behind; nothing is enforcing anything here"] };
   if (pid === null) return { id, level: DEGRADED, title,
     lines: [...lines, "the job is loaded but launchctl reports no running process",
             "-> nothing is enforcing anything here; the commit above is what the NEXT start would load"] };

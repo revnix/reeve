@@ -18,7 +18,7 @@ import { execFileSync } from "node:child_process";
 import { treeState } from "../src/daemon.mjs";
 import { checkDaemonProvenance, programArguments, checkoutFromArgs, loadedArguments,
          decodeXml, startupRecordFrom, daemonLogPath, loadedEnvironment,
-         loadedPid } from "../src/doctor.mjs";
+         loadedPid, loadedWorkingDirectory } from "../src/doctor.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -33,7 +33,7 @@ const PLIST = (args) => `<plist version="1.0"><dict>
 const ARGS = ["/n/bin/node", "/Users/x/deploy/bin/reeve", "run", "o/r"];
 const LOADED = "\tpid = 5\n\targuments = {\n\t/n/bin/node\n\t/Users/x/deploy/bin/reeve\n\trun\n\to/r\n}\n";
 const SHA = "abcdef1234567890";
-const START = (o = {}) => `reeve daemon starting — node v24.17.0, pid ${o.pid ?? 5}, ` +
+const START = (o = {}) => `2026-09-02T11:29:05.914Z reeve daemon starting — node v24.17.0, pid ${o.pid ?? 5}, ` +
   `running commit ${o.commit ?? SHA}${o.tree === undefined ? ", tree clean" : (o.tree === null ? "" : `, tree ${o.tree}`)}`;
 
 const runner = (over = {}) => (cwd, args) => {
@@ -49,7 +49,7 @@ const runner = (over = {}) => (cwd, args) => {
   return over[key] ?? d[key] ?? { ok: false, out: "", err: "unexpected " + args.join(" ") };
 };
 const base = { run: runner(), plist: () => PLIST(ARGS), launchctl: () => LOADED,
-               readLog: () => START(), home: "/h" };
+               readLog: () => START(), home: "/h", alive: () => true };
 const at = (io) => checkDaemonProvenance({ ...base, ...io });
 
 const TABLE = [
@@ -103,6 +103,11 @@ const TABLE = [
   { name: "a record with NO tree state is DEGRADED, not OK",
     io: { readLog: () => START({ tree: null }) }, level: "DEGRADED",
     says: /whether it loaded a clean tree is unknown/ },
+  // launchctl RETAINS the last pid after a bootout, and the stale startup record
+  // carries the same one -- so the pid match agrees with itself and the rule runs
+  // on to OK about a daemon that does not exist.
+  { name: "a pid launchctl still reports but that is DEAD is DEGRADED",
+    io: { alive: () => false }, level: "DEGRADED", says: /no such process is running/ },
   { name: "a checkout that moved after startup is DEGRADED",
     io: { readLog: () => START({ commit: "0ldc0de" }) }, level: "DEGRADED" },
   { name: "the running commit at the default branch is OK", io: {}, level: "OK" },
@@ -160,6 +165,11 @@ for (const { name, io, level, why, says } of TABLE) {
   // with the anchor removed. The sweep reported NOT_CAUGHT.
   check(startupRecordFrom(`${START({ commit: "aaaaaaa" })}\ncheck failed: build at pid 999, running commit deadbee`)?.commit === "aaaaaaa",
     "a later line merely CONTAINING the phrase is not read as a startup record");
+  // Requiring the PHRASE was not anchoring: a decision line ENDING in the whole
+  // shape matched it. Fixed in scripts/state.mjs first and left here, which is
+  // the same defect in its second place.
+  check(startupRecordFrom(`${START({ commit: "aaaaaaa" })}\nfailing: reeve daemon starting pid 5, running commit deadbee, tree clean`)?.commit === "aaaaaaa",
+    "nor is a decision line that ends in the whole startup shape");
   check(startupRecordFrom("") === null, "an empty log answers null rather than a value");
 }
 
@@ -190,8 +200,19 @@ for (const { name, io, level, why, says } of TABLE) {
       "and it still does when status.showUntrackedFiles=no would hide it", treeState(dir));
 
     git("config", "--unset", "status.showUntrackedFiles");
-    writeFileSync(join(dir, "a.txt"), "two");
-    check(treeState(dir) === "dirty", "control: a MODIFIED tracked file is dirty too", treeState(dir));
+    rmSync(join(dir, "untracked.mjs"));
+    // AN INDEX BIT HIDES A MODIFIED FILE FROM `status` ENTIRELY, so a clean
+    // status over such a tree establishes nothing. The answer is `unreadable`
+    // rather than `dirty`: we do not know that anything WAS modified, only that
+    // we cannot tell.
+    git("update-index", "--assume-unchanged", "a.txt");
+    check(treeState(dir) === "unreadable",
+      "a file marked assume-unchanged makes the tree state UNKNOWABLE, not clean", treeState(dir));
+    writeFileSync(join(dir, "a.txt"), "edited behind the bit");
+    check(treeState(dir) === "unreadable",
+      "and still so once it is actually modified, which status does not report", treeState(dir));
+    git("update-index", "--no-assume-unchanged", "a.txt");
+    check(treeState(dir) === "dirty", "control: a MODIFIED tracked file is dirty once the bit is cleared", treeState(dir));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
@@ -227,6 +248,12 @@ for (const { name, io, level, why, says } of TABLE) {
   check(daemonLogPath(["run", "--home", "/custom"], { REEVE_HOME: "/jobhome" }, "/h") === "/custom/reeve.log",
     "and --home OUTRANKS the environment, as bin/reeve resolves it");
   check(loadedPid("\tstate = running\n\tpid = 63207\n") === 63207, "the live pid is read from launchctl");
+  // Measured from a real `launchctl print`: a TOP-LEVEL field, not in the
+  // `environment` block where a first version looked for a PWD launchd does not set.
+  check(loadedWorkingDirectory("\tpath = /x.plist\n\tworking directory = /Users/m/reeve\n") === "/Users/m/reeve",
+    "the job's working directory is read from launchctl's own field");
+  check(loadedWorkingDirectory("\tenvironment = {\n\tPWD => /nope\n}\n") === null,
+    "control: and is not taken from the environment block");
   check(loadedPid("\tstate = not running\n") === null, "and a loaded job with no pid reports none");
   check(daemonLogPath(["run"], {}, "/h") === "/h/reeve.log", "control: falling back to the given home");
   check(loadedEnvironment("environment = {\n\tREEVE_HOME => /jobhome\n}\n").REEVE_HOME === "/jobhome",

@@ -2249,8 +2249,8 @@ export const STUBS = [
     test: "test/hub-incarnation.test.mjs",
     expectRed: "a v6 hub that has LOST the table propagates",
     edits: [{ file: "src/build/hubdb.mjs",
-              find: "    if (predatesIncarnation(db)) return null;\n    throw e;",
-              replace: "    if (true) return null;\n    throw e;" }],
+              find: "    if (predatesIncarnation(db)) return null;",
+              replace: "    if (true) return null;" }],
   },
   {
     name: "an-empty-incarnation-table-is-damage-too",
@@ -2434,7 +2434,7 @@ export const STUBS = [
     expectRed: "but the digest reports that the weaker check answered it",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "    cursor_proof: since === null ? null : provable ? \"incarnation\" : \"timestamp\",",
+      find: "      : provable ? \"incarnation\"",
       replace: "    cursor_proof: since === null ? null : \"incarnation\",",
     }],
   },
@@ -2535,6 +2535,39 @@ export const STUBS = [
       file: "bin/reeve",
       find: "          process.exit(model.cursor_rewound || model.incarnation_damaged\n            ? EXITS.degraded : EXITS.ok);",
       replace: "          process.exit(model.cursor_rewound ? EXITS.degraded : EXITS.ok);",
+    }],
+  },
+  {
+    name: "sequence-zero-survives-a-restore",
+    why: "judge a cursor at sequence 0 by its incarnation like any other. A first digest taken before any phase event exists issues one, and if the hub is restored before events arrive the identity differs -- so every transition since is withheld, permanently, because the operator resyncs to the new high-water mark. Sequence 0 names the beginning of any log rather than an event in a particular one",
+    test: "test/build-dash.test.mjs",
+    expectRed: "a cursor at sequence 0 is accepted even though its incarnation differs",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "      : since.seq === 0 ? \"ok\"\n",
+      replace: "",
+    }],
+  },
+  {
+    name: "the-proof-names-what-decided-it",
+    why: "report `timestamp` for a cursor settled by the sequence alone. A legacy cursor beyond the high-water mark is decided without looking up any event, so the renderer then prints a note about a restore inferred from timestamps directly beneath a line saying the cause cannot be told apart -- naming evidence that was never consulted",
+    test: "test/build-dash.test.mjs",
+    expectRed: "and the proof says SEQUENCE, because that is what settled it",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "      : verdict === \"ahead\" ? \"sequence\"\n",
+      replace: "",
+    }],
+  },
+  {
+    name: "a-missing-incarnation-table-is-damage",
+    why: "rethrow SQLite's bare `no such table` for a migrated hub that has lost the whole table, while the missing-ROW case is marked. Both mean the store was altered outside reeve, and a caller branching on the mark renders one as an actionable damage report and lets the other out as a generic unreadable-hub refusal with no remedy attached",
+    test: "test/hub-incarnation.test.mjs",
+    expectRed: "and it is MARKED as damage, so a caller can tell it from an unreadable store",
+    edits: [{
+      file: "src/build/hubdb.mjs",
+      find: "      { hubDamaged: true, cause: e });",
+      replace: "      { cause: e });",
     }],
   },
 ];

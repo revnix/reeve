@@ -138,7 +138,6 @@ export const GRANDFATHERED = [
   "test/review-shadow.test.mjs",
   "test/reviewer-refusal-shapes.test.mjs",
   "test/reviewer-status.test.mjs",
-  "test/sandbox.test.mjs",
   "test/schema-is-one-file.test.mjs",
   "test/schema-migration.test.mjs",
   "test/selfaudit.test.mjs",

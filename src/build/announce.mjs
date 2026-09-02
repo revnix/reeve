@@ -13,7 +13,7 @@
  */
 import { HOLD_ESCALATION, PHASES } from "./phases.mjs";
 import { hubTx, hubEvent } from "./hubdb.mjs";
-import { printable, redact } from "../notify.mjs";
+import { printable, redact, scrub } from "../notify.mjs";
 import { assertWritable } from "./locks.mjs";
 
 /**
@@ -90,10 +90,225 @@ export const PAGES = Object.freeze(["builder:backup:failed", "bt:<id>:phase:bloc
 const raised = (db, why) => hubEvent(db, {
   kind: "escalation.raised",
   task: /^bt:/.test(why) ? subjectOf(why) : null,
+  // `body` IS IN THE IMAGE. `escalation` is replayed from this event, so a
+  // column absent here is a column a restore silently empties -- and what it
+  // would empty is the only durable record of what the alert actually said.
   payload: db.prepare(
-    "SELECT why, count, first_seen_at, last_seen_at, announced_count FROM escalation WHERE why = ?")
+    "SELECT why, count, first_seen_at, last_seen_at, announced_count, body FROM escalation WHERE why = ?")
     .get(why),
 });
+
+/**
+ * The ceiling on a stored report, in serialised bytes.
+ *
+ * Generous for what a report IS -- a failure type and a handful of named facts --
+ * and small enough that re-appending it on every pass cannot outgrow the store.
+ * Not shared with `notify`'s alert cap: that one exists because a phone is not a
+ * log viewer, this one because an append-only authority table is not a spool, and
+ * two limits that happen to be numbers are not one limit.
+ */
+const BODY_LIMIT = 4096;
+
+/**
+ * Every string in a report, scrubbed of credentials -- keys included.
+ *
+ * SCRUBBED BEFORE IT IS DURABLE, not on the way to the phone. `redact` runs on
+ * the rendered alert, which is the last point before the text leaves the machine
+ * -- but the body is written to `escalation.body` AND to the `escalation.raised`
+ * payload, so an echoed token in a CI excerpt would be absent from the page and
+ * present verbatim in the hub, in every snapshot of it, and in exported event
+ * tails, surviving the escalation row being cleared.
+ *
+ * VALUE BY VALUE, never over the serialised text: a replacement landing across a
+ * JSON escape boundary could corrupt the document, and a body that no longer
+ * parses is a report lost to the guard that was protecting it.
+ */
+const BOXED = new Set(["[object Number]", "[object String]", "[object Boolean]", "[object BigInt]"]);
+
+/**
+ * The scrub, run as `JSON.stringify`'s own replacer.
+ *
+ * A REPLACER RATHER THAN A SECOND TRAVERSAL, and that is the whole design. The
+ * first version walked the value itself, which meant reimplementing
+ * `JSON.stringify`'s semantics -- and it diverged in the corners, every time in
+ * the direction of storing something other than what the caller supplied:
+ * `toJSON` was re-applied to its own result, where the serialiser applies it
+ * once; a boxed `new Number(5)` became `{}` and a `new String("abc")` became a
+ * map of character indices; a self-returning `toJSON` was refused as circular
+ * though it serialises perfectly.
+ *
+ * The serialiser calls `toJSON` FIRST and this second, so this sees exactly what
+ * would have been written and nothing else. Cycles, `undefined` in arrays and
+ * every other rule stay the serialiser's, where they were already correct.
+ */
+function scrubbing(_key, v) {
+  if (typeof v === "string") return scrub(v);
+  if (v === null || typeof v === "boolean") return v;
+  // NON-FINITE NUMBERS BECOME `null` IN JSON, silently. A report that said
+  // `attempts: Infinity` and stores `attempts: null` has lost the fact rather
+  // than carried it, and every signal still says the alert was delivered.
+  if (typeof v === "number") {
+    if (!Number.isFinite(v))
+      throw refuse("escalation_body_value",
+        `an escalation body cannot carry ${String(v)}: JSON turns it into null, so the report ` +
+        "would be stored having quietly lost the number.");
+    return v;
+  }
+  if (typeof v === "object") {
+    // A BOXED PRIMITIVE SERIALISES AS SOMETHING ELSE AGAIN, and refusing is
+    // honest where emulating would be guesswork: nobody puts `new Number(5)` in a
+    // report on purpose, and silently storing `5` for it would be inventing the
+    // caller's intent.
+    const tag = Object.prototype.toString.call(v);
+    if (BOXED.has(tag))
+      throw refuse("escalation_body_value",
+        `an escalation body cannot carry a boxed ${tag.slice(8, -1)}: it does not serialise as the ` +
+        "value it wraps, so the stored report would differ from the one supplied.");
+    if (Array.isArray(v)) return v;
+    // KEYS ARE SCRUBBED HERE, which a replacer cannot do in place -- it may
+    // replace a VALUE and never rename a key. So a plain object is rebuilt with
+    // safe names and the serialiser walks the rebuild.
+    //
+    // A NULL PROTOTYPE, because `out.__proto__ = x` on an ordinary object calls
+    // the legacy setter instead of creating a property: a report carrying an own
+    // `__proto__` key -- which `JSON.parse` produces -- would be accepted and
+    // silently stored without that field.
+    const out = Object.create(null);
+    for (const [k, x] of Object.entries(v)) {
+      const safe = scrub(k);
+      // SCRUBBED KEYS CAN COLLIDE. Two credential-shaped keys reduce to the same
+      // replacement, and one assignment would overwrite the other -- dropping a
+      // field from a report that was otherwise entirely valid.
+      let name = safe;
+      for (let n = 2; Object.hasOwn(out, name); n++) name = `${safe} (${n})`;
+      out[name] = x;
+    }
+    return out;
+  }
+  // THE SERIALISATION HOOK IS NOT A REPORT DETAIL. A `toJSON` property is a
+  // function the serialiser CALLS and then omits, so refusing it rejected a body
+  // that stringifies perfectly -- `{ type, detail, toJSON() { return this; } }`
+  // stores its data natively and merely loses the method. Nothing is lost by
+  // dropping it here, which is exactly what the serialiser does with it.
+  if (_key === "toJSON" && typeof v === "function") return undefined;
+  // undefined, a function, a symbol, a bigint. The first three are dropped from
+  // an object by the serialiser without a word and the last one throws, so a
+  // detail the caller supplied would simply not be in the stored report while the
+  // call succeeded and was marked delivered. Serialising without error is not
+  // proof that the whole report survived.
+  throw refuse("escalation_body_value",
+    `an escalation body cannot carry ${typeof v}: JSON discards it, so the report would be ` +
+    "stored having quietly lost that detail.");
+}
+
+/** What the caller passed, named the way the caller would recognise it. */
+const describeBody = (body) =>
+  Array.isArray(body) ? "an array"
+    : typeof body !== "object" ? `a ${typeof body}`
+    // NAMED SPECIFICALLY, because "an object" would be actively misleading here:
+    // the value IS one, and the reason it is refused is invisible without saying
+    // that its `toJSON` replaced it.
+    : typeof body.toJSON === "function" ? `${body.constructor?.name ?? "an object"} (its toJSON does not return an object)`
+    : "an object";
+
+/**
+ * The report, as the column stores it, or null where there is none.
+ *
+ * CANONICAL JSON, matching what `hub_event.payload` holds, so a reader learns
+ * one serialisation rather than two. The column carries a `json_valid` CHECK, so
+ * a value that cannot be serialised is refused HERE with a name rather than at
+ * the write, where the error names a constraint and not the caller's mistake.
+ */
+/**
+ * The body a pass OFFERS for a cause, or null where it offers none.
+ *
+ * ONE READING OF EMPTINESS, because the two sides of this seam read it
+ * separately and disagreed. The persist side asked `serialiseBody(...) === null`
+ * and the alert side asked `bodies.has(why)`, which is TRUE for a key mapped to
+ * `undefined` -- and that is what `new Map(items.map(i => [i.why, i.body]))`
+ * produces for any item carrying no body, which is the ordinary way to build
+ * this map. The row then kept its stored report while the alert paged bare,
+ * losing exactly the detail the column exists to keep.
+ *
+ * A key mapped to nothing is not an offer. Both sides now ask this.
+ */
+const offeredBody = (bodies, why) => {
+  const b = bodies?.get(why);
+  return b === null || b === undefined ? null : b;
+};
+
+const serialiseBody = (body) => {
+  if (body === null || body === undefined) return null;
+  // THE SCRUB'S OWN REFUSALS SURVIVE THE CATCH. They are thrown from inside the
+  // replacer, so they come out of `JSON.stringify` like any other error -- and a
+  // bare catch reported every one of them as "did not serialise", replacing a
+  // precise diagnosis with a generic one. A refusal carries `kind`; a cycle or
+  // any other serialiser failure does not, and only those become the shape
+  // refusal below.
+  let text;
+  try { text = JSON.stringify(body, scrubbing); }
+  catch (e) { if (e?.kind) throw e; text = undefined; }
+  // A REPORT, NOT A LOG. Every pass over a standing cause re-appends the row
+  // image to `hub_event`, which is append-only and is the authority store, so an
+  // unbounded body is an unbounded write rate: a megabyte of CI excerpt
+  // re-measured once a minute is gigabytes a day, and the file it exhausts is the
+  // one everything else depends on.
+  //
+  // REFUSED RATHER THAN TRUNCATED, and that is the same trade as everywhere else
+  // here: silently cutting a report in half loses the detail at exactly the point
+  // it was needed, and reports success. A producer over this cap is putting a log
+  // where a summary belongs, which is a defect in the producer.
+  // ENCODED BYTES, which is what the ceiling and the store both mean. `String
+  // .length` counts UTF-16 code units, so ~4000 CJK characters measure as 4000
+  // and occupy about 12KB -- passing a cap whose whole purpose is bounding what
+  // gets written, in the case where the two units diverge most.
+  const bytes = typeof text === "string" ? Buffer.byteLength(text, "utf8") : 0;
+  if (bytes > BODY_LIMIT)
+    throw refuse("escalation_body_too_large",
+      `an escalation body must serialise to at most ${BODY_LIMIT} bytes; this one is ${bytes}. ` +
+      "Every pass over a standing cause re-appends it to the append-only log, so an unbounded report " +
+      "is an unbounded write rate. Put a summary here and the full output in the run's artifacts.");
+  // THE SERIALISED FORM IS WHAT GETS STORED, so it is the form that has to be a
+  // renderable object -- not the value handed in. Checking the input instead is
+  // one check on the wrong side of the boundary: `toJSON` decides what
+  // `JSON.stringify` produces, and a `Date` returns a STRING from it. Such a body
+  // is an object, is not an array, and serialises perfectly -- then stores as a
+  // bare JSON string, renders NO detail because `Object.entries(new Date())` is
+  // empty, and is rejected as unrenderable when the next pass reads it back.
+  // The report is lost silently, which is the one outcome this column exists to
+  // prevent.
+  //
+  // ONE CHECK, on the value that is actually persisted. It subsumes the input
+  // cases -- a string, an array, a number and an unserialisable value all fail it
+  // -- so there are not two rules here that can drift apart.
+  let shape;
+  if (typeof text === "string") { try { shape = JSON.parse(text); } catch { shape = undefined; } }
+  // THE WHOLE CONTRACT, AT THE BOUNDARY EVERY BODY CROSSES. `body()` checked the
+  // failure type and `announce` accepted whatever the `bodies` map held, so a
+  // caller building that map directly -- which the exported signature invites --
+  // bypassed the vocabulary entirely. `{}`, an Error that serialises to `{}`, and
+  // `{ type: "UNKNOWN_VALUE" }` were all persisted and marked delivered while
+  // producing an alert with no type and no detail.
+  //
+  // This is the THIRD instance of one shape in this file: validating the value
+  // handed in rather than the value stored, validating the render source rather
+  // than the stored source, and now a vocabulary enforced by a helper nobody is
+  // obliged to call. A rule that only a convenience constructor applies is a
+  // suggestion. `body()` stays as the ergonomic way to build one and is no longer
+  // the only thing that checks it.
+  if (shape !== null && typeof shape === "object" && !Array.isArray(shape) &&
+      !FAILURE_TYPES.includes(shape.type))
+    throw refuse("escalation_body_type",
+      `an escalation body must name a failure type (${FAILURE_TYPES.join(", ")}); this one says ` +
+      `${JSON.stringify(shape.type)}. The type is what tells "it stopped" from "it may have stopped", ` +
+      "and an alert without one asks a human to guess which.");
+  if (shape === null || typeof shape !== "object" || Array.isArray(shape))
+    throw refuse("escalation_body_shape",
+      `an escalation body must serialise to a JSON object; ${describeBody(body)} did not. ` +
+      "The alert renders a body by walking its entries, so anything else pages its characters " +
+      "or pages nothing at all. `body({ type, ...detail })` builds one and names the failure type.");
+  return text;
+};
 
 /** A refusal that says WHICH rule it broke, so a caller can tell them apart. */
 const refuse = (kind, message) => Object.assign(new Error(message), { kind });
@@ -267,7 +482,7 @@ export function assertHub(db) {
  * @returns {{fresh: {why: string, count: number}[], cleared: string[]}}
  */
 export function builderAnnounceable(db, escalations, {
-  at = Math.floor(Date.now() / 1000), isAlive, examined = null } = {}) {
+  at = Math.floor(Date.now() / 1000), isAlive, examined = null, bodies = null } = {}) {
   assertHub(db);
   // EXPLICIT, never defaulted. `assertWritable` reads the restore lock and asks
   // whether its holder is alive; a predicate that always answered true would
@@ -295,12 +510,38 @@ export function builderAnnounceable(db, escalations, {
         // never told, while `declined` had already scrolled past. 0 is also what
         // `applyTransition` raises with, so a cause raised by a transition and
         // one raised here are the same row to this function.
-        db.prepare(`INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count)
-                    VALUES(?,?,?,?,0)`).run(why, count, at, at);
+        db.prepare(`INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count,body)
+                    VALUES(?,?,?,?,0,?)`).run(why, count, at, at, serialiseBody(offeredBody(bodies, why)));
         raised(db, why);
         fresh.push({ why, count });
       } else {
-        db.prepare("UPDATE escalation SET count=?, last_seen_at=? WHERE why=?").run(count, at, why);
+        // ONE ROW, ONE REPORT -- so a cause shared by several subjects must be
+        // offered ONE body describing all of them, and that is the producer's
+        // contract rather than something this can reconstruct.
+        //
+        // `builder:backup:failed` is a bare identity by design: two stores failing
+        // are one cause with a count of two, not two causes. The count already
+        // says how many, and the body has to say WHICH -- a producer that offers
+        // one report per subject overwrites its own previous one here, and the
+        // row ends up naming whichever store it happened to see last.
+        //
+        // Merging them here is not available and would be wrong if it were: this
+        // module cannot know whether two reports for one cause describe two
+        // subjects or the same subject re-measured, and guessing would invent a
+        // history. `count` is the shape of a shared cause; the body must be
+        // built to match it.
+        //
+        // THE REPORT IS REFRESHED, THE COUNTERS ARE NOT RESET. A standing cause
+        // measured again carries a newer report -- a different path, a later
+        // error -- and the row should say what is true now. A caller that offers
+        // no body leaves the stored one alone rather than erasing it: absence of
+        // a report in this pass is not evidence that the report is gone.
+        const body = serialiseBody(offeredBody(bodies, why));
+        if (body === null)
+          db.prepare("UPDATE escalation SET count=?, last_seen_at=? WHERE why=?").run(count, at, why);
+        else
+          db.prepare("UPDATE escalation SET count=?, last_seen_at=?, body=? WHERE why=?")
+            .run(count, at, body, why);
         raised(db, why);
         // The count is the SHAPE of a shared cause: one task blocked at RESEARCH
         // and four blocked there are different situations, and both deserve
@@ -462,7 +703,43 @@ export function announce(db, {
       "announce needs a send function: whether a page reached anyone is the one thing this " +
       "cannot infer, and a default that silently succeeded would report delivery it never made.");
 
-  const { fresh, cleared, clearable } = builderAnnounceable(db, escalations, { at, isAlive, examined });
+  const { fresh, cleared, clearable } =
+    builderAnnounceable(db, escalations, { at, isAlive, examined, bodies });
+
+  /**
+   * The report for a cause: this pass's, else the one the row already holds.
+   *
+   * A cause raised by `applyTransition` carries no body through this call at
+   * all, so reading only the caller's map would page it bare while the durable
+   * row had the report all along.
+   */
+  const bodyFor = (why) => {
+    // THE STORED ROW, ALWAYS -- never the object the caller handed in, because
+    // the two can differ and the stored one is what everything else will see.
+    // `toJSON` decides what is persisted, so a body whose `toJSON` replaces its
+    // shape stored the useful report and paged the ORIGINAL: an object with no
+    // enumerable properties renders as nothing, so the FIRST alert carried
+    // neither the failure type nor the detail while the row held both, and every
+    // LATER alert for the same cause -- read from the row -- disagreed with it.
+    //
+    // `builderAnnounceable` has already written this pass's body by the time
+    // anything dispatches, and a clearing reads this before the row is deleted,
+    // so the row is available to both and is the one answer they share. Preferring
+    // the caller's map was a second source for a value that has one.
+    const stored = db.prepare("SELECT body FROM escalation WHERE why = ?").get(why)?.body ?? null;
+    if (stored === null) return null;
+    // A row that cannot be parsed is reported as having no body rather than
+    // throwing: the alert is the thing that matters, and losing it because its
+    // detail is malformed would be the wrong trade.
+    // THE SAME SHAPE RULE THE WRITE SIDE APPLIES, for a row written around it --
+    // `json_valid` accepts a bare string or number, so direct SQL can put one
+    // here. Unrenderable and unparseable get the same answer for the same
+    // reason: the alert matters more than its detail.
+    try {
+      const parsed = JSON.parse(stored);
+      return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+    } catch { return null; }
+  };
   const paged = [], digested = [], declined = [];
 
   /**
@@ -564,7 +841,7 @@ export function announce(db, {
   };
 
   for (const f of fresh) {
-    const body = bodies?.get(f.why) ?? null;
+    const body = bodyFor(f.why);
     if (!pages(f.why)) {
       // THE DIGEST CANNOT DECLINE. It is the durable row itself, which is
       // already written, so surfacing there is complete the moment it exists.
@@ -584,7 +861,7 @@ export function announce(db, {
   // of losing it.
   const retired = [...cleared];
   for (const why of clearable) {
-    const sent = dispatch(why, 0, "cleared", bodies?.get(why) ?? null);
+    const sent = dispatch(why, 0, "cleared", bodyFor(why));
     if (!sent) continue;
     clearEscalation(db, why, { isAlive, at });
     paged.push(sent);

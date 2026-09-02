@@ -16,7 +16,8 @@
 // re-minting therefore hands back an id that MATCHES, and a matching id is
 // exactly the proof being asked for. So these drive a real snapshot and a real
 // restore rather than calling the mint directly.
-import { openHub, HUB_SCHEMA_VERSION, hubIncarnation, mintIncarnation } from "../src/build/hubdb.mjs";
+import { openHub, HUB_SCHEMA_VERSION, hubIncarnation, mintIncarnation,
+         INCARNATION_SINCE } from "../src/build/hubdb.mjs";
 import { snapshot, restoreHub } from "../src/backup.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -84,9 +85,15 @@ const DEAD = () => false;
 
   // Put the store back to v5: drop the table and retract the migration record,
   // which is what a hub last opened by yesterday's binary genuinely looks like.
+  //
+  // EVERYTHING FROM 6 UPWARD, not migration 6 alone. Retracting one version out
+  // of the middle does not age a store, it HOLES it: the store would record
+  // 1-5 and 7, which `openHub` refuses outright and rightly, so the fixture
+  // would stop building the thing it describes the moment any migration landed
+  // above this one. `>=` keeps it true for the next one too.
   const back = new DatabaseSync(p);
   back.exec("DROP TABLE hub_incarnation");
-  back.prepare("DELETE FROM schema_version WHERE version = ?").run(6);
+  back.prepare("DELETE FROM schema_version WHERE version >= ?").run(INCARNATION_SINCE);
   const wasEmpty = back.prepare(
     "SELECT count(*) n FROM sqlite_master WHERE type='table' AND name='hub_incarnation'").get().n;
   back.close();
@@ -145,11 +152,17 @@ const DEAD = () => false;
   // saying 6 -- which is the DAMAGED case, not the old one. It asserted null and
   // passed, so the fixture built the misclassification and certified it. Review
   // found that, not the suite.
+  //
+  // AND EVERY MIGRATION FROM 6 UPWARD, for the second time in this file and for
+  // the same reason. Retracting the exact version built a store recording 1-5 and
+  // 7 -- a HOLE, a damaged CURRENT store, not an old one -- so this fixture was
+  // once again constructing the misclassification and certifying it. The literal
+  // 6 is what rotted; `INCARNATION_SINCE` with `>=` is what does not.
   const p = join(dir, "prev6.db");
   openHub(p).close();
   const raw = new DatabaseSync(p);
   raw.exec("DROP TABLE hub_incarnation");
-  raw.prepare("DELETE FROM schema_version WHERE version = ?").run(6);
+  raw.prepare("DELETE FROM schema_version WHERE version >= ?").run(INCARNATION_SINCE);
   raw.close();
   const ro = new DatabaseSync(p, { readOnly: true });
   let threw = null, answer;
@@ -157,6 +170,29 @@ const DEAD = () => false;
   ro.close();
   check(threw === null, "reading a hub that predates the table does not throw", String(threw));
   check(answer === null, "it answers null, which a caller reads as `cannot prove`", JSON.stringify(answer));
+
+  // A HOLED CURRENT STORE IS NOT AN OLD ONE, which is what the exact-version
+  // reading could not tell apart. This records 1-5 and 7: no migration 6, so the
+  // old test said "predates the incarnation" and answered null, hiding damage
+  // behind the compatibility path. It has to reach the caller as damage instead.
+  const holed = join(dir, "holed-not-old.db");
+  openHub(holed).close();
+  {
+    const h = new DatabaseSync(holed);
+    h.exec("DROP TABLE hub_incarnation");
+    h.prepare("DELETE FROM schema_version WHERE version = ?").run(INCARNATION_SINCE);
+    const left = h.prepare("SELECT version FROM schema_version ORDER BY version").all().map(r => r.version);
+    check(!left.includes(INCARNATION_SINCE) && left.some(v => v > INCARNATION_SINCE),
+      "control: the fixture really is HOLED -- no migration 6, and something above it",
+      left.join(","));
+    h.close();
+  }
+  const hro = new DatabaseSync(holed, { readOnly: true });
+  const holedRead = read(hro);
+  hro.close();
+  check(holedRead.threw !== null,
+    "a holed CURRENT store propagates damage rather than answering null like an old one",
+    JSON.stringify({ threw: String(holedRead.threw), value: holedRead.value }));
 
   // AND THE DAMAGED CASE MUST NOT LOOK LIKE IT. A hub that RECORDS migration 6
   // and has lost the table is broken, and null there suppresses the only evidence

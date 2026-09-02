@@ -56,10 +56,25 @@ export const printable = text =>
   String(text ?? "").replace(/[\u0000-\u001F\u007F-\u009F]/g,
     c => NAMED[c] ?? `\\x${c.codePointAt(0).toString(16).padStart(2, "0")}`);
 
-/** Strip anything secret, and cap the length. A phone is not a log viewer. */
-export function redact(text) {
+/**
+ * Strip anything secret, and NOTHING else.
+ *
+ * SPLIT FROM `redact` because the cap belongs to the phone and the scrub belongs
+ * to every destination. A report persisted to the hub has to lose its
+ * credentials too -- it outlives the alert, rides into snapshots and exported
+ * event tails, and survives the escalation row being cleared -- but truncating it
+ * would destroy the report to protect it, which is the trade `redact` is allowed
+ * to make for a notification and this is not.
+ */
+export const scrub = (text) => {
   let s = String(text ?? "");
   for (const [re, with_] of SECRETS) s = s.replace(re, with_);
+  return s;
+};
+
+/** Strip anything secret, and cap the length. A phone is not a log viewer. */
+export function redact(text) {
+  const s = scrub(text);
   return s.length > LIMIT ? s.slice(0, LIMIT) + " […truncated]" : s;
 }
 

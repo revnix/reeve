@@ -52,7 +52,7 @@ const TABLE = [
   // NOTHING MAY SAY "RUNS" WITHOUT A LOADED JOB. The installed file describes the
   // next load; reading it alone would certify a guardian that is not there.
   { name: "a readable plist with NO loaded job is UNKNOWN, not OK",
-    io: { launchctl: () => null }, level: "UNKNOWN",
+    io: { launchctl: () => null }, level: "UNKNOWN", says: /nothing here establishes that anything is running/,
     why: "the file says what WOULD run; it cannot establish that anything is running" },
   { name: "a loaded job that runs something other than bin/reeve is UNKNOWN",
     io: { launchctl: () => "arguments = {\n\t/usr/bin/true\n}\n" }, level: "UNKNOWN" },
@@ -61,9 +61,10 @@ const TABLE = [
   // AN UNREADABLE STARTUP IS NOT A HEALTHY ONE. Appending a warning and returning
   // OK lets doctor exit healthy while admitting it cannot say what is running.
   { name: "no readable startup record is UNKNOWN, not OK",
-    io: { readLog: () => "" }, level: "UNKNOWN" },
+    io: { readLog: () => "" }, level: "UNKNOWN", says: /no startup record could be read/ },
   { name: "a daemon that recorded its own commit as unreadable is UNKNOWN",
-    io: { readLog: () => START({ commit: "unreadable" }) }, level: "UNKNOWN" },
+    io: { readLog: () => START({ commit: "unreadable" }) }, level: "UNKNOWN",
+    says: /recorded its own commit as unreadable/ },
   // RECORDED AT STARTUP, not read now: today's `git status` describes a different
   // moment than the one the process loaded from.
   { name: "a process that loaded from a DIRTY tree is BROKEN",
@@ -88,9 +89,16 @@ const TABLE = [
     io: { run: runner({ behind: { ok: true, out: "43" } }) }, level: "OK" },
 ];
 
-for (const { name, io, level, why } of TABLE) {
+// THE LEVEL AND THE REASON. Four distinct faults answer UNKNOWN here, so a stub
+// that removes one guard reaches the next and the level alone still matches --
+// the sweep reported exactly that, NOT_CAUGHT, for two of these rows. Where a row
+// carries `says`, the message has to name the fault it is about.
+for (const { name, io, level, why, says } of TABLE) {
   const r = at(io);
-  check(r.level === level, name, `${r.level} (wanted ${level})${why ? " -- " + why : ""}\n        ${(r.lines ?? []).join("\n        ")}`);
+  const text = (r.lines ?? []).join(" ");
+  check(r.level === level && (!says || says.test(text)), name,
+    `${r.level} (wanted ${level})${says && !says.test(text) ? ` and did not say ${says}` : ""}` +
+    `${why ? " -- " + why : ""}\n        ${(r.lines ?? []).join("\n        ")}`);
 }
 
 // ── the LOADED job outranks the installed file ───────────────────────────────

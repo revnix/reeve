@@ -8,7 +8,7 @@
 //
 // Every assertion below is about telling a MEASUREMENT from a REFUSAL. That is
 // the only thing this script does that can be wrong in a way nobody notices.
-import { startupRecordFrom, schemaVersionFrom, unopenedBranches, sweepVerdict,
+import { startupRecordFrom, schemaVersionFrom, unopenedBranches, sweepVerdict, runner,
          nodeFloorFailure, parseArgs, daemonPidFrom } from "../scripts/state.mjs";
 
 let fail = 0;
@@ -194,6 +194,17 @@ const check = (ok, name, detail) => {
   // `die()` writes the actionable reason to stderr only.
   check(/manifest is unusable/.test(sweepVerdict({ ok: false, out: "", err: "the manifest is unusable" }).lines.join(" ")),
     "a refusal carries the stderr that says what to do about it");
+  // THROUGH `runner`, because that is where the property lives. Asserting on an
+  // `err` handed straight to sweepVerdict cannot reach the line that decides how
+  // much stderr survives -- the sweep reported NOT_CAUGHT for exactly that: the
+  // fixture bypassed the mechanism it named. stub-sweep's preflight refusals are
+  // multi-line, and the LAST line is the advice, so keeping only it leaves the
+  // reader with a remedy and no subject.
+  const multi = runner(".")(process.execPath,
+    ["-e", "console.error('entry: a-thing\\nfile: src/x.mjs\\nre-anchor it'); process.exit(2)"]);
+  check(multi.ok === false, "control: the probe command really did fail", JSON.stringify(multi));
+  check(/entry: a-thing/.test(multi.err) && /re-anchor it/.test(multi.err),
+    "runner keeps the WHOLE stderr diagnostic, not only its last line", multi.err);
   check(sweepVerdict({ ok: true, out: "" }).stop === true, "and it stops the caller");
   check(sweepVerdict({ ok: true, out: "built fine, nothing to do" }).level === "refusal",
     "control: output without the `N/M stub(s) caught` line is still an absence");

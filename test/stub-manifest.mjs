@@ -162,6 +162,33 @@ export const GRANDFATHERED = [
 
 export const STUBS = [
   {
+    name: "a-reported-pid-must-still-be-alive",
+    why: "trust the pid launchctl reports without asking the kernel. launchctl retains the last pid after a `bootout`, and the stale startup record in the log carries that same number -- so the pid comparison agrees with itself and the rule runs on to OK about a daemon that no longer exists. Signal 0 is the only thing here that asks whether the process is actually there",
+    test: "test/doctor-provenance.test.mjs",
+    expectRed: "a pid launchctl still reports but that is DEAD is DEGRADED",
+    edits: [{ file: "src/doctor.mjs",
+              find: "  if (pid !== null && !alive(pid)) return { id, level: DEGRADED, title,",
+              replace: "  if (false) return { id, level: DEGRADED, title," }],
+  },
+  {
+    name: "the-working-directory-comes-from-launchd",
+    why: "look for the job's working directory in the environment block. Measured against a real `launchctl print`, it is a TOP-LEVEL field and launchd sets no PWD -- so a job configured as `node bin/reeve` with a WorkingDirectory resolves to nothing and a healthy deployment is reported UNKNOWN",
+    test: "test/doctor-provenance.test.mjs",
+    expectRed: "the job's working directory is read from launchctl's own field",
+    edits: [{ file: "src/doctor.mjs",
+              find: "  const m = /^\\s*working directory\\s*=\\s*(.+)$/m.exec(String(printOut ?? \"\"));",
+              replace: "  const m = /^\\s*PWD\\s*=>\\s*(.+)$/m.exec(String(printOut ?? \"\"));" }],
+  },
+  {
+    name: "an-index-bit-makes-the-tree-state-unknowable",
+    why: "let `assume-unchanged` and `skip-worktree` pass as a clean tree. A tracked file carrying either bit reports nothing from `status` however it is edited, so a clean status over such a tree establishes nothing -- and the daemon can load altered source while recording `tree clean`. The honest answer is that cleanliness cannot be determined, not that it holds",
+    test: "test/doctor-provenance.test.mjs",
+    expectRed: "a file marked assume-unchanged makes the tree state UNKNOWABLE, not clean",
+    edits: [{ file: "src/daemon.mjs",
+              find: "    if (git([\"ls-files\", \"-v\"]).split(\"\\n\").some(l => /^[a-z]/.test(l) || l.startsWith(\"S \")))\n      return \"unreadable\";",
+              replace: "    if (false)\n      return \"unreadable\";" }],
+  },
+  {
     name: "a-loaded-job-with-no-process-is-not-running",
     why: "report a job whose process is down as though it were running. launchd keeps a job loaded after its process exits, so the newest startup line in a shared log can belong to a stale or manually started daemon -- and attributing it to the launchd job lets this rule return OK about a guardian that is not there",
     test: "test/doctor-provenance.test.mjs",
@@ -203,8 +230,8 @@ export const STUBS = [
     test: "test/doctor-provenance.test.mjs",
     expectRed: "it still does when status.showUntrackedFiles=no would hide it",
     edits: [{ file: "src/daemon.mjs",
-              find: "    return execFileSync(\"git\", [\"-C\", from, ...GIT_NEUTRALISE,\n                                \"status\", \"--porcelain\", \"--untracked-files=all\"],",
-              replace: "    return execFileSync(\"git\", [\"-C\", from, ...GIT_NEUTRALISE,\n                                \"status\", \"--porcelain\"]," }],
+              find: "    if (git([\"status\", \"--porcelain\", \"--untracked-files=all\"]).trim()) return \"dirty\";",
+              replace: "    if (git([\"status\", \"--porcelain\"]).trim()) return \"dirty\";" }],
   },
   {
     name: "nothing-runs-without-a-loaded-job",
@@ -284,8 +311,8 @@ export const STUBS = [
     test: "test/doctor-provenance.test.mjs",
     expectRed: "a later line merely CONTAINING the phrase is not read as a startup record",
     edits: [{ file: "src/doctor.mjs",
-              find: "  const re = /reeve daemon starting[^\\n]*?\\bpid (\\d+), running commit (\\S+?)(?:, tree (\\w+))?\\s*$/gm;",
-              replace: "  const re = /pid (\\d+), running commit (\\S+?)(?:, tree (\\w+))?\\s*$/gm;" }],
+              find: "  const re = /^\\S+ reeve daemon starting \u2014 node \\S+, pid (\\d+), running commit (\\S+?)(?:, tree (\\w+))?$/gm;",
+              replace: "  const re = /\\S+ reeve daemon starting[^\\n]*?pid (\\d+), running commit (\\S+?)(?:, tree (\\w+))?$/gm;" }],
   },
   {
     name: "a-relative-entry-point-uses-the-jobs-working-directory",

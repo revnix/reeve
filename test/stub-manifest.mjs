@@ -2592,4 +2592,15 @@ export const STUBS = [
       replace: "    const out = {};",
     }],
   },
+  {
+    name: "the-serialisation-hook-is-not-a-detail",
+    why: "refuse every function value, including a `toJSON` property. The serialiser CALLS that one and then omits it, so a body defining a self-returning hook stringifies perfectly and loses nothing -- and refusing it rejects a valid report over a value that was never going to be stored",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a self-returning toJSON is stored exactly as plain JSON.stringify stores it",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  if (_key === \"toJSON\" && typeof v === \"function\") return undefined;\n",
+      replace: "",
+    }],
+  },
 ];

@@ -185,6 +185,12 @@ function scrubbing(_key, v) {
     }
     return out;
   }
+  // THE SERIALISATION HOOK IS NOT A REPORT DETAIL. A `toJSON` property is a
+  // function the serialiser CALLS and then omits, so refusing it rejected a body
+  // that stringifies perfectly -- `{ type, detail, toJSON() { return this; } }`
+  // stores its data natively and merely loses the method. Nothing is lost by
+  // dropping it here, which is exactly what the serialiser does with it.
+  if (_key === "toJSON" && typeof v === "function") return undefined;
   // undefined, a function, a symbol, a bigint. The first three are dropped from
   // an object by the serialiser without a word and the last one throws, so a
   // detail the caller supplied would simply not be in the stored report while the
@@ -509,6 +515,22 @@ export function builderAnnounceable(db, escalations, {
         raised(db, why);
         fresh.push({ why, count });
       } else {
+        // ONE ROW, ONE REPORT -- so a cause shared by several subjects must be
+        // offered ONE body describing all of them, and that is the producer's
+        // contract rather than something this can reconstruct.
+        //
+        // `builder:backup:failed` is a bare identity by design: two stores failing
+        // are one cause with a count of two, not two causes. The count already
+        // says how many, and the body has to say WHICH -- a producer that offers
+        // one report per subject overwrites its own previous one here, and the
+        // row ends up naming whichever store it happened to see last.
+        //
+        // Merging them here is not available and would be wrong if it were: this
+        // module cannot know whether two reports for one cause describe two
+        // subjects or the same subject re-measured, and guessing would invent a
+        // history. `count` is the shape of a shared cause; the body must be
+        // built to match it.
+        //
         // THE REPORT IS REFRESHED, THE COUNTERS ARE NOT RESET. A standing cause
         // measured again carries a newer report -- a different path, a later
         // error -- and the row should say what is true now. A caller that offers

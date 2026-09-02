@@ -71,6 +71,20 @@ export const NON_REPLAYED_KINDS = Object.freeze([
   // implementation this plan prescribes.
   "lease.singleton.granted",
   "lease.singleton.released",
+  // A LIVE RUN IS PROCESS STATE, and the rule is already written beside
+  // `phase_run.settled` below: live rows are excluded at replay, because a run
+  // whose process is gone must not be resurrected. These two are what a live row
+  // is made of -- `started` inserts it, `bound` attaches the pid and its start
+  // time -- so replaying either restores a row claiming a worker that no longer
+  // exists. `one_live_run` would then refuse the task's next real dispatch on
+  // behalf of a process that died before the restore.
+  //
+  // They stay in the log rather than being dropped: what ran, under which
+  // contract, and against which pid is the history `task why` reads. Only the
+  // PROJECTION is withheld, which is the same split `repo_gate_state.refreshed`
+  // and the singleton leases already make.
+  "phase_run.started",
+  "phase_run.bound",
 ]);
 
 /** kind -> the table its payload is a row of. */

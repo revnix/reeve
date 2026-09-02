@@ -33,6 +33,19 @@ const check = (ok, name, detail) => {
 // remaining assertions unreported -- which is indistinguishable, to the stub
 // sweep, from a run that was never a measurement. `nth` never throws, so a wrong
 // size fails exactly the assertions that are about size.
+// A CALL THAT MAY THROW, TURNED INTO A VALUE.
+//
+// Every assertion here runs under the stub sweep, which reintroduces a defect and
+// expects the NAMED assertion to go red. A bare call that the stub makes throw
+// kills the file instead: the run stops, and every assertion after it is
+// unmeasured -- which reads exactly like passing. That has now happened three
+// times in this file, each time to a newly written test, so it is closed here
+// rather than wrapped again at the fourth site.
+const attempt = (fn) => {
+  try { return { ok: true, value: fn(), kind: null }; }
+  catch (e) { return { ok: false, value: undefined, kind: e?.kind ?? "threw" }; }
+};
+
 const nth = (arr, i) => (Array.isArray(arr) ? arr[i] : undefined) ?? "";
 
 const refused = (args) => {
@@ -1478,11 +1491,14 @@ const freshHub = () => {
   // then omits it, so refusing every function rejected a body that stringifies
   // perfectly -- and the refusal was for a value nothing would have lost.
   const selfy = { type: "FAILED", detail: "kept", toJSON() { return this; } };
-  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
-                  bodies: new Map([[key, selfy]]) });
-  check((hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "") === JSON.stringify(selfy),
+  const selfyRun = attempt(() => announce(hub, { escalations: new Map([[key, 1]]), at: NOW,
+                                                 isAlive: ALIVE, send,
+                                                 bodies: new Map([[key, selfy]]) }));
+  check(selfyRun.ok &&
+        (hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "") === JSON.stringify(selfy),
     "a self-returning toJSON is stored exactly as plain JSON.stringify stores it",
-    JSON.stringify({ stored: hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body,
+    JSON.stringify({ refused: selfyRun.kind,
+                     stored: hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body,
                      native: JSON.stringify(selfy) }));
   // CONTROL: a function that is a real DETAIL is still refused, so the exemption
   // is the hook and not functions in general.

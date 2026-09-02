@@ -99,6 +99,37 @@ check(new Set(TABLE.map(r => r.kind)).size === 7 && TABLE.length === 8,
     "control: and to KEEP them, because they are the evidence of what happened",
     ahd.remedy);
 
+  // THE CONDITION IS THE STORE, NOT THE DIAGNOSIS. `restoreHub` refuses any live
+  // hub recording a version above this binary's, before `--force` can act -- so
+  // whether the plain restore command is runnable depends on `version > expect`
+  // and NOT on which fault was named. Three findings were the same defect in three
+  // different branches; asserting it per branch is what keeps the fourth from
+  // being written.
+  const aheadForms = [
+    ["invalid marker on a store that is also ahead",
+     hist({ have: [6], missing: [1, 2, 3, 4, 5], invalid: [-1], version: 6 })],
+    ["ahead and holed",
+     hist({ have: [1, 6], missing: [2, 3, 4, 5], holed: true, version: 6 })],
+  ];
+  for (const [label, h] of aheadForms) {
+    const r = historyFault(h, { expect: EXPECT });
+    check(/move the hub aside/.test(r.remedy),
+      `${label}: is told to move the store aside, because a plain restore refuses it`,
+      `${r.kind}: ${r.remedy}`);
+  }
+  const plainForms = [
+    ["invalid marker on a store within range",
+     hist({ have: [3], missing: [1, 2, 4, 5], holed: true, invalid: [-1], version: 3 })],
+    ["a hole within range",
+     hist({ have: [1, 3], missing: [2, 4, 5], holed: true, version: 3 })],
+  ];
+  for (const [label, h] of plainForms) {
+    const r = historyFault(h, { expect: EXPECT });
+    check(!/move the hub aside/.test(r.remedy) && /reeve restore --hub --force/.test(r.remedy),
+      `control: ${label} gets the PLAIN restore, so the move is a decision rather than a habit`,
+      `${r.kind}: ${r.remedy}`);
+  }
+
   const holed = historyFault(hist({ have: [1, 3], missing: [2, 4, 5], holed: true, version: 3 }), { expect: EXPECT });
   check(/restore a snapshot/i.test(holed.remedy) && !/reeve build run/.test(holed.remedy),
     "control: and a HOLE still gets the snapshot, so absence above is a decision rather than a habit",

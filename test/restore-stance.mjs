@@ -19,7 +19,12 @@
 const RESTORE_CMD = /reeve restore --hub --force/;
 const clauses = (s) => s.split(/(?:\.\s|:\s|--\s)/);
 const FORBIDDING = /\b(?:do not|does not|never|must not|cannot|rather than)\b/i;
-const SUBJUNCTIVE = /\b(?:would|could|needs)\b/i;
+// `needs` WAS HERE AND WAS A HOLE. It was added for "a restore needs more room
+// rather than less", but that clause is already excused by `rather than` -- so the
+// exemption bought nothing and cost the affirmative reading of "this store needs a
+// snapshot restore", which is an instruction rather than a hypothesis. Found by
+// review, in the rule written to close exactly this shape.
+const SUBJUNCTIVE = /\b(?:would|could)\b/i;
 
 /** Does this remedy tell the operator to install a snapshot over the live store? */
 export const recommendsRestore = (remedy) => RESTORE_CMD.test(remedy)

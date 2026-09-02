@@ -242,6 +242,10 @@ check(new Set(TABLE.map(r => r.kind)).size === 8 && TABLE.length === 9,
   const unreadable = (msg, extra) => ({ readable: false, missing: [], have: [], holed: false,
                                         invalid: [], version: 0,
                                         cause: Object.assign(new Error(msg), extra) });
+  // What each stance says the remedy must do about a snapshot. A map rather than a
+  // condition, so adding a stance forces a decision here instead of defaulting.
+  const WANTS_RESTORE = { forbidden: false, unneeded: false,
+                          "in-place": true, "aside-first": true, "if-it-persists": true };
   const ROWS = [
     { name: "a healthy newer hub forbids it", stance: "forbidden",
       h: hist({ have: [1, 2, 3, 4, 5, 6], version: 6 }) },
@@ -249,7 +253,7 @@ check(new Set(TABLE.map(r => r.kind)).size === 8 && TABLE.length === 9,
       h: unreadable("database is locked", { errcode: 5 }) },
     { name: "a full disk forbids it, because a restore needs more room rather than less", stance: "forbidden",
       h: unreadable("database or disk is full", { errcode: 13 }) },
-    { name: "damage takes the restore in place", stance: "in-place",
+    { name: "an unreadable history takes the restore only if it PERSISTS", stance: "if-it-persists",
       h: unreadable("no such table: schema_version", { errcode: 1 }) },
     { name: "a hole beneath this binary takes the restore in place", stance: "in-place",
       h: hist({ have: [1, 3], missing: [2, 4, 5], holed: true, version: 3 }) },
@@ -268,8 +272,13 @@ check(new Set(TABLE.map(r => r.kind)).size === 8 && TABLE.length === 9,
     const f = historyFault(h, { expect: EXPECT });
     check(f?.snapshotRestore === stance, `stance: ${name}`, `${f?.kind} -> ${f?.snapshotRestore}`);
     const rec = recommendsRestore(f?.remedy ?? "");
-    check(stance === "forbidden" || stance === "unneeded" ? !rec : rec,
-      `the remedy agrees with the field: ${name}`, f?.remedy);
+    check(WANTS_RESTORE[stance] === rec,
+      `the remedy agrees with the field: ${name}`, `${stance} -> rec=${rec}: ${f?.remedy}`);
+    // A CONDITIONAL RESTORE HAS TO SAY WHAT THE CONDITION IS. Without the re-run
+    // the sentence is an unconditional instruction wearing a conditional field.
+    if (stance === "if-it-persists")
+      check(/re-run/i.test(f.remedy) && /persists/i.test(f.remedy),
+        `a conditional restore names the condition: ${name}`, f.remedy);
     // A remedy that says to move the hub aside must name what "the hub" IS.
     // `openHub` forces WAL, so a live store is three files, and a crash leaves
     // the -wal holding committed pages -- which is the state this is reached in.
@@ -289,6 +298,11 @@ check(new Set(TABLE.map(r => r.kind)).size === 8 && TABLE.length === 9,
     "and the remedy that one replaced, which the WORD assertion accepted");
   check(!recommendsRestore(ahead.remedy.replace("over it", "on top of it")),
     "and a correct REWORD still passes, which the literal-clause assertion did not");
+  // AN AFFIRMATIVE NEED IS AN INSTRUCTION. Review found this hole in the rule
+  // above: `needs` was exempted for one explanatory clause that `rather than`
+  // already covered, and the exemption swallowed this sentence with it.
+  check(recommendsRestore("this store needs a snapshot restore"),
+    "an affirmative NEED is read as a recommendation, not as a hypothesis");
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

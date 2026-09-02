@@ -1182,9 +1182,10 @@ const T = {};
     JSON.stringify({ id: model?.incarnation, damaged: model?.incarnation_damaged?.slice(0, 60) }));
   check(/altered outside reeve/.test(model?.incarnation_damaged ?? ""),
     "carrying the reason the store cannot be trusted", String(model?.incarnation_damaged));
-  check(/HUB DAMAGED/.test(renderDash(model)) && /reeve restore --hub --force/.test(renderDash(model)),
+  const damagedText = model ? renderDash(model) : "";
+  check(/HUB DAMAGED/.test(damagedText) && /reeve restore --hub --force/.test(damagedText),
     "and the text says so, with the recovery command the error itself carries",
-    renderDash(model).split("\n").filter(l => /DAMAGED|recover/.test(l)).join(" | "));
+    damagedText.split("\n").filter(l => /DAMAGED|recover/.test(l)).join(" | ") || "(no model)");
   ddb.close();
   rmSync(dhome, { recursive: true, force: true });
 }

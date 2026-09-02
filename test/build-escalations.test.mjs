@@ -1580,10 +1580,11 @@ const freshHub = () => {
   announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
                   send: () => ({ ok: true, channels: [{ name: "t", ok: true }] }),
                   bodies: new Map([[key, { type: "FAILED", [`k${A}`]: "first", [`k${B}`]: "second" }]]) });
-  const stored = JSON.parse(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body);
-  const values = Object.values(stored).filter(v => v === "first" || v === "second");
+  const storedRow = hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null;
+  const stored = attempt(() => JSON.parse(storedRow)).value;
+  const values = Object.values(stored ?? {}).filter(v => v === "first" || v === "second");
   check(values.length === 2,
-    "both values survive a key collision, under distinct names", JSON.stringify(stored));
+    "both values survive a key collision, under distinct names", JSON.stringify(storedRow));
 }
 
 // ── toJSON is the SERIALISER's to call, and it calls it once ────────────────

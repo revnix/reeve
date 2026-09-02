@@ -345,6 +345,50 @@ const base = (over = {}) => ({
     JSON.stringify(row));
 }
 
+// ── the caller's spawn hook and halt probe are forwarded ────────────────────
+//
+// The tick claims a provider slot BEFORE the worker exists, so the lease records
+// the DAEMON's pid; its onSpawn re-binds that lease to the worker. A dispatcher
+// that hard-codes its own hook drops that -- and liveness is then asked about a
+// daemon that is always alive, so a dead worker's slot is held until expiry and
+// the reaper, whose basis is pid-and-lstart death, can never fire for it.
+{
+  const K12 = { ...KEY, attempt: 12 };
+  let callerSaw = null, order = [];
+  const r = await dispatched(base({
+    attempt: 12,
+    bind: (db2, args) => { order.push("run-row"); return args; },
+    onSpawn: ({ pid, lstart }) => { order.push("caller"); callerSaw = { pid, lstart }; },
+    run: async ({ onSpawn }) => { onSpawn({ pid: 777, lstart: "L" });
+      return { outcome: OUTCOMES.OK, why: "ok", truncated: false }; },
+  }));
+  check(r.ok === true, "control: the dispatch succeeded", JSON.stringify(r).slice(0, 90));
+  check(callerSaw && callerSaw.pid === 777 && callerSaw.lstart === "L",
+    "the caller's onSpawn is invoked with the worker's pid and start", JSON.stringify(callerSaw));
+  check(JSON.stringify(order) === JSON.stringify(["run-row", "caller"]),
+    "and the RUN ROW binds first: the row is the permission, and a provider lease re-bound to a worker no row can name is the wrong half to keep",
+    JSON.stringify(order));
+}
+
+// A HALT THAT ARRIVES MID-RUN. runWorker defaults isHalted to () => false, so
+// without forwarding, a HALT marker appearing after the worker started left it
+// running -- and the pre-dispatch check cannot see that case by construction.
+{
+  let asked = 0;
+  const r = await dispatched(base({
+    attempt: 13,
+    isHalted: () => { asked++; return asked > 1; },
+    run: async ({ isHalted }) => {
+      const seen = [isHalted(), isHalted()];
+      return { outcome: seen[1] ? OUTCOMES.CANCELLED : OUTCOMES.OK, why: JSON.stringify(seen), truncated: false };
+    },
+  }));
+  check(asked >= 2, "the builder's halt probe reaches runWorker and is asked", String(asked));
+  check(r.result?.outcome === OUTCOMES.CANCELLED,
+    "so a HALT raised after the worker started stops it, rather than waiting for a check that already ran",
+    JSON.stringify(r?.result?.outcome));
+}
+
 // ── a cancelled task's worker process is DEAD, not merely marked dead ────────
 //
 // MEASURED at 16cd880: transition.mjs's `terminate-worker` marks

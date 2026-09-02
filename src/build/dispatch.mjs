@@ -93,6 +93,26 @@ export async function dispatchPhase(db, {
   snapshot, drift = null, leaseSeconds, budgetMs, graceMs = 5000, maxOutputBytes = 64 * 1024 * 1024,
   now = () => Math.floor(Date.now() / 1000), isAlive = isSameProcess,
   run = runWorker, bind = bindRun,
+  // THE CALLER'S OWN SPAWN HOOK, chained after the run row's binding.
+  //
+  // The tick claims a provider slot BEFORE the worker exists, so the lease
+  // records the DAEMON's pid and lstart; its onSpawn re-binds that lease to the
+  // worker. Hard-coding this hook to the run row alone dropped that entirely --
+  // and provider.mjs says what follows in as many words: liveness is then asked
+  // about a long-lived daemon that is always alive, so a worker that dies takes
+  // its slot with it until expiry, and the reaper, whose whole basis is
+  // pid-and-lstart death, can never fire for it.
+  //
+  // Chained rather than replaced, and the run row binds FIRST: the row is the
+  // permission to run, and a provider lease re-bound to a worker no row can name
+  // is the wrong half to keep.
+  onSpawn = null,
+  // AND THE EMERGENCY STOP. runWorker defaults isHalted to () => false, so a
+  // HALT marker appearing AFTER a worker started left it running -- modifying
+  // its worktree and spending the subscription -- with the pre-dispatch check
+  // unable to see it. The guardian path passes its own probe for exactly this
+  // reason; the builder had none to pass.
+  isHalted = () => false,
 }) {
   const runKey = { task, generation, phase, slice, attempt };
   const { runDir, outPath, errPath, argvPath } = runPathsFor(home, runKey);
@@ -167,7 +187,12 @@ export async function dispatchPhase(db, {
       bin, args: argv, cwd, env, outPath, errPath, maxOutputBytes, budgetMs, graceMs,
       // FAIL CLOSED. A throw here is S1's UNBOUND path: the group is killed and
       // the worker never gets to run unobserved.
-      onSpawn: ({ pid, lstart }) => bind(db, { ...runKey, pid, lstart, isAlive }),
+      // BOTH BINDINGS, run row first, and either throwing stays fail closed.
+      onSpawn: ({ pid, lstart }) => {
+        bind(db, { ...runKey, pid, lstart, isAlive });
+        if (onSpawn) onSpawn({ pid, lstart });
+      },
+      isHalted,
       // THE ROW FIRST, the heartbeat second, and the order is the classification.
       // A cancelled row answers with a reason beginning `cancelled`, which is what
       // makes runWorker record an operator cancel rather than a lost lease. Asking

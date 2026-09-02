@@ -106,8 +106,37 @@ const raised = (db, why) => hubEvent(db, {
  * a value that cannot be serialised is refused HERE with a name rather than at
  * the write, where the error names a constraint and not the caller's mistake.
  */
+/**
+ * The body a pass OFFERS for a cause, or null where it offers none.
+ *
+ * ONE READING OF EMPTINESS, because the two sides of this seam read it
+ * separately and disagreed. The persist side asked `serialiseBody(...) === null`
+ * and the alert side asked `bodies.has(why)`, which is TRUE for a key mapped to
+ * `undefined` -- and that is what `new Map(items.map(i => [i.why, i.body]))`
+ * produces for any item carrying no body, which is the ordinary way to build
+ * this map. The row then kept its stored report while the alert paged bare,
+ * losing exactly the detail the column exists to keep.
+ *
+ * A key mapped to nothing is not an offer. Both sides now ask this.
+ */
+const offeredBody = (bodies, why) => {
+  const b = bodies?.get(why);
+  return b === null || b === undefined ? null : b;
+};
+
 const serialiseBody = (body) => {
   if (body === null || body === undefined) return null;
+  // AN OBJECT, because the alert renders a body by WALKING ITS ENTRIES. A string
+  // reaches `Object.entries` as its characters and pages one line per letter; an
+  // array pages its indices; a number has no entries at all and pages nothing,
+  // losing the report while reporting success. All three are the ordinary slip
+  // of passing the message instead of the report, all three serialise, and the
+  // `json_valid` CHECK accepts every one of them -- so nothing downstream
+  // refuses them and the damage is not visible until an alert is read.
+  if (typeof body !== "object" || Array.isArray(body))
+    throw refuse("escalation_body_shape",
+      `an escalation body must be an object; ${Array.isArray(body) ? "an array" : typeof body} ` +
+      "cannot be rendered as one. `body({ type, ...detail })` builds one and names the failure type.");
   let text;
   try { text = JSON.stringify(body); }
   catch (e) { text = undefined; }
@@ -319,7 +348,7 @@ export function builderAnnounceable(db, escalations, {
         // `applyTransition` raises with, so a cause raised by a transition and
         // one raised here are the same row to this function.
         db.prepare(`INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count,body)
-                    VALUES(?,?,?,?,0,?)`).run(why, count, at, at, serialiseBody(bodies?.get(why)));
+                    VALUES(?,?,?,?,0,?)`).run(why, count, at, at, serialiseBody(offeredBody(bodies, why)));
         raised(db, why);
         fresh.push({ why, count });
       } else {
@@ -328,7 +357,7 @@ export function builderAnnounceable(db, escalations, {
         // error -- and the row should say what is true now. A caller that offers
         // no body leaves the stored one alone rather than erasing it: absence of
         // a report in this pass is not evidence that the report is gone.
-        const body = serialiseBody(bodies?.get(why));
+        const body = serialiseBody(offeredBody(bodies, why));
         if (body === null)
           db.prepare("UPDATE escalation SET count=?, last_seen_at=? WHERE why=?").run(count, at, why);
         else
@@ -506,13 +535,21 @@ export function announce(db, {
    * row had the report all along.
    */
   const bodyFor = (why) => {
-    if (bodies?.has(why)) return bodies.get(why);
+    const offered = offeredBody(bodies, why);
+    if (offered !== null) return offered;
     const stored = db.prepare("SELECT body FROM escalation WHERE why = ?").get(why)?.body ?? null;
     if (stored === null) return null;
     // A row that cannot be parsed is reported as having no body rather than
     // throwing: the alert is the thing that matters, and losing it because its
     // detail is malformed would be the wrong trade.
-    try { return JSON.parse(stored); } catch { return null; }
+    // THE SAME SHAPE RULE THE WRITE SIDE APPLIES, for a row written around it --
+    // `json_valid` accepts a bare string or number, so direct SQL can put one
+    // here. Unrenderable and unparseable get the same answer for the same
+    // reason: the alert matters more than its detail.
+    try {
+      const parsed = JSON.parse(stored);
+      return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+    } catch { return null; }
   };
   const paged = [], digested = [], declined = [];
 

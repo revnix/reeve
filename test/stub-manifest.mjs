@@ -2440,4 +2440,26 @@ export const STUBS = [
       replace: "  if (false)",
     }],
   },
+  {
+    name: "an-offered-empty-body-is-not-an-offer",
+    why: "read the offer with `has` instead of through the shared emptiness rule, which is what the two sides of this seam did before they were made to agree. A key mapped to `undefined` reads as an offer of nothing, so the alert pages bare while the row still holds the report",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a key mapped to nothing is not an offer, so the alert still renders the stored report",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    const offered = offeredBody(bodies, why);\n    if (offered !== null) return offered;",
+      replace: "    if (bodies?.has(why)) return bodies.get(why);",
+    }],
+  },
+  {
+    name: "a-body-that-is-not-an-object-is-refused",
+    why: "accept any serialisable value as a body. The alert renders one by walking its entries, so a string pages one line per letter and a number pages nothing at all -- and both serialise and both satisfy the column's json_valid CHECK, so this refusal is the only thing that catches them",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a string is refused as a body, not rendered as one",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  if (typeof body !== \"object\" || Array.isArray(body))\n",
+      replace: "  if (false)\n",
+    }],
+  },
 ];

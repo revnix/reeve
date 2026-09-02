@@ -110,9 +110,11 @@ const beat = (args) => attempt(() => heartbeatRun(db, args));
 
 // ── binding fails CLOSED ─────────────────────────────────────────────────────
 {
-  const bound = bindRun(db, { ...KEY, pid: 4242, lstart: "42", sessionId: "s-1", isAlive: alive });
+  const bound = attempt(() => bindRun(db, { ...KEY, pid: 4242, lstart: "42", sessionId: "s-1", isAlive: alive }));
   check(bound.task === "bt:a", "a live run accepts a process binding", JSON.stringify(bound));
-  const row = db.prepare("SELECT pid, lstart, session_id FROM phase_run WHERE task='bt:a' AND attempt=1").get();
+  // `?? {}` for the same reason: with no row the read answers undefined and
+  // the property access below throws, which ends the file instead of failing.
+  const row = db.prepare("SELECT pid, lstart, session_id FROM phase_run WHERE task='bt:a' AND attempt=1").get() ?? {};
   check(row.pid === 4242 && row.lstart === "42" && row.session_id === "s-1",
     "and the pid, its start and the session are what the row now says", JSON.stringify(row));
 

@@ -2445,8 +2445,8 @@ export const STUBS = [
     expectRed: "a body that cannot serialise is refused with its own kind, not a constraint error",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "      throw refuse(\"escalation_body_shape\",\n        \"an escalation body must serialise to JSON; this one is circular.",
-      replace: "      return null; refuse(\"escalation_body_shape\",\n        \"an escalation body must serialise to JSON; this one is circular.",
+      find: "  catch (e) { if (e?.kind) throw e; text = undefined; }",
+      replace: "  catch (e) { if (e?.kind) throw e; text = \"{}\"; }",
     }],
   },
   {
@@ -2500,8 +2500,8 @@ export const STUBS = [
     expectRed: "a credential is scrubbed from the STORED report",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "  const cleaned = scrubDeep(body);",
-      replace: "  const cleaned = body;",
+      find: "  try { text = JSON.stringify(body, scrubbing); }",
+      replace: "  try { text = JSON.stringify(body); }",
     }],
   },
   {
@@ -2544,8 +2544,8 @@ export const STUBS = [
     expectRed: "a detail of undefined is refused rather than silently dropped from the report",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "  throw refuse(\"escalation_body_value\",\n    `an escalation body cannot carry ${typeof v} at",
-      replace: "  return undefined; throw refuse(\"escalation_body_value\",\n    `an escalation body cannot carry ${typeof v} at",
+      find: "  throw refuse(\"escalation_body_value\",\n    `an escalation body cannot carry ${typeof v}:",
+      replace: "  return undefined; refuse(\"escalation_body_value\",\n    `an escalation body cannot carry ${typeof v}:",
     }],
   },
   {
@@ -2571,25 +2571,25 @@ export const STUBS = [
     }],
   },
   {
-    name: "tojson-is-called-with-its-key",
-    why: "call toJSON with no argument. JSON.stringify hands it the property name, and the empty string at the root, so an implementation that branches on `key` persists something other than what stringify would produce -- the scrub changing the report's MEANING rather than only its credentials",
+    name: "a-boxed-primitive-is-refused",
+    why: "walk a boxed primitive as an ordinary object, which is what a hand-written traversal does. `new Number(5)` and `new Boolean(true)` then store as {} and `new String(\"abc\")` as a map of character indices -- the report accepted, and stored carrying different facts from the ones supplied",
     test: "test/build-escalations.test.mjs",
-    expectRed: "a toJSON that reads its key gets the root key, as JSON.stringify would give it",
+    expectRed: "a boxed Number is refused rather than stored as something else",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "    { const r = scrubDeep(v.toJSON(key), key, seen); seen.delete(v); return r; }",
-      replace: "    { const r = scrubDeep(v.toJSON(), key, seen); seen.delete(v); return r; }",
+      find: "    if (BOXED.has(tag))",
+      replace: "    if (false)",
     }],
   },
   {
-    name: "a-shared-reference-is-not-a-cycle",
-    why: "let the circularity set grow without unwinding it, so it records every value visited rather than the path from the root. A value referenced twice as siblings -- ordinary JSON, which stringify writes out twice -- is then refused as circular, and a valid report is lost to the guard against an invalid one",
+    name: "an-own-proto-key-survives",
+    why: "rebuild the scrubbed object with an ordinary prototype. An own `__proto__` key -- which JSON.parse produces -- then hits the legacy setter instead of becoming a property, so the call succeeds and the stored report is silently missing that field while plain JSON.stringify would have kept it",
     test: "test/build-escalations.test.mjs",
-    expectRed: "a value referenced twice as siblings is stored twice, not refused as circular",
+    expectRed: "an own __proto__ key survives, exactly as plain JSON.stringify keeps it",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "    seen.delete(v);\n    return out;",
-      replace: "    return out;",
+      find: "    const out = Object.create(null);",
+      replace: "    const out = {};",
     }],
   },
 ];

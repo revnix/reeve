@@ -3016,7 +3016,10 @@ export const STUBS = [
     expectRed: "and the settled attempt's argv record is untouched: the row keeps its argv_hash, so a file holding other bytes would make the audit trail disagree with itself",
     edits: [{ file: "src/build/dispatch.mjs",
               find: "  writeFileSync(argvPath, JSON.stringify({ argv, argvHash: snapshot.argvHash }, null, 2) + \"\\n\");",
-              replace: "  /* the record moved above the insert, where a refusal still overwrites it */" }],
+              replace: "" },
+            { file: "src/build/dispatch.mjs",
+              find: "  const inserted = insertRun(db, { ...runKey, outPath, errPath, snapshot, drift,",
+              replace: "  writeFileSync(argvPath, JSON.stringify({ argv, argvHash: snapshot.argvHash }, null, 2) + \"\\n\");\n  const inserted = insertRun(db, { ...runKey, outPath, errPath, snapshot, drift," }],
   },
   {
     name: "dispatch-a-failed-heartbeat-revokes",

@@ -2453,7 +2453,7 @@ export const STUBS = [
     name: "identity-replaces-the-timestamp-rule",
     why: "OR the two rules together, which is the plausible way to write this and refuses the same cursors. It reports a RESTORE for a cursor whose identity MATCHES -- so the log IS the one that issued it and only the cursor is wrong -- sending an operator to hunt damage that is not there instead of to re-copy a mistyped bookmark",
     test: "test/build-dash.test.mjs",
-    expectRed: "and is NEVER diagnosed as a restore, which would send an operator hunting damage that is not there",
+    expectRed: "and is NEVER reported as a different log, which would send an operator hunting damage that is not there",
     edits: [{
       file: "src/build/dash.mjs",
       find: "      : provable && since.incarnation !== incarnation ? \"different-log\"",

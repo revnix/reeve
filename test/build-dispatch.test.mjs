@@ -211,11 +211,17 @@ const base = (over = {}) => ({
 // ── a refused dispatch does not overwrite a settled attempt's argv record ────
 {
   const argvPath = join(dir, "tasks", "bt:d", "runs", "g1-RESEARCH-s0-a1.argv.json");
-  const before = readFileSync(argvPath, "utf8");
+  // A missing file must not READ as unchanged: two absences compare equal, and
+  // the assertion below would pass on a dispatcher that never wrote the record
+  // at all. So the read answers null on absence and a control demands content.
+  const readOr = (f) => { try { return readFileSync(f, "utf8"); } catch { return null; } };
+  const before = readOr(argvPath);
+  check(typeof before === "string" && before.length > 0,
+    "control: the settled attempt has a durable argv record to protect", String(before).slice(0, 40));
   // attempt 1 is settled, so this is a duplicate-attempt refusal.
   const r = await dispatchPhase(db, base({ attempt: 1 }));
   check(r.ok === false && r.reason === "duplicate-attempt", "control: the re-dispatch is refused", JSON.stringify(r));
-  check(readFileSync(argvPath, "utf8") === before,
+  check(readOr(argvPath) === before,
     "and the settled attempt's argv record is untouched: the row keeps its argv_hash, so a file holding other bytes would make the audit trail disagree with itself",
     "the file changed");
 }

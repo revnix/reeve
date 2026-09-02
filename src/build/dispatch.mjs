@@ -126,7 +126,22 @@ export async function dispatchPhase(db, {
   // The COMPLETE argv, not only the hash. A hash answers "did it change"; the
   // argv answers "what changed", which is the question after a retry behaves
   // differently from the attempt it was supposed to reproduce.
-  writeFileSync(argvPath, JSON.stringify({ argv, argvHash: snapshot.argvHash }, null, 2) + "\n");
+  //
+  // AND A FAILURE HERE SETTLES THE ROW IT WAS WRITTEN FOR. Moving the write
+  // below the insert closed one hole and opened its mirror: a full disk, a
+  // changed permission or a directory occupying the path throws AFTER the row
+  // is committed and BEFORE the try that would settle it, leaving `phase_run`
+  // live with no process -- and `one_live_run` then blocks every later dispatch
+  // of that task until something else intervenes. The same fault the throw
+  // handler below exists for, reached by a different door.
+  try {
+    writeFileSync(argvPath, JSON.stringify({ argv, argvHash: snapshot.argvHash }, null, 2) + "\n");
+  } catch (e) {
+    settleRun(db, { ...runKey, status: "failed", outcome: OUTCOMES.CRASHED,
+                    evidence: { why: `the argv record could not be written: ${e.message}`, denials: [], cost: null },
+                    truncated: 0, isAlive });
+    return { ok: false, reason: "argv-record-failed", runKey, error: e.message };
+  }
 
   // A HEARTBEAT THAT COULD NOT BE WRITTEN IS A CLAIM THAT WAS NOT RENEWED, and
   // swallowing it lets the worker act without one. The failure is not
@@ -180,7 +195,14 @@ export async function dispatchPhase(db, {
     : "failed";
   settleRun(db, { ...runKey, status, outcome: result.outcome,
                   evidence: { why: result.why, denials: result.denials ?? [], cost: result.cost ?? null },
-                  truncated: result.truncated ? 1 : 0,
+                  // EITHER STREAM. `runWorker` reports stdout truncation as
+                  // `truncated` and stderr's separately as `stderrTruncated`,
+                  // and it classifies a stderr-only truncation as FAILED for the
+                  // same reason this bit exists: the durable record is
+                  // incomplete. Reading only the first stored 0 beside a run
+                  // whose evidence is missing, so replay and every audit surface
+                  // reported it as complete.
+                  truncated: (result.truncated || result.stderrTruncated) ? 1 : 0,
                   // Learned from the worker's init event, so it arrives on the
                   // RESULT and never at `onSpawn`, which bound a null.
                   sessionId: result.sessionId ?? null, isAlive });

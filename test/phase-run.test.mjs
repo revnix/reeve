@@ -7,6 +7,7 @@ import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openHub } from "../src/build/hubdb.mjs";
+import { replayHub } from "../src/build/replay.mjs";
 import { insertRun, bindRun, heartbeatRun, settleRun, runStatus, liveRuns,
          runPathsFor, revocationProbe } from "../src/build/run.mjs";
 
@@ -131,7 +132,7 @@ const beat = (args) => attempt(() => heartbeatRun(db, args));
 
 // ── attempt is monotonic and never reused ────────────────────────────────────
 {
-  settleRun(db, { ...KEY, status: "succeeded", outcome: "ok", evidence: null, truncated: 0, isAlive: alive });
+  attempt(() => settleRun(db, { ...KEY, status: "succeeded", outcome: "ok", evidence: null, truncated: 0, isAlive: alive }));
   check(runStatus(db, KEY) === "succeeded", "a settled run leaves the live index", String(runStatus(db, KEY)));
 
   const next = ins({ attempt: 2, startedAt: 1200 });
@@ -140,7 +141,7 @@ const beat = (args) => attempt(() => heartbeatRun(db, args));
   check(rows.length === 2 && rows[0].attempt === 1 && rows[0].status === "succeeded",
     "and the previous attempt's row SURVIVES: attempt is monotonic and never reused", JSON.stringify(rows));
 
-  settleRun(db, { ...KEY, attempt: 2, status: "succeeded", outcome: "ok", truncated: 0, isAlive: alive });
+  attempt(() => settleRun(db, { ...KEY, attempt: 2, status: "succeeded", outcome: "ok", truncated: 0, isAlive: alive }));
   const again = ins({ attempt: 1, startedAt: 1300 });
   check(again.ok === false && again.reason === "duplicate-attempt",
     "re-inserting a settled attempt number is refused, not an upsert over the record of what happened",
@@ -175,7 +176,7 @@ const beat = (args) => attempt(() => heartbeatRun(db, args));
     "and the bytes are the hub's own canonical form, so a replay compares against the event log rather than a second spelling",
     row.contract_drift);
 
-  settleRun(db, { ...K3, status: "succeeded", outcome: "ok", truncated: 0, isAlive: alive });
+  attempt(() => settleRun(db, { ...K3, status: "succeeded", outcome: "ok", truncated: 0, isAlive: alive }));
 }
 
 // ── liveRuns is what admission and restart count ─────────────────────────────
@@ -235,30 +236,30 @@ const beat = (args) => attempt(() => heartbeatRun(db, args));
   // bt:b still holds the live run admitted by the control above, and this block
   // is about the epoch rather than the live-run rule -- settled first so a
   // refusal here can only be the one under test.
-  settleRun(db, { task: "bt:b", generation: 1, phase: "RESEARCH", slice: 0, attempt: 1,
-                  status: "succeeded", outcome: "ok", truncated: 0, isAlive: alive });
+  attempt(() => settleRun(db, { task: "bt:b", generation: 1, phase: "RESEARCH", slice: 0, attempt: 1,
+                  status: "succeeded", outcome: "ok", truncated: 0, isAlive: alive }));
   db.exec("UPDATE task SET phase='CANCELLING' WHERE id='bt:b'");
-  const stale = insertRun(db, { task: "bt:b", generation: 1, phase: "RESEARCH", slice: 0, attempt: 50,
+  const stale = attempt(() => insertRun(db, { task: "bt:b", generation: 1, phase: "RESEARCH", slice: 0, attempt: 50,
                                 ...PATHS, snapshot: SNAP, drift: null, startedAt: 2000,
-                                leaseSeconds: 400, isAlive: alive });
+                                leaseSeconds: 400, isAlive: alive }));
   check(stale.ok === false && stale.reason === "stale-epoch",
     "a run for a phase the task has left is refused", JSON.stringify(stale));
   check(db.prepare("SELECT count(*) c FROM phase_run WHERE task='bt:b' AND attempt=50").get().c === 0,
     "and nothing was written, so no row can read as entitled afterwards");
 
-  const gen = insertRun(db, { task: "bt:b", generation: 9, phase: "CANCELLING", slice: 0, attempt: 51,
+  const gen = attempt(() => insertRun(db, { task: "bt:b", generation: 9, phase: "CANCELLING", slice: 0, attempt: 51,
                               ...PATHS, snapshot: SNAP, drift: null, startedAt: 2000,
-                              leaseSeconds: 400, isAlive: alive });
+                              leaseSeconds: 400, isAlive: alive }));
   check(gen.ok === false && gen.reason === "stale-epoch",
     "control: a stale GENERATION is refused too, not only a stale phase", JSON.stringify(gen));
 
-  const ok = insertRun(db, { task: "bt:b", generation: 1, phase: "CANCELLING", slice: 0, attempt: 52,
+  const ok = attempt(() => insertRun(db, { task: "bt:b", generation: 1, phase: "CANCELLING", slice: 0, attempt: 52,
                              ...PATHS, snapshot: SNAP, drift: null, startedAt: 2000,
-                             leaseSeconds: 400, isAlive: alive });
+                             leaseSeconds: 400, isAlive: alive }));
   check(ok.ok === true,
     "control: and a run that matches the task's current epoch is still admitted", JSON.stringify(ok));
-  settleRun(db, { task: "bt:b", generation: 1, phase: "CANCELLING", slice: 0, attempt: 52,
-                  status: "succeeded", outcome: "ok", truncated: 0, isAlive: alive });
+  attempt(() => settleRun(db, { task: "bt:b", generation: 1, phase: "CANCELLING", slice: 0, attempt: 52,
+                  status: "succeeded", outcome: "ok", truncated: 0, isAlive: alive }));
 }
 
 // ── the settled event carries the whole row ─────────────────────────────────
@@ -281,6 +282,62 @@ const beat = (args) => attempt(() => heartbeatRun(db, args));
   check(payload.status === "succeeded" && payload.outcome === "ok",
     "control: and it is the settled row rather than the row as it was inserted",
     JSON.stringify({ status: payload.status, outcome: payload.outcome }));
+}
+
+// ── the run records the task's resume sequence ──────────────────────────────
+//
+// A plain resume leaves the generation unchanged on purpose and resets the
+// bounded attempt budget by counting runs under the NEW resume sequence. A row
+// that defaults to 0 after a resume is counted with the attempts from before
+// it, so the budget either re-exhausts at once or never sees the new attempts.
+{
+  db.exec("UPDATE task SET resume_seq = 4 WHERE id='bt:a'");
+  const r = attempt(() => insertRun(db, { ...KEY, attempt: 60, ...PATHS, snapshot: SNAP, drift: null,
+                                          startedAt: 3000, leaseSeconds: 400, isAlive: alive }));
+  check(r.ok === true, "control: a run is admitted after the resume", JSON.stringify(r));
+  const row = db.prepare("SELECT resume_seq FROM phase_run WHERE task='bt:a' AND attempt=60").get() ?? {};
+  check(row.resume_seq === 4,
+    "the run carries the task's CURRENT resume sequence, not the column default",
+    JSON.stringify(row));
+  const earlier = db.prepare("SELECT resume_seq FROM phase_run WHERE task='bt:a' AND attempt=1").get() ?? {};
+  check(earlier.resume_seq === 0,
+    "control: and an attempt filed before the resume still reads 0, so the two are distinguishable",
+    JSON.stringify(earlier));
+  attempt(() => settleRun(db, { ...KEY, attempt: 60, status: "succeeded", outcome: "ok",
+                                truncated: 0, isAlive: alive }));
+}
+
+// ── a tail-only attempt survives a restore as a TERMINAL row ────────────────
+//
+// restoreHub converts the live rows it finds IN the snapshot to killed BEFORE
+// the tail is replayed, so an attempt created after the snapshot and not yet
+// settled exists only in the tail. Withholding its events removed it from the
+// projection altogether: task why loses it, the retry budget is refunded, and
+// its attempt number and output paths are free to be reused by another run.
+{
+  const fresh = join(dir, "replayed.db");
+  const rdb = openHub(fresh);
+  rdb.exec(
+    `INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,generation,source_kind,source_key,
+       repo_path,profile_path,profile_hash,default_branch,visibility,registry_version,created_at,updated_at)
+     VALUES('bt:z','p',7,'o/r','t','RESEARCH',1,'founder','z','/p','/f','h','main','private',1,
+            unixepoch(),unixepoch())`);
+  const tail = db.prepare(
+    "SELECT seq, at, kind, task, payload FROM hub_event WHERE kind IN ('phase_run.started','phase_run.bound') ORDER BY seq").all()
+    .map((e) => ({ ...e, task: "bt:z", payload: JSON.stringify({ ...JSON.parse(e.payload), task: "bt:z" }) }));
+  check(tail.length > 0, "control: the tail carries started/bound events to replay", String(tail.length));
+  const res = replayHub(rdb, tail);
+  check(res.applied > 0, "a tail-only attempt is APPLIED rather than skipped", JSON.stringify(res));
+  const rows = rdb.prepare("SELECT status, started_at, out_path FROM phase_run WHERE task='bt:z'").all();
+  check(rows.length > 0, "so the attempt exists in the restored projection at all",
+    JSON.stringify(rows.slice(0, 2)));
+  check(rows.every((x) => x.status === "killed"),
+    "and it is TERMINAL, not live -- one_live_run must not refuse the task's next dispatch on behalf of a dead process",
+    JSON.stringify(rows.map((x) => x.status)));
+  check(rows.every((x) => Number.isInteger(x.started_at) && x.out_path),
+    "control: with its NOT NULL columns intact, which is what a partial image could not have supplied",
+    JSON.stringify(rows.slice(0, 1)));
+  rdb.close();
 }
 
 // ── the contract snapshot is frozen, in both halves ─────────────────────────

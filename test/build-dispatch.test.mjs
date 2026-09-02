@@ -1,10 +1,10 @@
 // The dispatch seam: what a phase runs, and the row that exists before the
 // process does.
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openHub } from "../src/build/hubdb.mjs";
-import { runStatus, liveRuns } from "../src/build/run.mjs";
+import { runStatus, liveRuns, runPathsFor } from "../src/build/run.mjs";
 import { PHASE_SPECS, specFor, contractSnapshot, contractDrift, dispatchPhase } from "../src/build/dispatch.mjs";
 import { OUTCOMES, readStart } from "../src/supervisor.mjs";
 import { applyTransition } from "../src/build/transition.mjs";
@@ -295,6 +295,48 @@ const base = (over = {}) => ({
     String(sawRevocation));
   check(r.ok === true && r.result.outcome === OUTCOMES.LEASE_LOST,
     "control: and the run settles as a lost lease rather than a success", JSON.stringify(r?.result?.outcome));
+}
+
+// ── a granted row does not survive a failed argv write ──────────────────────
+//
+// Moving the write below the insert closed one hole and opened its mirror: a
+// full disk, a changed permission or a directory occupying the path throws
+// AFTER the row is committed and BEFORE the try that would settle it, leaving
+// phase_run live with no process -- and one_live_run then blocks every later
+// dispatch of that task until something else intervenes.
+{
+  const K10 = { ...KEY, attempt: 10 };
+  // A DIRECTORY where the argv file must go, so the write fails for a reason
+  // the filesystem supplies rather than one the test fakes.
+  const paths = runPathsFor(dir, K10);
+  mkdirSync(paths.argvPath, { recursive: true });
+  let spawned = false;
+  const r = await dispatchPhase(db, base({ attempt: 10, run: async () => { spawned = true; return { outcome: OUTCOMES.OK }; } }));
+  check(r.ok === false && r.reason === "argv-record-failed",
+    "a failed argv write is answered with a refusal", JSON.stringify(r).slice(0, 140));
+  check(spawned === false, "control: and nothing was spawned", String(spawned));
+  check(runStatus(db, K10) === "failed",
+    "and the granted row is SETTLED, so one_live_run does not block the task for ever",
+    String(runStatus(db, K10)));
+  check(liveRuns(db).length === 0, "control: nothing is holding the task's live slot",
+    JSON.stringify(liveRuns(db).map((x) => [x.task, x.attempt, x.status])));
+}
+
+// ── either stream truncated makes the record incomplete ─────────────────────
+{
+  const K11 = { ...KEY, attempt: 11 };
+  const r = await dispatchPhase(db, base({
+    attempt: 11,
+    // runWorker reports stdout truncation as `truncated` and stderr's
+    // separately, and classifies a stderr-only truncation as FAILED for the same
+    // reason this bit exists: the durable record is incomplete.
+    run: async () => ({ outcome: OUTCOMES.FAILED, why: "stderr truncated", truncated: false, stderrTruncated: true }),
+  }));
+  check(r.ok === true, "control: the dispatch completed", JSON.stringify(r).slice(0, 90));
+  const row = db.prepare("SELECT truncated FROM phase_run WHERE task='bt:d' AND attempt=11").get() ?? {};
+  check(row.truncated === 1,
+    "a stderr-only truncation still marks the row truncated, so no audit surface reports a complete record",
+    JSON.stringify(row));
 }
 
 // ── a cancelled task's worker process is DEAD, not merely marked dead ────────

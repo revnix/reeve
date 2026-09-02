@@ -18,7 +18,8 @@ import { GIT_NEUTRALISE_FOUNDER, founderGitEnv } from "./gitguard.mjs";
 import { readOauthToken } from "./workerenv.mjs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync, statSync, realpathSync,
+         openSync, readSync, closeSync, fstatSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 // The remediation must name the home the token check actually used.
@@ -787,6 +788,36 @@ function currentPolicy(profile, { read = readCanaryState, stateDir = null, nwo =
  * supervisor is not launchd; until this rule learns those, saying so plainly is
  * the honest reading rather than a silent pass.
  */
+/** What launchd currently holds for the job, or null when it holds nothing. */
+function readLoadedJob() {
+  try {
+    return execFileSync("launchctl", ["print", `gui/${process.getuid()}/com.revnix.reeve`],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 20_000 });
+  } catch { return null; }
+}
+
+/**
+ * The commit the RUNNING daemon loaded, from its own startup record.
+ *
+ * Scanned backward in a growing window: the log is append-only and unrotated, so
+ * reading it whole is unbounded, and a fixed tail is not the fix either -- the
+ * last start can be older than any window you pick.
+ */
+function daemonStartupCommit(path = join(resolveHome(), "reeve.log")) {
+  let fd = null;
+  try {
+    fd = openSync(path, "r");
+    const size = fstatSync(fd).size;
+    for (let window = Math.min(256 * 1024, size); ; window = Math.min(window * 4, size)) {
+      const buf = Buffer.alloc(window);
+      readSync(fd, buf, 0, window, size - window);
+      const hits = [...buf.toString("utf8").matchAll(/running commit ([0-9a-f]{7,40})/g)];
+      if (hits.length) return hits[hits.length - 1][1];
+      if (window >= size || window >= 64 * 1024 * 1024) return null;
+    }
+  } catch { return null; } finally { if (fd !== null) try { closeSync(fd); } catch { /* gone */ } }
+}
+
 function readInstalledPlist(path = join(homedir(), "Library", "LaunchAgents", "com.revnix.reeve.plist")) {
   try { return readFileSync(path, "utf8"); } catch { return null; }
 }
@@ -1134,73 +1165,140 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
 }
 
 
-// ── R-17: what code would the daemon actually run? ────────────────────────
+// ── R-17: what code is the daemon actually running? ───────────────────────
 //
-// STALE BY ACCIDENT AND PINNED ON PURPOSE LOOK IDENTICAL FROM OUTSIDE, and that
+// STALE BY ACCIDENT AND PINNED ON PURPOSE LOOKED IDENTICAL FROM OUTSIDE, and that
 // ambiguity is the defect this answers. Measured 2026-09-02: the launchd job was
 // running a commit from three days and 43 merges earlier, and establishing that
 // took reading the plist, grepping the daemon for update logic that does not
 // exist, and comparing two checkouts by hand. Nothing reported it, because
 // nothing was asking.
 //
-// READ THE INSTALLED PLIST, not the repository's copy of it. The repo's
-// `deploy/com.revnix.reeve.plist` is what someone INTENDED; the file in
-// LaunchAgents is what launchd will actually execute, and they drift -- the
-// installed one here has already been rewritten by macOS into a different key
-// order. The read that matters is the read that decides.
+// THREE FACTS, AND THEY DISAGREE. Review found the first version conflating them:
 //
-// BEING BEHIND IS NOT A FAULT. A guardian pinned to a commit you promoted is
-// working as designed, so distance from the default branch is reported as a
-// NUMBER and never as a level. What IS a fault is running code that is not on
-// the default branch at all: a dirty tree, or commits the branch has never
-// seen. Those are code no review ever looked at, enforcing rules on everyone
-// else.
+//   the LOADED job      what launchd is running now. launchd caches its
+//                       configuration at bootstrap, so an edited plist does not
+//                       reach a job until it is reloaded.
+//   the INSTALLED plist what the NEXT load will use. Read second, and a
+//                       difference between the two is itself the finding.
+//   the checkout HEAD   what the next START would load -- not what the running
+//                       process holds, which is whatever it read at startup.
+//                       Pulling the checkout moves the tree, not the process.
+//
+// Reporting HEAD alone let a clean checkout certify a daemon executing an older
+// commit. The daemon records `running commit <sha>` at startup; that is the only
+// evidence of what the live process actually loaded.
 
-/** The checkout a `.../bin/reeve` argument implies, or null if none does. */
-export function checkoutFromArgs(args) {
-  const bin = (args ?? []).find(a => typeof a === "string" && /(^|\/)bin\/reeve$/.test(a));
-  return bin ? bin.replace(/\/bin\/reeve$/, "") : null;
+const XML_ENTITIES = { "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&apos;": "'" };
+
+/** A plist string node's real value. `&` is escaped in any valid plist. */
+export function decodeXml(text) {
+  return String(text ?? "").replace(/&(?:amp|lt|gt|quot|apos);/g, (m) => XML_ENTITIES[m]);
 }
 
-/** ProgramArguments from a launchd plist, without parsing XML properly. */
+/**
+ * The checkout a `.../bin/reeve` argument implies, or null if none does.
+ *
+ * The entry point is RESOLVED first: launchd may invoke a symlink such as
+ * `/usr/local/bin/reeve` whose target lives in the checkout, and stripping the
+ * textual path would name `/usr/local` and report BROKEN for a healthy tree.
+ */
+export function checkoutFromArgs(args, { realpath = (p) => realpathSync(p) } = {}) {
+  const bin = (args ?? []).find(a => typeof a === "string" && /(^|\/)bin\/reeve$/.test(a));
+  if (!bin) return null;
+  let resolved = bin;
+  try { resolved = realpath(bin); } catch { /* not on this machine; the textual path is all there is */ }
+  return /(^|\/)bin\/reeve$/.test(resolved) ? resolved.replace(/\/bin\/reeve$/, "") : bin.replace(/\/bin\/reeve$/, "");
+}
+
+/** ProgramArguments from a launchd plist, decoded. */
 export function programArguments(plistText) {
   const block = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(plistText ?? "");
   if (!block) return null;
-  return [...block[1].matchAll(/<string>([\s\S]*?)<\/string>/g)].map(m => m[1].trim());
+  return [...block[1].matchAll(/<string>([\s\S]*?)<\/string>/g)].map(m => decodeXml(m[1].trim()));
+}
+
+/** ProgramArguments as launchd currently holds them, from `launchctl print`. */
+export function loadedArguments(printOut) {
+  const block = /arguments\s*=\s*\{([\s\S]*?)\n\s*\}/.exec(String(printOut ?? ""));
+  if (!block) return null;
+  return block[1].split("\n").map(l => l.trim()).filter(Boolean);
 }
 
 export function checkDaemonProvenance({ run = founderRun, plist = readInstalledPlist,
+                                        launchctl = null, runningCommit = () => null,
                                         defaultBranch = "main" } = {}) {
   const id = "R-17", title = "daemon code provenance";
+  const printed = launchctl ? launchctl() : null;
+  const loaded = printed === null ? null : loadedArguments(printed);
   const text = plist();
-  if (text === null) return { id, level: UNKNOWN, title,
-    lines: ["no launchd job is installed for reeve on this machine",
+  if (text === null && loaded === null) return { id, level: UNKNOWN, title,
+    lines: ["no launchd job is installed for reeve on this machine, and none is loaded",
             "-> nothing runs the guardian here, so there is no code to account for"] };
 
-  const args = programArguments(text);
+  const declared = programArguments(text);
+  // THE LOADED JOB WINS, because it is what is executing. The plist is what the
+  // next load will use, and a difference between them is a finding of its own.
+  const args = loaded ?? declared;
   if (!args) return { id, level: UNKNOWN, title,
-    lines: ["the installed launchd job declares no ProgramArguments",
-            "-> what launchd would execute cannot be read, so neither can the commit"] };
+    lines: ["the launchd job declares no ProgramArguments and none could be read from launchctl",
+            "-> what launchd executes cannot be read, so neither can the commit"] };
 
   const root = checkoutFromArgs(args);
   if (!root) return { id, level: UNKNOWN, title,
-    lines: [`the installed launchd job runs ${args.join(" ") || "(nothing)"}`,
-            "none of its arguments is a path ending in bin/reeve",
+    lines: [`the launchd job runs ${args.join(" ") || "(nothing)"}`,
+            "none of its arguments resolves to a path ending in bin/reeve",
             "-> the daemon is started some other way, and this rule cannot say from where"] };
+
+  const lines = [`launchd runs reeve from ${root}`];
+  const declaredRoot = declared ? checkoutFromArgs(declared) : null;
+  if (loaded && declaredRoot && declaredRoot !== root)
+    lines.push(`the INSTALLED plist names ${declaredRoot} instead -- the job has not been reloaded since it was edited`);
 
   const head = run(root, ["rev-parse", "HEAD"]);
   if (!head.ok) return { id, level: BROKEN, title,
-    lines: [`launchd would run reeve from ${root}`,
-            `that path is not a readable git checkout${head.err ? `: ${head.err}` : ""}`,
+    lines: [...lines, `that path is not a readable git checkout${head.err ? `: ${head.err}` : ""}`,
             "-> the guardian would enforce rules from code with no commit behind it"] };
+  // NOT "promoted": nothing on this machine records a promotion, and the first
+  // version of this line called every readable HEAD a promoted commit -- including
+  // a checkout that is merely behind because nobody pulled.
+  lines.push(`checkout commit ${head.out.slice(0, 10)}`);
 
-  const lines = [`launchd would run reeve from ${root}`, `promoted commit ${head.out.slice(0, 10)}`];
+  // WHAT THE LIVE PROCESS LOADED, which is not HEAD. A running Node process holds
+  // the modules it read at startup, so a checkout pulled afterwards reports a
+  // clean current commit while the daemon executes an older one.
+  const started = runningCommit();
+  if (started === null) lines.push("what the RUNNING process loaded is unknown: no startup record was readable");
+  else if (!head.out.startsWith(started) && !started.startsWith(head.out.slice(0, started.length)))
+    return { id, level: DEGRADED, title,
+      lines: [...lines, `but the running process loaded ${started}, which is not this checkout's HEAD`,
+              "-> the tree moved after the daemon started; restart it to run the code that is here"] };
+  else lines.push(`and the running process loaded ${started}`);
 
+  // A FAILED STATUS PROBE IS NOT A CLEAN TREE. `rev-parse` and `rev-list` can
+  // succeed with an unreadable index, so falling through here would let the rule
+  // return OK having never established whether the executable tree is clean.
   const dirty = run(root, ["status", "--porcelain"]);
-  if (dirty.ok && dirty.out) return { id, level: BROKEN, title,
-    lines: [...lines,
-            `the tree has ${dirty.out.split("\n").length} uncommitted change(s)`,
-            "-> what runs is not the promoted commit and is not any commit; nobody can say what it is"] };
+  if (!dirty.ok) return { id, level: UNKNOWN, title,
+    lines: [...lines, `could not read whether the tree is clean${dirty.err ? `: ${dirty.err}` : ""}`,
+            "-> the commit above names a tree nobody has confirmed is the tree on disk"] };
+  if (dirty.out) return { id, level: BROKEN, title,
+    lines: [...lines, `the tree has ${dirty.out.split("\n").length} uncommitted change(s)`,
+            "-> what runs is not that commit and is not any commit; nobody can say what it is"] };
+
+  // THE TRACKING REF MAY PREDATE THE MERGE. `rev-list origin/<branch>..HEAD`
+  // reads a LOCAL ref, so a checkout that has not fetched since its commit landed
+  // upstream would be reported as carrying commits the branch has never seen --
+  // this rule's most alarming verdict, on reviewed code.
+  const localRef = run(root, ["rev-parse", `origin/${defaultBranch}`]);
+  const liveRef = run(root, ["ls-remote", "origin", `refs/heads/${defaultBranch}`]);
+  const live = liveRef.ok ? (liveRef.out.split(/\s+/)[0] ?? "") : "";
+  if (!localRef.ok || !live) return { id, level: UNKNOWN, title,
+    lines: [...lines, `cannot resolve origin/${defaultBranch} to compare against${liveRef.err ? `: ${liveRef.err}` : ""}`,
+            `-> until that resolves, whether this commit is on origin/${defaultBranch} is unknown`] };
+  if (localRef.out !== live) return { id, level: UNKNOWN, title,
+    lines: [...lines, `this checkout's origin/${defaultBranch} is ${localRef.out.slice(0, 10)} but the remote is at ${live.slice(0, 10)}`,
+            `-> fetch in ${root} and re-run; comparing against a stale ref would report reviewed code as unreviewed`] };
 
   // TWO COUNTS RATHER THAN `merge-base --is-ancestor`, whose FALSE answer and
   // whose FAILURE are both a non-zero exit -- so a git that could not run would
@@ -1208,29 +1306,26 @@ export function checkDaemonProvenance({ run = founderRun, plist = readInstalledP
   const ahead = run(root, ["rev-list", "--count", `origin/${defaultBranch}..HEAD`]);
   const behind = run(root, ["rev-list", "--count", `HEAD..origin/${defaultBranch}`]);
   if (!ahead.ok || !behind.ok) return { id, level: UNKNOWN, title,
-    lines: [...lines,
-            `cannot compare against origin/${defaultBranch}${ahead.err ? `: ${ahead.err}` : ""}`,
-            `-> fetch in ${root} and re-run; until then the promoted commit's provenance is unknown`] };
+    lines: [...lines, `cannot compare against origin/${defaultBranch}${ahead.err ? `: ${ahead.err}` : ""}`,
+            `-> until that resolves, this commit's provenance is unknown`] };
 
   if (Number(ahead.out) > 0) return { id, level: BROKEN, title,
-    lines: [...lines,
-            `it carries ${ahead.out} commit(s) that origin/${defaultBranch} has never seen`,
-            `-> the guardian would enforce rules from code no review looked at; promote a commit on origin/${defaultBranch}`] };
+    lines: [...lines, `it carries ${ahead.out} commit(s) that origin/${defaultBranch} has never seen`,
+            `-> the guardian would enforce rules from code no review looked at; deploy a commit on origin/${defaultBranch}`] };
 
-  // DISTANCE IS REPORTED; INTENT IS NOT CLAIMED. The first draft of this line
-  // said "pinned, not drifting", which asserts a decision nothing on this machine
-  // records -- and the very checkout that produced it was behind by 43 because
-  // nobody had pulled, not because anybody chose the commit. A rule written to
-  // end that ambiguity must not resolve it by guessing the reassuring side.
+  // DISTANCE IS REPORTED; INTENT IS NOT CLAIMED. The first draft said "pinned,
+  // not drifting", which asserts a decision nothing on this machine records --
+  // and the checkout that produced it was behind by 43 because nobody had pulled.
   return { id, level: OK, title,
     lines: [...lines,
             Number(behind.out) === 0
               ? `which is origin/${defaultBranch}`
               : `which is ${behind.out} commit(s) behind origin/${defaultBranch}`,
             ...(Number(behind.out) === 0 ? [] : [
-              "being behind is not itself a fault: a guardian held at a commit you promoted is working as intended",
-              "-> but nothing here RECORDS a promotion, so a deliberate pin and an unpulled checkout read identically"])] };
+              "being behind is not itself a fault: a guardian held at a commit you deployed is working as intended",
+              "-> but nothing here RECORDS a deployment, so a deliberate pin and an unpulled checkout read identically"])] };
 }
+
 
 // ── driver ────────────────────────────────────────────────────────────────
 
@@ -1249,7 +1344,14 @@ export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null
     checkCanary(nwo, { stateDir, currentPolicyHash: currentPolicy(profile, { ...canaryIo, stateDir, nwo }), ...canaryIo }),
     checkKeychain({ isolation: profile.worker?.isolation, ...keychainIo }),
     checkRemoteReach(profile, reachIo),
-    checkDaemonProvenance(provenanceIo),
+    checkDaemonProvenance({
+      // THE CONFIGURED BRANCH, like every neighbouring check. A profile whose
+      // default branch is not `main` would otherwise be compared against an
+      // `origin/main` that either does not resolve or is an unrelated branch.
+      defaultBranch: profile.identity?.defaultBranch ?? "main",
+      launchctl: readLoadedJob,
+      runningCommit: () => daemonStartupCommit(),
+      ...provenanceIo }),
   ].filter(Boolean);
 
   const broken = checks.filter(c => c.level === BROKEN);

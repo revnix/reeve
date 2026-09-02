@@ -1474,6 +1474,29 @@ const freshHub = () => {
     "an own __proto__ key survives, exactly as plain JSON.stringify keeps it",
     JSON.stringify({ stored: protoRow, plain: JSON.stringify(withProto) }));
 
+  // A `toJSON` PROPERTY IS THE HOOK, NOT A DETAIL. The serialiser calls it and
+  // then omits it, so refusing every function rejected a body that stringifies
+  // perfectly -- and the refusal was for a value nothing would have lost.
+  const selfy = { type: "FAILED", detail: "kept", toJSON() { return this; } };
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                  bodies: new Map([[key, selfy]]) });
+  check((hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "") === JSON.stringify(selfy),
+    "a self-returning toJSON is stored exactly as plain JSON.stringify stores it",
+    JSON.stringify({ stored: hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body,
+                     native: JSON.stringify(selfy) }));
+  // CONTROL: a function that is a real DETAIL is still refused, so the exemption
+  // is the hook and not functions in general.
+  {
+    let k = null;
+    try {
+      announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                      bodies: new Map([[key, { type: "FAILED", detail: () => 1 }]]) });
+    } catch (e) { k = e.kind ?? "threw"; }
+    check(k === "escalation_body_value",
+      "control: a function as an ordinary detail is still refused, so this exempts the hook alone",
+      String(k));
+  }
+
   const shared = { a: 1 };
   let sharedRefused = null;
   try {

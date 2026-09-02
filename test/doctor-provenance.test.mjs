@@ -11,8 +11,14 @@
 // running PROCESS read at startup. A table, because every failure here is "this
 // state reached the wrong level", and the levels carry consequences: BROKEN means
 // the guardian enforces rules from code no review saw.
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { treeState } from "../src/daemon.mjs";
 import { checkDaemonProvenance, programArguments, checkoutFromArgs, loadedArguments,
-         decodeXml, startupRecordFrom, daemonLogPath, loadedEnvironment } from "../src/doctor.mjs";
+         decodeXml, startupRecordFrom, daemonLogPath, loadedEnvironment,
+         loadedPid } from "../src/doctor.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -25,7 +31,7 @@ const PLIST = (args) => `<plist version="1.0"><dict>
   <array>${(args ?? []).map(a => `<string>${a}</string>`).join("")}</array>
 </dict></plist>`;
 const ARGS = ["/n/bin/node", "/Users/x/deploy/bin/reeve", "run", "o/r"];
-const LOADED = "arguments = {\n\t/n/bin/node\n\t/Users/x/deploy/bin/reeve\n\trun\n\to/r\n}\n";
+const LOADED = "\tpid = 5\n\targuments = {\n\t/n/bin/node\n\t/Users/x/deploy/bin/reeve\n\trun\n\to/r\n}\n";
 const SHA = "abcdef1234567890";
 const START = (o = {}) => `reeve daemon starting — node v24.17.0, pid ${o.pid ?? 5}, ` +
   `running commit ${o.commit ?? SHA}${o.tree === undefined ? ", tree clean" : (o.tree === null ? "" : `, tree ${o.tree}`)}`;
@@ -82,6 +88,21 @@ const TABLE = [
                         aheadOfRunning: { ok: true, out: "2" } }) }, level: "UNKNOWN" },
   { name: "a comparison that could not RUN is UNKNOWN, not unreviewed code",
     io: { run: runner({ aheadOfRunning: { ok: false, out: "", err: "unknown revision" } }) }, level: "UNKNOWN" },
+  // A JOB CAN STAY LOADED WITH ITS PROCESS DOWN. Reading the newest startup line
+  // then attributes a stale or unrelated process to the launchd job.
+  { name: "a job loaded with NO running process is DEGRADED, not OK",
+    io: { launchctl: () => LOADED.replace("\tpid = 5\n", "") }, level: "DEGRADED",
+    says: /no running process/ },
+  // A manually started daemon writes to the same log, so the newest record is
+  // not necessarily this job's.
+  { name: "a startup record from ANOTHER pid says nothing about this job",
+    io: { readLog: () => START({ pid: 999 }) }, level: "UNKNOWN",
+    says: /belongs to another process/ },
+  // The field was added because the commit alone does not describe what a
+  // process loaded; a record without it never established that.
+  { name: "a record with NO tree state is DEGRADED, not OK",
+    io: { readLog: () => START({ tree: null }) }, level: "DEGRADED",
+    says: /whether it loaded a clean tree is unknown/ },
   { name: "a checkout that moved after startup is DEGRADED",
     io: { readLog: () => START({ commit: "0ldc0de" }) }, level: "DEGRADED" },
   { name: "the running commit at the default branch is OK", io: {}, level: "OK" },
@@ -142,6 +163,38 @@ for (const { name, io, level, why, says } of TABLE) {
   check(startupRecordFrom("") === null, "an empty log answers null rather than a value");
 }
 
+// ── the tree state the daemon records ────────────────────────────────────────
+//
+// A REAL REPOSITORY, because the defect is a git CONFIGURATION rather than a
+// code path: `status.showUntrackedFiles=no` makes `--porcelain` omit untracked
+// files entirely, so a checkout with new, uncommitted source in it reports
+// clean. A committed module importing one of those files then executes code no
+// commit contains, and R-17 certifies the startup as clean.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-treestate-"));
+  const git = (...a) => execFileSync("git", ["-C", dir, ...a], { encoding: "utf8" });
+  try {
+    git("init", "-q");
+    git("config", "user.email", "t@t"); git("config", "user.name", "t");
+    writeFileSync(join(dir, "a.txt"), "one");
+    git("add", "-A"); git("commit", "-qm", "one");
+    check(treeState(dir) === "clean", "a committed tree is clean", treeState(dir));
+
+    writeFileSync(join(dir, "untracked.mjs"), "export const x = 1;\n");
+    check(treeState(dir) === "dirty", "an UNTRACKED file makes the tree dirty", treeState(dir));
+
+    // The configuration that hides it. Set locally, so it is exactly what a
+    // deployment checkout could carry.
+    git("config", "status.showUntrackedFiles", "no");
+    check(treeState(dir) === "dirty",
+      "and it still does when status.showUntrackedFiles=no would hide it", treeState(dir));
+
+    git("config", "--unset", "status.showUntrackedFiles");
+    writeFileSync(join(dir, "a.txt"), "two");
+    check(treeState(dir) === "dirty", "control: a MODIFIED tracked file is dirty too", treeState(dir));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
 // ── the readers, alone ───────────────────────────────────────────────────────
 {
   check(programArguments(PLIST(["a", "b"]))?.join(",") === "a,b", "ProgramArguments reads every string in order");
@@ -169,6 +222,12 @@ for (const { name, io, level, why, says } of TABLE) {
     "the --log argument decides where the daemon writes");
   check(daemonLogPath(["run"], { REEVE_HOME: "/jobhome" }, "/h") === "/jobhome/reeve.log",
     "and the JOB's REEVE_HOME decides it when --log is absent");
+  // `bin/reeve` derives HOME from the flag FIRST and only then from the
+  // environment, so a job started with --home and no --log writes there.
+  check(daemonLogPath(["run", "--home", "/custom"], { REEVE_HOME: "/jobhome" }, "/h") === "/custom/reeve.log",
+    "and --home OUTRANKS the environment, as bin/reeve resolves it");
+  check(loadedPid("\tstate = running\n\tpid = 63207\n") === 63207, "the live pid is read from launchctl");
+  check(loadedPid("\tstate = not running\n") === null, "and a loaded job with no pid reports none");
   check(daemonLogPath(["run"], {}, "/h") === "/h/reeve.log", "control: falling back to the given home");
   check(loadedEnvironment("environment = {\n\tREEVE_HOME => /jobhome\n}\n").REEVE_HOME === "/jobhome",
     "the job's environment is read from launchctl");

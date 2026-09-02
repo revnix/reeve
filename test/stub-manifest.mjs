@@ -2937,4 +2937,13 @@ export const STUBS = [
               find: "  if (!model || ALIASES.has(String(model)))",
               replace: "  if (!model)" }],
   },
+  {
+    name: "dispatch-a-cancel-kills-the-process-group",
+    why: "hand runWorker no revocation probe, which is the implementation that exists today for every other caller. `terminate-worker` marks phase_run.status='killed' and kills no OS process, so the database write is then the WHOLE of the revocation: `reeve task cancel` returns success, the task reads CANCELLING, and the worker keeps running, keeps writing its artifact and keeps drawing on the subscription. The failure is silent in the direction that reads as working, which is why the assertion is the PROCESS and never the row -- the compensation sets that status whether or not anything died",
+    test: "test/build-dispatch.test.mjs",
+    expectRed: "THE PROCESS GROUP IS DEAD -- not merely marked dead",
+    edits: [{ file: "src/build/dispatch.mjs",
+              find: "      isRevoked: () => revocationProbe(db, runKey),",
+              replace: "      isRevoked: () => null," }],
+  },
 ];

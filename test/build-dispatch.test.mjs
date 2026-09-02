@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { openHub } from "../src/build/hubdb.mjs";
 import { runStatus, liveRuns } from "../src/build/run.mjs";
 import { PHASE_SPECS, specFor, contractSnapshot, contractDrift, dispatchPhase } from "../src/build/dispatch.mjs";
-import { OUTCOMES } from "../src/supervisor.mjs";
+import { OUTCOMES, readStart } from "../src/supervisor.mjs";
+import { applyTransition } from "../src/build/transition.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -167,6 +168,63 @@ const base = (over = {}) => ({
     "and NOTHING was spawned: the row is the permission to run, so a refused row must not produce a process",
     String(spawned));
   check(runStatus(db, K5) === null, "control: and no row appeared for the attempt that was refused");
+}
+
+// ── a cancelled task's worker process is DEAD, not merely marked dead ────────
+//
+// MEASURED at 16cd880: transition.mjs's `terminate-worker` marks
+// phase_run.status='killed' and kills no OS process. `reeve task cancel` would
+// therefore return success, the task would read CANCELLING, and the worker would
+// keep running, keep writing its artifact, and keep drawing on the subscription.
+// The failure is silent in the direction that reads as working.
+//
+// So the assertion is the PROCESS, never the row. A test that checked the status
+// would pass against the exact defect it exists to catch: the compensation sets
+// that status whether or not anything died. The process dies only because the
+// dispatch seam handed runWorker an isRevoked that reads the row.
+{
+  const K6 = { ...KEY, attempt: 6 };
+  // Alive until killed, and it exits on SIGTERM by default -- which is what a
+  // cooperative cancel is supposed to achieve.
+  const pending = dispatchPhase(db, {
+    ...KEY, attempt: 6, home: dir, bin: process.execPath, argv: ["-e", "setInterval(() => {}, 1000)"],
+    env: {}, cwd: dir, snapshot: contractSnapshot(LIVE), drift: null,
+    leaseSeconds: 400, budgetMs: 25000, isAlive: alive,
+  });
+
+  // Wait for the BINDING, not for a fixed delay: a sleep long enough to be safe
+  // on this machine is a flake on a loaded one, and a sleep too short reads as
+  // "no process" for the wrong reason.
+  const until = Date.now() + 15000;
+  let pid = null;
+  while (Date.now() < until && pid == null) {
+    pid = db.prepare("SELECT pid FROM phase_run WHERE task='bt:d' AND attempt=6").get()?.pid ?? null;
+    if (pid == null) await new Promise((r) => setTimeout(r, 50));
+  }
+  check(Number.isInteger(pid) && pid > 0, "a real worker process was bound to the run row", String(pid));
+  check(readStart(pid) !== null,
+    "control: the fixture worker is genuinely ALIVE before the cancel -- one that had already exited could not exhibit the defect",
+    String(readStart(pid)));
+
+  const t = applyTransition(db, { taskId: "bt:d", expectedPhase: "RESEARCH", expectedGeneration: 1,
+    evidence: { kind: "founder.cancel", reason: "the founder cancelled" }, op: "task.cancelling" });
+  check(t.applied === true && t.to === "CANCELLING", "the cancel transition applied", JSON.stringify(t));
+  check(db.prepare("SELECT status FROM phase_run WHERE task='bt:d' AND attempt=6").get().status === "killed",
+    "and `terminate-worker` marked the row killed -- which is ALL it does");
+
+  // THE ASSERTION. runWorker polls isRevoked every 2,000 ms and then sends
+  // SIGTERM to the process GROUP, so the wait is bounded by the poll plus the
+  // grace, not by anything this test chooses.
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline && readStart(pid) !== null) await new Promise((r) => setTimeout(r, 100));
+  check(readStart(pid) === null,
+    "THE PROCESS GROUP IS DEAD -- not merely marked dead", String(readStart(pid)));
+
+  const r = await pending;
+  check(r.result?.outcome === OUTCOMES.CANCELLED,
+    "and the run is classified as a cancellation rather than a failure, because the operator asked",
+    JSON.stringify(r?.result?.outcome ?? r));
+  check(runStatus(db, K6) === "killed", "control: and the row still reads killed after the settle");
 }
 
 db.close();

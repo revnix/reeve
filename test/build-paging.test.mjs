@@ -67,23 +67,34 @@ const raise = (db, why, count, at) => db.prepare(
   db.close();
 }
 
-// ── nothing retires, because this pass examines nothing ─────────────────────
+// ── nothing retires, and the reason is the SURVEY rather than `examined` ────
 //
-// `examined` names the subjects a pass actually looked at. The builder tick
-// refreshes gate state and evaluates no task, so it can vouch for none -- and
-// retiring on that silence would announce "resolved" for something nobody
-// looked at, then re-announce it on the next pass that did look.
+// A cause becomes a clearing candidate by being ABSENT from the pass's map while
+// standing in the hub. This pass builds that map FROM the hub, so the two sets
+// are identical and no cause is ever a candidate -- clearing is unreachable by
+// construction, not merely declined. `examined: null` is the second guard, and
+// it only starts mattering if the survey ever stops being total.
+//
+// So the property worth asserting is the TOTALITY of the survey. A filtered
+// survey -- for live projects only, say, or for unannounced rows -- would make
+// every excluded cause a candidate, and `examined: null` is then the one thing
+// between that and announcing "resolved" for something nobody looked at.
 {
   const home = freshHome(), db = hubOf(home);
   raise(db, KEY, 1, NOW);
+  raise(db, escalationKey({ kind: "probe:merged" }), 2, NOW);
   const send = () => ({ ok: true, channels: [{ name: "t", ok: true, ref: "r" }] });
   pageStandingCauses(db, { home, at: NOW, isAlive: ALIVE, send });
   const r = pageStandingCauses(db, { home, at: NOW + 150, isAlive: ALIVE, send });
-  check(r.cleared.length === 0, "a pass that examined nothing retires nothing",
-    JSON.stringify(r.cleared));
-  check(db.prepare("SELECT count(*) c FROM escalation").get().c === 1,
-    "control: and the cause is still standing, so the absence of a clear is not an empty hub",
-    JSON.stringify(db.prepare("SELECT count(*) c FROM escalation").get()));
+
+  const rows = db.prepare("SELECT count(*) c FROM escalation").get().c;
+  check(r.standing === rows && rows === 2,
+    "the pass surveys EVERY standing row, so no cause can quietly become a clearing candidate",
+    JSON.stringify({ surveyed: r.standing, rows }));
+  check(r.cleared.length === 0, "and nothing is retired", JSON.stringify(r.cleared));
+  check(rows === 2,
+    "control: the causes are still standing, so the absence of a clear is not an empty hub",
+    String(rows));
   db.close();
 }
 

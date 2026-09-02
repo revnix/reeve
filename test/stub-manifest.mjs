@@ -2405,4 +2405,48 @@ export const STUBS = [
               find: "             retryable: true };",
               replace: "             retryable: false };" }],
   },
+  {
+    name: "a-restored-log-is-caught-by-identity",
+    why: "decide the rewind by timestamp alone, which is the rule this replaced. `phase_event.at` is integer seconds with no uniqueness constraint, so a log restored and regrown to the same sequence within ONE SECOND presents an identical (seq, at) and the stale cursor is accepted -- every event through that sequence in the new incarnation is then omitted permanently and the digest reports it as a quiet period",
+    test: "test/build-dash.test.mjs",
+    expectRed: "a cursor from a PREVIOUS incarnation is rewound, though its (seq, at) still matches",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "     (provable\n       ? since.incarnation !== incarnation\n       : (since.seq > 0 && atOf(since.seq) !== since.at)));",
+      replace: "     (since.seq > 0 && atOf(since.seq) !== since.at));",
+    }],
+  },
+  {
+    name: "the-cursor-carries-the-hub-identity",
+    why: "format a cursor without its incarnation, so the digest hands back the two fields it always did. A cursor that cannot name the log it came from cannot be checked against one, and the rewind check silently falls back to the weaker rule for every cursor the digest itself issued",
+    test: "test/build-dash.test.mjs",
+    expectRed: "and the identity it round-trips is this hub's own, not a shape that merely parses",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "  incarnation ? `${seq}.${at}.${incarnation}` : `${seq}.${at}`;",
+      replace: "  `${seq}.${at}`;",
+    }],
+  },
+  {
+    name: "a-weaker-cursor-answer-says-it-is-weaker",
+    why: "report every answer as proof. `cursor_rewound: false` reached by comparing identities is proof; the same false from the timestamp fallback is only an absence of evidence, and a client deciding whether to trust the movement list is entitled to know which one it got",
+    test: "test/build-dash.test.mjs",
+    expectRed: "but the digest reports that the weaker check answered it",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "    cursor_proof: since === null ? null : provable ? \"incarnation\" : \"timestamp\",",
+      replace: "    cursor_proof: since === null ? null : \"incarnation\",",
+    }],
+  },
+  {
+    name: "a-mistyped-cursor-identity-is-refused",
+    why: "accept anything in the cursor's third field. A fumbled paste then differs from the hub's identity and is reported as a RESTORE THAT NEVER HAPPENED, sending an operator to look for damage that is not there -- an unparseable cursor is a misuse the CLI can name, and a plausible one is not",
+    test: "test/build-dash.test.mjs",
+    expectRed: "a cursor whose identity is too short is refused, not guessed",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "(?:\\.([0-9a-f]{32}))?$/",
+      replace: "(?:\\.(.+))?$/",
+    }],
+  },
 ];

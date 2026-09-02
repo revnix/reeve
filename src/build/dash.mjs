@@ -16,6 +16,7 @@
 
 import { TERMINAL } from "./phases.mjs";
 import { LEASE_SECONDS } from "./locks.mjs";
+import { hubIncarnation } from "./hubdb.mjs";
 import {
   READ_FORMAT_VERSION, UNKNOWN, HUMAN_WAITS, ageInState, taskList, oneLine,
 } from "./show.mjs";
@@ -31,14 +32,31 @@ const TERMINAL_SET = new Set(TERMINAL);
  * another project's name.
  */
 /**
- * A cursor is `<seq>.<at>` -- opaque to the operator, who copies what the digest
- * printed. Two fields rather than one because the sequence alone cannot survive a
- * restore; see the rewind check in `dashModel`.
+ * A cursor is `<seq>.<at>.<incarnation>` -- opaque to the operator, who copies
+ * what the digest printed.
+ *
+ * THE INCARNATION IS THE PROOF, and the other two fields are what the cursor
+ * MEANS. `seq` says where in the log the operator stopped reading; `at` is the
+ * older evidence that the log is the same one, kept because a cursor issued
+ * before the incarnation table existed still has to be readable.
+ *
+ * A TRAILING FIELD RATHER THAN A NEW FORMAT, so a cursor written by yesterday's
+ * binary still parses and still answers. It reads with a WEAKER guarantee, which
+ * `cursor_proof` reports rather than leaves as an impression -- the whole defect
+ * this closes was a check that looked like proof and was not.
+ *
+ * The id is 32 hex characters, so it can never contain the separator and the
+ * three fields cannot be confused for one another.
  */
-export const formatCursor = (seq, at) => `${seq}.${at}`;
+export const formatCursor = (seq, at, incarnation = null) =>
+  incarnation ? `${seq}.${at}.${incarnation}` : `${seq}.${at}`;
 export function parseCursor(raw) {
-  const m = /^(\d+)\.(\d+)$/.exec(String(raw ?? ""));
-  return m ? { seq: Number(m[1]), at: Number(m[2]) } : null;
+  // STRICT ON THE THIRD FIELD. A mistyped incarnation refused as unparseable is a
+  // misuse the CLI can name; accepted, it would differ from the hub's and report
+  // a RESTORE that never happened -- sending an operator to look for damage
+  // because they fumbled a paste.
+  const m = /^(\d+)\.(\d+)(?:\.([0-9a-f]{32}))?$/.exec(String(raw ?? ""));
+  return m ? { seq: Number(m[1]), at: Number(m[2]), incarnation: m[3] ?? null } : null;
 }
 
 export function dashModel(db, { now, switchesFor, projects = [], since = null, isAlive }) {
@@ -104,19 +122,37 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
   // usually does not -- the cursor therefore carries the event it names, and a
   // sequence wearing a different row is caught.
   //
-  // It is NOT proof. `at` has integer-second resolution and is not unique, so a
-  // log restored and regrown to the same sequence WITHIN ONE SECOND presents an
-  // identical (seq, at) and this check accepts it. Closing that needs a durable
-  // hub incarnation -- a `hub.restored` event, or a column -- and neither is a
-  // decision a read surface may take: `restoreHub` records nothing today, and
-  // searching hub.sql for any per-incarnation value finds none.
+  // It was NOT proof, and now it is -- when both ends can supply an identity.
+  // `at` has integer-second resolution and is not unique, so a log restored and
+  // regrown to the same sequence WITHIN ONE SECOND presents an identical
+  // (seq, at) and the timestamp check accepts it. Every event through that
+  // sequence in the new incarnation is then omitted permanently and the digest
+  // reports it as a quiet period.
   //
-  // So the bound is stated rather than inferred away, and the remaining gap is
-  // carried to whoever owns the hub schema. A third guess at incarnation would be
-  // the third guess.
+  // The hub now carries a durable per-incarnation id, minted on creation and
+  // re-minted by a restore, so the cursor carries it too and the check COMPARES
+  // IDENTITIES rather than inferring one from a timestamp. Two different logs
+  // cannot present the same id, whatever their clocks did.
+  //
+  // THE FALLBACK IS NOT A SECOND RULE, it is the older rule kept for the cursors
+  // that predate the new one. A cursor without an incarnation, or a hub too old
+  // to have one, cannot be answered by identity at all -- so it is answered the
+  // old way, with the old bound, and `cursor_proof` says which of the two
+  // answered rather than letting a weaker check pass for the stronger one.
+  //
+  // `hubIncarnation` THROWS on a migrated hub whose row is missing, and that is
+  // deliberately not caught here. It distinguishes "predates the table" (null)
+  // from "the table is damaged" (throws), and swallowing the throw would collapse
+  // exactly the distinction it exists to draw, reporting damage as an ordinary
+  // older store. The read route already turns it into a typed refusal.
+  const incarnation = hubIncarnation(db)?.id ?? null;
+  const provable = since !== null && since.incarnation !== null && incarnation !== null;
   const atOf = (seq) => db.prepare("SELECT at FROM phase_event WHERE seq = ?").get(seq)?.at ?? null;
   const rewound = since !== null &&
-    (since.seq > highWater || (since.seq > 0 && atOf(since.seq) !== since.at));
+    (since.seq > highWater ||
+     (provable
+       ? since.incarnation !== incarnation
+       : (since.seq > 0 && atOf(since.seq) !== since.at)));
 
   const byProject = Object.create(null);
   for (const p of projects) byProject[p.name] = switchesFor(p.name);
@@ -240,7 +276,7 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
     // later still. `phase_event.seq` is lossless and monotonic, and
     // `next_cursor` is handed back so the operator never has to construct one.
     since_you_looked: since === null || rewound ? [] : movedSince(db, since.seq),
-    next_cursor: formatCursor(highWater, head?.at ?? 0),
+    next_cursor: formatCursor(highWater, head?.at ?? 0, incarnation),
     // A RESTORE REWINDS THE LOG. `phase_event.seq` is monotonic within one hub,
     // not across a restore: replacing the store with an older snapshot can put
     // the high-water mark BELOW a cursor issued before it. Every later
@@ -251,7 +287,17 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
     // period, which is why it is reported rather than inferred: a cursor ahead of
     // the log is PROOF the log is not the one that issued it.
     cursor_rewound: rewound,
-    since: since === null ? null : formatCursor(since.seq, since.at),
+    // WHICH CHECK ANSWERED, said out loud. `cursor_rewound: false` from an
+    // identity comparison is proof; the same false from the timestamp fallback
+    // is "no evidence of a restore", and the two are worth different amounts to
+    // anything deciding whether to trust the movement list. Reporting the
+    // stronger and the weaker answer as one value is the defect this closes.
+    // `null` where no cursor was given: there was nothing to prove.
+    cursor_proof: since === null ? null : provable ? "incarnation" : "timestamp",
+    // The hub's own identity, so a client holding several cursors can tell which
+    // of them belong to this log without asking for each in turn.
+    incarnation,
+    since: since === null ? null : formatCursor(since.seq, since.at, since.incarnation),
 
     // 5. WHAT DID IT DECLINE, FAIL OR REFUSE. Standing escalations, beside the
     // task that raised them.
@@ -381,6 +427,14 @@ export function renderDash(m) {
   // never constructs one; printing it only under --json makes that promise
   // reachable exclusively by the people who did not need it.
   out.push(`  next: --since ${m.next_cursor}`);
+  // THE WEAKER ANSWER IS SAID OUT LOUD, and only the weaker one. Printing a line
+  // for the proof case too would train the reader past both, and the strong case
+  // is the one that needs no caveat -- so silence here means proof, and the only
+  // sentence on this subject is the one that changes what the reader may conclude.
+  if (m.cursor_proof === "timestamp")
+    out.push("  note: this cursor predates the hub's incarnation id, so a restore is " +
+             "inferred from timestamps and a same-second restore can pass unseen. " +
+             "The cursor above carries the id; the next call is provable.");
 
   // Per task, the facts a digest owes beside the state: what is draining, what
   // territory is pinned and until when, and every UNKNOWN said out loud.

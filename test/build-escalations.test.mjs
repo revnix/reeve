@@ -1444,12 +1444,16 @@ const freshHub = () => {
   // -- ordinary JSON, which stringify serialises perfectly by writing it twice.
   // The set therefore tracks the PATH from the root and is unwound on the way out.
   const shared = { a: 1 };
-  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
-                  bodies: new Map([[key, { type: "FAILED", x: shared, y: shared }]]) });
-  const twice = JSON.parse(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body);
-  check(twice.x?.a === 1 && twice.y?.a === 1,
+  let sharedRefused = null;
+  try {
+    announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                    bodies: new Map([[key, { type: "FAILED", x: shared, y: shared }]]) });
+  } catch (e) { sharedRefused = e.kind ?? "threw"; }
+  const twiceRow = hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "null";
+  const twice = JSON.parse(twiceRow);
+  check(sharedRefused === null && twice?.x?.a === 1 && twice?.y?.a === 1,
     "a value referenced twice as siblings is stored twice, not refused as circular",
-    JSON.stringify(twice));
+    JSON.stringify({ refused: sharedRefused, stored: twice }));
 }
 
 // ── the ceiling is measured in the unit it promises ─────────────────────────

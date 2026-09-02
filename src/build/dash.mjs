@@ -197,15 +197,21 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
   // which is a symptom, while the identity sitting right there said `restored`,
   // which is the cause. The sequence arms only ever run once identity has failed
   // to decide, or could not be consulted at all.
+  //
+  // A SEQUENCE BEYOND THE LOG IS A KIND OF UNKNOWN EVENT, and which of the two
+  // names it depends on whether an identity was available. With a MATCHING
+  // identity, a sequence past the high-water mark says the cursor is wrong rather
+  // than the log: this IS the log that issued it, and it never reached that
+  // number. Calling that `ahead` and explaining it as "carries no identity" was
+  // false twice over -- the cursor carries one, and `cursor_proof` said so on the
+  // same screen. `ahead` is reserved for the case where nothing could say why.
+  const beyond = since !== null && since.seq > highWater;
   const verdict =
     since === null ? null
       : provable && since.incarnation !== incarnation ? "different-log"
-      : since.seq > highWater ? "ahead"
-      : namesAKnownEvent() ? "ok"
-      // WITHOUT AN IDENTITY THE TWO CANNOT BE TOLD APART, which is the whole of
-      // the defect this closes. A changed event is reported as exactly that --
-      // neither diagnosis claimed -- rather than asserted to be a restore.
-      : provable ? "unknown-event" : "changed-event";
+      : beyond || !namesAKnownEvent()
+        ? (provable ? "unknown-event" : beyond ? "ahead" : "changed-event")
+        : "ok";
   // UNCHANGED IN MEANING: do not trust the movement list. Every verdict but `ok`
   // says the cursor cannot be resolved against this log, which is what the exit
   // status and the withheld list have always keyed off.
@@ -487,7 +493,8 @@ export function renderDash(m) {
   // diagnosis for three of the four verdicts -- and the restore case this whole
   // change exists to catch is precisely one where the cursor is NOT ahead.
   const WHY_UNUSABLE = {
-    ahead: "names a sequence beyond this hub's log, and carries no identity that could say why",
+    ahead: "names a sequence beyond this hub's log. It carries no incarnation, so whether the " +
+           "hub was restored beneath it or the sequence is simply wrong cannot be told apart",
     "different-log": "does not belong to this hub's log. Either this hub was restored since the " +
                      "cursor was issued, or the cursor came from a different hub — the identities " +
                      "differ, which settles that it is not this log without saying which of the two",

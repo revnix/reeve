@@ -2478,8 +2478,8 @@ export const STUBS = [
     expectRed: "a cursor carrying THIS hub's identity but naming an event it does not have is a corrupt cursor",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "      : namesAKnownEvent() ? \"ok\"",
-      replace: "      : true ? \"ok\"",
+      find: "      : beyond || !namesAKnownEvent()",
+      replace: "      : beyond",
     }],
   },
   {
@@ -2500,8 +2500,8 @@ export const STUBS = [
     expectRed: "a restore to a SHORTER log is judged by identity, not reported as merely `ahead`",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "      : provable && since.incarnation !== incarnation ? \"different-log\"\n      : since.seq > highWater ? \"ahead\"",
-      replace: "      : since.seq > highWater ? \"ahead\"\n      : provable && since.incarnation !== incarnation ? \"different-log\"",
+      find: "      : provable && since.incarnation !== incarnation ? \"different-log\"\n      : beyond || !namesAKnownEvent()",
+      replace: "      : beyond ? \"ahead\"\n      : provable && since.incarnation !== incarnation ? \"different-log\"\n      : !namesAKnownEvent()",
     }],
   },
   {
@@ -2513,6 +2513,28 @@ export const STUBS = [
       file: "src/build/dash.mjs",
       find: "  if (m.cursor_proof === \"timestamp\" && m.incarnation !== null)",
       replace: "  if (m.cursor_proof === \"timestamp\")",
+    }],
+  },
+  {
+    name: "a-matching-identity-past-the-log-is-the-cursor",
+    why: "call any out-of-range sequence `ahead`, whose sentence explains that the cursor carries no incarnation. With a MATCHING identity that is false twice over: the cursor carries one, and cursor_proof says `incarnation` on the same screen -- while the real finding, that this log never reached that sequence, goes unsaid",
+    test: "test/build-dash.test.mjs",
+    expectRed: "a cursor with THIS hub's identity whose sequence is past the log is the cursor being wrong",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "        ? (provable ? \"unknown-event\" : beyond ? \"ahead\" : \"changed-event\")",
+      replace: "        ? (beyond ? \"ahead\" : provable ? \"unknown-event\" : \"changed-event\")",
+    }],
+  },
+  {
+    name: "a-damaged-hub-exits-non-zero",
+    why: "decide the exit status from the cursor alone. A plain `task dash` with no --since on a hub altered outside reeve then prints HUB DAMAGED and exits 0, so anything watching the status -- which is what monitoring watches -- reads a damaged store as healthy while the payload says otherwise",
+    test: "test/build-dash.test.mjs",
+    expectRed: "and `task dash` exits NON-ZERO on a damaged hub even with no --since given",
+    edits: [{
+      file: "bin/reeve",
+      find: "          process.exit(model.cursor_rewound || model.incarnation_damaged\n            ? EXITS.degraded : EXITS.ok);",
+      replace: "          process.exit(model.cursor_rewound ? EXITS.degraded : EXITS.ok);",
     }],
   },
 ];

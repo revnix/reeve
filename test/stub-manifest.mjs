@@ -2755,7 +2755,7 @@ export const STUBS = [
     edits: [{
       file: "src/build/dash.mjs",
       find: "  if (m.cursor_proof === \"timestamp\" && m.incarnation !== null)",
-      replace: "  if (m.cursor_proof === \"timestamp\")",
+      replace: "  if (m.cursor_proof === \"timestamp\" || m.incarnation === null)",
     }],
   },
   {

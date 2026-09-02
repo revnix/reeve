@@ -2343,6 +2343,15 @@ export const STUBS = [
               replace: "const restoreAdvice = (plainRestoreRefused) => false" }],
   },
   {
+    name: "the-forward-version-remedy-forbids-a-restore",
+    why: "turn the ahead remedy's own forbidding clause affirmative: `Do NOT restore a snapshot over it` becomes `Restore a snapshot over it`. That store is HEALTHY and this binary is old, so an older snapshot discards everything the newer binary wrote and repairs nothing -- it is the one fault in this module whose correct advice is the ABSENCE of a restore. Nothing proved the guard could fail: two versions of the assertion passed a remedy recommending the downgrade, the first without the word and the second with the phrase, and the sweep caught neither because the assertion had no entry at all",
+    test: "test/task-show.test.mjs",
+    expectRed: "a hub newer than this binary is refused too",
+    edits: [{ file: "src/build/hubfault.mjs",
+              find: "             remedy: \"run the newer binary. Do NOT restore a snapshot over it: this store is \"",
+              replace: "             remedy: \"run the newer binary. Restore a snapshot over it: this store is \"" }],
+  },
+  {
     name: "an-out-of-range-marker-is-not-transient",
     why: "treat a `schema_version` value beyond JavaScript's safe integer range as an ordinary unreadable history, which is told to re-run and then to restore. Neither works: the value IS the fault, so re-running reproduces it, and `restoreHub` reads versions the same way and refuses with the same error -- measured, along with the fact that moving all three files aside and restoring then succeeds",
     test: "test/hub-fault.test.mjs",

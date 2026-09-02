@@ -387,7 +387,13 @@ const holeAt = (p, v) => {
       JSON.stringify(defects).slice(0, 200));
   }
   const damaged = dryRun();
-  check(damaged.status === 1 && /is damaged/.test(damaged.out),
+  // THE INTEGRITY CHECK'S OWN SENTENCE, not two common words. `/is damaged/`
+  // matched any message containing them -- and it began doing exactly that when
+  // the unreadable-history remedy gained "the store is damaged", so this assertion
+  // passed while the check it names was stubbed out and something else refused.
+  // `quick_check` reports the FIRST problem it finds, and saying so is unique to
+  // that refusal.
+  check(damaged.status === 1 && /The first problem found is:/.test(damaged.out),
     "a hub damaged in a page is refused by the dry run, on the integrity check openHub would have run",
     damaged.out.slice(0, 400));
   // EITHER REMEDY, because which one is right depends on whether a snapshot

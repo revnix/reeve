@@ -1,0 +1,144 @@
+// dispatch -- what a phase runs, and the seam that runs it.
+//
+// Everything a run is judged against is captured ONCE, here: the argv, the
+// prompt hash, the registry snapshot hash, and the run row. Nothing downstream
+// re-resolves any of it, because a changed environment must never change a
+// running task by itself.
+import { createHash } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { runWorker, OUTCOMES, isSameProcess } from "../supervisor.mjs";
+import { insertRun, bindRun, settleRun, runPathsFor, revocationProbe, heartbeatRun } from "./run.mjs";
+
+const sha = (s) => createHash("sha256").update(s).digest("hex");
+
+// ALIASES ARE REFUSED, NOT RESOLVED HERE. Resolving one needs the installed CLI,
+// which is I/O; refusing one keeps this function pure and puts the resolution at
+// the caller, where the resolved id is also what goes on the command line. A
+// snapshot that recorded `fable` would resolve to a different model after an
+// upgrade, and the task's model would change with nobody deciding it.
+const ALIASES = new Set(["fable", "sonnet", "opus", "haiku", "default", "sonnet[1m]"]);
+
+/**
+ * Which phases dispatch, and what each one runs.
+ *
+ * EMPTY HERE, ON PURPOSE. S3-D registers SIZING, RESEARCH and DESIGN, one per
+ * pull request. Until it does, `specFor` answers null for every phase and the
+ * stage is a filing surface that spawns nothing -- which is the correct state
+ * for this task rather than a gap in it.
+ *
+ * NULL-PROTOTYPE, and that is load-bearing rather than tidy. A plain object
+ * literal answers `specFor("toString")` with a function, and `specFor("__proto__")`
+ * with the prototype -- so a phase name arriving from a task row could resolve to
+ * a "spec" nobody wrote. Phase names come out of the database, so this lookup
+ * takes untrusted input.
+ *
+ * A FOURTH KEY TURNS S3 INTO S4. `ADVANCE.DESIGN` is `SPEC_DRAFT`, so a finished
+ * DESIGN really does move the task there; what must not happen is the next tick
+ * dispatching it. The absence of a `SPEC_DRAFT` entry is the boundary of the
+ * whole stage, and it is enforced by `specFor` returning null rather than by
+ * anyone remembering.
+ */
+export const PHASE_SPECS = Object.freeze(Object.assign(Object.create(null), {
+}));
+
+/**
+ * The spec for a phase, or null when that phase dispatches nothing.
+ *
+ * `null` is an ANSWER, not a failure: the tick reads it as "no action for this
+ * phase" and moves on. `Object.hasOwn` rather than a truthiness test, so a key
+ * whose spec is legitimately falsy is still distinguishable from an absent one.
+ */
+export function specFor(phase) {
+  return Object.hasOwn(PHASE_SPECS, phase) ? PHASE_SPECS[phase] : null;
+}
+
+export function contractSnapshot({ cliVersion, model, effort, argv, prompt, settings, tools,
+                                   agents, maxTurns, maxBudgetUsd, canaryId, registrySnapshotHash }) {
+  if (!model || ALIASES.has(String(model)))
+    return { ok: false, error: `contractSnapshot: model must be a fully resolved id, never the alias ${JSON.stringify(model)}` };
+  // `ok` on BOTH paths. A refusal shaped `{ok:false}` beside a success with no
+  // `ok` at all makes `if (!snap.ok)` true for a perfectly good snapshot, and the
+  // caller that gets it right is the one that happened to test the other branch.
+  return {
+    ok: true, cliVersion, modelId: model, effort,
+    argvHash: sha(JSON.stringify(argv)), promptHash: sha(prompt), settingsHash: sha(settings),
+    toolsHash: sha(tools), agentsHash: sha(agents),
+    maxTurns, maxBudgetUsd, canaryId, snapshotHash: registrySnapshotHash,
+  };
+}
+
+/** The per-field difference between the snapshot an attempt will reuse and the
+ *  environment it is about to run in. RECORDED, never acted on: adopting drift
+ *  is a founder command, and a dispatcher that refused on drift would stop a
+ *  task because someone upgraded the CLI. */
+export function contractDrift(snapshot, live) {
+  const out = {};
+  for (const f of ["cliVersion", "modelId", "effort", "settingsHash", "toolsHash", "agentsHash", "snapshotHash"])
+    if (snapshot[f] !== live[f]) out[f] = { was: snapshot[f] ?? null, now: live[f] ?? null };
+  // NULL, not {}. An empty object is truthy, and a caller writing `if (drift)`
+  // would record drift on every clean dispatch.
+  return Object.keys(out).length ? out : null;
+}
+
+export async function dispatchPhase(db, {
+  task, generation, phase, slice = 0, attempt, home, bin = "claude", argv, env, cwd,
+  snapshot, drift = null, leaseSeconds, budgetMs, graceMs = 5000, maxOutputBytes = 64 * 1024 * 1024,
+  now = () => Math.floor(Date.now() / 1000), isAlive = isSameProcess,
+  run = runWorker, bind = bindRun,
+}) {
+  const runKey = { task, generation, phase, slice, attempt };
+  const { runDir, outPath, errPath, argvPath } = runPathsFor(home, runKey);
+  mkdirSync(runDir, { recursive: true });
+  // The COMPLETE argv, not only the hash. A hash answers "did it change"; the
+  // argv answers "what changed", which is the question after a retry behaves
+  // differently from the attempt it was supposed to reproduce.
+  writeFileSync(argvPath, JSON.stringify({ argv, argvHash: snapshot.argvHash }, null, 2) + "\n");
+
+  // THE ROW BEFORE THE PROCESS. A row written after the spawn is a window in
+  // which a live worker is invisible to admission, to the reaper and to a
+  // restart.
+  const inserted = insertRun(db, { ...runKey, outPath, errPath, snapshot, drift,
+                                   startedAt: now(), leaseSeconds, isAlive });
+  if (!inserted.ok) return { ok: false, reason: inserted.reason };
+
+  const beat = setInterval(
+    () => { try { heartbeatRun(db, { ...runKey, at: now(), leaseSeconds, isAlive }); } catch { /* a missed beat is not a reason to abort a run; the lease expiry is */ } },
+    Math.max(1000, Math.floor(leaseSeconds / 4) * 1000));
+
+  let result;
+  try {
+    result = await run({
+      bin, args: argv, cwd, env, outPath, errPath, maxOutputBytes, budgetMs, graceMs,
+      // FAIL CLOSED. A throw here is S1's UNBOUND path: the group is killed and
+      // the worker never gets to run unobserved.
+      onSpawn: ({ pid, lstart }) => bind(db, { ...runKey, pid, lstart, isAlive }),
+      isRevoked: () => revocationProbe(db, runKey),
+    });
+  } catch (e) {
+    // A REJECTION IS AN OUTCOME TOO, and leaving the row live is worse than any
+    // of them. The `finally` that clears the heartbeat does not settle the row,
+    // so a `runWorker` that THREW rather than returning left `phase_run` saying
+    // `live` for a process that is gone -- and `one_live_run` then refuses the
+    // task's next dispatch forever, on behalf of nothing. Nobody would see it
+    // until the task simply stopped progressing.
+    clearInterval(beat);
+    settleRun(db, { ...runKey, status: "failed", outcome: OUTCOMES.CRASHED,
+                    evidence: { why: `the dispatch threw: ${e.message}`, denials: [], cost: null },
+                    truncated: 0, isAlive });
+    return { ok: false, reason: "dispatch-threw", runKey, error: e.message };
+  }
+  clearInterval(beat);
+
+  const status = result.outcome === OUTCOMES.OK ? "succeeded"
+    : result.outcome === OUTCOMES.CANCELLED || result.outcome === OUTCOMES.LEASE_LOST ? "killed"
+    : "failed";
+  settleRun(db, { ...runKey, status, outcome: result.outcome,
+                  evidence: { why: result.why, denials: result.denials ?? [], cost: result.cost ?? null },
+                  truncated: result.truncated ? 1 : 0, isAlive });
+  if (result.outcome === OUTCOMES.UNBOUND)
+    return { ok: false, reason: "unbound", runKey, pid: result.pid ?? null, result };
+  // `runKey`, `argv` and `env` travel with the answer: they are what the tick
+  // logs and what a reader compares a retry against, and re-deriving them at the
+  // caller is how two spellings of one dispatch start to disagree.
+  return { ok: true, runKey, argv, env, result };
+}

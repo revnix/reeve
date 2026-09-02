@@ -136,6 +136,47 @@ export const NEVER_TOOLS = [
   "EnterWorktree", "ExitWorktree",
 ];
 
+/**
+ * What each action is granted, replacing the two ternaries that keyed on FIX_CI.
+ *
+ * THE CONFLICT THIS RESOLVES, stated because it is real and neither document
+ * gives way on its own. `NEVER_TOOLS` denies WebFetch, WebSearch, Task and Agent
+ * for every action and reaches BOTH `disallowedTools` and `permissions.deny`.
+ * The design's phase table grants RESEARCH `Agent(*)`, WebSearch and WebFetch,
+ * and DESIGN `Agent(*)`. Both cannot hold as written.
+ *
+ * It is resolved as a per-action SUBTRACTION rather than by narrowing
+ * `NEVER_TOOLS` itself, and the direction is the whole point: the guardian's
+ * four actions must be provably unchanged, and a shorter global list would widen
+ * them silently. `neverToolsFor` therefore removes exactly the fan-out tools an
+ * action's own row grants and nothing else -- asserted empty for every action
+ * that is not one of the three.
+ *
+ * NULL-PROTOTYPE, and this file already knows why: `reviewDiff` below reads
+ * `Object.hasOwn(ARTIFACT_FILE, action)` rather than indexing. `action` is
+ * `decision.action`, derived from the task's phase in the hub, so this lookup
+ * takes input from the database. Indexed plainly, `toolsFor("constructor")`
+ * answers with a function whose `.file` is undefined, and `scopedFileTools`
+ * would be handed it.
+ */
+const ACTION_TOOLS = Object.freeze(Object.assign(Object.create(null), {
+  FIX_CI:         { file: ["Read", "Edit", "Write", "Grep", "Glob"], runners: true,  fanOut: [] },
+  FIX_FINDINGS:   { file: ["Read", "Edit", "Write", "Grep", "Glob"], runners: true,  fanOut: [] },
+  BUILD_SIZE:     { file: ["Read", "Grep", "Glob"],                  runners: false, fanOut: [] },
+  BUILD_RESEARCH: { file: ["Read", "Grep", "Glob"],                  runners: false, fanOut: ["Agent", "WebSearch", "WebFetch"] },
+  BUILD_DESIGN:   { file: ["Read", "Grep", "Glob"],                  runners: false, fanOut: ["Agent"] },
+}));
+const DEFAULT_TOOLS = Object.freeze({ file: ["Read", "Grep", "Glob"], runners: false, fanOut: [] });
+const toolsFor = (action) => (Object.hasOwn(ACTION_TOOLS, action) ? ACTION_TOOLS[action] : DEFAULT_TOOLS);
+
+/** `NEVER_TOOLS` minus this action's fan-out grant, and nothing else. Exported
+ *  so the caller hands ONE list to both `--disallowedTools` and
+ *  `permissions.deny`: a tool named in only one of them is not withheld. */
+export const neverToolsFor = (action) => {
+  const granted = new Set(toolsFor(action).fanOut);
+  return NEVER_TOOLS.filter((t) => !granted.has(t));
+};
+
 /** The paths that judge the work. A worker EDITING these grades its own exam;
  * reading them is how it understands the exam. */
 const SELF_GOVERNING = [".github/**", ".git/**"];
@@ -533,12 +574,11 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
   // forbidden paths, which is the same reason a worker gets its own clone rather
   // than a list of branches it must not move. The deny list stays as the second
   // layer, and it holds even against a bare grant once the rule form is right.
-  const fileTools = action === "FIX_CI" || action === "FIX_FINDINGS"
-    ? ["Read", "Edit", "Write", "Grep", "Glob"]
-    : ["Read", "Grep", "Glob"];
-  const tools = [...scopedFileTools(fileTools, worktree),
+  const grant = toolsFor(action);
+  const tools = [...scopedFileTools(grant.file, worktree),
                  ...gitTools,
-                 ...(action === "FIX_CI" || action === "FIX_FINDINGS" ? [...runnerTools, ...new Set(projectCmds)] : [])];
+                 ...(grant.runners ? [...runnerTools, ...new Set(projectCmds)] : []),
+                 ...grant.fanOut];
 
   const deny = [
     // Bash is NOT denied as a class here, and that is a measured decision rather
@@ -605,6 +645,12 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
   // because its own probes only ever read OUTSIDE and could not represent this.
   // (Codex #7-[2].)
 
+  // ONE WITHHELD LIST, computed once and handed to both surfaces below. A tool
+  // named in only one of them is not withheld: `--disallowedTools` is the flag
+  // the CLI enforces and `permissions.deny` is what the settings file states, so
+  // two separately-derived lists would let a grant exist in one reading of the
+  // boundary and not the other.
+  const withheld = neverToolsFor(action);
   return {
     allowedTools: tools.join(","),
     // Both, on purpose, and they are not redundant. `--disallowedTools` is the
@@ -613,10 +659,10 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
     // reconstruct the command line. A bare tool name in `deny` removes the tool
     // outright -- which for these is exactly the intent, unlike `Bash`, where the
     // same move was measured to take the scoped grants with it.
-    disallowedTools: NEVER_TOOLS.join(","),
+    disallowedTools: withheld.join(","),
     settings: {
       permissions: {
-        deny: [...deny, ...NEVER_TOOLS],
+        deny: [...deny, ...withheld],
         allow: tools.filter(t => t.startsWith("Bash(")),
         // Empty on purpose. The worktree is the boundary.
         additionalDirectories: [],

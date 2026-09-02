@@ -26,7 +26,7 @@
 // And a sixth, unprompted: denied twice, the model reached for a THIRD tool that
 // was not in the allowlist at all. Any tool that can run a command is a write
 // primitive, so this must be a closed allowlist, never a denylist.
-import { sandboxFor, reviewDiff, validateSettings, validateToolGrant, scopeGrant, credentialPaths, quarantineOsDenies, siblingRootsOf, CREDENTIAL_PATHS } from "../src/sandbox.mjs";
+import { sandboxFor, reviewDiff, validateSettings, validateToolGrant, scopeGrant, credentialPaths, quarantineOsDenies, siblingRootsOf, CREDENTIAL_PATHS, NEVER_TOOLS, neverToolsFor } from "../src/sandbox.mjs";
 import { readFileSync, mkdtempSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -650,6 +650,93 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
     const ok = sandboxFor({ profile, action: "FIX_CI", worktree: "/Users/x/code/wt", tmpDir: "/t" });
     check(ok.stateHomeContainsWorktree.length === 0, "and a normal layout reports nothing", JSON.stringify(ok.stateHomeContainsWorktree));
   } finally { if (saved === undefined) delete process.env.REEVE_HOME; else process.env.REEVE_HOME = saved; }
+}
+
+// ── the three BUILD actions get exactly the tools their phase needs ─────────
+//
+// Three read-only phases, three different answers, and the differences are the
+// whole point: SIZING reads, RESEARCH reads and reaches the network through a
+// named allowlist, DESIGN reads and fans out with no network at all. A single
+// "builder" branch would give SIZING the web.
+//
+// THE CONFLICT THIS RESOLVES. `NEVER_TOOLS` denies WebFetch, WebSearch, Task and
+// Agent for every action and reaches BOTH `disallowedTools` and
+// `permissions.deny`; the design's phase table grants RESEARCH `Agent(*)`,
+// WebSearch and WebFetch, and DESIGN `Agent(*)`. Both cannot hold as written.
+// It is resolved as a per-action SUBTRACTION, and the direction is what these
+// assertions are for: the guardian's actions must be provably unchanged.
+{
+  const P = { identity: { key: "o/r", defaultBranch: "main" },
+              units: [{ id: "root", commands: { test: { cmd: "pnpm test", state: "present" } } }],
+              builder: { network: { research: { allowedDomains: ["docs.example.com"] } } } };
+  const sb = (action) => sandboxFor({ profile: P, action, worktree: "/tmp/wt-build" });
+  // FILE TOOLS ARE SCOPED -- `Read(//tmp/wt-build)`, not `Read` -- and fan-out
+  // tools are bare. A membership test on the bare name is false for BOTH a
+  // granted scoped tool and an absent one, so `!has("Edit")` would pass against
+  // a sandbox that granted `Edit(...)` freely. The predicate matches either
+  // spelling, which is what makes the negative assertions mean anything.
+  const has = (s, t) => s.allowedTools.split(",").some((g) => g === t || g.startsWith(`${t}(`));
+  const granted = (s) => ({ has: (t) => has(s, t) });
+  const subtracted = (s) => NEVER_TOOLS.filter((t) => !s.disallowedTools.split(",").includes(t));
+
+  const size = sb("BUILD_SIZE"), research = sb("BUILD_RESEARCH"), design = sb("BUILD_DESIGN");
+
+  check(granted(size).has("Read") && granted(research).has("Read") && granted(design).has("Read"),
+    "control: all three BUILD actions can read at all", size.allowedTools);
+  check(!granted(size).has("Edit") && !granted(research).has("Edit") && !granted(design).has("Edit"),
+    "and none of them can write: these are read-only phases",
+    JSON.stringify([size, research, design].map((s) => s.allowedTools)));
+
+  check(!granted(size).has("WebSearch") && !granted(size).has("Agent"),
+    "SIZING gets no web and no fan-out -- a single builder branch would have given it both",
+    size.allowedTools);
+  check(granted(research).has("WebSearch") && granted(research).has("WebFetch") && granted(research).has("Agent"),
+    "RESEARCH gets the web and the fan-out its phase is defined by", research.allowedTools);
+  check(granted(design).has("Agent") && !granted(design).has("WebSearch") && !granted(design).has("WebFetch"),
+    "DESIGN fans out with no network at all", design.allowedTools);
+
+  // THE SUBTRACTION IS EXACTLY THE ROW'S FAN-OUT, and nothing else. This is the
+  // assertion that keeps the resolution narrow: a change that widened
+  // NEVER_TOOLS itself would satisfy every grant assertion above and quietly
+  // widen the guardian's four actions too.
+  check(JSON.stringify(subtracted(size)) === "[]",
+    "SIZING subtracts nothing from NEVER_TOOLS", JSON.stringify(subtracted(size)));
+  check(JSON.stringify(subtracted(research).sort()) === JSON.stringify(["Agent", "WebFetch", "WebSearch"]),
+    "RESEARCH subtracts exactly its three", JSON.stringify(subtracted(research)));
+  check(JSON.stringify(subtracted(design)) === JSON.stringify(["Agent"]),
+    "DESIGN subtracts exactly Agent", JSON.stringify(subtracted(design)));
+
+  for (const guardian of ["FIX_CI", "FIX_FINDINGS", "REVIEW", "VERDICT"]) {
+    check(JSON.stringify(subtracted(sb(guardian))) === "[]",
+      `the guardian action ${guardian} subtracts nothing, so this resolution cannot widen it`,
+      JSON.stringify(subtracted(sb(guardian))));
+  }
+
+  // ONE LIST, BOTH SURFACES. A tool named in only one of them is not withheld:
+  // `--disallowedTools` is what the CLI enforces and `permissions.deny` is what
+  // the settings file states, so two separately-derived lists would let a grant
+  // exist in one reading of the boundary and not the other.
+  for (const [name, s] of [["BUILD_RESEARCH", research], ["BUILD_DESIGN", design], ["FIX_CI", sb("FIX_CI")]]) {
+    const flag = s.disallowedTools.split(",");
+    const deny = new Set(s.settings.permissions.deny);
+    check(flag.every((t) => deny.has(t)),
+      `${name}: every tool the flag withholds is also denied in the settings`,
+      JSON.stringify(flag.filter((t) => !deny.has(t))));
+  }
+
+  // AN ACTION NAME COMES FROM THE HUB. `sandboxFor` is called with
+  // `decision.action`, derived from the task's phase in the database, so this
+  // lookup takes untrusted input -- and this file already reads
+  // `Object.hasOwn(ARTIFACT_FILE, action)` for the same reason. Indexed plainly,
+  // a hostile name resolves to a function whose `.file` is undefined.
+  for (const hostile of ["constructor", "toString", "__proto__", "valueOf"]) {
+    check(JSON.stringify(neverToolsFor(hostile)) === JSON.stringify(NEVER_TOOLS),
+      `the action name ${hostile} subtracts nothing, rather than resolving to Object's prototype`,
+      JSON.stringify(neverToolsFor(hostile)));
+  }
+  check(neverToolsFor("BUILD_RESEARCH").length === NEVER_TOOLS.length - 3,
+    "control: and a real action still subtracts, so the guard is not just refusing everything",
+    String(neverToolsFor("BUILD_RESEARCH").length));
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

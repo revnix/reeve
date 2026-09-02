@@ -1366,6 +1366,35 @@ const freshHub = () => {
     check(k === "escalation_body_shape",
       `${what} is refused as a body, not rendered as one`, String(k));
   }
+
+  // AND A BODY WHOSE `toJSON` REPLACES IT, which is the case a check on the
+  // INPUT cannot see. A `Date` is an object and is not an array, so it passes any
+  // test of the value handed in -- then `JSON.stringify` asks its `toJSON`, gets
+  // a STRING, and stores that. The alert renders no detail, because
+  // `Object.entries(new Date())` is empty; the next pass parses the stored scalar
+  // back, finds it unrenderable, and drops it. The report is lost with every
+  // other signal reporting success, which is the single outcome this column
+  // exists to prevent. So the check is on what is STORED, not on what was passed.
+  {
+    let k = null;
+    try {
+      announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                      send: () => ({ ok: true, channels: [] }),
+                      bodies: new Map([[key, new Date(NOW)]]) });
+    } catch (e) { k = e.kind ?? "threw"; }
+    check(k === "escalation_body_shape",
+      "a body whose toJSON returns a scalar is refused, though the body itself is an object",
+      String(k));
+
+    // CONTROL: an object that merely HAS a toJSON is fine when it returns one, so
+    // the refusal is about the produced shape rather than about the method.
+    const shaped = { type: "FAILED", detail: "x", toJSON() { return { type: "FAILED", detail: "x" }; } };
+    announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                    send: () => ({ ok: true, channels: [] }), bodies: new Map([[key, shaped]]) });
+    check(/"detail":"x"/.test(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? ""),
+      "control: a toJSON that returns an object is stored, so this is about the shape produced",
+      hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null);
+  }
 }
 
 hub.close();

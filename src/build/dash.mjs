@@ -145,7 +145,27 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
   // from "the table is damaged" (throws), and swallowing the throw would collapse
   // exactly the distinction it exists to draw, reporting damage as an ordinary
   // older store. The read route already turns it into a typed refusal.
-  const incarnation = hubIncarnation(db)?.id ?? null;
+  // THREE OUTCOMES, KEPT AS THREE. `hubIncarnation` answers a row, `null` for a
+  // store that genuinely predates the table, or THROWS for one that records the
+  // migration and has no row -- which is damage, and each of those three was put
+  // there by a review finding.
+  //
+  // Catching the throw into `null` would rebuild the exact misclassification the
+  // throw exists to prevent, one layer up: a hand-repaired or partially restored
+  // store would render as an ordinary old hub and the operator would read
+  // "cannot prove" for a store that has been altered outside reeve.
+  //
+  // Letting it out raw is not the other half of that choice. A stack trace is not
+  // an interface for a state an operator has to act on, and this surface exists
+  // to answer "what is going on" rather than to fail at it. So the damage becomes
+  // its own visible answer, carrying the recovery line the error already holds --
+  // and ONLY the marked verdict is caught, so anything else still propagates.
+  let incarnation = null, incarnationDamaged = null;
+  try { incarnation = hubIncarnation(db)?.id ?? null; }
+  catch (e) {
+    if (!e?.hubDamaged) throw e;
+    incarnationDamaged = e.message;
+  }
   const provable = since !== null && since.incarnation !== null && incarnation !== null;
   const atOf = (seq) => db.prepare("SELECT at FROM phase_event WHERE seq = ?").get(seq)?.at ?? null;
   const rewound = since !== null &&
@@ -297,6 +317,11 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
     // The hub's own identity, so a client holding several cursors can tell which
     // of them belong to this log without asking for each in turn.
     incarnation,
+    // AND THE REASON THERE IS NONE, when the reason is damage rather than age.
+    // `incarnation: null` alone cannot distinguish a store older than the table
+    // from one whose row was removed, and those need opposite responses: the
+    // first is fine and the second is a hub altered outside reeve.
+    incarnation_damaged: incarnationDamaged,
     since: since === null ? null : formatCursor(since.seq, since.at, since.incarnation),
 
     // 5. WHAT DID IT DECLINE, FAIL OR REFUSE. Standing escalations, beside the
@@ -431,6 +456,12 @@ export function renderDash(m) {
   // for the proof case too would train the reader past both, and the strong case
   // is the one that needs no caveat -- so silence here means proof, and the only
   // sentence on this subject is the one that changes what the reader may conclude.
+  // DAMAGE FIRST, because it changes what every other line on this subject is
+  // worth. The sentence is the error's own, so the recovery command an operator
+  // needs is not re-typed here and cannot drift from the one hubdb prints.
+  if (m.incarnation_damaged)
+    out.push(`  HUB DAMAGED: ${m.incarnation_damaged.split("\n")[0]}`,
+             ...m.incarnation_damaged.split("\n").slice(1).map(l => `  ${l.trim()}`));
   if (m.cursor_proof === "timestamp")
     out.push("  note: this cursor predates the hub's incarnation id, so a restore is " +
              "inferred from timestamps and a same-second restore can pass unseen. " +

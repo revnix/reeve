@@ -2071,9 +2071,9 @@ export const STUBS = [
   },
   {
     name: "an-alert-is-sanitised-before-it-leaves-the-machine",
-    why: "assemble the outbound message without `redact`. The boundary is two properties, not one, and this is the half that neutralises SECRET SHAPES and applies the length cap — a credential echoed into CI output then leaves the machine in a notification. `buildAlert` applies it and `notify` itself does not, so a second producer of alerts is a second place it has to be applied. The control-character half lives in the per-part `clean`, which is why this entry names the redaction assertion and not the escaping one",
+    why: "assemble the outbound message without `redact`. It carries two properties -- neutralising secret SHAPES, and the length cap -- and the entry now names the CAP, because the first is no longer this boundary's alone: the body is scrubbed where it is stored, with the same SECRETS list, so a credential is gone before an alert is assembled and removing this one no longer exposes it. The cap is not applied there and must not be, since truncating a durable report destroys what it protects. An uncapped alert reaches a phone as a wall of CI output with the action somewhere inside it. The control-character half lives in the per-part `clean`, which is why this names neither escaping nor redaction",
     test: "test/build-escalations.test.mjs",
-    expectRed: "and a credential shape is redacted rather than sent",
+    expectRed: "the outbound message is capped, which is what the alert boundary still uniquely applies",
     edits: [{
       file: "src/build/announce.mjs",
       find: "    const message = redact(raw);",

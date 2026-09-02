@@ -218,8 +218,13 @@ const base = (over = {}) => ({
   const before = readOr(argvPath);
   check(typeof before === "string" && before.length > 0,
     "control: the settled attempt has a durable argv record to protect", String(before).slice(0, 40));
-  // attempt 1 is settled, so this is a duplicate-attempt refusal.
-  const r = await dispatchPhase(db, base({ attempt: 1 }));
+  // attempt 1 is settled, so this is a duplicate-attempt refusal -- and it
+  // carries DIFFERENT argv, with its own snapshot naming it, because that is
+  // what makes an overwrite observable. Re-dispatching the same argv writes
+  // identical bytes and the assertion cannot see the defect it is here for.
+  const OTHER = ["-p", "a-retry-that-never-ran"];
+  const r = await dispatchPhase(db, base({ attempt: 1, argv: OTHER,
+                                           snapshot: contractSnapshot({ ...LIVE, argv: OTHER }) }));
   check(r.ok === false && r.reason === "duplicate-attempt", "control: the re-dispatch is refused", JSON.stringify(r));
   check(readOr(argvPath) === before,
     "and the settled attempt's argv record is untouched: the row keeps its argv_hash, so a file holding other bytes would make the audit trail disagree with itself",

@@ -123,15 +123,71 @@ const BODY_LIMIT = 4096;
  * JSON escape boundary could corrupt the document, and a body that no longer
  * parses is a report lost to the guard that was protecting it.
  */
-const scrubDeep = (v) =>
-  typeof v === "string" ? scrub(v)
-    : Array.isArray(v) ? v.map(scrubDeep)
-    : v && typeof v === "object" && !(typeof v.toJSON === "function")
-      ? Object.fromEntries(Object.entries(v).map(([k, x]) => [scrub(k), scrubDeep(x)]))
-      // A value with its own `toJSON` decides its own serialisation, so scrub what
-      // that PRODUCES rather than its enumerable shape, which may be empty.
-      : v && typeof v === "object" ? scrubDeep(v.toJSON())
-      : v;
+const scrubDeep = (v, key = "", seen = new WeakSet()) => {
+  // A CYCLE IS DETECTED HERE, not by `JSON.stringify` further down. This walk now
+  // runs BEFORE the serialisation and outside its try, so a circular body would
+  // recurse until the stack gave out -- a crash where the surrounding code has
+  // always produced a named refusal.
+  if (v !== null && typeof v === "object") {
+    // Removed again on the way OUT of each value, so this tracks the path from the
+    // root rather than everything seen: a value referenced twice as siblings is
+    // ordinary JSON and must not read as a cycle.
+    if (seen.has(v))
+      throw refuse("escalation_body_shape",
+        "an escalation body must serialise to JSON; this one is circular. Detail belongs in the " +
+        "body precisely because the key refuses it, so a body that cannot be stored loses the report.");
+    seen.add(v);
+  }
+  // `toJSON` DECIDES THE SERIALISATION, AND IT IS HANDED THE KEY. `JSON.stringify`
+  // passes "" at the root and the property name for nested values, so calling it
+  // with no argument is a DIFFERENT call: an implementation that branches on
+  // `key` would persist something other than what stringify would have produced,
+  // and the scrub would have changed the report's meaning rather than only its
+  // credentials.
+  if (v && typeof v === "object" && typeof v.toJSON === "function")
+    { const r = scrubDeep(v.toJSON(key), key, seen); seen.delete(v); return r; }
+  if (typeof v === "string") return scrub(v);
+  if (v === null || typeof v === "boolean") return v;
+  // NON-FINITE NUMBERS BECOME `null` IN JSON, silently. A report that said
+  // `attempts: Infinity` and stores `attempts: null` has lost the fact rather
+  // than carried it, and every signal still says the alert was delivered.
+  if (typeof v === "number") {
+    if (!Number.isFinite(v))
+      throw refuse("escalation_body_value",
+        `an escalation body cannot carry ${String(v)} at ${key ? `\`${key}\`` : "its root"}: ` +
+        "JSON turns it into null, so the report would be stored having quietly lost the number.");
+    return v;
+  }
+  if (Array.isArray(v)) {
+    const r = v.map((x, i) => scrubDeep(x, String(i), seen));
+    seen.delete(v);
+    return r;
+  }
+  if (typeof v === "object") {
+    // SCRUBBED KEYS CAN COLLIDE. Two credential-shaped keys reduce to the same
+    // replacement, and building the object in one pass keeps only the last --
+    // dropping a field from a report that was otherwise entirely valid. Each
+    // survives under a distinct name instead, because losing a fact to the guard
+    // that was protecting it is the failure this whole column exists to avoid.
+    const out = {};
+    for (const [k, x] of Object.entries(v)) {
+      const safe = scrub(k);
+      let name = safe;
+      for (let n = 2; Object.hasOwn(out, name); n++) name = `${safe} (${n})`;
+      out[name] = scrubDeep(x, k, seen);
+    }
+    seen.delete(v);
+    return out;
+  }
+  // undefined, a function, a symbol, a bigint. `JSON.stringify` DROPS the first
+  // three from an object without a word and throws on the last, so a detail the
+  // caller supplied would simply not be in the stored report while the call
+  // succeeded and was marked delivered. Serialising without error is not proof
+  // that the whole report survived.
+  throw refuse("escalation_body_value",
+    `an escalation body cannot carry ${typeof v} at ${key ? `\`${key}\`` : "its root"}: ` +
+    "JSON discards it, so the report would be stored having quietly lost that detail.");
+};
 
 /** What the caller passed, named the way the caller would recognise it. */
 const describeBody = (body) =>
@@ -171,8 +227,14 @@ const offeredBody = (bodies, why) => {
 
 const serialiseBody = (body) => {
   if (body === null || body === undefined) return null;
+  // SCRUBBED FIRST, OUTSIDE THE TRY. The walk refuses by name -- a circular body,
+  // a detail JSON would discard -- and running it inside the catch below swallowed
+  // every one of those and reported them all as "did not serialise", replacing a
+  // precise diagnosis with a generic one. The try covers `JSON.stringify` and
+  // nothing else, which is the only thing it was ever meant to cover.
+  const cleaned = scrubDeep(body);
   let text;
-  try { text = JSON.stringify(scrubDeep(body)); }
+  try { text = JSON.stringify(cleaned); }
   catch { text = undefined; }
   // A REPORT, NOT A LOG. Every pass over a standing cause re-appends the row
   // image to `hub_event`, which is append-only and is the authority store, so an
@@ -184,9 +246,14 @@ const serialiseBody = (body) => {
   // here: silently cutting a report in half loses the detail at exactly the point
   // it was needed, and reports success. A producer over this cap is putting a log
   // where a summary belongs, which is a defect in the producer.
-  if (typeof text === "string" && text.length > BODY_LIMIT)
+  // ENCODED BYTES, which is what the ceiling and the store both mean. `String
+  // .length` counts UTF-16 code units, so ~4000 CJK characters measure as 4000
+  // and occupy about 12KB -- passing a cap whose whole purpose is bounding what
+  // gets written, in the case where the two units diverge most.
+  const bytes = typeof text === "string" ? Buffer.byteLength(text, "utf8") : 0;
+  if (bytes > BODY_LIMIT)
     throw refuse("escalation_body_too_large",
-      `an escalation body must serialise to at most ${BODY_LIMIT} bytes; this one is ${text.length}. ` +
+      `an escalation body must serialise to at most ${BODY_LIMIT} bytes; this one is ${bytes}. ` +
       "Every pass over a standing cause re-appends it to the append-only log, so an unbounded report " +
       "is an unbounded write rate. Put a summary here and the full output in the run's artifacts.");
   // THE SERIALISED FORM IS WHAT GETS STORED, so it is the form that has to be a

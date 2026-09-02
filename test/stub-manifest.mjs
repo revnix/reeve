@@ -2445,8 +2445,8 @@ export const STUBS = [
     expectRed: "a body that cannot serialise is refused with its own kind, not a constraint error",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "  try { text = JSON.stringify(scrubDeep(body)); }\n  catch { text = undefined; }",
-      replace: "  try { text = JSON.stringify(scrubDeep(body)); }\n  catch { text = \"{}\"; }",
+      find: "  try { text = JSON.stringify(cleaned); }\n  catch { text = undefined; }",
+      replace: "  try { text = JSON.stringify(cleaned); }\n  catch { text = \"{}\"; }",
     }],
   },
   {
@@ -2500,8 +2500,8 @@ export const STUBS = [
     expectRed: "a credential is scrubbed from the STORED report",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "  try { text = JSON.stringify(scrubDeep(body)); }",
-      replace: "  try { text = JSON.stringify(body); }",
+      find: "  const cleaned = scrubDeep(body);",
+      replace: "  const cleaned = body;",
     }],
   },
   {
@@ -2511,7 +2511,7 @@ export const STUBS = [
     expectRed: "an oversized report is refused by its own name, not silently cut down",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "  if (typeof text === \"string\" && text.length > BODY_LIMIT)",
+      find: "  if (bytes > BODY_LIMIT)",
       replace: "  if (false)",
     }],
   },
@@ -2535,6 +2535,61 @@ export const STUBS = [
       file: "src/build/announce.mjs",
       find: "      !FAILURE_TYPES.includes(shape.type))",
       replace: "      false)",
+    }],
+  },
+  {
+    name: "a-detail-json-would-discard-is-refused",
+    why: "treat serialising without error as proof the whole report survived. JSON.stringify DROPS an undefined, a function and a symbol from an object without a word and turns a non-finite number into null, so a body loses a fact the caller supplied, passes every shape check, is stored, and is marked DELIVERED",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a detail of undefined is refused rather than silently dropped from the report",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  throw refuse(\"escalation_body_value\",\n    `an escalation body cannot carry ${typeof v} at",
+      replace: "  return undefined; throw refuse(\"escalation_body_value\",\n    `an escalation body cannot carry ${typeof v} at",
+    }],
+  },
+  {
+    name: "the-report-cap-is-measured-in-bytes",
+    why: "measure the ceiling in UTF-16 code units while the cap and its message both promise bytes. About 4000 CJK characters measure as 4000 and occupy roughly 12KB, so a body three times over the ceiling passes the check whose whole purpose is bounding what gets appended on every pass",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a body measured in bytes is refused though its code-unit count is inside the cap",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  const bytes = typeof text === \"string\" ? Buffer.byteLength(text, \"utf8\") : 0;",
+      replace: "  const bytes = typeof text === \"string\" ? text.length : 0;",
+    }],
+  },
+  {
+    name: "a-scrubbed-key-never-displaces-another",
+    why: "build the scrubbed object in one pass, so two credential-shaped keys reducing to the same replacement keep only the last. A field vanishes from a report that was otherwise entirely valid -- a fact lost to the guard that was protecting it",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "both values survive a key collision, under distinct names",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "      for (let n = 2; Object.hasOwn(out, name); n++) name = `${safe} (${n})`;",
+      replace: "",
+    }],
+  },
+  {
+    name: "tojson-is-called-with-its-key",
+    why: "call toJSON with no argument. JSON.stringify hands it the property name, and the empty string at the root, so an implementation that branches on `key` persists something other than what stringify would produce -- the scrub changing the report's MEANING rather than only its credentials",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a toJSON that reads its key gets the root key, as JSON.stringify would give it",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    { const r = scrubDeep(v.toJSON(key), key, seen); seen.delete(v); return r; }",
+      replace: "    { const r = scrubDeep(v.toJSON(), key, seen); seen.delete(v); return r; }",
+    }],
+  },
+  {
+    name: "a-shared-reference-is-not-a-cycle",
+    why: "let the circularity set grow without unwinding it, so it records every value visited rather than the path from the root. A value referenced twice as siblings -- ordinary JSON, which stringify writes out twice -- is then refused as circular, and a valid report is lost to the guard against an invalid one",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a value referenced twice as siblings is stored twice, not refused as circular",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    seen.delete(v);\n    return out;",
+      replace: "    return out;",
     }],
   },
 ];

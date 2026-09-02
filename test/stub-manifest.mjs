@@ -264,7 +264,7 @@ export const STUBS = [
     name: "no-launchd-job-is-not-a-healthy-one",
     why: "report a machine with no launchd job as OK. `nothing runs the guardian here` and `the guardian is fine` are opposite facts, and an absence read as success is how a control plane that is not running reports that it is",
     test: "test/doctor-provenance.test.mjs",
-    expectRed: "no launchd job installed is UNKNOWN, never OK",
+    expectRed: "no job installed and none loaded is UNKNOWN, never OK",
     edits: [{ file: "src/doctor.mjs",
               find: "  if (text === null && loaded === null) return { id, level: UNKNOWN, title,",
               replace: "  if (text === null && loaded === null) return { id, level: OK, title," }],

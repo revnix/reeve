@@ -24,18 +24,36 @@ chasing drift that does not exist. The handoff's §0 is the authority and it is 
 
 ## Do these in order
 
-1. **Run `node scripts/state.mjs`.** That is the authority on current state, and it
-   replaces the §0.1 shell block this step used to name. Do not run §0.1: it is
-   superseded, it is not covered by any test, and two of its guards alarmed on
-   SUCCESS -- a `grep -m1` pipeline reporting SIGPIPE as a failed read, and a sweep
-   worktree with no dependencies installed reporting a healthy main as broken. A
-   session following it stopped twice on a green repository.
+1. **Run the state script with Node 24.**
 
-   If the script exits non-zero, stop and read what it refused. Every reading it
-   prints is a measurement or a refusal and there is no third thing, so an empty
-   answer never reaches you as good news. Add `--sweep` when you need the full
-   verification as well; it takes roughly twenty minutes and stops you on an
+   ```
+   ~/.nvm/versions/node/v24.17.0/bin/node scripts/state.mjs
+   ```
+
+   The shell's default `node` on this host is v22, and the script refuses below
+   v24.10 because the suite needs it -- so a bare `node` here would fail on every
+   correct run and this step tells you to stop on a non-zero exit. The launchd
+   job names the same absolute path for the same reason.
+
+   Every reading it prints is a measurement or a refusal and there is no third
+   thing, so an empty answer never reaches you as good news. Add `--sweep` for the
+   full verification; it takes roughly twenty minutes and stops you on an
    incomplete run as well as on a finding.
+
+   **It does not replace all of §0.1.** It covers the default branch, this
+   checkout's distance from it, the running daemon and the commit that process
+   loaded, the hub schema version, open pull requests, and branches with commits
+   no pull request claims. Still only in §0.1 of the handoff, and still worth
+   running when you need them: the open-ISSUE inventory, the daemon's live
+   arguments and arming state, both `reeve doctor` reports, the shadow record,
+   and the premerge / verify-merge gate for a specific pull request.
+
+   Where the two overlap, prefer the script: §0.1's schema read reports a refusal
+   on a SUCCESSFUL read (a `grep -m1` pipeline returning SIGPIPE under `pipefail`,
+   141 in bash and 0 in zsh), and its sweep worktree installs no dependencies, so
+   it calls a healthy main broken. A session following it stopped twice on a green
+   repository. Neither defect is fixed in that document; the script is where the
+   fixes are.
 
    Then read docs/2026-09-02-session-handoff.md for the context no command can
    give you -- the decisions, the constraints, and who holds what.

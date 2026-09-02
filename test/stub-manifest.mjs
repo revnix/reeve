@@ -176,8 +176,8 @@ export const STUBS = [
     test: "test/state-script.test.mjs",
     expectRed: "a later line merely CONTAINING the phrase is not read as a startup record",
     edits: [{ file: "scripts/state.mjs",
-              find: "  const re = /reeve daemon starting[^\\n]*?\\bpid (\\d+), running commit (\\S+)/g;",
-              replace: "  const re = /pid (\\d+), running commit (\\S+)/g;" }],
+              find: "  const re = /^\\S+ reeve daemon starting \u2014 node \\S+, pid (\\d+), running commit (\\S+?)(?:, tree \\w+)?$/gm;",
+              replace: "  const re = /\\S+ reeve daemon starting \u2014 node \\S+, pid (\\d+), running commit (\\S+?)(?:, tree \\w+)?/gm;" }],
   },
   {
     name: "a-clean-exit-without-a-verdict-is-not-a-pass",
@@ -185,7 +185,7 @@ export const STUBS = [
     test: "test/state-script.test.mjs",
     expectRed: "a clean exit that printed NO verdict is a refusal, not a pass",
     edits: [{ file: "scripts/state.mjs",
-              find: "  if (ok && !summary) return { level: \"refusal\", stop: true,",
+              find: "  if (ok && (!summary || !coverage || summary[1] !== summary[2])) return { level: \"refusal\", stop: true,",
               replace: "  if (false) return { level: \"refusal\", stop: true," }],
   },
   {

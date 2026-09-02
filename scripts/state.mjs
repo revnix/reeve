@@ -99,7 +99,19 @@ export function parseArgs(argv) {
  * written.
  */
 export function startupRecordFrom(logText) {
-  const re = /reeve daemon starting[^\n]*?\bpid (\d+), running commit (\S+)/g;
+  // ^ AND $, not merely a distinctive phrase. A previous version anchored on
+  // `reeve daemon starting` and still matched `failing: reeve daemon starting x
+  // pid 999, running commit deadbee` in the middle of a decision line -- so the
+  // phrase moved the goalposts without closing the hole. A startup record is a
+  // whole line the daemon wrote, and nothing else is.
+  // ONE LINE, END TO END. Anchoring on the phrase alone was not enough -- it
+  // still matched `failing: reeve daemon starting x pid 999, running commit
+  // deadbee` inside a decision line. But `^` alone is too strict: `log()` writes
+  // an ISO timestamp first, so the record never starts the line. Measured against
+  // the real log, the shape is
+  //   2026-09-02T11:29:05.914Z reeve daemon starting — node v24.17.0, pid 2683, running commit e29cae6
+  // and the optional `, tree <state>` a newer daemon appends after it.
+  const re = /^\S+ reeve daemon starting — node \S+, pid (\d+), running commit (\S+?)(?:, tree \w+)?$/gm;
   const hits = [...String(logText ?? "").matchAll(re)];
   if (!hits.length) return null;
   const [, pid, commit] = hits[hits.length - 1];
@@ -127,7 +139,10 @@ export function daemonPidFrom(launchctlOut) {
  * was fetched, so the fetch is the caller's problem and this cannot repeat it.
  */
 export function schemaVersionFrom(sourceText) {
-  const m = /HUB_SCHEMA_VERSION\s*=\s*(\d+)/.exec(String(sourceText ?? ""));
+  // THE DECLARATION, not any mention of it. An unanchored search returns an
+  // example inside a comment or a string if one appears before the real line,
+  // and reports a confident wrong next-migration number from it.
+  const m = /^export const HUB_SCHEMA_VERSION\s*=\s*(\d+)\s*;/m.exec(String(sourceText ?? ""));
   return m ? Number(m[1]) : null;
 }
 
@@ -158,16 +173,24 @@ export function unopenedBranches(branches, claimedOids) {
  * the verification is incomplete either way; only the SENTENCE differs, because
  * only the sentence tells the operator where to look.
  */
-export function sweepVerdict({ ok, out }) {
+export function sweepVerdict({ ok, out, err }) {
   // A ZERO EXIT IS NOT EVIDENCE. A sweep that returned success without printing
   // its verdict -- an early return, a build that produced no output -- would give
   // `ok` with a blank line and let the caller continue. That is the exact absence
   // read as success that this whole file exists to prevent, in the function
   // written to prevent it.
-  const summary = /(\d+)\/(\d+) stub\(s\) caught/.exec(String(out ?? ""));
-  if (ok && !summary) return { level: "refusal", stop: true,
-    lines: ["the sweep exited 0 but printed no verdict, so nothing was actually measured",
-            "-> a clean exit without the `N/M stub(s) caught` line is an absence, not a pass"] };
+  const text0 = String(out ?? "");
+  const summary = /(\d+)\/(\d+) stub\(s\) caught/.exec(text0);
+  const coverage = /\d+ entries over \d+ of \d+ test file\(s\)/.test(text0);
+  // A SUMMARY IS NOT A PASSING SUMMARY. `0/280 stub(s) caught` matches the shape
+  // and means every entry failed; the coverage line can also be absent entirely
+  // after an early return. Both halves have to be there and the counts have to
+  // agree before a zero exit means anything.
+  if (ok && (!summary || !coverage || summary[1] !== summary[2])) return { level: "refusal", stop: true,
+    lines: [!summary ? "the sweep exited 0 but printed no verdict, so nothing was actually measured"
+                     : !coverage ? "the sweep printed a verdict but no coverage line, so it did not finish"
+                     : `the sweep exited 0 reporting ${summary[1]} of ${summary[2]} caught, which is not a pass`,
+            "-> a clean exit is only a pass when every stub was caught and the coverage line is present"] };
   if (ok) return { level: "ok", stop: false,
                    lines: [(out ?? "").split("\n").filter(Boolean).slice(-2).join(" | ")] };
   const text = String(out ?? "");
@@ -184,8 +207,13 @@ export function sweepVerdict({ ok, out }) {
             // operator to the wrong place for three of those four.
             "causes differ: a control already red on the base, a failed restore, a test with side effects, or missing dependencies",
             "-> read the entry's own lines above; the verification is incomplete either way, so this stops the caller"] };
+  // `die()` writes the actionable reason to STDERR -- an unusable manifest, an
+  // unresolved anchor, a diff gate that could not run. Reporting only stdout
+  // drops the one line that says what to do.
   return { level: "refusal", stop: true,
-           lines: ["the sweep failed and named no verdict", text.split("\n").slice(-3).join(" | ")] };
+           lines: ["the sweep failed and named no verdict",
+                   ...(err ? [`stderr: ${String(err).slice(0, 300)}`] : []),
+                   text.split("\n").slice(-3).join(" | ")] };
 }
 
 /**
@@ -355,11 +383,19 @@ function main(argv) {
           // process: an operator invoking the script with the Node 24 binary while
           // PATH still holds the host default would run the authoritative sweep
           // under Node 22, which is the runtime the floor exists to refuse.
-          const swept = runner(dir)(process.execPath, ["scripts/stub-sweep.mjs"],
-            { timeout: 3_600_000, env: { ...process.env, STUB_SWEEP_BASE: `origin/${branch}~1` } });
-          const verdict = sweepVerdict(swept);
-          say("", `sweep           ${verdict.level}`, ...verdict.lines.map(l => `  ${l}`));
-          if (verdict.stop) refusals++;
+          // RESOLVED TO A SHA, because `origin/<branch>~1` is a symbolic ref in a
+          // repository three sessions share: another fetch during the twenty
+          // minutes this runs moves it, and the sweep then compares against a
+          // base that is not the one the worktree was created from.
+          const baseRef = run("git", ["rev-parse", `origin/${branch}~1`]);
+          if (!baseRef.ok) refuse(`could not resolve a sweep base: ${baseRef.err}`);
+          const swept = !baseRef.ok ? null : runner(dir)(process.execPath, ["scripts/stub-sweep.mjs"],
+            { timeout: 3_600_000, env: { ...process.env, STUB_SWEEP_BASE: baseRef.out } });
+          if (swept !== null) {
+            const verdict = sweepVerdict(swept);
+            say("", `sweep           ${verdict.level}`, ...verdict.lines.map(l => `  ${l}`));
+            if (verdict.stop) refusals++;
+          }
         }
       }
     } finally {

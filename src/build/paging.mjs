@@ -33,6 +33,20 @@ const defaultHome = () => join(homedir(), ".reeve");
 export const machineProfilePath = (home) => join(home, "profile.json");
 
 /**
+ * The credential a configured ntfy channel needs, or null.
+ *
+ * SAME READ `notify` MAKES, so the doctor and the sender cannot disagree: an
+ * empty file is as unusable as a missing one, which is why this trims before
+ * deciding rather than testing existence.
+ */
+const readCredentialAt = (file) => {
+  try {
+    const v = readFileSync(file, "utf8").trim();
+    return v === "" ? null : v;
+  } catch { return null; }
+};
+
+/**
  * That profile, or the reason there is none -- never one standing for the other.
  *
  * A SENTENCE, NOT A NULL. "No profile is configured", "the file is unreadable"
@@ -64,11 +78,27 @@ export function machineProfile(home) {
   // same question here rather than a looser one keeps the doctor's answer and the
   // sender's behaviour from disagreeing.
   const cfg = raw.notify;
-  const usable = (cfg.provider === "ntfy" && !!cfg.url && !!cfg.topic) || cfg.desktop === true;
+  const ntfy = cfg.provider === "ntfy" && !!cfg.url && !!cfg.topic;
+  // THE CREDENTIAL IS PART OF THE CHANNEL, not a detail beside it. `notify`
+  // refuses to publish to an unauthenticated topic deterministically, so an ntfy
+  // channel whose credential file is unset, empty or unreadable declines EVERY
+  // send -- and calling that machine able to page is the same false assurance an
+  // empty block gave, one field deeper.
+  //
+  // READ, not merely named. A path that points nowhere is the ordinary way this
+  // breaks, and `notify` discovers it at send time whatever the config says; a
+  // doctor that only checked the key would disagree with the sender exactly when
+  // an operator was relying on it.
+  const credential = ntfy && cfg.credentialFile ? readCredentialAt(cfg.credentialFile) : null;
+  const usable = (ntfy && credential !== null) || cfg.desktop === true;
   if (!usable)
     return { profile: null, path,
-             why: `${path} configures no usable channel: \`notify\` needs provider "ntfy" with url ` +
-                  `and topic, or desktop true` };
+             why: ntfy
+               ? `${path} names an ntfy channel whose credential is unreadable at ` +
+                 `${cfg.credentialFile ?? "(unset)"}, and notify refuses to publish to an ` +
+                 `unauthenticated topic`
+               : `${path} configures no usable channel: \`notify\` needs provider "ntfy" with url, ` +
+                 `topic and a readable credentialFile, or desktop true` };
   return { profile: raw, path, why: null };
 }
 

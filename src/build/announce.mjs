@@ -690,6 +690,21 @@ export const ACTION_FOR = Object.freeze({
  * command they cannot paste -- under a shell `<id>` is input redirection -- and
  * makes them reconstruct the very identifier the alert is holding.
  */
+/**
+ * A path as one shell word, whatever is in it.
+ *
+ * A PASTED COMMAND IS RUN BY A SHELL, so a home containing a space -- an external
+ * volume, most obviously -- splits into two arguments and `--home` takes the
+ * first. The command then succeeds against a different hub, which is worse than
+ * failing: the likeliest answer there is that the task does not exist, and an
+ * operator will believe it.
+ *
+ * Single quotes with the `'\''` escape, because a POSIX shell reads everything
+ * between them literally and that idiom is the only way to include the quote
+ * itself. Nothing in a pathname can end the quoting or be re-interpreted.
+ */
+const shellQuote = (s) => `'${String(s).replaceAll("'", "'\\''")}'`;
+
 export const actionFor = (key, { home = null } = {}) => {
   const action = ACTION_FOR[shapeOf(key)] ?? null;
   if (action === null) return null;
@@ -708,7 +723,15 @@ export const actionFor = (key, { home = null } = {}) => {
   // Only when it differs: appending the default to every action would be noise
   // on the ordinary path, and noise in a command is how a command stops being
   // read.
-  return home ? `${named} --home ${home}` : named;
+  if (!home) return named;
+  // INTO THE COMMAND, NOT ONTO THE SENTENCE. Every action is `<command> — <why it
+  // matters>`, so appending put `--home` after the prose and produced something
+  // no shell would accept: a fix for pasteability that destroyed it. The em dash
+  // is this module's own separator, not anything a caller supplies, so splitting
+  // on it is reading our own format rather than parsing someone else's.
+  const cut = named.indexOf(" — ");
+  const arg = ` --home ${shellQuote(home)}`;
+  return cut === -1 ? named + arg : named.slice(0, cut) + arg + named.slice(cut);
 };
 
 /**

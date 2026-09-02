@@ -203,14 +203,22 @@ const DEAD = () => false;
   draw.exec("DROP TABLE hub_incarnation");
   draw.close();
   const dro = new DatabaseSync(d, { readOnly: true });
-  let dthrew = null, danswer;
+  let dthrew = null, danswer, dmarked = false;
   ({ value: danswer, threw: dthrew } = read(dro));
+  try { hubIncarnation(dro); } catch (e) { dmarked = e?.hubDamaged === true; }
   dro.close();
   check(dthrew !== null,
     "a v6 hub that has LOST the table propagates, rather than reading as an older store",
     `it answered ${JSON.stringify(danswer)}`);
-  check(/no such table/i.test(dthrew ?? ""),
-    "control: and the error it propagates is the missing table, not something else", String(dthrew));
+  check(dmarked === true,
+    "and it is MARKED as damage, so a caller can tell it from an unreadable store",
+    JSON.stringify({ marked: dmarked }));
+  check(/hub_incarnation/.test(dthrew ?? "") && /altered outside reeve/.test(dthrew ?? ""),
+    "control: and it names the table and says the store was altered outside reeve",
+    String(dthrew));
+  check(/restore --hub --force/.test(dthrew ?? ""),
+    "carrying the same recovery line the missing-ROW case carries, since it is the same corruption",
+    String(dthrew));
 
   // AND THE SAME RULE ONE ROW DOWN. The table can be absent, or present and
   // EMPTY, and both mean "no incarnation" without saying why. `DELETE FROM

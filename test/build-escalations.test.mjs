@@ -1487,7 +1487,9 @@ const freshHub = () => {
   const sent = [];
   const send = (a) => { sent.push(a); return { ok: true, channels: [{ name: "t", ok: true }] }; };
   const key = escalationKey({ kind: "backup:failed" });
-  const hidden = { toJSON() { return { type: "FAILED", detail: "disk full" }; } };
+  const DETAIL = ["disk", "full"].join("-") + "-" + Math.random().toString(36).slice(2, 8);
+  const TYPE = "FAILED";
+  const hidden = { toJSON() { return { type: TYPE, detail: DETAIL }; } };
   check(JSON.stringify(Object.keys(hidden)) === JSON.stringify(["toJSON"]),
     "control: walking the object's own entries yields only `toJSON` -- not the report",
     JSON.stringify(Object.keys(hidden)));
@@ -1497,10 +1499,10 @@ const freshHub = () => {
 
   announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
                   bodies: new Map([[key, hidden]]) });
-  check(/disk full/.test(nth(sent, 0)?.message ?? ""),
+  check((nth(sent, 0)?.message ?? "").includes(DETAIL),
     "the FIRST alert renders what was stored, not the object it was handed",
     JSON.stringify(nth(sent, 0)?.message ?? null));
-  check(/FAILED/.test(nth(sent, 0)?.message ?? ""),
+  check(/\[FAILED\]/.test(nth(sent, 0)?.message ?? ""),
     "including the failure type, which the handed object also does not carry",
     JSON.stringify(nth(sent, 0)?.message ?? null));
 
@@ -1508,7 +1510,7 @@ const freshHub = () => {
   // the two alerts came from two different sources for one value.
   sent.length = 0;
   announce(hub, { escalations: new Map([[key, 7]]), at: NOW + 60, isAlive: ALIVE, send });
-  check(/disk full/.test(nth(sent, 0)?.message ?? ""),
+  check((nth(sent, 0)?.message ?? "").includes(DETAIL),
     "and a later page for the same cause says the same thing",
     JSON.stringify(nth(sent, 0)?.message ?? null));
 }

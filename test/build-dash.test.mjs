@@ -231,7 +231,8 @@ const T = {};
   const FIVE = ["alive", "doing", "waiting_on_you", "since_you_looked", "declined"];
   for (const k of FIVE) check(k in m, `the digest answers "${k}"`, Object.keys(m).join(","));
   const SUPPORTING = ["format_version", "generated_at", "projects", "switches", "tasks",
-                      "since", "next_cursor", "cursor_rewound", "cursor_proof", "incarnation"];
+                      "since", "next_cursor", "cursor_rewound", "cursor_proof", "incarnation",
+                      "incarnation_damaged"];
   const extra = Object.keys(m).filter(k => !FIVE.includes(k) && !SUPPORTING.includes(k));
   check(extra.length === 0,
     "and nothing else, so the digest cannot grow a sixth question quietly", extra.join(","));
@@ -1083,6 +1084,28 @@ const T = {};
     "and the cursor handed back carries the NEW identity, to resync from",
     String(restored.next_cursor));
 
+  // IDENTITY REPLACES THE TIMESTAMP RULE -- it is not ANDed with it. This is the
+  // case that separates the two designs, and neither assertion above reaches it:
+  // a cursor whose identity MATCHES but whose `at` does not. The old rule calls
+  // that rewound. An implementation that kept both rules as `identityDiffers ||
+  // atDiffers` would pass every other assertion in this block and fail only here,
+  // reporting a restore for a log that merely had a row's clock corrected.
+  const clockMoved = cur(high - 1, atOfSeq(high - 1) + 999, after);
+  const stillOurs = dash({ since: clockMoved });
+  check(stillOurs.cursor_rewound === false,
+    "a cursor whose identity matches is NOT rewound though its timestamp does not",
+    JSON.stringify({ rewound: stillOurs.cursor_rewound, proof: stillOurs.cursor_proof }));
+  check(!(clockMoved.seq > high) && atOfSeq(clockMoved.seq) !== clockMoved.at,
+    "control: and the timestamp rule WOULD have called that one rewound, so the two disagree here",
+    JSON.stringify({ at: atOfSeq(clockMoved.seq), cursor: clockMoved.at }));
+
+  // AND IT CATCHES A RESTORE WHEN THE CLOCK MOVED TOO, so the identity check is
+  // not merely the same-second special case wearing a different name.
+  const bothMoved = dash({ since: cur(high - 1, atOfSeq(high - 1) + 999, before) });
+  check(bothMoved.cursor_rewound === true,
+    "and a previous incarnation is still caught when the timestamp differs as well",
+    JSON.stringify({ rewound: bothMoved.cursor_rewound, proof: bothMoved.cursor_proof }));
+
   // THE OLD CHECK, RUN AGAINST THE SAME FIXTURE, to show it is discrimination
   // rather than a test that would pass either way: the timestamp rule this
   // replaced answers "not rewound" for the case above.
@@ -1129,6 +1152,41 @@ const T = {};
     check(parseCursor(raw) === null, `a cursor whose identity is ${what} is refused, not guessed`,
       JSON.stringify(raw));
   }
+}
+
+// ── a damaged incarnation row is a visible state, not a stack trace ─────────
+//
+// `hubIncarnation` answers three things and they must stay three: a row, `null`
+// for a store older than the table, and a THROW for a store that records the
+// migration with no row -- a hub altered outside reeve. Collapsing the throw into
+// null would rebuild the misclassification the throw exists to prevent; letting
+// it out raw makes a stack trace the interface for a state an operator has to act
+// on. So it renders, carrying the error's own recovery line.
+{
+  const dhome = mkdtempSync(join(dir, "dash-damaged-"));
+  mkdirSync(join(dhome, "state"), { recursive: true });
+  const ddb = openHub(join(dhome, "state", "hub.db"));
+  check(hubIncarnation(ddb) !== null, "control: the fresh hub has an incarnation to remove",
+    JSON.stringify(hubIncarnation(ddb)));
+  ddb.prepare("DELETE FROM hub_incarnation").run();
+
+  let model = null, threw = null;
+  try {
+    model = dashModel(ddb, { now: NOW, switchesFor: resolver(), projects: [],
+                             since: null, isAlive: ALIVE });
+  } catch (e) { threw = e.message; }
+  check(threw === null, "the digest still answers on a hub whose incarnation row is gone",
+    String(threw));
+  check(model?.incarnation === null && typeof model?.incarnation_damaged === "string",
+    "and it reports DAMAGE rather than the absence that means `merely old`",
+    JSON.stringify({ id: model?.incarnation, damaged: model?.incarnation_damaged?.slice(0, 60) }));
+  check(/altered outside reeve/.test(model?.incarnation_damaged ?? ""),
+    "carrying the reason the store cannot be trusted", String(model?.incarnation_damaged));
+  check(/HUB DAMAGED/.test(renderDash(model)) && /reeve restore --hub --force/.test(renderDash(model)),
+    "and the text says so, with the recovery command the error itself carries",
+    renderDash(model).split("\n").filter(l => /DAMAGED|recover/.test(l)).join(" | "));
+  ddb.close();
+  rmSync(dhome, { recursive: true, force: true });
 }
 
 // ── the cursor an operator needs next is in the TEXT ───────────────────────

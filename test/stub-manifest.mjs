@@ -2449,4 +2449,26 @@ export const STUBS = [
       replace: "(?:\\.(.+))?$/",
     }],
   },
+  {
+    name: "identity-replaces-the-timestamp-rule",
+    why: "keep BOTH rules and OR them together, which is the plausible way to write this and passes every other assertion about the cursor. A log whose row clock was corrected then reports a RESTORE that never happened -- the identity matches, so the log IS the one that issued the cursor, and the timestamp half overrules the proof",
+    test: "test/build-dash.test.mjs",
+    expectRed: "a cursor whose identity matches is NOT rewound though its timestamp does not",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "     (provable\n       ? since.incarnation !== incarnation\n       : (since.seq > 0 && atOf(since.seq) !== since.at)));",
+      replace: "     (provable\n       ? since.incarnation !== incarnation || (since.seq > 0 && atOf(since.seq) !== since.at)\n       : (since.seq > 0 && atOf(since.seq) !== since.at)));",
+    }],
+  },
+  {
+    name: "a-damaged-incarnation-row-is-a-visible-state",
+    why: "let the damage verdict out of the digest raw. `hubIncarnation` answers three things -- a row, null for a store older than the table, and a throw for one that records the migration with no row -- and a stack trace is not an interface for a state an operator has to act on. The digest exists to say what is going on rather than to fail at it",
+    test: "test/build-dash.test.mjs",
+    expectRed: "the digest still answers on a hub whose incarnation row is gone",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "    if (!e?.hubDamaged) throw e;\n    incarnationDamaged = e.message;",
+      replace: "    throw e;",
+    }],
+  },
 ];

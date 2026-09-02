@@ -18,6 +18,7 @@ import { insertLease } from "../src/build/providerdb.mjs";
 import { liveLeases } from "../src/build/territory.mjs";
 import { DatabaseSync } from "node:sqlite";
 import { fileTask } from "../src/build/taskfile.mjs";
+import { recommendsRestore } from "./restore-stance.mjs";
 import { isSameProcess, readStart } from "../src/supervisor.mjs";
 import { CAPABILITY_NAMES, capabilitiesFrom } from "../src/build/capabilities.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
@@ -1574,12 +1575,17 @@ const filed = {};
     // recommendation survives its removal. A snapshot restore is the right remedy
     // for every OTHER fault here, so this is the one case where its absence is
     // the property worth asserting.
+    // THE STRONG CLAIM MOVED INTO A FIELD. `historyFault` now says the stance
+    // outright -- `snapshotRestore: "forbidden"` -- and test/hub-fault.test.mjs
+    // asserts it there, where a reword cannot reach it. What is left for this
+    // file is the CLI wiring: that the read route reaches the ahead branch and
+    // hands its remedy through intact. The version this replaces required the
+    // literal clause `do not restore a snapshot over it`, which is sound but goes
+    // red on a correct reword to "on top of it" -- word, phrase, longer phrase,
+    // each a smaller target for one miss.
     const aMsg = aj?.message ?? "";
-    const aAdvice = aMsg.replace(/\bdo not restore a snapshot over it\b/i, "");
     check(aj?.kind === "hub_incompatible" && /newer binary/.test(aMsg)
-          && /\bdo not restore a snapshot over it\b/i.test(aMsg)
-          && !/\bdowngrad/i.test(aAdvice)
-          && !/restore a snapshot/i.test(aAdvice),
+          && !recommendsRestore(aMsg),
       "a hub newer than this binary is refused too, and says to upgrade reeve rather than the store",
       String(aj?.message));
 

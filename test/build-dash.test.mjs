@@ -1114,6 +1114,22 @@ const T = {};
   // the saved cursor, so `seq > highWater` is true AND the identity differs.
   // Answering `ahead` there reports the symptom -- the log is shorter -- and
   // throws away the identity sitting right beside it, which reports the cause.
+  // A MATCHING IDENTITY WITH A SEQUENCE BEYOND THE LOG is the cursor being wrong,
+  // not the log: this IS the log that issued it, and it never reached that
+  // number. Naming it `ahead` and explaining it as "carries no identity" was
+  // false twice -- the cursor carries one, and `cursor_proof` says so on the same
+  // screen.
+  const pastEnd = dash({ since: cur(high + 1000, 0, hubIncarnation(db).id) });
+  check(pastEnd.cursor_verdict === "unknown-event",
+    "a cursor with THIS hub's identity whose sequence is past the log is the cursor being wrong",
+    JSON.stringify({ verdict: pastEnd.cursor_verdict, proof: pastEnd.cursor_proof }));
+  check(!/carries no incarnation/.test(renderDash(pastEnd)),
+    "and the text never says it carries no incarnation, which the cursor plainly does",
+    renderDash(pastEnd).split("\n").find(l => /CURSOR UNUSABLE/.test(l)) ?? "(none)");
+  check(pastEnd.cursor_proof === "incarnation",
+    "control: the identity WAS available, which is what makes the old wording false",
+    String(pastEnd.cursor_proof));
+
   const shorter = dash({ since: cur(high + 1000, 0, before) });
   check(shorter.cursor_verdict === "different-log",
     "a restore to a SHORTER log is judged by identity, not reported as merely `ahead`",
@@ -1264,6 +1280,25 @@ const T = {};
   check(!/the next call is provable/.test(withText),
     "nor promises a next call that will be provable, since next_cursor carries no id either",
     String(withCursor?.next_cursor));
+
+  // AND THE EXIT STATUS SAYS SO. Monitoring watches the status, not the payload:
+  // a plain `task dash` with no --since on a damaged hub printed HUB DAMAGED and
+  // exited 0, so anything polling this read a store altered outside reeve as
+  // healthy. The model said one thing and the status contradicted it.
+  const CLI = fileURLToPath(new URL("../bin/reeve", import.meta.url));
+  const dr = spawnSync(process.execPath, [CLI, "task", "dash", "--home", dhome, "--json"],
+    { encoding: "utf8", timeout: 60_000 });
+  check(dr.status !== 0,
+    "and `task dash` exits NON-ZERO on a damaged hub even with no --since given",
+    JSON.stringify({ status: dr.status, out: (dr.stdout ?? "").slice(0, 120) }));
+  const dj = JSON.parse(dr.stdout || "{}");
+  check(typeof (dj?.data?.incarnation_damaged ?? null) === "string",
+    "control: and it is the damage that made it non-zero, since no cursor was given",
+    JSON.stringify({ damaged: dj?.data?.incarnation_damaged?.slice(0, 60),
+                     rewound: dj?.data?.cursor_rewound }));
+  check(dj?.data?.cursor_rewound === false,
+    "control: cursor_rewound is false here, so the old rule alone would have exited 0",
+    String(dj?.data?.cursor_rewound));
 
   const damagedText = model ? renderDash(model) : "";
   check(/HUB DAMAGED/.test(damagedText) && /reeve restore --hub --force/.test(damagedText),

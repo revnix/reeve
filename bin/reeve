@@ -1457,7 +1457,8 @@ switch (cmd) {
           // either way -- it carries the cursor to resync from -- but the exit
           // status says the movement list is not an answer, so a script polling
           // this cannot mistake a restore for nothing having happened.
-          process.exit(model.cursor_rewound ? EXITS.degraded : EXITS.ok);
+          process.exit(model.cursor_rewound || model.incarnation_damaged
+            ? EXITS.degraded : EXITS.ok);
         }
 
         if (sub === "list") {

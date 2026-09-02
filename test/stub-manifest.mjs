@@ -2593,6 +2593,17 @@ export const STUBS = [
     }],
   },
   {
+    name: "the-serialisation-hook-is-not-a-detail",
+    why: "refuse every function value, including a `toJSON` property. The serialiser CALLS that one and then omits it, so a body defining a self-returning hook stringifies perfectly and loses nothing -- and refusing it rejects a valid report over a value that was never going to be stored",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a self-returning toJSON is stored exactly as plain JSON.stringify stores it",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  if (_key === \"toJSON\" && typeof v === \"function\") return undefined;\n",
+      replace: "",
+    }],
+  },
+  {
     name: "a-standing-cause-is-actually-paged",
     why: "remove the call from the heartbeat loop, which is the state this whole change ends. Every unit assertion about the pass still passes -- they call it directly -- while nothing in production invokes it, so escalations accumulate in the hub and reach nobody. An alarm system nothing reads is indistinguishable from a system with nothing to report",
     test: "test/build-paging.test.mjs",
@@ -2648,14 +2659,14 @@ export const STUBS = [
     }],
   },
   {
-    name: "the-serialisation-hook-is-not-a-detail",
-    why: "refuse every function value, including a `toJSON` property. The serialiser CALLS that one and then omits it, so a body defining a self-returning hook stringifies perfectly and loses nothing -- and refusing it rejects a valid report over a value that was never going to be stored",
-    test: "test/build-escalations.test.mjs",
-    expectRed: "a self-returning toJSON is stored exactly as plain JSON.stringify stores it",
+    name: "delivering-is-not-observing",
+    why: "let the delivery pass record an observation for every row it re-reads. It has seen nothing -- the rows came from the table -- so `last_seen_at` moves forward on every heartbeat and a condition observed once reads as continuously present, which is the one fact that column carries. It also appends a row image per standing cause per pass: at a 2.5-minute cadence, hundreds of events a day for a log that recorded one event",
+    test: "test/build-paging.test.mjs",
+    expectRed: "five delivery passes do not move last_seen_at, because none of them saw the cause",
     edits: [{
-      file: "src/build/announce.mjs",
-      find: "  if (_key === \"toJSON\" && typeof v === \"function\") return undefined;\n",
-      replace: "",
+      file: "src/build/paging.mjs",
+      find: "                                examined: null, observe: false });",
+      replace: "                                examined: null });",
     }],
   },
 ];

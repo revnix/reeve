@@ -2110,8 +2110,8 @@ export const STUBS = [
     expectRed: "and no placeholder survives into something a founder is asked to run",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "  return subject === null ? action : action.replaceAll(\"<id>\", subject);",
-      replace: "  return action;",
+      find: "  const named = subject === null ? action : action.replaceAll(\"<id>\", subject);",
+      replace: "  const named = action;",
     }],
   },
   {
@@ -2665,8 +2665,41 @@ export const STUBS = [
     expectRed: "five delivery passes do not move last_seen_at, because none of them saw the cause",
     edits: [{
       file: "src/build/paging.mjs",
-      find: "                                examined: null, observe: false });",
-      replace: "                                examined: null });",
+      find: "                                examined: null, observe: false, limit,",
+      replace: "                                examined: null, limit,",
+    }],
+  },
+  {
+    name: "a-notify-block-is-not-a-channel",
+    why: "treat the presence of a `notify` block as deliverability. `{ \"notify\": {} }` parses and configures nothing -- notify builds no channels and declines every page -- so the doctor reports a machine that can reach NOBODY as healthy, which is the one assurance H-14 exists to withhold",
+    test: "test/build-paging.test.mjs",
+    expectRed: "an empty notify block is not deliverable, so the doctor cannot report it as healthy",
+    edits: [{
+      file: "src/build/paging.mjs",
+      find: "  if (!usable)",
+      replace: "  if (false)",
+    }],
+  },
+  {
+    name: "one-pass-cannot-block-the-heartbeat",
+    why: "send the whole backlog in one pass. Sending is synchronous and each attempt can take the sender's 8-second timeout, and `build run` calls this inline before its sleep -- so a deep backlog against a dead channel stalls the loop past the 120-second singleton lease, and the daemon can lose the authority it holds while waiting to finish paging",
+    test: "test/build-paging.test.mjs",
+    expectRed: "one pass attempts at most 5 sends, whatever the backlog",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    if (attempted >= limit) continue;\n",
+      replace: "",
+    }],
+  },
+  {
+    name: "a-pasted-action-reaches-the-hub-it-is-about",
+    why: "render the action without the home it concerns. The command is meant to be pasted, and pasted outside the daemon's environment a bare `reeve task why bt:...` resolves the DEFAULT home -- so an operator whose daemon runs with --home inspects a different hub, where the likeliest answer is that the task does not exist. An alert that sends someone to the wrong store is worse than one carrying no command, because they will believe what they find",
+    test: "test/build-paging.test.mjs",
+    expectRed: "the action names the home the alert is about, so the pasted command reaches THIS hub",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  return home ? `${named} --home ${home}` : named;",
+      replace: "  return named;",
     }],
   },
 ];

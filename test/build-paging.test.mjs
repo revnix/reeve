@@ -13,7 +13,8 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { openHub } from "../src/build/hubdb.mjs";
 import { escalationKey } from "../src/build/announce.mjs";
-import { machineProfile, machineProfilePath, pageStandingCauses } from "../src/build/paging.mjs";
+import { machineProfile, machineProfilePath, pageStandingCauses,
+         PAGES_PER_PASS } from "../src/build/paging.mjs";
 import { hubFindings } from "../src/doctor.mjs";
 
 const dir = mkdtempSync(join(tmpdir(), "reeve-paging-"));
@@ -32,6 +33,21 @@ const freshHome = () => {
   return home;
 };
 const hubOf = (home) => openHub(join(home, "state", "hub.db"));
+const seedTasks = (db, n) => {
+  const ins = db.prepare(`INSERT INTO task(
+      id, project, repo_id, nwo_snapshot, title, phase, source_kind, source_key,
+      repo_path, profile_path, profile_hash, default_branch, visibility,
+      registry_version, created_at, updated_at)
+    VALUES(?, 'alpha', 42, 'o/a', 'a task', 'ESCALATED', 'founder', ?, '/repo',
+           '/p.json', 'ph-1', 'main', 'private', 1, ?, ?)`);
+  const ids = [];
+  for (let i = 0; i < n; i++) {
+    const id = `bt:0PAGE${String(i).padStart(3, "0")}`;
+    ins.run(id, `src-${id}`, NOW, NOW);
+    ids.push(id);
+  }
+  return ids;
+};
 const CLI = fileURLToPath(new URL("../bin/reeve", import.meta.url));
 const KEY = escalationKey({ kind: "backup:failed" });
 const raise = (db, why, count, at) => db.prepare(
@@ -226,7 +242,9 @@ const raise = (db, why, count, at) => db.prepare(
 {
   const home = freshHome(), db = hubOf(home);
   raise(db, KEY, 1, NOW);
-  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: { provider: "ntfy" } }));
+  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: {
+    provider: "ntfy", url: "http://127.0.0.1:9", topic: "t",
+    credentialFile: join(home, "no-such-credential") } }));
   const r = pageStandingCauses(db, { home, at: NOW, isAlive: ALIVE });
   check(r.deliverable === true,
     "control: a profile IS loaded here, so presence alone would have reported success",
@@ -269,6 +287,96 @@ const raise = (db, why, count, at) => db.prepare(
     JSON.stringify(h14));
   check(/profile\.json/.test(h14?.action ?? ""),
     "naming where to write the profile", String(h14?.action));
+}
+
+// ── a block is not a channel ───────────────────────────────────────────────
+//
+// `{ "notify": {} }` parses, is an object, and configures nothing: `notify`
+// builds no channels and declines every page. Treating the block's presence as
+// deliverability made the doctor report a machine that can reach nobody as
+// healthy -- the exact assurance H-14 exists to withhold.
+{
+  for (const [what, cfg] of [["an empty notify block", {}],
+                             ["ntfy with no url", { provider: "ntfy", topic: "t" }],
+                             ["ntfy with no topic", { provider: "ntfy", url: "http://x" }],
+                             ["a provider nothing builds", { provider: "none" }]]) {
+    const home = freshHome();
+    writeFileSync(machineProfilePath(home), JSON.stringify({ notify: cfg }));
+    const m = machineProfile(home);
+    check(m.profile === null && /no usable channel/.test(m.why ?? ""),
+      `${what} is not deliverable, so the doctor cannot report it as healthy`,
+      JSON.stringify({ why: m.why }));
+  }
+  // CONTROLS: both shapes `notify` actually builds a channel from are accepted,
+  // so this refuses configurations rather than refusing configuration.
+  for (const [what, cfg] of [["desktop", { desktop: true }],
+                             ["a complete ntfy", { provider: "ntfy", url: "http://x", topic: "t" }]]) {
+    const home = freshHome();
+    writeFileSync(machineProfilePath(home), JSON.stringify({ notify: cfg }));
+    check(machineProfile(home).profile !== null,
+      `control: ${what} IS deliverable, so the check bounds the config and not the file`,
+      JSON.stringify(machineProfile(home).why));
+  }
+}
+
+// ── one pass cannot block the heartbeat indefinitely ───────────────────────
+//
+// Sending is synchronous and each attempt can take the sender's own 8-second
+// timeout. `build run` calls this inline before its sleep, so an unbounded
+// backlog against a dead channel stalls the loop for as long as the backlog is
+// deep -- past the 120-second singleton lease, at which point the daemon can lose
+// the authority it is holding while it waits to finish paging. An alarm that
+// costs a daemon its lease has cost more than it reported.
+{
+  const home = freshHome(), db = hubOf(home);
+  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: { desktop: true } }));
+  const tasks = seedTasks(db, 8);
+  check(tasks.length >= 6, "control: the fixture has enough tasks to exceed the bound",
+    String(tasks.length));
+  for (const [i, id] of tasks.entries())
+    raise(db, `${id}:phase:blocked:RESEARCH`, 1, NOW + i);
+
+  const sent = [];
+  const send = (a) => { sent.push(a); return { ok: true, channels: [{ name: "t", ok: true, ref: "r" }] }; };
+  const first = pageStandingCauses(db, { home, at: NOW + 100, isAlive: ALIVE, send });
+  check(sent.length === PAGES_PER_PASS,
+    `one pass attempts at most ${PAGES_PER_PASS} sends, whatever the backlog`,
+    JSON.stringify({ sent: sent.length, standing: first.standing }));
+  check(first.standing > PAGES_PER_PASS,
+    "control: there really were more causes than the bound, so the cap is what stopped it",
+    JSON.stringify({ standing: first.standing, bound: PAGES_PER_PASS }));
+
+  // NOTHING IS LOST. What was not attempted keeps announced_count unchanged and
+  // is offered again -- the same mechanism that makes a refused page come back.
+  const owed = db.prepare(
+    "SELECT count(*) c FROM escalation WHERE announced_count <> count").get().c;
+  check(owed > 0, "and what it did not attempt is still owed", String(owed));
+  sent.length = 0;
+  pageStandingCauses(db, { home, at: NOW + 250, isAlive: ALIVE, send });
+  check(sent.length > 0, "so the next pass delivers more of the backlog", String(sent.length));
+  db.close();
+}
+
+// ── a rendered action names the hub it is about ────────────────────────────
+//
+// The action is meant to be pasted. Pasted later, outside the daemon's
+// environment, a bare `reeve task why bt:...` resolves the DEFAULT home -- so an
+// operator whose daemon runs with `--home /custom` inspects a different hub, and
+// the likeliest answer there is that the task does not exist. An alert that sends
+// someone to the wrong store is worse than one carrying no command, because they
+// will believe what they find.
+{
+  const home = freshHome(), db = hubOf(home);
+  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: { desktop: true } }));
+  const task = seedTasks(db, 1)[0];
+  raise(db, `${task}:phase:blocked:RESEARCH`, 1, NOW);
+  const sent = [];
+  const send = (a) => { sent.push(a); return { ok: true, channels: [{ name: "t", ok: true, ref: "r" }] }; };
+  pageStandingCauses(db, { home, at: NOW, isAlive: ALIVE, send });
+  const msg = sent[0]?.message ?? "";
+  check(/--home /.test(msg) && msg.includes(home),
+    "the action names the home the alert is about, so the pasted command reaches THIS hub",
+    JSON.stringify(msg.split("\n").find(l => /->/.test(l)) ?? msg.slice(0, 120)));
 }
 
 // ── the wiring exists, which no unit test above can see ─────────────────────

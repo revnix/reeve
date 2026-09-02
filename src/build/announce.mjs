@@ -690,11 +690,25 @@ export const ACTION_FOR = Object.freeze({
  * command they cannot paste -- under a shell `<id>` is input redirection -- and
  * makes them reconstruct the very identifier the alert is holding.
  */
-export const actionFor = (key) => {
+export const actionFor = (key, { home = null } = {}) => {
   const action = ACTION_FOR[shapeOf(key)] ?? null;
   if (action === null) return null;
   const subject = subjectOf(key);
-  return subject === null ? action : action.replaceAll("<id>", subject);
+  const named = subject === null ? action : action.replaceAll("<id>", subject);
+  // THE HOME THE ALERT IS ABOUT, when it is not the one a bare command finds.
+  //
+  // A daemon started with `--home /custom` raises causes about THAT hub, and the
+  // action is meant to be pasted. Pasted later, outside the daemon's environment,
+  // a bare `reeve task why bt:...` resolves the default `~/.reeve` -- so the
+  // operator inspects a different hub, and the most likely answer there is that
+  // the task does not exist. An alert that sends someone to the wrong store is
+  // worse than one carrying no command at all, because they will believe what
+  // they find.
+  //
+  // Only when it differs: appending the default to every action would be noise
+  // on the ordinary path, and noise in a command is how a command stops being
+  // read.
+  return home ? `${named} --home ${home}` : named;
 };
 
 /**
@@ -717,7 +731,8 @@ export const actionFor = (key) => {
  */
 export function announce(db, {
   escalations, at = Math.floor(Date.now() / 1000), isAlive, send,
-  profile = null, examined = null, bodies = null, observe = true } = {}) {
+  profile = null, examined = null, bodies = null, observe = true, limit = Infinity,
+  homeArg = null } = {}) {
   if (typeof send !== "function")
     throw refuse("not_writable",
       "announce needs a send function: whether a page reached anyone is the one thing this " +
@@ -800,7 +815,7 @@ export function announce(db, {
     // command that changes it, a page read at night is a notification the reader
     // can only file away -- and a channel whose alerts cannot be acted on is one
     // that gets muted, which is the outcome the closed page list exists to avoid.
-    const action = actionFor(why);
+    const action = actionFor(why, { home: homeArg });
     // THE ACTION GOES ABOVE THE DETAIL, and that ordering is load-bearing rather
     // than cosmetic. `redact` caps a message at its own limit and truncates the
     // TAIL, so an action appended after an externally supplied body is the first
@@ -860,6 +875,18 @@ export function announce(db, {
     return null;
   };
 
+  // BOUNDED, because sending is synchronous and a caller may be a heartbeat loop
+  // holding a lease. Each attempt can take the sender's own timeout, so an
+  // unbounded backlog against a dead channel blocks that caller for as long as
+  // the backlog is deep -- and an alarm that costs a daemon its authority has
+  // cost more than it reported.
+  //
+  // STOPPING LOSES NOTHING. An undelivered cause keeps `announced_count`
+  // unchanged and is offered again next pass, which is the same mechanism that
+  // makes a refused page come back. The DIGEST is not bounded: it writes no
+  // channel and cannot block, and withholding it would hide a cause from the
+  // durable surface to save time that was never spent.
+  let attempted = 0;
   for (const f of fresh) {
     const body = bodyFor(f.why);
     if (!pages(f.why)) {
@@ -869,6 +896,8 @@ export function announce(db, {
       markAnnounced(f.why, f.count);
       continue;
     }
+    if (attempted >= limit) continue;
+    attempted++;
     const sent = dispatch(f.why, f.count, "raised", body);
     // ONLY ON SUCCESS. A refused page leaves `announced_count` where it was, so
     // the next pass raises it again rather than treating silence as delivery.
@@ -881,6 +910,11 @@ export function announce(db, {
   // of losing it.
   const retired = [...cleared];
   for (const why of clearable) {
+    // THE SAME BOUND. A clearing sends too, so a backlog of them blocks a caller
+    // exactly as a backlog of raises does -- and a clearing that waits costs
+    // nothing, because the row stands until one is delivered.
+    if (attempted >= limit) break;
+    attempted++;
     const sent = dispatch(why, 0, "cleared", bodyFor(why));
     if (!sent) continue;
     clearEscalation(db, why, { isAlive, at });

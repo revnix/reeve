@@ -11,6 +11,10 @@ import { join } from "node:path";
 import { announce } from "./announce.mjs";
 import { notify } from "../notify.mjs";
 import { isSameProcess } from "../supervisor.mjs";
+import { homedir } from "node:os";
+
+/** What a bare `reeve` command resolves when nothing names a home. */
+const defaultHome = () => join(homedir(), ".reeve");
 
 /**
  * The machine's own notify profile.
@@ -49,6 +53,22 @@ export function machineProfile(home) {
   }
   if (!raw?.notify || typeof raw.notify !== "object")
     return { profile: null, path, why: `${path} carries no \`notify\` block, so no channel is configured` };
+  // A BLOCK IS NOT A CHANNEL. `{ "notify": {} }` parses, is an object, and
+  // configures nothing -- `notify` then produces no channels at all and declines
+  // every page. Treating the block's presence as deliverability made the doctor
+  // report a machine that can reach nobody as healthy, which is the exact
+  // assurance H-14 exists to withhold.
+  //
+  // The condition mirrors `notify`'s own: it builds an ntfy channel when the
+  // provider says so, and a desktop channel when `desktop` is true. Asking the
+  // same question here rather than a looser one keeps the doctor's answer and the
+  // sender's behaviour from disagreeing.
+  const cfg = raw.notify;
+  const usable = (cfg.provider === "ntfy" && !!cfg.url && !!cfg.topic) || cfg.desktop === true;
+  if (!usable)
+    return { profile: null, path,
+             why: `${path} configures no usable channel: \`notify\` needs provider "ntfy" with url ` +
+                  `and topic, or desktop true` };
   return { profile: raw, path, why: null };
 }
 
@@ -70,8 +90,25 @@ export function machineProfile(home) {
  * pass that did look -- two pushes for one unchanged condition, which is the same
  * way a channel earns being muted.
  */
+/**
+ * How many causes one pass may try to deliver.
+ *
+ * A HEARTBEAT LOOP MUST NOT BLOCK ON A CHANNEL. Sending is synchronous and each
+ * attempt can take up to `notify`'s own 8-second timeout, so an unbounded backlog
+ * against a slow or unreachable channel stalls the loop for as long as the
+ * backlog is deep -- past the 120-second singleton lease, at which point the
+ * daemon can lose the authority it is holding while it waits to complete a page.
+ * The alarm would then have cost the thing it was reporting on.
+ *
+ * Five, so the worst case is ~40 seconds against a dead channel and the tick and
+ * lease renewal still fit inside the lease. Nothing is lost by stopping: an
+ * undelivered cause keeps `announced_count` unchanged and is offered again on the
+ * next pass, which is the same mechanism that makes a refused page come back.
+ */
+export const PAGES_PER_PASS = 5;
+
 export function pageStandingCauses(db, { home, at = undefined, isAlive = isSameProcess,
-                                         send = null } = {}) {
+                                         send = null, limit = PAGES_PER_PASS } = {}) {
   const { profile, why } = machineProfile(home);
   // A SENDER THAT REFUSES BY NAME, rather than skipping the pass. `announce`
   // leaves `announced_count` at 0 for a page its sender refused, so every cause
@@ -90,6 +127,7 @@ export function pageStandingCauses(db, { home, at = undefined, isAlive = isSameP
   // pass. The announcement bookkeeping still writes, because announcing IS what
   // this pass does.
   const result = announce(db, { escalations, at, isAlive, send: sender, profile,
-                                examined: null, observe: false });
+                                examined: null, observe: false, limit,
+                                homeArg: home === defaultHome() ? null : home });
   return { ...result, standing: escalations.size, deliverable: profile !== null, why };
 }

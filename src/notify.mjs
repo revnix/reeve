@@ -118,7 +118,13 @@ function postViaOsascript({ title, body }) {
        title, body],
       { stdio: ["ignore", "ignore", "pipe"], timeout: 8000 });
     return { ok: true };
-  } catch (e) { return { ok: false, why: String(e.message).split("\n")[0] }; }
+  } catch (e) {
+    // THE SAME RULE, one function up. No credential rides in this argv, but the
+    // alert text does -- so a failure message would repeat a whole notification
+    // into the log, and the reason a send failed is not the notification.
+    const said = String(e?.stderr ?? "").trim().split("\n")[0];
+    return { ok: false, why: redact(said ? `osascript: ${said}` : `osascript exited ${e?.status ?? "?"}`) };
+  }
 }
 
 /**
@@ -145,6 +151,31 @@ export function readNtfyResponse(out) {
   return typeof id === "string" && id !== "" ? { ok: true, ref: `ntfy:${id}` } : { ok: true };
 }
 
+// curl's own exit codes, for the two an operator actually meets. The rest are
+// reported as the number, which `man curl` names.
+const CURL_EXIT = { 6: "could not resolve the host", 7: "could not connect", 28: "timed out" };
+
+/**
+ * Why a curl send failed, WITHOUT the command line.
+ *
+ * `execFileSync`'s message is `Command failed: ` followed by the whole argv --
+ * and the argv carries `-u <credential>`. Reporting that as the reason put the
+ * ntfy password into every consumer of it, including an unattended daemon log
+ * that persists for as long as the machine runs. Measured: the first line of
+ * `e.message` contains the credential verbatim, while `e.stderr` does not and
+ * `e.status` is curl's own exit code.
+ *
+ * So the reason is built from the status and stderr, which say what went wrong
+ * without repeating what was sent. `redact` runs over it anyway, because stderr
+ * is still output from another program.
+ */
+function curlFailure(e) {
+  const said = String(e?.stderr ?? "").trim().split("\n")[0];
+  const code = e?.status;
+  const named = CURL_EXIT[code] ?? (code === undefined ? "did not run" : `exited ${code}`);
+  return redact(said ? `curl ${named}: ${said}` : `curl ${named}`);
+}
+
 function postViaCurl({ url, auth, title, priority, tags, body }) {
   try {
     // THE BODY IS KEPT. `-o /dev/null` discarded the server's response before
@@ -157,7 +188,7 @@ function postViaCurl({ url, auth, title, priority, tags, body }) {
                   "-H", `Title: ${title}`, "-H", `Priority: ${priority}`, "-H", `Tags: ${tags}`,
                   "-d", body, url];
     return readNtfyResponse(execFileSync("curl", args, { encoding: "utf8" }));
-  } catch (e) { return { ok: false, why: String(e.message).split("\n")[0] }; }
+  } catch (e) { return { ok: false, why: curlFailure(e) }; }
 }
 
 /**

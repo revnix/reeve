@@ -117,7 +117,11 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
 
   if (!hist || hist.readable !== true)
     return { kind: "unreadable",
-             detail: "its schema_version cannot be read, so which migrations it carries is unknown",
+             // THE CAUSE TRAVELS IN THE DETAIL, so a caller rendering this does not
+             // have to reach past it for the one fact that decides whether trying
+             // again can help.
+             detail: "its schema_version cannot be read, so which migrations it carries is unknown" +
+                     (hist?.cause?.message ? ` — ${hist.cause.message}` : ""),
              remedy: "re-run: a hub being created for the first time reads this way for an instant. " +
                      "If it persists, the store is damaged and `reeve restore --hub --force` installs " +
                      "the newest usable snapshot" };

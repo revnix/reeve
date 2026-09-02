@@ -2262,4 +2262,13 @@ export const STUBS = [
               find: "  if (hist?.readable !== true && outOfRange(hist?.cause))",
               replace: "  if (false && outOfRange(hist?.cause))" }],
   },
+  {
+    name: "an-unreadable-history-reaches-the-shared-decision",
+    why: "refuse an unreadable history in the read route before `historyFault` runs, which is where this block started. The branch that tells a marker no reader can represent from a hub being created for an instant is then unreachable from `task list|show|why|dash`, the refusal carries no remedy, and -- because ERR_OUT_OF_RANGE has no SQLite errcode and `faultKind` calls it operational -- the envelope says `retryable: true` for a failure every retry reproduces",
+    test: "test/task-show.test.mjs",
+    expectRed: "it is NOT retryable, because the value is the fault",
+    edits: [{ file: "bin/reeve",
+              find: "          if (fault.kind === \"unreadable-marker\")",
+              replace: "          if (false)" }],
+  },
 ];

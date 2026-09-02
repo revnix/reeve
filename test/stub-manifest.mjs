@@ -2434,8 +2434,8 @@ export const STUBS = [
     expectRed: "but the digest reports that the weaker check answered it",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "      : provable ? \"incarnation\"",
-      replace: "    cursor_proof: since === null ? null : \"incarnation\",",
+      find: "      : provable ? \"incarnation\"\n      : verdict === \"ahead\" ? \"sequence\"\n      : \"timestamp\",",
+      replace: "      : \"incarnation\",",
     }],
   },
   {

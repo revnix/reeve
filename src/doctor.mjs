@@ -1309,7 +1309,10 @@ export function checkDaemonProvenance({ run = founderRun, plist = readInstalledP
   const env = loadedEnvironment(printed);
   const root = checkoutFromArgs(args, { cwd: env.PWD ?? null });
   if (!root) return { id, level: UNKNOWN, title,
-    lines: [`the loaded launchd job runs ${args.join(" ") || "(nothing)"}`,
+    // `args ?? []` so a stub that removes the loaded-job guard FAILS the
+    // assertion below rather than throwing here and taking the file with it --
+    // an assertion that never ran reads exactly like one that passed.
+    lines: [`the loaded launchd job runs ${(args ?? []).join(" ") || "(nothing)"}`,
             "none of its arguments resolves to a path ending in bin/reeve",
             "-> the daemon is started some other way, and this rule cannot say from where"] };
 
@@ -1341,7 +1344,10 @@ export function checkDaemonProvenance({ run = founderRun, plist = readInstalledP
   if (record === null) return { id, level: UNKNOWN, title,
     lines: [...lines, `no startup record could be read${logPath ? ` from ${logPath}` : ""}`,
             "-> what the RUNNING process loaded cannot be established, so neither can its provenance"] };
-  if (record.commit === null) return { id, level: UNKNOWN, title,
+  // Optional chaining for the same reason: the guard above returns on a null
+  // record, so this only ever runs with one -- but a stub that removes that guard
+  // must reach an assertion rather than a TypeError.
+  if (record?.commit == null) return { id, level: UNKNOWN, title,
     lines: [...lines, "the daemon recorded its own commit as unreadable at startup",
             "-> the process is running, and nothing says from which commit"] };
 

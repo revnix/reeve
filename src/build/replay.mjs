@@ -130,6 +130,32 @@ const HANDLERS = {
   // resumed run collide with an earlier attempt's key, and the retry budget
   // silently resets. Live rows are excluded at replay: a run whose process is
   // gone is not resurrected.
+  // AND ITS LIVE EVENTS ARE REPLAYED TERMINAL, which is neither resurrecting
+  // them nor dropping them.
+  //
+  // Withholding these two entirely was wrong in a way only the snapshot
+  // BOUNDARY shows. `restoreHub` converts the live rows it finds IN the snapshot
+  // to `killed` before the tail is replayed -- so an attempt created after the
+  // snapshot and not yet settled exists only in the tail, and skipping its
+  // events removed it from the projection altogether. `task why` loses it, the
+  // retry budget is refunded, and its attempt number and output paths are free
+  // to be reused by a different run.
+  //
+  // The original concern was right and is still met: a row must not come back
+  // LIVE, because `one_live_run` would then refuse the task's next real dispatch
+  // on behalf of a process that died before the restore. `killed` is outside
+  // that partial index, so the history is kept and the ghost is not.
+  //
+  // The image is forced to the same terminal shape `restoreHub` writes for the
+  // rows it can see, so a tail-only attempt and a snapshot one are
+  // indistinguishable afterwards -- which is the point. A `settled` event later
+  // in the same tail overwrites it with the truth.
+  "phase_run.started":        { table: "phase_run", key: ["task","generation","phase","slice","attempt"],
+                                map: (row) => ({ ...row, status: "killed",
+                                                 outcome: row.outcome ?? "lost to a hub restore" }) },
+  "phase_run.bound":          { table: "phase_run", key: ["task","generation","phase","slice","attempt"],
+                                map: (row) => ({ ...row, status: "killed",
+                                                 outcome: row.outcome ?? "lost to a hub restore" }) },
   "phase_run.settled":        { table: "phase_run", key: ["task","generation","phase","slice","attempt"] },
   "task.filed":               { table: "task", key: ["id"] },
   // A filing writes the task AND its territory children in one transaction, so a

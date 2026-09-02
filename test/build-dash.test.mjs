@@ -1028,7 +1028,7 @@ const T = {};
   check(ahead.next_cursor === `${high}.${headAt()}.${hubIncarnation(db).id}`,
     "and the cursor handed back is this hub's own high-water mark AND its identity, to resync from",
     String(ahead.next_cursor));
-  check(/CURSOR UNUSABLE/.test(renderDash(ahead)) && /is ahead of this hub/.test(renderDash(ahead)),
+  check(/CURSOR UNUSABLE/.test(renderDash(ahead)) && /beyond this hub's log/.test(renderDash(ahead)),
     "and the text says so rather than printing a silent zero",
     renderDash(ahead).split("\n").find(l => /since you looked/.test(l)));
 
@@ -1089,18 +1089,41 @@ const T = {};
   check(restored.next_cursor.endsWith(`.${after}`),
     "and the cursor handed back carries the NEW identity, to resync from",
     String(restored.next_cursor));
-  check(restored.cursor_verdict === "restored",
-    "and the verdict NAMES the restore rather than reporting it as any other fault",
+  check(restored.cursor_verdict === "different-log",
+    "and the verdict names the identity mismatch rather than any other fault",
     String(restored.cursor_verdict));
+  check(!/was restored\b/.test(renderDash(restored).split("\n").find(l => /CURSOR UNUSABLE/.test(l)) ?? "")
+        || /or the cursor came from a different hub/.test(renderDash(restored)),
+    "and it never asserts a RESTORE as the cause without naming the other one: a cursor " +
+    "pasted from a different hub differs identically, and sending an operator to hunt damage " +
+    "for a wrong bookmark is the failure this wording avoids",
+    renderDash(restored).split("\n").find(l => /CURSOR UNUSABLE/.test(l)) ?? "(none)");
   // THE FALSE DIAGNOSIS THIS REPLACES. Every unusable cursor was rendered as
   // "ahead of this hub's log", and the restore this whole change exists to catch
   // is one where the cursor is NOT ahead: its sequence is inside the log.
   check(!(issued.seq > high),
     "control: this cursor is INSIDE the log, so `ahead` would be a false diagnosis",
     JSON.stringify({ seq: issued.seq, high }));
-  check(/was restored/.test(renderDash(restored)) && !/is ahead of this hub/.test(renderDash(restored)),
-    "so the text says it was restored, and does not claim the cursor is ahead",
+  check(/does not belong to this hub's log/.test(renderDash(restored)) &&
+        !/beyond this hub's log/.test(renderDash(restored)),
+    "so the text says the cursor is not this log's, and does not claim it is ahead",
     renderDash(restored).split("\n").find(l => /CURSOR UNUSABLE/.test(l)) ?? "(no line)");
+
+  // IDENTITY IS ASKED BEFORE THE SEQUENCE, which is the COMMON restore rather
+  // than an exotic one: a restore from a shorter snapshot leaves the log below
+  // the saved cursor, so `seq > highWater` is true AND the identity differs.
+  // Answering `ahead` there reports the symptom -- the log is shorter -- and
+  // throws away the identity sitting right beside it, which reports the cause.
+  const shorter = dash({ since: cur(high + 1000, 0, before) });
+  check(shorter.cursor_verdict === "different-log",
+    "a restore to a SHORTER log is judged by identity, not reported as merely `ahead`",
+    JSON.stringify({ verdict: shorter.cursor_verdict, seq: high + 1000, high }));
+  check(shorter.cursor_proof === "incarnation",
+    "control: and the proof is the identity, which is what decided it",
+    String(shorter.cursor_proof));
+  check(high + 1000 > high,
+    "control: that cursor genuinely IS beyond the log, so the two arms really do compete here",
+    JSON.stringify({ seq: high + 1000, high }));
 
   // IDENTITY REPLACES THE TIMESTAMP RULE -- it is not ANDed with it. This is the
   // case that separates the two designs, and neither assertion above reaches it:
@@ -1218,6 +1241,30 @@ const T = {};
     JSON.stringify({ id: model?.incarnation, damaged: model?.incarnation_damaged?.slice(0, 60) }));
   check(/altered outside reeve/.test(model?.incarnation_damaged ?? ""),
     "carrying the reason the store cannot be trusted", String(model?.incarnation_damaged));
+  // AND THE NOTE MUST NOT BLAME THE CURSOR. `cursor_proof` is "timestamp" for two
+  // opposite reasons -- a legacy cursor, or a hub that cannot supply an identity
+  // -- and one note served both. For the second it is simply false: the cursor
+  // DOES carry an id, the hub does not, and telling the operator "the cursor
+  // above carries the id; the next call is provable" promises a cure that will
+  // not arrive. `next_cursor` was formatted with no identity, so it has two
+  // fields and the next call is no better.
+  const SOME_ID = "a".repeat(32);
+  const withCursor = model && dashModel(ddb, { now: NOW, switchesFor: resolver(), projects: [],
+                                               since: cur(0, 0, SOME_ID), isAlive: ALIVE });
+  const withText = withCursor ? renderDash(withCursor) : "";
+  check(withCursor?.cursor_proof === "timestamp",
+    "control: a damaged hub cannot prove a cursor even when the cursor carries an id",
+    String(withCursor?.cursor_proof));
+  check(/this HUB cannot supply an incarnation id/.test(withText),
+    "the note blames the HUB, which is what cannot supply the identity",
+    withText.split("\n").find(l => /note:/.test(l)) ?? "(no note)");
+  check(!/this cursor predates/.test(withText),
+    "and never says the cursor predates the id, which is false when the cursor carries one",
+    withText.split("\n").find(l => /note:/.test(l)) ?? "(no note)");
+  check(!/the next call is provable/.test(withText),
+    "nor promises a next call that will be provable, since next_cursor carries no id either",
+    String(withCursor?.next_cursor));
+
   const damagedText = model ? renderDash(model) : "";
   check(/HUB DAMAGED/.test(damagedText) && /reeve restore --hub --force/.test(damagedText),
     "and the text says so, with the recovery command the error itself carries",

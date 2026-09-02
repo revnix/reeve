@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { openHub, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
+import { openHub, HUB_SCHEMA_VERSION, hubIncarnation, mintIncarnation } from "../src/build/hubdb.mjs";
 import { DatabaseSync } from "node:sqlite";
 import { fileTask } from "../src/build/taskfile.mjs";
 import { isSameProcess, readStart } from "../src/supervisor.mjs";
@@ -83,7 +83,7 @@ const file = async (over) => fileTask({
 });
 const setPhase = (id, phase) => db.prepare("UPDATE task SET phase = ? WHERE id = ?").run(phase, id);
 const ALIVE = () => true, DEAD = () => false;
-const cur = (seq, at) => ({ seq, at });
+const cur = (seq, at, incarnation = null) => ({ seq, at, incarnation });
 // A LIVE BUILDER, because `doing` is an inference and the inference needs a
 // running process: with nothing running, a task with no wait against it is not
 // moving, it is simply unattended.
@@ -231,7 +231,7 @@ const T = {};
   const FIVE = ["alive", "doing", "waiting_on_you", "since_you_looked", "declined"];
   for (const k of FIVE) check(k in m, `the digest answers "${k}"`, Object.keys(m).join(","));
   const SUPPORTING = ["format_version", "generated_at", "projects", "switches", "tasks",
-                      "since", "next_cursor", "cursor_rewound"];
+                      "since", "next_cursor", "cursor_rewound", "cursor_proof", "incarnation"];
   const extra = Object.keys(m).filter(k => !FIVE.includes(k) && !SUPPORTING.includes(k));
   check(extra.length === 0,
     "and nothing else, so the digest cannot grow a sixth question quietly", extra.join(","));
@@ -501,8 +501,13 @@ const T = {};
   check(parseCursor(all.next_cursor) !== null,
     "the digest hands back a parseable cursor for next time", String(all.next_cursor));
   check(all.next_cursor === formatCursor(parseCursor(all.next_cursor).seq,
-                                         parseCursor(all.next_cursor).at),
-    "and it round-trips through the pair that formats and reads it", String(all.next_cursor));
+                                         parseCursor(all.next_cursor).at,
+                                         parseCursor(all.next_cursor).incarnation),
+    "and it round-trips through the pair that formats and reads it, ALL THREE fields",
+    String(all.next_cursor));
+  check(parseCursor(all.next_cursor).incarnation === hubIncarnation(db).id,
+    "and the identity it round-trips is this hub's own, not a shape that merely parses",
+    JSON.stringify({ cursor: parseCursor(all.next_cursor).incarnation, hub: hubIncarnation(db).id }));
 
   const mid = all.since_you_looked[1].seq;
   const recent = dash({ since: cur(mid, atOfSeq(mid)) });
@@ -1013,8 +1018,8 @@ const T = {};
     JSON.stringify({ since: high + 1000, next: ahead.next_cursor }));
   check(ahead.since_you_looked.length === 0,
     "the movement list is empty, because it cannot be computed", JSON.stringify(ahead.since_you_looked));
-  check(ahead.next_cursor === `${high}.${headAt()}`,
-    "and the cursor handed back is this hub's own high-water mark, to resync from",
+  check(ahead.next_cursor === `${high}.${headAt()}.${hubIncarnation(db).id}`,
+    "and the cursor handed back is this hub's own high-water mark AND its identity, to resync from",
     String(ahead.next_cursor));
   check(/CURSOR REWOUND/.test(renderDash(ahead)),
     "and the text says so rather than printing a silent zero",
@@ -1026,6 +1031,104 @@ const T = {};
   check(level.cursor_rewound === false && level.since_you_looked.length === 0,
     "control: a cursor exactly at the mark is quiet, not rewound",
     JSON.stringify({ rewound: level.cursor_rewound, n: level.since_you_looked.length }));
+}
+
+// ── a restore is caught by IDENTITY, including the one timestamps miss ──────
+//
+// THE DEFECT THIS CLOSES. `phase_event.at` is integer seconds with no uniqueness
+// constraint, so a log restored and regrown to the same sequence WITHIN ONE
+// SECOND presents an identical (seq, at) pair. The timestamp check accepts that
+// stale cursor, every event through that sequence in the new incarnation is
+// omitted permanently, and the digest reports it as a quiet period -- the worst
+// possible failure for this surface, because it looks exactly like good news.
+//
+// The fixture does not simulate the restore with a sleep or a clock. It re-mints
+// the incarnation and CHANGES NOTHING ELSE, which is the same-second case in its
+// purest form: seq identical, `at` identical, only the identity different. If the
+// check were still reading timestamps this would pass as quiet.
+{
+  const high = db.prepare("SELECT COALESCE(max(seq),0) s FROM phase_event").get().s;
+  const before = hubIncarnation(db).id;
+  const issued = cur(high - 1, atOfSeq(high - 1), before);
+
+  const ok = dash({ since: issued });
+  check(ok.cursor_rewound === false,
+    "control: a cursor carrying THIS hub's identity is not rewound",
+    JSON.stringify({ rewound: ok.cursor_rewound, proof: ok.cursor_proof }));
+  check(ok.cursor_proof === "incarnation",
+    "and the answer is reported as PROOF, not as an absence of evidence",
+    String(ok.cursor_proof));
+  check(ok.since_you_looked.length > 0,
+    "control: and it still returns what moved after it, so the fixture is not vacuous",
+    String(ok.since_you_looked.length));
+
+  // THE RESTORE. Only the identity moves.
+  const after = mintIncarnation(db).id;
+  check(after !== before, "control: re-minting yields a different identity",
+    JSON.stringify({ before, after }));
+  check(atOfSeq(high - 1) === issued.at && db.prepare(
+    "SELECT COALESCE(max(seq),0) s FROM phase_event").get().s === high,
+    "control: and the log is otherwise UNCHANGED -- same seq, same at -- so only " +
+    "an identity check can tell this apart",
+    JSON.stringify({ at: atOfSeq(high - 1), was: issued.at, high }));
+
+  const restored = dash({ since: issued });
+  check(restored.cursor_rewound === true,
+    "a cursor from a PREVIOUS incarnation is rewound, though its (seq, at) still matches",
+    JSON.stringify({ rewound: restored.cursor_rewound, proof: restored.cursor_proof }));
+  check(restored.since_you_looked.length === 0,
+    "so the movement list is withheld rather than reported as a quiet period",
+    JSON.stringify(restored.since_you_looked));
+  check(restored.next_cursor.endsWith(`.${after}`),
+    "and the cursor handed back carries the NEW identity, to resync from",
+    String(restored.next_cursor));
+
+  // THE OLD CHECK, RUN AGAINST THE SAME FIXTURE, to show it is discrimination
+  // rather than a test that would pass either way: the timestamp rule this
+  // replaced answers "not rewound" for the case above.
+  const timestampRuleSays = !(issued.seq > high || (issued.seq > 0 && atOfSeq(issued.seq) !== issued.at));
+  check(timestampRuleSays === true,
+    "control: the timestamp rule this replaced accepts that very cursor, which is the defect",
+    String(timestampRuleSays));
+}
+
+// ── a cursor that predates the identity is answered, and says it is weaker ──
+{
+  const high = db.prepare("SELECT COALESCE(max(seq),0) s FROM phase_event").get().s;
+  const legacy = dash({ since: cur(high - 1, atOfSeq(high - 1)) });
+  check(legacy.cursor_rewound === false,
+    "a cursor with no incarnation is still answered rather than refused",
+    JSON.stringify(legacy.cursor_rewound));
+  check(legacy.cursor_proof === "timestamp",
+    "but the digest reports that the weaker check answered it",
+    String(legacy.cursor_proof));
+  check(/predates the hub's incarnation id/.test(renderDash(legacy)),
+    "and the text says so, so a reader is not left with an impression of proof",
+    renderDash(legacy).split("\n").find(l => /note:/.test(l)) ?? "(no note line)");
+  check(!/predates the hub's incarnation id/.test(renderDash(dash({
+    since: cur(high - 1, atOfSeq(high - 1), hubIncarnation(db).id) }))),
+    "control: and it says NOTHING when the answer is proof, so the caveat stays readable",
+    "the note must appear only for the weaker answer");
+  check(dash().cursor_proof === null,
+    "control: with no cursor there was nothing to prove", String(dash().cursor_proof));
+}
+
+// ── the cursor's third field is strict, so a fumbled paste is not a restore ──
+//
+// An unparseable cursor is a misuse the CLI names. Accepted loosely, a mistyped
+// identity would differ from the hub's and report a RESTORE THAT NEVER HAPPENED,
+// sending an operator to look for damage because they fumbled a copy.
+{
+  const id = hubIncarnation(db).id;
+  check(parseCursor(`5.10.${id}`) !== null, "control: a well-formed cursor parses", "5.10." + id);
+  check(parseCursor("5.10") !== null, "control: and so does one with no identity", "5.10");
+  for (const [what, raw] of [["too short", `5.10.${id.slice(0, 31)}`],
+                             ["too long", `5.10.${id}a`],
+                             ["not hex", `5.10.${"z".repeat(32)}`],
+                             ["a fourth field", `5.10.${id}.9`]]) {
+    check(parseCursor(raw) === null, `a cursor whose identity is ${what} is refused, not guessed`,
+      JSON.stringify(raw));
+  }
 }
 
 // ── the cursor an operator needs next is in the TEXT ───────────────────────

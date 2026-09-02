@@ -772,6 +772,25 @@ function currentPolicy(profile, { read = readCanaryState, stateDir = null, nwo =
 // and is the only half that can tell those two apart.
 
 /** git in the founder's own checkout, exactly as `founderGit` runs it. */
+/**
+ * The launchd job as INSTALLED, or null when nothing is installed to read.
+ *
+ * Deliberately the file in LaunchAgents rather than the repository's
+ * `deploy/com.revnix.reeve.plist`. The repo copy records what someone meant to
+ * install; this one is what launchd executes, and macOS rewrites it on load --
+ * measured 2026-09-02, the installed copy had the same values in a different key
+ * order with every comment stripped.
+ *
+ * On a machine with no launchd this returns null, and the caller reports UNKNOWN
+ * rather than OK: "no job is installed" and "the job is fine" must not be the
+ * same answer. reeve is meant to run on Linux and Windows too, where the
+ * supervisor is not launchd; until this rule learns those, saying so plainly is
+ * the honest reading rather than a silent pass.
+ */
+function readInstalledPlist(path = join(homedir(), "Library", "LaunchAgents", "com.revnix.reeve.plist")) {
+  try { return readFileSync(path, "utf8"); } catch { return null; }
+}
+
 function founderRun(cwd, args, { input = null, timeout = 20_000 } = {}) {
   try {
     return { ok: true, out: execFileSync("git", ["-C", cwd, ...GIT_NEUTRALISE_FOUNDER, ...args],
@@ -1114,9 +1133,108 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
   return { id, level: OK, title, lines };
 }
 
+
+// ── R-17: what code would the daemon actually run? ────────────────────────
+//
+// STALE BY ACCIDENT AND PINNED ON PURPOSE LOOK IDENTICAL FROM OUTSIDE, and that
+// ambiguity is the defect this answers. Measured 2026-09-02: the launchd job was
+// running a commit from three days and 43 merges earlier, and establishing that
+// took reading the plist, grepping the daemon for update logic that does not
+// exist, and comparing two checkouts by hand. Nothing reported it, because
+// nothing was asking.
+//
+// READ THE INSTALLED PLIST, not the repository's copy of it. The repo's
+// `deploy/com.revnix.reeve.plist` is what someone INTENDED; the file in
+// LaunchAgents is what launchd will actually execute, and they drift -- the
+// installed one here has already been rewritten by macOS into a different key
+// order. The read that matters is the read that decides.
+//
+// BEING BEHIND IS NOT A FAULT. A guardian pinned to a commit you promoted is
+// working as designed, so distance from the default branch is reported as a
+// NUMBER and never as a level. What IS a fault is running code that is not on
+// the default branch at all: a dirty tree, or commits the branch has never
+// seen. Those are code no review ever looked at, enforcing rules on everyone
+// else.
+
+/** The checkout a `.../bin/reeve` argument implies, or null if none does. */
+export function checkoutFromArgs(args) {
+  const bin = (args ?? []).find(a => typeof a === "string" && /(^|\/)bin\/reeve$/.test(a));
+  return bin ? bin.replace(/\/bin\/reeve$/, "") : null;
+}
+
+/** ProgramArguments from a launchd plist, without parsing XML properly. */
+export function programArguments(plistText) {
+  const block = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(plistText ?? "");
+  if (!block) return null;
+  return [...block[1].matchAll(/<string>([\s\S]*?)<\/string>/g)].map(m => m[1].trim());
+}
+
+export function checkDaemonProvenance({ run = founderRun, plist = readInstalledPlist,
+                                        defaultBranch = "main" } = {}) {
+  const id = "R-17", title = "daemon code provenance";
+  const text = plist();
+  if (text === null) return { id, level: UNKNOWN, title,
+    lines: ["no launchd job is installed for reeve on this machine",
+            "-> nothing runs the guardian here, so there is no code to account for"] };
+
+  const args = programArguments(text);
+  if (!args) return { id, level: UNKNOWN, title,
+    lines: ["the installed launchd job declares no ProgramArguments",
+            "-> what launchd would execute cannot be read, so neither can the commit"] };
+
+  const root = checkoutFromArgs(args);
+  if (!root) return { id, level: UNKNOWN, title,
+    lines: [`the installed launchd job runs ${args.join(" ") || "(nothing)"}`,
+            "none of its arguments is a path ending in bin/reeve",
+            "-> the daemon is started some other way, and this rule cannot say from where"] };
+
+  const head = run(root, ["rev-parse", "HEAD"]);
+  if (!head.ok) return { id, level: BROKEN, title,
+    lines: [`launchd would run reeve from ${root}`,
+            `that path is not a readable git checkout${head.err ? `: ${head.err}` : ""}`,
+            "-> the guardian would enforce rules from code with no commit behind it"] };
+
+  const lines = [`launchd would run reeve from ${root}`, `promoted commit ${head.out.slice(0, 10)}`];
+
+  const dirty = run(root, ["status", "--porcelain"]);
+  if (dirty.ok && dirty.out) return { id, level: BROKEN, title,
+    lines: [...lines,
+            `the tree has ${dirty.out.split("\n").length} uncommitted change(s)`,
+            "-> what runs is not the promoted commit and is not any commit; nobody can say what it is"] };
+
+  // TWO COUNTS RATHER THAN `merge-base --is-ancestor`, whose FALSE answer and
+  // whose FAILURE are both a non-zero exit -- so a git that could not run would
+  // read as "not an ancestor" and be reported as unreviewed code.
+  const ahead = run(root, ["rev-list", "--count", `origin/${defaultBranch}..HEAD`]);
+  const behind = run(root, ["rev-list", "--count", `HEAD..origin/${defaultBranch}`]);
+  if (!ahead.ok || !behind.ok) return { id, level: UNKNOWN, title,
+    lines: [...lines,
+            `cannot compare against origin/${defaultBranch}${ahead.err ? `: ${ahead.err}` : ""}`,
+            `-> fetch in ${root} and re-run; until then the promoted commit's provenance is unknown`] };
+
+  if (Number(ahead.out) > 0) return { id, level: BROKEN, title,
+    lines: [...lines,
+            `it carries ${ahead.out} commit(s) that origin/${defaultBranch} has never seen`,
+            `-> the guardian would enforce rules from code no review looked at; promote a commit on origin/${defaultBranch}`] };
+
+  // DISTANCE IS REPORTED; INTENT IS NOT CLAIMED. The first draft of this line
+  // said "pinned, not drifting", which asserts a decision nothing on this machine
+  // records -- and the very checkout that produced it was behind by 43 because
+  // nobody had pulled, not because anybody chose the commit. A rule written to
+  // end that ambiguity must not resolve it by guessing the reassuring side.
+  return { id, level: OK, title,
+    lines: [...lines,
+            Number(behind.out) === 0
+              ? `which is origin/${defaultBranch}`
+              : `which is ${behind.out} commit(s) behind origin/${defaultBranch}`,
+            ...(Number(behind.out) === 0 ? [] : [
+              "being behind is not itself a fault: a guardian held at a commit you promoted is working as intended",
+              "-> but nothing here RECORDS a promotion, so a deliberate pin and an unpulled checkout read identically"])] };
+}
+
 // ── driver ────────────────────────────────────────────────────────────────
 
-export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null, baselineIo = {}, stateDir = null, canaryIo = {}, keychainIo = {}, reachIo = {} }) {
+export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null, baselineIo = {}, stateDir = null, canaryIo = {}, keychainIo = {}, reachIo = {}, provenanceIo = {} }) {
   const checks = [
     checkMergeAuthority(nwo),
     pluginCacheRoot ? checkArtifactDrift(pluginCacheRoot, repoPluginDir) : null,
@@ -1131,6 +1249,7 @@ export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null
     checkCanary(nwo, { stateDir, currentPolicyHash: currentPolicy(profile, { ...canaryIo, stateDir, nwo }), ...canaryIo }),
     checkKeychain({ isolation: profile.worker?.isolation, ...keychainIo }),
     checkRemoteReach(profile, reachIo),
+    checkDaemonProvenance(provenanceIo),
   ].filter(Boolean);
 
   const broken = checks.filter(c => c.level === BROKEN);

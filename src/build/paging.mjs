@@ -82,6 +82,14 @@ export function pageStandingCauses(db, { home, at = undefined, isAlive = isSameP
   const escalations = new Map(
     db.prepare("SELECT why, count FROM escalation ORDER BY first_seen_at")
       .all().map(r => [r.why, r.count]));
-  const result = announce(db, { escalations, at, isAlive, send: sender, profile, examined: null });
+  // OBSERVE: FALSE, because this pass observes nothing. It re-reads the rows
+  // another writer recorded, so it has no evidence any cause is still true --
+  // only that nobody has retired it. Recording that as a sighting would move
+  // `last_seen_at` forward on every heartbeat, making a condition seen once read
+  // as continuously present, and would append a row image per standing cause per
+  // pass. The announcement bookkeeping still writes, because announcing IS what
+  // this pass does.
+  const result = announce(db, { escalations, at, isAlive, send: sender, profile,
+                                examined: null, observe: false });
   return { ...result, standing: escalations.size, deliverable: profile !== null, why };
 }

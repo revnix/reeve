@@ -482,7 +482,8 @@ export function assertHub(db) {
  * @returns {{fresh: {why: string, count: number}[], cleared: string[]}}
  */
 export function builderAnnounceable(db, escalations, {
-  at = Math.floor(Date.now() / 1000), isAlive, examined = null, bodies = null } = {}) {
+  at = Math.floor(Date.now() / 1000), isAlive, examined = null, bodies = null,
+  observe = true } = {}) {
   assertHub(db);
   // EXPLICIT, never defaulted. `assertWritable` reads the restore lock and asks
   // whether its holder is alive; a predicate that always answered true would
@@ -502,6 +503,25 @@ export function builderAnnounceable(db, escalations, {
 
     for (const [why, count] of escalations) {
       const prev = standing.get(why);
+      // A DELIVERY PASS IS NOT AN OBSERVATION. A caller that re-reads the
+      // standing rows and hands them back has SEEN nothing -- it has no evidence
+      // the cause is still true, only that nobody retired it. Recording that as a
+      // sighting moves `last_seen_at` forward on every pass, so a condition
+      // observed once reads as continuously present, and appends a row image per
+      // standing cause per pass: at a heartbeat cadence, hundreds of events a day
+      // for a log that recorded one.
+      //
+      // So `observe: false` writes nothing ABOUT the cause and decides only what
+      // is owed. Marking an announcement is still a write and still happens,
+      // because that is what such a pass actually did.
+      if (!observe) {
+        // A survey of the standing rows cannot DISCOVER a cause: everything it
+        // holds came from the table. A key that is not standing is a caller error
+        // rather than an arrival, and inventing a row for it would record an
+        // observation this pass certainly did not make.
+        if (prev && prev.announced_count !== count) fresh.push({ why, count });
+        continue;
+      }
       if (!prev) {
         // ANNOUNCED_COUNT 0: RAISED, NOT YET ANNOUNCED. Writing `count` here
         // claimed the announcement before anything had been sent, so a page the
@@ -697,14 +717,14 @@ export const actionFor = (key) => {
  */
 export function announce(db, {
   escalations, at = Math.floor(Date.now() / 1000), isAlive, send,
-  profile = null, examined = null, bodies = null } = {}) {
+  profile = null, examined = null, bodies = null, observe = true } = {}) {
   if (typeof send !== "function")
     throw refuse("not_writable",
       "announce needs a send function: whether a page reached anyone is the one thing this " +
       "cannot infer, and a default that silently succeeded would report delivery it never made.");
 
   const { fresh, cleared, clearable } =
-    builderAnnounceable(db, escalations, { at, isAlive, examined, bodies });
+    builderAnnounceable(db, escalations, { at, isAlive, examined, bodies, observe });
 
   /**
    * The report for a cause: this pass's, else the one the row already holds.

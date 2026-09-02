@@ -173,6 +173,50 @@ const raise = (db, why, count, at) => db.prepare(
   ddb.close();
 }
 
+// ── delivering is not observing ────────────────────────────────────────────
+//
+// This pass re-reads rows another writer recorded. It has SEEN nothing: it has no
+// evidence a cause is still true, only that nobody retired it. Recording that as
+// a sighting moved `last_seen_at` forward on every heartbeat -- so a condition
+// observed once read as continuously present, which is the single fact
+// `last_seen_at` exists to carry -- and appended a row image per standing cause
+// per pass, which at a heartbeat cadence is hundreds of events a day for a log
+// that recorded one event.
+{
+  const home = freshHome(), db = hubOf(home);
+  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: { desktop: true } }));
+  raise(db, KEY, 1, NOW);
+  const send = () => ({ ok: true, channels: [{ name: "t", ok: true, ref: "r" }] });
+  const row = () => db.prepare("SELECT last_seen_at, announced_count FROM escalation WHERE why=?").get(KEY);
+  const events = () => db.prepare("SELECT count(*) c FROM hub_event WHERE kind='escalation.raised'").get().c;
+
+  const before = { seen: row().last_seen_at, events: events() };
+  for (let i = 1; i <= 5; i++)
+    pageStandingCauses(db, { home, at: NOW + i * 150, isAlive: ALIVE, send });
+
+  check(row().last_seen_at === before.seen,
+    "five delivery passes do not move last_seen_at, because none of them saw the cause",
+    JSON.stringify({ before: before.seen, after: row().last_seen_at }));
+  check(events() - before.events === 1,
+    "and append ONE event, for the announcement they actually made",
+    JSON.stringify({ appended: events() - before.events, passes: 5 }));
+  check(row().announced_count === 1,
+    "control: the announcement bookkeeping still writes, so this is not simply an inert pass",
+    JSON.stringify(row()));
+
+  // AND A CHANGED COUNT STILL PAGES, so the silence above is about observation
+  // rather than about delivery having stopped.
+  raise(db, KEY, 4, NOW + 900);
+  const seenAtRaise = row().last_seen_at;
+  const r = pageStandingCauses(db, { home, at: NOW + 1050, isAlive: ALIVE, send });
+  check(r.paged.length === 1, "control: a changed count is still delivered",
+    JSON.stringify({ paged: r.paged.length }));
+  check(row().last_seen_at === seenAtRaise,
+    "and the writer that OBSERVED it is the one that set last_seen_at, not this pass",
+    JSON.stringify({ raisedAt: seenAtRaise, after: row().last_seen_at }));
+  db.close();
+}
+
 // ── a refused CHANNEL is reported, not just a missing profile ──────────────
 //
 // `deliverable` says only that a profile object loaded. A configured channel that

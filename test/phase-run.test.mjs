@@ -3,7 +3,7 @@
 // read followed by a write, and two ticks interleave there -- which is exactly
 // the shape that put two workers on one subscription slot before the provider
 // scheduler existed.
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openHub } from "../src/build/hubdb.mjs";
@@ -217,6 +217,54 @@ const beat = (args) => attempt(() => heartbeatRun(db, args));
   check(p2.outPath !== p.outPath,
     "so a resumed attempt writes a NEW file rather than appending to the one being read",
     JSON.stringify([p.outPath, p2.outPath]));
+}
+
+// ── the contract snapshot is frozen, in both halves ─────────────────────────
+//
+// A freeze verified only against the half it already covered proves nothing
+// about the half that was added. The COLUMNS are what phase_run promises;
+// `insertRun`'s statement is what actually reaches them. A column added to one
+// without the other is a permanent NULL that reads as recorded.
+{
+  const { createHash } = await import("node:crypto");
+  const frozen = JSON.parse(readFileSync(new URL("./fixtures/phase-run-contract.json", import.meta.url), "utf8"));
+  const cols = db.prepare("SELECT name FROM pragma_table_info('phase_run')").all().map((r) => r.name).sort();
+  check(JSON.stringify(cols) === JSON.stringify(frozen.columns),
+    "phase_run's columns are unchanged since PR-C1 froze them",
+    `expected ${frozen.columns.join(",")}\n        actual   ${cols.join(",")}\n        ` +
+    "A new column needs a new numbered migration AND an entry in TABLES_AT/COLUMNS_AT.");
+
+  const src = readFileSync(new URL("../src/build/run.mjs", import.meta.url), "utf8");
+  check(src.length > 2000, "control: src/build/run.mjs was actually read", String(src.length));
+  check(createHash("sha256").update(src).digest("hex") === frozen.writerSha256,
+    "and so is the writer that fills them",
+    "If this change is intentional, re-generate the fixture in the same commit and say in the body which column moved.");
+
+  // AND THE PROPERTY THE FREEZE EXISTS FOR, asserted directly rather than
+  // inferred from a hash. A sha over the whole file reddens on a comment and
+  // stays green on nothing else -- it is a tripwire, not a check. What actually
+  // matters is that every column of the CONTRACT family is reached by the
+  // insert: a snapshot column that exists and is never written is worse than a
+  // missing one, because it reads as recorded and drift is computed against it.
+  //
+  // The other columns are deliberately absent from this list: status is a
+  // literal, pid/lstart/session_id are bindRun's, and outcome/evidence/truncated
+  // are settleRun's. Naming the family rather than "every column" is what keeps
+  // this assertion about the contract instead of about the schema.
+  const CONTRACT = ["cli_version", "model_id", "effort", "argv_hash", "prompt_hash", "settings_hash",
+                    "tools_hash", "agents_hash", "max_turns", "max_budget_usd", "canary_id",
+                    "snapshot_hash", "contract_drift"];
+  const insert = src.slice(src.indexOf("const INSERT_SQL"), src.indexOf("export function insertRun"));
+  check(insert.includes("INSERT INTO phase_run"),
+    "control: the insert statement was located in the source", insert.slice(0, 60));
+  const unwritten = CONTRACT.filter((c) => !insert.includes(c));
+  check(unwritten.length === 0,
+    "every contract column is reached by the insert, so none can exist unwritten",
+    JSON.stringify(unwritten));
+  const missingFromTable = CONTRACT.filter((c) => !cols.includes(c));
+  check(missingFromTable.length === 0,
+    "control: and every one of them is a real column, so the list cannot pass by naming nothing",
+    JSON.stringify(missingFromTable));
 }
 
 db.close();

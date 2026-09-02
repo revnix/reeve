@@ -16,7 +16,8 @@
 // re-minting therefore hands back an id that MATCHES, and a matching id is
 // exactly the proof being asked for. So these drive a real snapshot and a real
 // restore rather than calling the mint directly.
-import { openHub, HUB_SCHEMA_VERSION, hubIncarnation, mintIncarnation } from "../src/build/hubdb.mjs";
+import { openHub, HUB_SCHEMA_VERSION, hubIncarnation, mintIncarnation,
+         INCARNATION_SINCE } from "../src/build/hubdb.mjs";
 import { snapshot, restoreHub } from "../src/backup.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -84,9 +85,15 @@ const DEAD = () => false;
 
   // Put the store back to v5: drop the table and retract the migration record,
   // which is what a hub last opened by yesterday's binary genuinely looks like.
+  //
+  // EVERYTHING FROM 6 UPWARD, not migration 6 alone. Retracting one version out
+  // of the middle does not age a store, it HOLES it: the store would record
+  // 1-5 and 7, which `openHub` refuses outright and rightly, so the fixture
+  // would stop building the thing it describes the moment any migration landed
+  // above this one. `>=` keeps it true for the next one too.
   const back = new DatabaseSync(p);
   back.exec("DROP TABLE hub_incarnation");
-  back.prepare("DELETE FROM schema_version WHERE version = ?").run(6);
+  back.prepare("DELETE FROM schema_version WHERE version >= ?").run(INCARNATION_SINCE);
   const wasEmpty = back.prepare(
     "SELECT count(*) n FROM sqlite_master WHERE type='table' AND name='hub_incarnation'").get().n;
   back.close();

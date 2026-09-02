@@ -3197,8 +3197,8 @@ export const STUBS = [
     expectRed: "the action names the home the alert is about, so the pasted command reaches THIS hub",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "  return home ? `${named} --home ${home}` : named;",
-      replace: "  return named;",
+      find: "  if (!home) return named;",
+      replace: "  return named; if (!home) return named;",
     }],
   },
   {

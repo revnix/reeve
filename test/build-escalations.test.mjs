@@ -1401,6 +1401,45 @@ const freshHub = () => {
       hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null);
   }
 
+// ── the vocabulary is enforced where every body passes, not only in body() ──
+//
+// `body()` checked the failure type; `announce` took the `bodies` map as given.
+// A caller building that map directly -- which the exported signature invites --
+// bypassed the vocabulary, and the value was persisted AND marked delivered while
+// producing an alert carrying no type and no detail. A rule only a convenience
+// constructor applies is a suggestion.
+{
+  const hub = freshHub();
+  const key = escalationKey({ kind: "backup:failed" });
+  const send = () => ({ ok: true, channels: [{ name: "t", ok: true }] });
+  for (const [what, value] of [["an empty object", {}],
+                               ["an Error, which serialises to {}", new Error("boom")],
+                               ["a type outside the vocabulary", { type: "UNKNOWN_VALUE", detail: "x" }],
+                               ["a type of the wrong case", { type: "failed", detail: "x" }]]) {
+    let k = null;
+    try {
+      announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                      bodies: new Map([[key, value]]) });
+    } catch (e) { k = e.kind ?? "threw"; }
+    check(k === "escalation_body_type",
+      `${what} is refused at the announce boundary, not only by body()`, String(k));
+  }
+  check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 0,
+    "control: and none of them was persisted, so the refusal precedes the write",
+    JSON.stringify(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key)));
+
+  // CONTROL: every type the vocabulary DOES name is accepted, so this bounds the
+  // vocabulary rather than the field.
+  for (const t of FAILURE_TYPES) {
+    const h = freshHub();
+    announce(h, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                  bodies: new Map([[key, { type: t, detail: "d" }]]) });
+    check(/"type"/.test(h.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? ""),
+      `control: ${t} is accepted, so the check names a vocabulary and not a single value`,
+      h.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null);
+  }
+}
+
 // ── a credential never becomes durable ──────────────────────────────────────
 //
 // `redact` runs on the RENDERED alert, which is the last point before text

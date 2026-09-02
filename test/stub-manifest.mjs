@@ -2610,8 +2610,8 @@ export const STUBS = [
     expectRed: "a cursor from a PREVIOUS incarnation is rewound, though its (seq, at) still matches",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "      : provable && since.incarnation !== incarnation ? \"different-log\"",
-      replace: "      : false ? \"different-log\"",
+      find: "    if (provable && since.incarnation !== incarnation)\n      return { verdict: \"different-log\", proof: \"incarnation\" };",
+      replace: "    if (false)\n      return { verdict: \"different-log\", proof: \"incarnation\" };",
     }],
   },
   {
@@ -2632,8 +2632,8 @@ export const STUBS = [
     expectRed: "but the digest reports that the weaker check answered it",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "      : provable ? \"incarnation\"\n      : verdict === \"ahead\" ? \"sequence\"\n      : \"timestamp\",",
-      replace: "      : \"incarnation\",",
+      find: "    return { verdict: \"ok\", proof: provable ? \"incarnation\" : \"timestamp\" };",
+      replace: "    return { verdict: \"ok\", proof: \"incarnation\" };",
     }],
   },
   {
@@ -2654,8 +2654,8 @@ export const STUBS = [
     expectRed: "and is NEVER reported as a different log, which would send an operator hunting damage that is not there",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "      : provable && since.incarnation !== incarnation ? \"different-log\"",
-      replace: "      : provable && (since.incarnation !== incarnation || !namesAKnownEvent()) ? \"different-log\"",
+      find: "    if (provable && since.incarnation !== incarnation)\n",
+      replace: "    if (provable && (since.incarnation !== incarnation || !namesAKnownEvent()))\n",
     }],
   },
   {
@@ -2676,8 +2676,8 @@ export const STUBS = [
     expectRed: "a cursor carrying THIS hub's identity but naming an event it does not have is a corrupt cursor",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "      : beyond || !namesAKnownEvent()",
-      replace: "      : beyond",
+      find: "    if (beyond || !namesAKnownEvent())",
+      replace: "    if (beyond)",
     }],
   },
   {
@@ -2698,8 +2698,8 @@ export const STUBS = [
     expectRed: "a restore to a SHORTER log is judged by identity, not reported as merely `ahead`",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "      : provable && since.incarnation !== incarnation ? \"different-log\"\n      : beyond || !namesAKnownEvent()",
-      replace: "      : beyond ? \"ahead\"\n      : provable && since.incarnation !== incarnation ? \"different-log\"\n      : !namesAKnownEvent()",
+      find: "    if (since.seq === 0) return { verdict: \"ok\", proof: \"sequence\" };\n    if (provable",
+      replace: "    if (since.seq === 0) return { verdict: \"ok\", proof: \"sequence\" };\n    if (beyond) return { verdict: \"ahead\", proof: \"sequence\" };\n    if (provable",
     }],
   },
   {
@@ -2720,8 +2720,8 @@ export const STUBS = [
     expectRed: "a cursor with THIS hub's identity whose sequence is past the log is the cursor being wrong",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "        ? (provable ? \"unknown-event\" : beyond ? \"ahead\" : \"changed-event\")",
-      replace: "        ? (beyond ? \"ahead\" : provable ? \"unknown-event\" : \"changed-event\")",
+      find: "      return provable ? { verdict: \"unknown-event\", proof: \"incarnation\" }",
+      replace: "      return beyond ? { verdict: \"ahead\", proof: \"sequence\" } : provable ? { verdict: \"unknown-event\", proof: \"incarnation\" }",
     }],
   },
   {
@@ -2742,7 +2742,7 @@ export const STUBS = [
     expectRed: "a cursor at sequence 0 is accepted even though its incarnation differs",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "      : since.seq === 0 ? \"ok\"\n",
+      find: "    if (since.seq === 0) return { verdict: \"ok\", proof: \"sequence\" };\n",
       replace: "",
     }],
   },
@@ -2753,8 +2753,8 @@ export const STUBS = [
     expectRed: "and the proof says SEQUENCE, because that is what settled it",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "      : verdict === \"ahead\" ? \"sequence\"\n",
-      replace: "",
+      find: "        : beyond ? { verdict: \"ahead\", proof: \"sequence\" }",
+      replace: "        : beyond ? { verdict: \"ahead\", proof: \"timestamp\" }",
     }],
   },
   {
@@ -2766,6 +2766,28 @@ export const STUBS = [
       file: "src/build/hubdb.mjs",
       find: "      { hubDamaged: true, cause: e });",
       replace: "      { cause: e });",
+    }],
+  },
+  {
+    name: "the-zero-cursor-proof-names-the-sequence",
+    why: "ground the sequence-zero answer in the incarnation because both ids happen to exist. The identity would have REJECTED that cursor -- it is accepted only because zero names the origin of any log -- so reporting `incarnation` tells a client that identity proved an answer identity disagreed with. Third instance on this surface of a proof naming evidence that decided nothing, and the third arrived inside the fix for the second",
+    test: "test/build-dash.test.mjs",
+    expectRed: "and the proof names the SEQUENCE, not an identity that would have rejected it",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "    if (since.seq === 0) return { verdict: \"ok\", proof: \"sequence\" };",
+      replace: "    if (since.seq === 0) return { verdict: \"ok\", proof: provable ? \"incarnation\" : \"timestamp\" };",
+    }],
+  },
+  {
+    name: "a-hub-with-no-identity-says-so-however-the-answer-was-reached",
+    why: "key the hub-identity note on this answer's proof. A hub that cannot supply an identity issues cursors carrying none, so the NEXT call is unprovable however this one was settled -- and keying it on `cursor_proof` silences the note for exactly the operator whose hub is damaged and whose answer happened to be reached some other way",
+    test: "test/build-dash.test.mjs",
+    expectRed: "the note blames the HUB, which is what cannot supply the identity",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "  else if (m.incarnation === null && m.since !== null)",
+      replace: "  else if (m.cursor_proof === \"timestamp\")",
     }],
   },
 ];

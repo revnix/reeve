@@ -1268,9 +1268,9 @@ const T = {};
   const withCursor = model && dashModel(ddb, { now: NOW, switchesFor: resolver(), projects: [],
                                                since: cur(0, 0, SOME_ID), isAlive: ALIVE });
   const withText = withCursor ? renderDash(withCursor) : "";
-  check(withCursor?.cursor_proof === "timestamp",
+  check(withCursor?.cursor_proof !== "incarnation" && withCursor?.incarnation === null,
     "control: a damaged hub cannot prove a cursor even when the cursor carries an id",
-    String(withCursor?.cursor_proof));
+    JSON.stringify({ proof: withCursor?.cursor_proof, hub: withCursor?.incarnation }));
   check(/this HUB cannot supply an incarnation id/.test(withText),
     "the note blames the HUB, which is what cannot supply the identity",
     withText.split("\n").find(l => /note:/.test(l)) ?? "(no note)");
@@ -1323,6 +1323,16 @@ const T = {};
     "control: the cursor carries an identity this hub does not have", foreign);
 
   const zero = dash({ since: cur(0, 0, foreign) });
+  // AND THE PROOF SAYS WHAT GROUNDED IT. Both ids exist here, so a proof derived
+  // from "was an identity available" reports `incarnation` -- claiming that the
+  // identity proved an answer the identity would have REJECTED. The sequence is
+  // what settled it, because zero names the origin of any log.
+  check(zero.cursor_proof === "sequence",
+    "and the proof names the SEQUENCE, not an identity that would have rejected it",
+    JSON.stringify({ proof: zero.cursor_proof, cursorId: foreign, hubId: hubIncarnation(db).id }));
+  check(zero.cursor_proof !== "incarnation",
+    "control: and never `incarnation`, which is the claim that was false",
+    String(zero.cursor_proof));
   check(zero.cursor_verdict === "ok",
     "a cursor at sequence 0 is accepted even though its incarnation differs",
     JSON.stringify({ verdict: zero.cursor_verdict, rewound: zero.cursor_rewound }));

@@ -205,14 +205,32 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
   // number. Calling that `ahead` and explaining it as "carries no identity" was
   // false twice over -- the cursor carries one, and `cursor_proof` said so on the
   // same screen. `ahead` is reserved for the case where nothing could say why.
+  // DECIDED IN ONE PLACE, VERDICT AND PROOF TOGETHER. They were two expressions
+  // over the same facts, and two expressions can disagree: the sequence-zero arm
+  // accepted a cursor whose incarnation DIFFERS -- correctly, because zero names
+  // the origin of any log -- while the proof beside it still said `incarnation`,
+  // because both ids merely existed. It reported that identity proved an answer
+  // the identity would have rejected.
+  //
+  // That was the third time on this surface that a proof named evidence which had
+  // not decided anything, and the third arrived inside the fix for the second. So
+  // the answer and its grounds are produced by one function: whichever arm
+  // returns, returns both, and there is no second expression left to drift.
   const beyond = since !== null && since.seq > highWater;
-  const verdict =
-    since === null ? null
-      : since.seq === 0 ? "ok"
-      : provable && since.incarnation !== incarnation ? "different-log"
-      : beyond || !namesAKnownEvent()
-        ? (provable ? "unknown-event" : beyond ? "ahead" : "changed-event")
-        : "ok";
+  const decide = () => {
+    if (since === null) return { verdict: null, proof: null };
+    // THE ORIGIN OF ANY LOG, which is why this precedes the identity check and
+    // why the sequence -- not the identity -- is what grounds it.
+    if (since.seq === 0) return { verdict: "ok", proof: "sequence" };
+    if (provable && since.incarnation !== incarnation)
+      return { verdict: "different-log", proof: "incarnation" };
+    if (beyond || !namesAKnownEvent())
+      return provable ? { verdict: "unknown-event", proof: "incarnation" }
+        : beyond ? { verdict: "ahead", proof: "sequence" }
+        : { verdict: "changed-event", proof: "timestamp" };
+    return { verdict: "ok", proof: provable ? "incarnation" : "timestamp" };
+  };
+  const { verdict, proof } = decide();
   // UNCHANGED IN MEANING: do not trust the movement list. Every verdict but `ok`
   // says the cursor cannot be resolved against this log, which is what the exit
   // status and the withheld list have always keyed off.
@@ -362,10 +380,7 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
     // anything deciding whether to trust the movement list. Reporting the
     // stronger and the weaker answer as one value is the defect this closes.
     // `null` where no cursor was given: there was nothing to prove.
-    cursor_proof: since === null ? null
-      : provable ? "incarnation"
-      : verdict === "ahead" ? "sequence"
-      : "timestamp",
+    cursor_proof: proof,
     // The hub's own identity, so a client holding several cursors can tell which
     // of them belong to this log without asking for each in turn.
     incarnation,
@@ -534,7 +549,13 @@ export function renderDash(m) {
     out.push("  note: this cursor predates the hub's incarnation id, so a restore is " +
              "inferred from timestamps and a same-second restore can pass unseen. " +
              "The cursor above carries the id; the next call is provable.");
-  else if (m.cursor_proof === "timestamp")
+  // NOT `else if`, and not keyed on this answer's proof. A hub that cannot supply
+  // an identity issues cursors carrying none, so the NEXT call is unprovable
+  // however this one was settled -- including a sequence-zero cursor, which is
+  // safe today and unprovable tomorrow. Keying it on `cursor_proof` meant the
+  // operator whose hub was damaged heard nothing precisely when the answer had
+  // been reached some other way.
+  else if (m.incarnation === null && m.since !== null)
     out.push("  note: this HUB cannot supply an incarnation id, so a restore is inferred from " +
              "timestamps and a same-second restore can pass unseen. The cursor above carries " +
              "no id either, so the next call is no better until the hub's identity is restored.");

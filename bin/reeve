@@ -1429,13 +1429,21 @@ switch (cmd) {
           let since = null;
           if (raw !== null) {
             // OPAQUE, and parsed by the module that formats it. A cursor is
-            // `<seq>.<at>` so a restore can be PROVED rather than guessed at; an
+            // `<seq>.<at>.<incarnation>`: the sequence says where the operator
+            // stopped reading, and the incarnation is what lets a restore be
+            // PROVED rather than inferred from a timestamp that repeats. An
             // operator copies what the digest printed and never builds one.
+            //
+            // The two-field form still parses -- a cursor issued before the
+            // incarnation existed is answered by the older rule, and the digest
+            // reports which rule answered it rather than presenting the weaker
+            // one as the stronger.
             since = parseCursor(raw);
             if (since === null)
               fail("usage",
                    `reeve task dash: --since expects a cursor from a previous digest's ` +
-                   `next_cursor (it looks like 1234.1800000000), got ${JSON.stringify(raw)}`,
+                   `next_cursor (it looks like 1234.1800000000.${"0".repeat(32)}), ` +
+                   `got ${JSON.stringify(raw)}`,
                    { exit: EXITS.misuse });
           }
           let model;
@@ -1464,7 +1472,8 @@ switch (cmd) {
           // either way -- it carries the cursor to resync from -- but the exit
           // status says the movement list is not an answer, so a script polling
           // this cannot mistake a restore for nothing having happened.
-          process.exit(model.cursor_rewound ? EXITS.degraded : EXITS.ok);
+          process.exit(model.cursor_rewound || model.incarnation_damaged
+            ? EXITS.degraded : EXITS.ok);
         }
 
         if (sub === "list") {

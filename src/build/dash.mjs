@@ -16,6 +16,7 @@
 
 import { TERMINAL } from "./phases.mjs";
 import { LEASE_SECONDS } from "./locks.mjs";
+import { hubIncarnation } from "./hubdb.mjs";
 import {
   READ_FORMAT_VERSION, UNKNOWN, HUMAN_WAITS, ageInState, taskList, oneLine,
 } from "./show.mjs";
@@ -31,14 +32,31 @@ const TERMINAL_SET = new Set(TERMINAL);
  * another project's name.
  */
 /**
- * A cursor is `<seq>.<at>` -- opaque to the operator, who copies what the digest
- * printed. Two fields rather than one because the sequence alone cannot survive a
- * restore; see the rewind check in `dashModel`.
+ * A cursor is `<seq>.<at>.<incarnation>` -- opaque to the operator, who copies
+ * what the digest printed.
+ *
+ * THE INCARNATION IS THE PROOF, and the other two fields are what the cursor
+ * MEANS. `seq` says where in the log the operator stopped reading; `at` is the
+ * older evidence that the log is the same one, kept because a cursor issued
+ * before the incarnation table existed still has to be readable.
+ *
+ * A TRAILING FIELD RATHER THAN A NEW FORMAT, so a cursor written by yesterday's
+ * binary still parses and still answers. It reads with a WEAKER guarantee, which
+ * `cursor_proof` reports rather than leaves as an impression -- the whole defect
+ * this closes was a check that looked like proof and was not.
+ *
+ * The id is 32 hex characters, so it can never contain the separator and the
+ * three fields cannot be confused for one another.
  */
-export const formatCursor = (seq, at) => `${seq}.${at}`;
+export const formatCursor = (seq, at, incarnation = null) =>
+  incarnation ? `${seq}.${at}.${incarnation}` : `${seq}.${at}`;
 export function parseCursor(raw) {
-  const m = /^(\d+)\.(\d+)$/.exec(String(raw ?? ""));
-  return m ? { seq: Number(m[1]), at: Number(m[2]) } : null;
+  // STRICT ON THE THIRD FIELD. A mistyped incarnation refused as unparseable is a
+  // misuse the CLI can name; accepted, it would differ from the hub's and report
+  // a RESTORE that never happened -- sending an operator to look for damage
+  // because they fumbled a paste.
+  const m = /^(\d+)\.(\d+)(?:\.([0-9a-f]{32}))?$/.exec(String(raw ?? ""));
+  return m ? { seq: Number(m[1]), at: Number(m[2]), incarnation: m[3] ?? null } : null;
 }
 
 export function dashModel(db, { now, switchesFor, projects = [], since = null, isAlive }) {
@@ -104,19 +122,119 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
   // usually does not -- the cursor therefore carries the event it names, and a
   // sequence wearing a different row is caught.
   //
-  // It is NOT proof. `at` has integer-second resolution and is not unique, so a
-  // log restored and regrown to the same sequence WITHIN ONE SECOND presents an
-  // identical (seq, at) and this check accepts it. Closing that needs a durable
-  // hub incarnation -- a `hub.restored` event, or a column -- and neither is a
-  // decision a read surface may take: `restoreHub` records nothing today, and
-  // searching hub.sql for any per-incarnation value finds none.
+  // It was NOT proof, and now it is -- when both ends can supply an identity.
+  // `at` has integer-second resolution and is not unique, so a log restored and
+  // regrown to the same sequence WITHIN ONE SECOND presents an identical
+  // (seq, at) and the timestamp check accepts it. Every event through that
+  // sequence in the new incarnation is then omitted permanently and the digest
+  // reports it as a quiet period.
   //
-  // So the bound is stated rather than inferred away, and the remaining gap is
-  // carried to whoever owns the hub schema. A third guess at incarnation would be
-  // the third guess.
+  // The hub now carries a durable per-incarnation id, minted on creation and
+  // re-minted by a restore, so the cursor carries it too and the check COMPARES
+  // IDENTITIES rather than inferring one from a timestamp. Two different logs
+  // cannot present the same id, whatever their clocks did.
+  //
+  // THE FALLBACK IS NOT A SECOND RULE, it is the older rule kept for the cursors
+  // that predate the new one. A cursor without an incarnation, or a hub too old
+  // to have one, cannot be answered by identity at all -- so it is answered the
+  // old way, with the old bound, and `cursor_proof` says which of the two
+  // answered rather than letting a weaker check pass for the stronger one.
+  //
+  // `hubIncarnation` THROWS on a migrated hub whose row is missing, and that is
+  // deliberately not caught here. It distinguishes "predates the table" (null)
+  // from "the table is damaged" (throws), and swallowing the throw would collapse
+  // exactly the distinction it exists to draw, reporting damage as an ordinary
+  // older store. The read route already turns it into a typed refusal.
+  // THREE OUTCOMES, KEPT AS THREE. `hubIncarnation` answers a row, `null` for a
+  // store that genuinely predates the table, or THROWS for one that records the
+  // migration and has no row -- which is damage, and each of those three was put
+  // there by a review finding.
+  //
+  // Catching the throw into `null` would rebuild the exact misclassification the
+  // throw exists to prevent, one layer up: a hand-repaired or partially restored
+  // store would render as an ordinary old hub and the operator would read
+  // "cannot prove" for a store that has been altered outside reeve.
+  //
+  // Letting it out raw is not the other half of that choice. A stack trace is not
+  // an interface for a state an operator has to act on, and this surface exists
+  // to answer "what is going on" rather than to fail at it. So the damage becomes
+  // its own visible answer, carrying the recovery line the error already holds --
+  // and ONLY the marked verdict is caught, so anything else still propagates.
+  let incarnation = null, incarnationDamaged = null;
+  try { incarnation = hubIncarnation(db)?.id ?? null; }
+  catch (e) {
+    if (!e?.hubDamaged) throw e;
+    incarnationDamaged = e.message;
+  }
+  // TWO QUESTIONS, NOT ONE, and collapsing them is what the old rule did.
+  //
+  //   is this log the one that issued the cursor?   -- the INCARNATION answers it
+  //   does the cursor name an event this log has?   -- the (seq, at) pair does
+  //
+  // The first is a restore. The second is a corrupt cursor -- a digit changed in a
+  // paste, say. Both mean the movement list cannot be computed, and they are not
+  // the same fact: reporting a mistyped sequence as "the hub was restored" sends
+  // an operator looking for damage that is not there, and reporting a restore as
+  // a bad paste sends them to re-copy a cursor that will never work again.
+  //
+  // So identity REPLACES the timestamp for deciding a restore -- an implementation
+  // that ORed them reports a restore whenever the pair disagrees, which is the
+  // first error -- and the pair is STILL CHECKED, because dropping it lets an
+  // altered sequence through under an intact identity and `movedSince` then
+  // silently skips every transition between the real mark and the altered one,
+  // which is this surface's worst failure and the one it exists to prevent.
+  //
+  // `phase_event` is append-only, so the `at` recorded for a sequence never
+  // legitimately changes: under a matching identity, a mismatch IS corruption.
+  const provable = since !== null && since.incarnation !== null && incarnation !== null;
   const atOf = (seq) => db.prepare("SELECT at FROM phase_event WHERE seq = ?").get(seq)?.at ?? null;
-  const rewound = since !== null &&
-    (since.seq > highWater || (since.seq > 0 && atOf(since.seq) !== since.at));
+  const namesAKnownEvent = () => since.seq === 0 || atOf(since.seq) === since.at;
+  //
+  // IDENTITY IS ASKED FIRST, because it is the only conclusive answer available
+  // and every other arm is a guess beside it. Asking `ahead` first threw the
+  // proof away in the COMMON restore -- one to a shorter snapshot, which leaves
+  // the log below the saved cursor. That reported `ahead` ("the log is shorter"),
+  // which is a symptom, while the identity sitting right there said `restored`,
+  // which is the cause. The sequence arms only ever run once identity has failed
+  // to decide, or could not be consulted at all.
+  //
+  // A SEQUENCE BEYOND THE LOG IS A KIND OF UNKNOWN EVENT, and which of the two
+  // names it depends on whether an identity was available. With a MATCHING
+  // identity, a sequence past the high-water mark says the cursor is wrong rather
+  // than the log: this IS the log that issued it, and it never reached that
+  // number. Calling that `ahead` and explaining it as "carries no identity" was
+  // false twice over -- the cursor carries one, and `cursor_proof` said so on the
+  // same screen. `ahead` is reserved for the case where nothing could say why.
+  // DECIDED IN ONE PLACE, VERDICT AND PROOF TOGETHER. They were two expressions
+  // over the same facts, and two expressions can disagree: the sequence-zero arm
+  // accepted a cursor whose incarnation DIFFERS -- correctly, because zero names
+  // the origin of any log -- while the proof beside it still said `incarnation`,
+  // because both ids merely existed. It reported that identity proved an answer
+  // the identity would have rejected.
+  //
+  // That was the third time on this surface that a proof named evidence which had
+  // not decided anything, and the third arrived inside the fix for the second. So
+  // the answer and its grounds are produced by one function: whichever arm
+  // returns, returns both, and there is no second expression left to drift.
+  const beyond = since !== null && since.seq > highWater;
+  const decide = () => {
+    if (since === null) return { verdict: null, proof: null };
+    // THE ORIGIN OF ANY LOG, which is why this precedes the identity check and
+    // why the sequence -- not the identity -- is what grounds it.
+    if (since.seq === 0) return { verdict: "ok", proof: "sequence" };
+    if (provable && since.incarnation !== incarnation)
+      return { verdict: "different-log", proof: "incarnation" };
+    if (beyond || !namesAKnownEvent())
+      return provable ? { verdict: "unknown-event", proof: "incarnation" }
+        : beyond ? { verdict: "ahead", proof: "sequence" }
+        : { verdict: "changed-event", proof: "timestamp" };
+    return { verdict: "ok", proof: provable ? "incarnation" : "timestamp" };
+  };
+  const { verdict, proof } = decide();
+  // UNCHANGED IN MEANING: do not trust the movement list. Every verdict but `ok`
+  // says the cursor cannot be resolved against this log, which is what the exit
+  // status and the withheld list have always keyed off.
+  const rewound = verdict !== null && verdict !== "ok";
 
   const byProject = Object.create(null);
   for (const p of projects) byProject[p.name] = switchesFor(p.name);
@@ -240,7 +358,7 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
     // later still. `phase_event.seq` is lossless and monotonic, and
     // `next_cursor` is handed back so the operator never has to construct one.
     since_you_looked: since === null || rewound ? [] : movedSince(db, since.seq),
-    next_cursor: formatCursor(highWater, head?.at ?? 0),
+    next_cursor: formatCursor(highWater, head?.at ?? 0, incarnation),
     // A RESTORE REWINDS THE LOG. `phase_event.seq` is monotonic within one hub,
     // not across a restore: replacing the store with an older snapshot can put
     // the high-water mark BELOW a cursor issued before it. Every later
@@ -251,7 +369,27 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
     // period, which is why it is reported rather than inferred: a cursor ahead of
     // the log is PROOF the log is not the one that issued it.
     cursor_rewound: rewound,
-    since: since === null ? null : formatCursor(since.seq, since.at),
+    // WHY it cannot be resolved, because the remedies differ. `restored` is proof
+    // the log changed underneath the cursor and the old one is dead; `ahead` and
+    // `unknown-event` mean the cursor does not describe this log; `changed-event`
+    // is the honest answer when no identity was available to tell those apart.
+    cursor_verdict: verdict,
+    // WHICH CHECK ANSWERED, said out loud. `cursor_rewound: false` from an
+    // identity comparison is proof; the same false from the timestamp fallback
+    // is "no evidence of a restore", and the two are worth different amounts to
+    // anything deciding whether to trust the movement list. Reporting the
+    // stronger and the weaker answer as one value is the defect this closes.
+    // `null` where no cursor was given: there was nothing to prove.
+    cursor_proof: proof,
+    // The hub's own identity, so a client holding several cursors can tell which
+    // of them belong to this log without asking for each in turn.
+    incarnation,
+    // AND THE REASON THERE IS NONE, when the reason is damage rather than age.
+    // `incarnation: null` alone cannot distinguish a store older than the table
+    // from one whose row was removed, and those need opposite responses: the
+    // first is fine and the second is a hub altered outside reeve.
+    incarnation_damaged: incarnationDamaged,
+    since: since === null ? null : formatCursor(since.seq, since.at, since.incarnation),
 
     // 5. WHAT DID IT DECLINE, FAIL OR REFUSE. Standing escalations, beside the
     // task that raised them.
@@ -369,9 +507,25 @@ export function renderDash(m) {
   for (const e of m.declined)
     out.push(`  ${e.id}  ${oneLine(e.why)}  x${e.count}  since ${e.first_seen_at}`);
 
+  // THE REASON, NOT ONE SENTENCE FOR ALL OF THEM. Every unusable cursor used to
+  // be reported as "ahead of this hub's log (it was restored)", which is a false
+  // diagnosis for three of the four verdicts -- and the restore case this whole
+  // change exists to catch is precisely one where the cursor is NOT ahead.
+  const WHY_UNUSABLE = {
+    ahead: "names a sequence beyond this hub's log. It carries no incarnation, so whether the " +
+           "hub was restored beneath it or the sequence is simply wrong cannot be told apart",
+    "different-log": "does not belong to this hub's log. Either this hub was restored since the " +
+                     "cursor was issued, or the cursor came from a different hub — the identities " +
+                     "differ, which settles that it is not this log without saying which of the two",
+    "unknown-event": "does not name an event this hub has, though it carries this hub's identity — " +
+                     "the cursor itself is wrong rather than the log",
+    "changed-event": "names an event this hub does not have. It carries no incarnation, so whether " +
+                     "the hub was restored or the cursor is simply wrong cannot be told apart",
+  };
   out.push("", m.cursor_rewound
-    ? `since you looked  CURSOR REWOUND: --since ${m.since} is ahead of this hub's log ` +
-      "(it was restored). Resync from the cursor below."
+    ? `since you looked  CURSOR UNUSABLE: --since ${m.since} ` +
+      `${WHY_UNUSABLE[m.cursor_verdict] ?? "cannot be resolved against this hub's log"}. ` +
+      "Resync from the cursor below."
     : m.since === null
       ? "since you looked  (no --since given)"
       : `since you looked (${m.since_you_looked.length})`);
@@ -381,6 +535,30 @@ export function renderDash(m) {
   // never constructs one; printing it only under --json makes that promise
   // reachable exclusively by the people who did not need it.
   out.push(`  next: --since ${m.next_cursor}`);
+  // THE WEAKER ANSWER IS SAID OUT LOUD, and only the weaker one. Printing a line
+  // for the proof case too would train the reader past both, and the strong case
+  // is the one that needs no caveat -- so silence here means proof, and the only
+  // sentence on this subject is the one that changes what the reader may conclude.
+  // DAMAGE FIRST, because it changes what every other line on this subject is
+  // worth. The sentence is the error's own, so the recovery command an operator
+  // needs is not re-typed here and cannot drift from the one hubdb prints.
+  if (m.incarnation_damaged)
+    out.push(`  HUB DAMAGED: ${m.incarnation_damaged.split("\n")[0]}`,
+             ...m.incarnation_damaged.split("\n").slice(1).map(l => `  ${l.trim()}`));
+  if (m.cursor_proof === "timestamp" && m.incarnation !== null)
+    out.push("  note: this cursor predates the hub's incarnation id, so a restore is " +
+             "inferred from timestamps and a same-second restore can pass unseen. " +
+             "The cursor above carries the id; the next call is provable.");
+  // NOT `else if`, and not keyed on this answer's proof. A hub that cannot supply
+  // an identity issues cursors carrying none, so the NEXT call is unprovable
+  // however this one was settled -- including a sequence-zero cursor, which is
+  // safe today and unprovable tomorrow. Keying it on `cursor_proof` meant the
+  // operator whose hub was damaged heard nothing precisely when the answer had
+  // been reached some other way.
+  else if (m.incarnation === null && m.since !== null)
+    out.push("  note: this HUB cannot supply an incarnation id, so a restore is inferred from " +
+             "timestamps and a same-second restore can pass unseen. The cursor above carries " +
+             "no id either, so the next call is no better until the hub's identity is restored.");
 
   // Per task, the facts a digest owes beside the state: what is draining, what
   // territory is pinned and until when, and every UNKNOWN said out loud.

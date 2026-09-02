@@ -395,7 +395,7 @@ for (let i = 0; i < 500; i++) {
   check(branch.length > 200 && !/hubDamaged: true/.test(branch),
     "control: the could-not-check branch never sets the damage marker",
     `branch=${branch.length} chars`);
-  // TWO, and both are named here so a THIRD still trips this.
+  // THREE, and all three are named here so a FOURTH still trips this.
   //
   // A bare count is a tripwire rather than a rule: it exists so that adding a
   // damage claim costs someone a visit to this line, where they have to say which
@@ -405,11 +405,19 @@ for (let i = 0; i < 500; i++) {
   //   2. `hubIncarnation` on a migrated hub with an EMPTY incarnation table --
   //      migration 6 mints a row and nothing removes one, so no row on a store
   //      that records the migration means the store was altered outside reeve
+  //   3. `hubIncarnation` on a migrated hub with NO incarnation table at all --
+  //      the same corruption one step further, and added because only (2) was
+  //      marked: a store that had lost the whole table threw SQLite's bare
+  //      `no such table`, so a caller branching on the mark rendered the missing
+  //      ROW as an actionable damage report and let the missing TABLE out as a
+  //      generic unreadable-hub refusal carrying no remedy. Migration 6 CREATES
+  //      that table and nothing drops it, so its absence on a store recording
+  //      the migration means the same thing (2) does.
   //
   // The could-not-check branch is still excluded, and by its own assertion above
   // rather than by this count.
-  check((src.match(/hubDamaged: true/g) ?? []).length === 2,
-    "control: exactly two places in the file claim damage, and both are named here",
+  check((src.match(/hubDamaged: true/g) ?? []).length === 3,
+    "control: exactly three places in the file claim damage, and all three are named here",
     String((src.match(/hubDamaged: true/g) ?? []).length));
   // AND THE THIRD ANSWER IS CLASSIFIED, not merely worded. `isOperational` is
   // what every recovery path consults, and it reads an errcode -- so a refusal

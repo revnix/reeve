@@ -2241,7 +2241,16 @@ export const STUBS = [
     test: "test/hub-fault.test.mjs",
     expectRed: "told to move the store aside",
     edits: [{ file: "src/build/hubfault.mjs",
-              find: "             remedy: \"no binary will repair this in place: a restore refuses a store recording a \" +",
-              replace: "             remedy: \"restore a snapshot (`reeve restore --hub --force`), then retry\" || \"\" +" }],
+              find: "             remedy: restoreAdvice(true) };",
+              replace: "             remedy: \"restore a snapshot (`reeve restore --hub --force`), then retry\" };" }],
+  },
+  {
+    name: "every-damage-remedy-asks-the-store-not-the-diagnosis",
+    why: "give the plain `reeve restore --hub --force` to a store recording a version above this binary's. `restoreHub` refuses exactly that, before the lock and where `--force` cannot reach, so the advice produces the second refusal this module exists to prevent. Three findings were this same defect in three different branches -- the condition is a property of the STORE rather than of which fault was diagnosed, so it is asked once and every damage branch consults it",
+    test: "test/hub-fault.test.mjs",
+    expectRed: "is told to move the store aside, because a plain restore refuses it",
+    edits: [{ file: "src/build/hubfault.mjs",
+              find: "const restoreAdvice = (aheadOfUs) => aheadOfUs",
+              replace: "const restoreAdvice = (aheadOfUs) => false" }],
   },
 ];

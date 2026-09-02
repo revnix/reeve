@@ -48,6 +48,30 @@ import { HUB_SCHEMA_VERSION } from "./hubdb.mjs";
  * @param {{readable:boolean, missing:number[], have:number[], holed:boolean, invalid:number[], version:number}} hist
  * @returns {{kind:string, detail:string, remedy:string}|null}
  */
+/**
+ * How to install a snapshot over a store this binary may not touch.
+ *
+ * ONE PLACE, because three separate findings were the same defect: a remedy
+ * naming `reeve restore --hub --force` for a store whose recorded version exceeds
+ * this binary's. `restoreHub` refuses exactly that, BEFORE it takes the lock and
+ * where `--force` cannot reach -- so the advice produced the second refusal this
+ * module exists to prevent, three times, in three different branches.
+ *
+ * Patching the third instance would have left the fourth. The condition is not a
+ * property of WHICH fault was diagnosed; it is a property of the STORE, so it is
+ * asked once here and every damage branch consults it.
+ *
+ * `aheadOfUs` is `hist.version > expect`: the one fact that decides whether the
+ * plain command can run at all.
+ */
+const restoreAdvice = (aheadOfUs) => aheadOfUs
+  ? "no binary will repair this in place: a restore refuses a store recording a newer version, " +
+    "and a newer binary refuses a history it cannot read. Stop the daemon, move the hub aside -- " +
+    "`hub.db` AND `hub.db-wal` AND `hub.db-shm`, together, since a WAL database is all three and " +
+    "the -wal can hold committed pages -- and keep them, they are the evidence. Then " +
+    "`reeve restore --hub --force` installs the newest usable snapshot in their place"
+  : "restore a snapshot (`reeve restore --hub --force`), then retry";
+
 export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
                                     migrateWith = "`reeve build run`" } = {}) {
   // UNKNOWN IS NOT DAMAGED, and this remedy used to say it was.
@@ -76,8 +100,8 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
     return { kind: "invalid",
              detail: `it records ${hist.invalid.join(", ")} in schema_version, which is not a migration ` +
                      `number this binary can act on (they run 1 through ${expect})`,
-             remedy: "the marker itself is wrong, so migrating cannot repair it: restore a snapshot " +
-                     "(`reeve restore --hub --force`), then retry" };
+             remedy: "the marker itself is wrong, so migrating cannot repair it: " +
+                     restoreAdvice(hist.version > expect) };
 
   // AHEAD **AND SOUND**. A forward-only history that reached version N carries
   // every version below it, so a store that is ahead AND missing one of the
@@ -111,20 +135,7 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
              // has to stop being the live hub before anything will touch it, so
              // the remedy names the move, and the move keeps the file as evidence
              // rather than deleting it.
-             // ALL THREE FILES, because a hub is not one file. `openHub` forces
-             // `journal_mode = WAL`, so a live store is `hub.db`, `hub.db-wal`
-             // and `hub.db-shm` -- measured: three files while open, one after a
-             // clean close. A crash or a reader still holding the file leaves the
-             // WAL behind with COMMITTED pages in it, which is exactly the state
-             // this remedy is reached in. Moving only the `.db` splits the
-             // evidence I just told them to keep, and leaves a stale `-wal`
-             // beside whatever the restore puts back.
-             remedy: "no binary will repair this in place: a restore refuses a store recording a " +
-                     "newer version, and a newer binary refuses a history with a gap. Stop the daemon, " +
-                     "move the hub aside -- `hub.db` AND `hub.db-wal` AND `hub.db-shm`, together, since " +
-                     "a WAL database is all three and the -wal can hold committed pages -- and keep " +
-                     "them, they are the evidence. Then `reeve restore --hub --force` installs the " +
-                     "newest usable snapshot in their place" };
+             remedy: restoreAdvice(true) };
 
   // NO SNAPSHOT REMEDY FOR A HEALTHY NEWER HUB, and this is the one case where
   // offering the usual repair is dangerous rather than merely unhelpful.
@@ -158,8 +169,7 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
   return hist.holed
     ? { kind: "hole", detail,
         remedy: "this is a HOLE, not a missing tail, so migrating cannot repair it: the migrations " +
-                "beneath the ones already applied cannot be re-run. Restore a snapshot " +
-                "(`reeve restore --hub --force`), then retry" }
+                "beneath the ones already applied cannot be re-run. " + restoreAdvice(hist.version > expect) }
     // THE COMMAND IS THE CALLER'S, the DECISION is not -- and so are its backticks.
     //
     // The two hints are not the same shape: one is a bare command, the other is a

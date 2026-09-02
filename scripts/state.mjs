@@ -76,16 +76,34 @@ export function parseArgs(argv) {
 }
 
 /**
- * The commit a RUNNING daemon loaded, from its log.
+ * THE WHOLE STARTUP LINE, pid and commit together.
  *
- * Returns null when the log says nothing, and null is a REFUSAL to the caller
- * rather than a value. The shell version piped through `tail`, which exits 0 on
- * empty input -- so a missing log, an unreadable one, and one with no such record
- * all printed a blank line that read as a measurement.
+ * The format is owned by `src/daemon.mjs`, which writes exactly
+ *
+ *   reeve daemon starting — node vX, pid N, running commit <sha|unreadable>
+ *
+ * Three things follow, and the first version of this got all three wrong.
+ *
+ * ANCHORED ON THE WHOLE LINE. A bare `running commit <sha>` matches anywhere in
+ * a shared log whose later lines carry externally influenced text -- a GitHub
+ * check named "running commit abcdef1" reaches the log through `describe()` and
+ * would be read as the daemon's revision.
+ *
+ * `unreadable` IS A RECORD, not a miss. `runningCommit()` returns the literal
+ * string when `git rev-parse` fails, deliberately. Skipping it and scanning
+ * further back finds an OLDER start and attributes its commit to the process
+ * running now, which is worse than answering nothing.
+ *
+ * AND THE PID COMES FROM THE SAME LINE, so the commit can be checked against the
+ * process that is actually alive rather than against whichever start was last
+ * written.
  */
-export function runningCommitFrom(logText) {
-  const hits = [...String(logText ?? "").matchAll(/running commit ([0-9a-f]{7,40})/g)];
-  return hits.length ? hits[hits.length - 1][1] : null;
+export function startupRecordFrom(logText) {
+  const re = /reeve daemon starting[^\n]*?\bpid (\d+), running commit (\S+)/g;
+  const hits = [...String(logText ?? "").matchAll(re)];
+  if (!hits.length) return null;
+  const [, pid, commit] = hits[hits.length - 1];
+  return { pid: Number(pid), commit: commit === "unreadable" ? null : commit };
 }
 
 /**
@@ -141,6 +159,15 @@ export function unopenedBranches(branches, claimedOids) {
  * only the sentence tells the operator where to look.
  */
 export function sweepVerdict({ ok, out }) {
+  // A ZERO EXIT IS NOT EVIDENCE. A sweep that returned success without printing
+  // its verdict -- an early return, a build that produced no output -- would give
+  // `ok` with a blank line and let the caller continue. That is the exact absence
+  // read as success that this whole file exists to prevent, in the function
+  // written to prevent it.
+  const summary = /(\d+)\/(\d+) stub\(s\) caught/.exec(String(out ?? ""));
+  if (ok && !summary) return { level: "refusal", stop: true,
+    lines: ["the sweep exited 0 but printed no verdict, so nothing was actually measured",
+            "-> a clean exit without the `N/M stub(s) caught` line is an absence, not a pass"] };
   if (ok) return { level: "ok", stop: false,
                    lines: [(out ?? "").split("\n").filter(Boolean).slice(-2).join(" | ")] };
   const text = String(out ?? "");
@@ -149,9 +176,14 @@ export function sweepVerdict({ ok, out }) {
   if (uncaught.length) return { level: "refusal", stop: true,
     lines: [`${uncaught.length} assertion(s) cannot fail for the reason they name:`, ...uncaught] };
   if (unrunnable.length) return { level: "environment", stop: true,
-    lines: [`the sweep could not RUN ${unrunnable.length} entr(ies) here:`, ...unrunnable,
-            "this is a fact about this machine rather than about the code -- check dependencies are installed in the sweep tree",
-            "the verification is incomplete either way, so this still stops the caller"] };
+    lines: [`the sweep produced no evidence for ${unrunnable.length} entr(ies):`, ...unrunnable,
+            // NOT ONLY A DEPENDENCY PROBLEM. `stubsweep` also emits UNRUNNABLE when
+            // the CONTROL test is already red on the base, when a restore fails, and
+            // when a test leaves side effects; CRASHED means the stubbed process died
+            // before reporting. Naming dependencies as the cause would send an
+            // operator to the wrong place for three of those four.
+            "causes differ: a control already red on the base, a failed restore, a test with side effects, or missing dependencies",
+            "-> read the entry's own lines above; the verification is incomplete either way, so this stops the caller"] };
   return { level: "refusal", stop: true,
            lines: ["the sweep failed and named no verdict", text.split("\n").slice(-3).join(" | ")] };
 }
@@ -172,7 +204,7 @@ export function fileReadable(path) {
   try { closeSync(openSync(path, "r")); return true; } catch { return false; }
 }
 
-export function lastMatchBackward(path, re, { chunk = 256 * 1024, max = 64 * 1024 * 1024 } = {}) {
+export function lastStartupRecord(path, { chunk = 256 * 1024, max = 64 * 1024 * 1024 } = {}) {
   let fd = null;
   try {
     fd = openSync(path, "r");
@@ -180,8 +212,8 @@ export function lastMatchBackward(path, re, { chunk = 256 * 1024, max = 64 * 102
     for (let window = Math.min(chunk, size); ; window = Math.min(window * 4, size)) {
       const buf = Buffer.alloc(window);
       readSync(fd, buf, 0, window, size - window);
-      const hits = [...buf.toString("utf8").matchAll(re)];
-      if (hits.length) return hits[hits.length - 1][1];
+      const found = startupRecordFrom(buf.toString("utf8"));
+      if (found) return found;
       if (window >= size || window >= max) return null;
     }
   } catch { return null; } finally { if (fd !== null) try { closeSync(fd); } catch { /* already gone */ } }
@@ -226,12 +258,22 @@ function main(argv) {
   const pid = printed.ok ? daemonPidFrom(printed.out) : null;
   const logPath = join(process.env.REEVE_HOME ?? join(process.env.HOME ?? "", ".reeve"), "reeve.log");
   const logReadable = fileReadable(logPath);
-  const running = logReadable ? lastMatchBackward(logPath, /running commit ([0-9a-f]{7,40})/g) : null;
+  const record = logReadable ? lastStartupRecord(logPath) : null;
   if (!printed.ok) refuse(`could not ask launchctl about the daemon job: ${printed.err}`);
   else if (pid === null) say("daemon          the job is loaded but NOT running (launchctl reports no pid)");
   else if (!logReadable) refuse("the daemon is running but no log could be read, so what it loaded is unknown");
-  else if (running === null) refuse("the daemon is running but its log records no `running commit`");
-  else say(`daemon          pid ${pid}, loaded commit ${running}`);
+  else if (record === null) refuse("the daemon is running but its log records no startup line");
+  // THE RECORD MUST BELONG TO THE LIVE PROCESS. launchctl proves SOME pid is
+  // alive; the log's newest start may be an earlier one, written before a restart
+  // that has not logged yet. Attributing an old commit to the running pid is the
+  // failure this pairing exists to stop.
+  else if (record.pid !== pid)
+    refuse(`the daemon is running as pid ${pid} but the newest startup record is pid ${record.pid}, so what it loaded is unknown`);
+  // `unreadable` is what the daemon writes when its OWN `git rev-parse` failed.
+  // Scanning past it to an older start would attribute that start's commit here.
+  else if (record.commit === null)
+    refuse(`the daemon is running as pid ${pid} but recorded its commit as unreadable, so what it loaded is unknown`);
+  else say(`daemon          pid ${pid}, loaded commit ${record.commit}`);
 
   const src = run("git", ["show", `origin/${branch}:src/build/hubdb.mjs`]);
   if (!src.ok) refuse(`could not read hubdb.mjs from origin/${branch}: ${src.err}`);
@@ -285,6 +327,14 @@ function main(argv) {
     if (uncounted) refuse(`${uncounted} branch(es) could not be compared, so that list is not complete`);
   }
 
+  // PRINTED BEFORE THE SWEEP, because the sweep takes roughly twenty minutes and
+  // everything above is a "right now" reading. Buffering it to one write at the
+  // end means main can advance, a pull request can open and the daemon can
+  // restart while the readings sit in memory -- and they are then printed under a
+  // heading that says they are current.
+  console.log(out.join("\n"));
+  out.length = 0;
+
   if (args.sweep) {
     const dir = mkdtempSync(join(tmpdir(), "reeve-state-sweep-"));
     try {
@@ -301,7 +351,11 @@ function main(argv) {
           // default base resolves to HEAD and the comparison is empty -- which
           // silently skips the grandfathered-file and manifest-growth gates and
           // still reports ok. Those gates are most of what the sweep is for.
-          const swept = runner(dir)("node", ["scripts/stub-sweep.mjs"],
+          // process.execPath, NOT a bare `node`. The floor above validates only THIS
+          // process: an operator invoking the script with the Node 24 binary while
+          // PATH still holds the host default would run the authoritative sweep
+          // under Node 22, which is the runtime the floor exists to refuse.
+          const swept = runner(dir)(process.execPath, ["scripts/stub-sweep.mjs"],
             { timeout: 3_600_000, env: { ...process.env, STUB_SWEEP_BASE: `origin/${branch}~1` } });
           const verdict = sweepVerdict(swept);
           say("", `sweep           ${verdict.level}`, ...verdict.lines.map(l => `  ${l}`));
@@ -314,7 +368,7 @@ function main(argv) {
     }
   }
 
-  console.log(out.join("\n"));
+  if (out.length) console.log(out.join("\n"));
   return refusals ? 1 : 0;
 }
 

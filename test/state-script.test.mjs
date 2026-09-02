@@ -8,7 +8,7 @@
 //
 // Every assertion below is about telling a MEASUREMENT from a REFUSAL. That is
 // the only thing this script does that can be wrong in a way nobody notices.
-import { runningCommitFrom, schemaVersionFrom, unopenedBranches, sweepVerdict,
+import { startupRecordFrom, schemaVersionFrom, unopenedBranches, sweepVerdict,
          nodeFloorFailure, parseArgs, daemonPidFrom } from "../scripts/state.mjs";
 
 let fail = 0;
@@ -43,19 +43,37 @@ const check = (ok, name, detail) => {
     "control: an unknown flag alongside a known one is still refused");
 }
 
-// ── an absent reading is null, and null is a refusal ─────────────────────────
+// ── the startup record: pid and commit, from one anchored line ──────────────
+//
+// The format is owned by src/daemon.mjs, which writes
+//   reeve daemon starting — node vX, pid N, running commit <sha|unreadable>
 {
-  check(runningCommitFrom("x\nreeve daemon starting — running commit a939cb1\ny") === "a939cb1",
-    "the loaded commit is read from the log line that records it");
-  check(runningCommitFrom("running commit aaaaaaa\nrunning commit bbbbbbb") === "bbbbbbb",
+  const LINE = (pid, c) => `reeve daemon starting — node v24.17.0, pid ${pid}, running commit ${c}`;
+
+  const r = startupRecordFrom(`noise\n${LINE(63207, "a939cb1")}\nmore`);
+  check(r?.pid === 63207 && r?.commit === "a939cb1", "pid and commit come from the SAME startup line", JSON.stringify(r));
+
+  check(startupRecordFrom(`${LINE(1, "aaaaaaa")}\n${LINE(2, "bbbbbbb")}`)?.pid === 2,
     "the LAST start wins, because a daemon that restarted loaded the newer one");
-  // The shell version piped through `tail`, which exits 0 on empty input: a
-  // missing log, an unreadable one, and one with no such record all printed a
-  // blank line that read as a measurement.
-  check(runningCommitFrom("") === null, "an empty log answers null rather than an empty string");
-  check(runningCommitFrom(null) === null, "and so does no log at all");
-  check(runningCommitFrom("reeve daemon starting, no commit here") === null,
-    "and so does a log that starts a daemon without recording a commit");
+
+  // `runningCommit()` returns the literal string when its own git rev-parse
+  // fails, deliberately. Scanning past it to an older start would attribute that
+  // start's commit to the process running now -- worse than answering nothing.
+  const u = startupRecordFrom(`${LINE(9, "aaaaaaa")}\n${LINE(10, "unreadable")}`);
+  check(u?.pid === 10 && u?.commit === null,
+    "an `unreadable` commit is a RECORD, not a miss: it does not fall back to an older start",
+    JSON.stringify(u));
+
+  // A bare `running commit <sha>` matches anywhere in a shared log whose later
+  // lines carry externally influenced text -- a GitHub check named
+  // "running commit abcdef1" reaches the log through describe().
+  check(startupRecordFrom(`${LINE(5, "aaaaaaa")}\ncheck failed: running commit deadbee`)?.commit === "aaaaaaa",
+    "a later line merely CONTAINING the phrase is not read as a startup record");
+
+  check(startupRecordFrom("") === null, "an empty log answers null rather than a value");
+  check(startupRecordFrom(null) === null, "and so does no log at all");
+  check(startupRecordFrom("reeve daemon starting, no pid or commit here") === null,
+    "and so does a start that records neither");
 }
 
 // ── liveness is not a log line ───────────────────────────────────────────────
@@ -105,24 +123,42 @@ const check = (ok, name, detail) => {
 // what sent a session hunting a defect in a healthy repository. main's CI was
 // green on the same commit the block called broken.
 {
-  const notCaught = { ok: false, out: "228/229 stubs\n  · some-entry: NOT_CAUGHT" };
-  const unrunnable = { ok: false, out: "228/229 stubs\n  · lint-rule-reports-a-pathname-read: UNRUNNABLE" };
+  const SUMMARY = "229/229 stub(s) caught";
+  const notCaught = { ok: false, out: "228/229 stub(s) caught\n  · some-entry: NOT_CAUGHT" };
+  const unrunnable = { ok: false, out: "228/229 stub(s) caught\n  · lint-rule-reports-a-pathname-read: UNRUNNABLE" };
 
   check(sweepVerdict(notCaught).level === "refusal",
     "an assertion that CANNOT FAIL is a refusal -- the finding the sweep exists to produce");
   check(sweepVerdict(unrunnable).level === "environment",
     "an entry that could not RUN is a fact about this machine, not about the code");
-  check(sweepVerdict(unrunnable).lines.join(" ").includes("dependencies"),
-    "and it says so, naming the thing that is actually missing");
-  // BOTH STILL STOP THE CALLER. An entry that could not run produced no evidence,
+  // UNRUNNABLE is NOT only a dependency problem: stubsweep emits it when the
+  // control is already red on the base, when a restore fails, and when a test
+  // leaves side effects. Naming dependencies as the cause misdirects three times
+  // out of four.
+  check(!/check dependencies are installed/.test(sweepVerdict(unrunnable).lines.join(" ")),
+    "and it does not name dependencies as THE cause, since three other causes share the verdict",
+    sweepVerdict(unrunnable).lines.join(" "));
+  check(/control already red|failed restore|side effects/.test(sweepVerdict(unrunnable).lines.join(" ")),
+    "it lists the causes that share the verdict instead");
+  // BOTH STILL STOP THE CALLER: an entry that could not run produced no evidence,
   // so the verification is incomplete either way; only the sentence differs.
-  // Reporting `environment` and exiting 0 would hand a resumed session an
-  // incomplete verification wearing a clean exit.
   check(sweepVerdict(unrunnable).stop === true,
     "an incomplete verification STOPS the caller, even though it is not a code finding");
   check(sweepVerdict(notCaught).stop === true, "and so does a real finding");
-  check(sweepVerdict({ ok: true, out: "229/229 stub(s) caught" }).stop === false,
+  check(sweepVerdict({ ok: true, out: SUMMARY }).stop === false,
     "control: only a sweep that actually passed lets the caller continue");
+
+  // A ZERO EXIT IS NOT EVIDENCE. A sweep returning success without printing its
+  // verdict would give `ok` with a blank line -- the exact absence read as
+  // success that this file exists to prevent, in the function written to prevent
+  // it.
+  check(sweepVerdict({ ok: true, out: "" }).level === "refusal",
+    "a clean exit that printed NO verdict is a refusal, not a pass",
+    JSON.stringify(sweepVerdict({ ok: true, out: "" })));
+  check(sweepVerdict({ ok: true, out: "" }).stop === true, "and it stops the caller");
+  check(sweepVerdict({ ok: true, out: "built fine, nothing to do" }).level === "refusal",
+    "control: output without the `N/M stub(s) caught` line is still an absence");
+
   check(sweepVerdict({ ok: false, out: "  · a: NOT_CAUGHT\n  · b: UNRUNNABLE" }).level === "refusal",
     "control: a real finding alongside an unrunnable entry is still a refusal");
   check(sweepVerdict({ ok: false, out: "exploded" }).level === "refusal",

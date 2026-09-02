@@ -24,10 +24,21 @@ chasing drift that does not exist. The handoff's §0 is the authority and it is 
 
 ## Do these in order
 
-1. **Read docs/2026-09-02-session-handoff.md in full**, then RUN its §0.1 block. Do
-   not skip it because the prose above it looks current. If any command in that block
-   fails, stop: it is chained precisely so a failed read cannot reach you as an empty
-   answer, and an empty answer there reads as good news.
+1. **Run `node scripts/state.mjs`.** That is the authority on current state, and it
+   replaces the §0.1 shell block this step used to name. Do not run §0.1: it is
+   superseded, it is not covered by any test, and two of its guards alarmed on
+   SUCCESS -- a `grep -m1` pipeline reporting SIGPIPE as a failed read, and a sweep
+   worktree with no dependencies installed reporting a healthy main as broken. A
+   session following it stopped twice on a green repository.
+
+   If the script exits non-zero, stop and read what it refused. Every reading it
+   prints is a measurement or a refusal and there is no third thing, so an empty
+   answer never reaches you as good news. Add `--sweep` when you need the full
+   verification as well; it takes roughly twenty minutes and stops you on an
+   incomplete run as well as on a finding.
+
+   Then read docs/2026-09-02-session-handoff.md for the context no command can
+   give you -- the decisions, the constraints, and who holds what.
 
 2. **Read section 2 before touching anything.** It is two defect shapes this lane produced
    repeatedly in one evening, each caught by review rather than by its own tests. The next

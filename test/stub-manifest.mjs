@@ -2412,8 +2412,8 @@ export const STUBS = [
     expectRed: "a cursor from a PREVIOUS incarnation is rewound, though its (seq, at) still matches",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "        ? (since.incarnation !== incarnation ? \"restored\"",
-      replace: "        ? (false ? \"restored\"",
+      find: "      : provable && since.incarnation !== incarnation ? \"different-log\"",
+      replace: "      : false ? \"different-log\"",
     }],
   },
   {
@@ -2456,8 +2456,8 @@ export const STUBS = [
     expectRed: "and is NEVER diagnosed as a restore, which would send an operator hunting damage that is not there",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "        ? (since.incarnation !== incarnation ? \"restored\"\n           : namesAKnownEvent() ? \"ok\" : \"unknown-event\")",
-      replace: "        ? (since.incarnation !== incarnation || !namesAKnownEvent() ? \"restored\"\n           : \"ok\")",
+      find: "      : provable && since.incarnation !== incarnation ? \"different-log\"",
+      replace: "      : provable && (since.incarnation !== incarnation || !namesAKnownEvent()) ? \"different-log\"",
     }],
   },
   {
@@ -2478,8 +2478,8 @@ export const STUBS = [
     expectRed: "a cursor carrying THIS hub's identity but naming an event it does not have is a corrupt cursor",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "           : namesAKnownEvent() ? \"ok\" : \"unknown-event\")",
-      replace: "           : \"ok\")",
+      find: "      : namesAKnownEvent() ? \"ok\"",
+      replace: "      : true ? \"ok\"",
     }],
   },
   {

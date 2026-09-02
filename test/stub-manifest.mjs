@@ -3201,4 +3201,37 @@ export const STUBS = [
       replace: "  return named;",
     }],
   },
+  {
+    name: "a-credential-is-part-of-the-channel",
+    why: "call an ntfy channel usable without a readable credential. `notify` refuses to publish to an unauthenticated topic deterministically, so that channel declines EVERY send while the doctor reports the machine able to page -- the same false assurance an empty notify block gave, one field deeper",
+    test: "test/build-paging.test.mjs",
+    expectRed: "ntfy with no credentialFile is not deliverable, so the doctor cannot report it as healthy",
+    edits: [{
+      file: "src/build/paging.mjs",
+      find: "  const usable = (ntfy && credential !== null) || cfg.desktop === true;",
+      replace: "  const usable = ntfy || cfg.desktop === true;",
+    }],
+  },
+  {
+    name: "a-pasted-action-is-one-shell-command",
+    why: "append the home to the action STRING. Every action is `<command> — <why it matters>`, so the argument lands after the prose and no shell will take it -- a fix for pasteability that destroys it. The command up to the em dash has to run on its own",
+    test: "test/build-paging.test.mjs",
+    expectRed: "and it sits in the COMMAND rather than after the prose, which no shell would accept",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  return cut === -1 ? named + arg : named.slice(0, cut) + arg + named.slice(cut);",
+      replace: "  return named + arg;",
+    }],
+  },
+  {
+    name: "a-home-with-a-space-stays-one-argument",
+    why: "interpolate the home unquoted. A path containing a space -- an external volume, most obviously -- splits into two words, so `--home` consumes only the first and the command SUCCEEDS against a different hub. That is worse than failing: the likeliest answer there is that the task does not exist, and an operator will believe it",
+    test: "test/build-paging.test.mjs",
+    expectRed: "the home is quoted, so a path containing a space stays one argument",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  const arg = ` --home ${shellQuote(home)}`;",
+      replace: "  const arg = ` --home ${home}`;",
+    }],
+  },
 ];

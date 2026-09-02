@@ -15,6 +15,7 @@ import { openHub } from "../src/build/hubdb.mjs";
 import { escalationKey } from "../src/build/announce.mjs";
 import { machineProfile, machineProfilePath, pageStandingCauses,
          PAGES_PER_PASS } from "../src/build/paging.mjs";
+import { pages } from "../src/build/announce.mjs";
 import { hubFindings } from "../src/doctor.mjs";
 
 const dir = mkdtempSync(join(tmpdir(), "reeve-paging-"));
@@ -242,9 +243,10 @@ const raise = (db, why, count, at) => db.prepare(
 {
   const home = freshHome(), db = hubOf(home);
   raise(db, KEY, 1, NOW);
+  writeFileSync(join(home, "cred"), "user:pass");
   writeFileSync(machineProfilePath(home), JSON.stringify({ notify: {
     provider: "ntfy", url: "http://127.0.0.1:9", topic: "t",
-    credentialFile: join(home, "no-such-credential") } }));
+    credentialFile: join(home, "cred") } }));
   const r = pageStandingCauses(db, { home, at: NOW, isAlive: ALIVE });
   check(r.deliverable === true,
     "control: a profile IS loaded here, so presence alone would have reported success",
@@ -296,23 +298,37 @@ const raise = (db, why, count, at) => db.prepare(
 // deliverability made the doctor report a machine that can reach nobody as
 // healthy -- the exact assurance H-14 exists to withhold.
 {
-  for (const [what, cfg] of [["an empty notify block", {}],
-                             ["ntfy with no url", { provider: "ntfy", topic: "t" }],
-                             ["ntfy with no topic", { provider: "ntfy", url: "http://x" }],
-                             ["a provider nothing builds", { provider: "none" }]]) {
+  for (const [what, cfg, expect] of [
+                             ["an empty notify block", {}, /no usable channel/],
+                             ["ntfy with no url", { provider: "ntfy", topic: "t" }, /no usable channel/],
+                             ["ntfy with no topic", { provider: "ntfy", url: "http://x" }, /no usable channel/],
+                             ["a provider nothing builds", { provider: "none" }, /no usable channel/],
+                             // THE CREDENTIAL IS PART OF THE CHANNEL: `notify` refuses to
+                             // publish to an unauthenticated topic, so an ntfy channel
+                             // without a readable one declines every send.
+                             ["ntfy with no credentialFile",
+                              { provider: "ntfy", url: "http://x", topic: "t" },
+                              /credential is unreadable/],
+                             ["ntfy whose credential file is absent",
+                              { provider: "ntfy", url: "http://x", topic: "t",
+                                credentialFile: "/no/such/credential" },
+                              /credential is unreadable/]]) {
     const home = freshHome();
     writeFileSync(machineProfilePath(home), JSON.stringify({ notify: cfg }));
     const m = machineProfile(home);
-    check(m.profile === null && /no usable channel/.test(m.why ?? ""),
+    check(m.profile === null && expect.test(m.why ?? ""),
       `${what} is not deliverable, so the doctor cannot report it as healthy`,
-      JSON.stringify({ why: m.why }));
+      JSON.stringify({ why: m.why, expected: String(expect) }));
   }
   // CONTROLS: both shapes `notify` actually builds a channel from are accepted,
   // so this refuses configurations rather than refusing configuration.
   for (const [what, cfg] of [["desktop", { desktop: true }],
-                             ["a complete ntfy", { provider: "ntfy", url: "http://x", topic: "t" }]]) {
+                             ["a complete ntfy", { provider: "ntfy", url: "http://x", topic: "t",
+                                                   credentialFile: "CRED" }]]) {
     const home = freshHome();
-    writeFileSync(machineProfilePath(home), JSON.stringify({ notify: cfg }));
+    writeFileSync(join(home, "cred"), "user:pass");
+    writeFileSync(machineProfilePath(home), JSON.stringify({ notify:
+      cfg.credentialFile === "CRED" ? { ...cfg, credentialFile: join(home, "cred") } : cfg }));
     check(machineProfile(home).profile !== null,
       `control: ${what} IS deliverable, so the check bounds the config and not the file`,
       JSON.stringify(machineProfile(home).why));
@@ -377,6 +393,58 @@ const raise = (db, why, count, at) => db.prepare(
   check(/--home /.test(msg) && msg.includes(home),
     "the action names the home the alert is about, so the pasted command reaches THIS hub",
     JSON.stringify(msg.split("\n").find(l => /->/.test(l)) ?? msg.slice(0, 120)));
+}
+
+// ── a pasted action is one shell command, whatever the home contains ───────
+//
+// The action is `<command> — <why it matters>`, so an argument appended to the
+// STRING lands after the prose and no shell will take it -- a fix for
+// pasteability that destroyed it. And a home containing a space splits into two
+// words, so `--home` consumes only the first and the command succeeds against a
+// different hub, which is worse than failing.
+{
+  const home = freshHome(), db = hubOf(home);
+  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: { desktop: true } }));
+  const task = seedTasks(db, 1)[0];
+  raise(db, `${task}:phase:blocked:RESEARCH`, 1, NOW);
+  const sent = [];
+  const send = (a) => { sent.push(a); return { ok: true, channels: [{ name: "t", ok: true, ref: "r" }] }; };
+  pageStandingCauses(db, { home, at: NOW, isAlive: ALIVE, send });
+  const line = (sent[0]?.message ?? "").split("\n").find(l => /->/.test(l)) ?? "";
+
+  check(/--home '/.test(line),
+    "the home is quoted, so a path containing a space stays one argument", JSON.stringify(line));
+  // THE ARGUMENT IS INSIDE THE COMMAND, before the explanation. Everything up to
+  // the em dash has to be runnable on its own.
+  const command = line.replace(/^\s*->\s*/, "").split(" — ")[0];
+  check(/--home '/.test(command),
+    "and it sits in the COMMAND rather than after the prose, which no shell would accept",
+    JSON.stringify(command));
+  check(command.includes(home),
+    "control: and it is this hub's home, not a placeholder", JSON.stringify(command));
+  db.close();
+}
+
+// ── H-14 counts the causes that would have paged ───────────────────────────
+//
+// The row reports what a missing channel COSTS. A digest-only cause is never sent
+// to any channel by design, so counting it inflates the harm and invites an
+// operator to configure a profile for alarms that were never going to use one.
+{
+  const home = freshHome(), db = hubOf(home);
+  const task = seedTasks(db, 1)[0];
+  raise(db, `${task}:infeasible`, 1, NOW);              // declared, but not on the page list
+  raise(db, `${task}:phase:blocked:RESEARCH`, 1, NOW);  // pages
+  check(pages(`${task}:phase:blocked:RESEARCH`) && !pages(`${task}:infeasible`),
+    "control: the fixture really holds one paging cause and one digest-only cause",
+    JSON.stringify({ blocked: pages(`${task}:phase:blocked:RESEARCH`),
+                     infeasible: pages(`${task}:infeasible`) }));
+
+  const counted = db.prepare("SELECT why FROM escalation").all().filter(r => pages(r.why)).length;
+  check(counted === 1 && db.prepare("SELECT count(*) c FROM escalation").get().c === 2,
+    "so the affected count is the paging one, not every standing row",
+    JSON.stringify({ counted, standing: 2 }));
+  db.close();
 }
 
 // ── the wiring exists, which no unit test above can see ─────────────────────

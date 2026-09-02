@@ -717,11 +717,18 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   // the settings file states, so two separately-derived lists would let a grant
   // exist in one reading of the boundary and not the other.
   for (const [name, s] of [["BUILD_RESEARCH", research], ["BUILD_DESIGN", design], ["FIX_CI", sb("FIX_CI")]]) {
-    const flag = s.disallowedTools.split(",");
-    const deny = new Set(s.settings.permissions.deny);
-    check(flag.every((t) => deny.has(t)),
-      `${name}: every tool the flag withholds is also denied in the settings`,
-      JSON.stringify(flag.filter((t) => !deny.has(t))));
+    const flag = s.disallowedTools.split(",").filter(Boolean).sort();
+    // RESTRICTED TO NEVER_TOOLS and compared as EQUAL SETS. `deny` also carries
+    // the path denials, so the comparison is over the tool names only -- and it
+    // must be equality, not containment. `flag every-in deny` is one-directional
+    // and passes against a `deny` that withholds MORE than the flag does, which
+    // is exactly the disagreement this asserts against: a tool denied in the
+    // settings but not on the command line is withheld in one reading of the
+    // boundary and granted in the other.
+    const denyTools = s.settings.permissions.deny.filter((t) => NEVER_TOOLS.includes(t)).sort();
+    check(JSON.stringify(flag) === JSON.stringify(denyTools),
+      `${name}: the flag and the settings withhold the SAME tools, not one a subset of the other`,
+      JSON.stringify({ flag, denyTools }));
   }
 
   // AN ACTION NAME COMES FROM THE HUB. `sandboxFor` is called with
@@ -729,10 +736,23 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   // lookup takes untrusted input -- and this file already reads
   // `Object.hasOwn(ARTIFACT_FILE, action)` for the same reason. Indexed plainly,
   // a hostile name resolves to a function whose `.file` is undefined.
+  //
+  // The observable is the GRANT, not the subtraction. Measured: indexed plainly,
+  // `toolsFor("constructor")` returns a FUNCTION whose `.file` and `.fanOut` are
+  // both undefined -- so `new Set(undefined)` is empty and the subtraction looks
+  // correct while `scopedFileTools` is handed undefined. An assertion on
+  // `neverToolsFor` cannot see this; one on the file tools can.
+  const grantOf = (action) => {
+    try { return sandboxFor({ profile: P, action, worktree: "/tmp/wt-build" }); }
+    catch (e) { return { allowedTools: "", threw: String(e.message) }; }
+  };
   for (const hostile of ["constructor", "toString", "__proto__", "valueOf"]) {
-    check(JSON.stringify(neverToolsFor(hostile)) === JSON.stringify(NEVER_TOOLS),
-      `the action name ${hostile} subtracts nothing, rather than resolving to Object's prototype`,
-      JSON.stringify(neverToolsFor(hostile)));
+    const s2 = grantOf(hostile);
+    check(has(s2, "Read") && has(s2, "Grep") && has(s2, "Glob"),
+      `the action name ${hostile} falls to the default read-only row, rather than to Object's prototype`,
+      JSON.stringify({ allowedTools: s2.allowedTools, threw: s2.threw }));
+    check(!has(s2, "Agent") && !has(s2, "WebSearch") && !has(s2, "Edit"),
+      `control: and ${hostile} is granted nothing beyond it`, s2.allowedTools);
   }
   check(neverToolsFor("BUILD_RESEARCH").length === NEVER_TOOLS.length - 3,
     "control: and a real action still subtracts, so the guard is not just refusing everything",

@@ -755,7 +755,7 @@ export const actionFor = (key, { home = null } = {}) => {
 export function announce(db, {
   escalations, at = Math.floor(Date.now() / 1000), isAlive, send,
   profile = null, examined = null, bodies = null, observe = true, limit = Infinity,
-  homeArg = null } = {}) {
+  homeArg = null, budgetMs = Infinity, now = () => Date.now() } = {}) {
   if (typeof send !== "function")
     throw refuse("not_writable",
       "announce needs a send function: whether a page reached anyone is the one thing this " +
@@ -909,6 +909,18 @@ export function announce(db, {
   // makes a refused page come back. The DIGEST is not bounded: it writes no
   // channel and cannot block, and withholding it would hide a cause from the
   // durable surface to save time that was never spent.
+  // A COUNT CANNOT BOUND WORK, and that is what the first version got wrong. One
+  // `notify` call sends on EVERY configured channel in turn, so a machine with
+  // both ntfy and desktop configured spends up to two 8-second timeouts on a
+  // single page -- five pages is 80 seconds, not the 40 the count was chosen for,
+  // and the loop's own sleep then puts the lease in reach again. A third channel
+  // would move the number once more.
+  //
+  // A DEADLINE bounds it whatever the channels do. It is checked BEFORE each
+  // send, so the worst case is the budget plus one send already in flight, and
+  // that overshoot is the only part a caller has to reason about.
+  const startedAt = now();
+  const spent = () => now() - startedAt;
   let attempted = 0;
   for (const f of fresh) {
     const body = bodyFor(f.why);
@@ -919,7 +931,7 @@ export function announce(db, {
       markAnnounced(f.why, f.count);
       continue;
     }
-    if (attempted >= limit) continue;
+    if (attempted >= limit || spent() >= budgetMs) continue;
     attempted++;
     const sent = dispatch(f.why, f.count, "raised", body);
     // ONLY ON SUCCESS. A refused page leaves `announced_count` where it was, so
@@ -936,7 +948,7 @@ export function announce(db, {
     // THE SAME BOUND. A clearing sends too, so a backlog of them blocks a caller
     // exactly as a backlog of raises does -- and a clearing that waits costs
     // nothing, because the row stands until one is delivered.
-    if (attempted >= limit) break;
+    if (attempted >= limit || spent() >= budgetMs) break;
     attempted++;
     const sent = dispatch(why, 0, "cleared", bodyFor(why));
     if (!sent) continue;

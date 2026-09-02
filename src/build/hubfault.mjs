@@ -47,7 +47,7 @@ import { HUB_SCHEMA_VERSION, faultKind } from "./hubdb.mjs";
  *
  * @param {{readable:boolean, missing:number[], have:number[], holed:boolean, invalid:number[], version:number}} hist
  * @returns {{kind:string, detail:string, remedy:string,
- *            snapshotRestore:"forbidden"|"in-place"|"aside-first"|"unneeded"}|null}
+ *            snapshotRestore:"forbidden"|"in-place"|"if-it-persists"|"aside-first"|"unneeded"}|null}
  */
 /**
  * How to install a snapshot over a store this binary may not touch.
@@ -85,6 +85,7 @@ const outOfRange = (cause) =>
  *
  *   "forbidden"    the store is healthy; a restore would destroy what it holds
  *   "in-place"     the store is broken; `reeve restore --hub --force` repairs it
+ *   "if-it-persists"  NOT YET KNOWN: re-run first, and restore only if it recurs
  *   "aside-first"  a restore is right but refuses in place; move the hub first
  *   "unneeded"     migrating repairs it; no snapshot is involved
  *
@@ -181,7 +182,14 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
                                   "check `PRAGMA max_page_count` against `PRAGMA page_count` if the database " +
                                   "has hit its own limit, then re-run. Do NOT restore over it: nothing is " +
                                   "wrong with the file, and a restore needs more room rather than less" };
-               return { snapshotRestore: "in-place",
+               // NOT "in-place", WHICH WOULD CONTRADICT `retryable: true` BESIDE IT.
+               // `openHub` creates the file and then runs the DDL, so a reader in that
+               // window sees `no such table: schema_version` on a hub one moment from
+               // ready. The remedy says re-run and restore only if it PERSISTS; a field
+               // saying the store is broken invites a consumer to act on the machine
+               // reading and overwrite a healthy hub during its creation window. The
+               // whole module exists because unknown is not damaged.
+               return { snapshotRestore: "if-it-persists",
                         remedy: "re-run: a hub being created for the first time reads this way for an " +
                                 "instant. If it persists, the store is damaged and `reeve restore --hub " +
                                 "--force` installs the newest usable snapshot" };

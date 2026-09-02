@@ -3135,6 +3135,9 @@ export const STUBS = [
     expectRed: "the action name constructor falls to the default read-only row, rather than to Object's prototype",
     edits: [{ file: "src/sandbox.mjs",
               find: "const toolsFor = (action) => (Object.hasOwn(ACTION_TOOLS, action) ? ACTION_TOOLS[action] : DEFAULT_TOOLS);",
-              replace: "const toolsFor = (action) => ACTION_TOOLS[action] ?? DEFAULT_TOOLS;" }],
+              replace: "const toolsFor = (action) => ACTION_TOOLS[action] ?? DEFAULT_TOOLS;" },
+            { file: "src/sandbox.mjs",
+              find: "const ACTION_TOOLS = Object.freeze(Object.assign(Object.create(null), {",
+              replace: "const ACTION_TOOLS = Object.freeze(Object.assign({}, {" }],
   },
 ];

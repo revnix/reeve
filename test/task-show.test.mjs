@@ -1560,15 +1560,26 @@ const filed = {};
     // Both halves, because the direction is the whole point: it must send the
     // operator at the BINARY and must not suggest changing the store, which for a
     // forward-only history would be a downgrade that cannot be undone.
-    // THE ACT, not the word. This asserted `!/downgrad/i` and passed against a
-    // remedy that said "run the newer binary, or restore a snapshot taken at N" --
-    // which recommends the downgrade without using the word, and would destroy a
-    // healthy forward-version store. Review caught what the assertion could not.
-    // A snapshot restore is the right remedy for every OTHER fault here, so this
-    // is the one case where its absence is the property worth asserting.
-    check(aj?.kind === "hub_incompatible" && /newer binary/.test(aj?.message ?? "")
-          && !/\bdowngrad/i.test(aj?.message ?? "")
-          && !/restore a snapshot(?! over it)/i.test(aj?.message ?? ""),
+    // THE ACT, not the word -- and the NEGATION, not the phrase that carries it.
+    // Two versions of this assertion have now passed a remedy recommending the
+    // downgrade. The first asserted `!/downgrad/i` against "run the newer binary,
+    // or restore a snapshot taken at N", which recommends the act without using
+    // the word. The second exempted "restore a snapshot over it" with a lookahead,
+    // so that the message's own forbidding clause could pass -- but that exempts
+    // the PHRASE, leaving "Do NOT", the two words carrying the entire meaning,
+    // the one thing unasserted. Replacing "Do NOT restore" with "Restore" in the
+    // real remedy passed it: an affirmative instruction to destroy a healthy
+    // forward-version store, through a guard whose comment says THE ACT.
+    // So assert the negation positively, remove it, and require that no
+    // recommendation survives its removal. A snapshot restore is the right remedy
+    // for every OTHER fault here, so this is the one case where its absence is
+    // the property worth asserting.
+    const aMsg = aj?.message ?? "";
+    const aAdvice = aMsg.replace(/\bdo not restore a snapshot over it\b/i, "");
+    check(aj?.kind === "hub_incompatible" && /newer binary/.test(aMsg)
+          && /\bdo not restore a snapshot over it\b/i.test(aMsg)
+          && !/\bdowngrad/i.test(aAdvice)
+          && !/restore a snapshot/i.test(aAdvice),
       "a hub newer than this binary is refused too, and says to upgrade reeve rather than the store",
       String(aj?.message));
 

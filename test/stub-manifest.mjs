@@ -3181,12 +3181,12 @@ export const STUBS = [
   },
   {
     name: "one-pass-cannot-block-the-heartbeat",
-    why: "send the whole backlog in one pass. Sending is synchronous and each attempt can take the sender's 8-second timeout, and `build run` calls this inline before its sleep -- so a deep backlog against a dead channel stalls the loop past the 120-second singleton lease, and the daemon can lose the authority it holds while waiting to finish paging",
+    why: "send the whole backlog in one pass. Sending is synchronous and ONE notify call sends on every configured channel in turn, so a page against two dead channels costs two 8-second timeouts -- and `build run` calls this inline before its sleep, so a deep backlog stalls the loop past the 120-second singleton lease and the daemon can lose the authority it holds while waiting to finish paging",
     test: "test/build-paging.test.mjs",
-    expectRed: "one pass attempts at most 5 sends, whatever the backlog",
+    expectRed: "one pass stops when its time budget is spent, whatever the backlog",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "    if (attempted >= limit) continue;\n",
+      find: "    if (attempted >= limit || spent() >= budgetMs) continue;\n",
       replace: "",
     }],
   },
@@ -3232,6 +3232,28 @@ export const STUBS = [
       file: "src/build/announce.mjs",
       find: "  const arg = ` --home ${shellQuote(home)}`;",
       replace: "  const arg = ` --home ${home}`;",
+    }],
+  },
+  {
+    name: "a-bounded-queue-does-not-starve-its-tail",
+    why: "read the standing set in a fixed order under a bounded budget. The same head is attempted every pass, so causes whose sender permanently rejects them consume the whole budget for ever and a later cause that WOULD deliver is never attempted -- it stays owed while the log reports work being done. Ordering by first_seen_at makes that deterministic rather than unlikely",
+    test: "test/build-paging.test.mjs",
+    expectRed: "every owed cause is attempted across passes, so a permanently refused head cannot starve the tail",
+    edits: [{
+      file: "src/build/paging.mjs",
+      find: "  const escalations = new Map(rotated(rows, rotate).map(r => [r.why, r.count]));",
+      replace: "  const escalations = new Map(rows.map(r => [r.why, r.count]));",
+    }],
+  },
+  {
+    name: "a-desktop-channel-only-exists-where-it-can-run",
+    why: "count a desktop channel as usable on every platform. `postViaOsascript` executes osascript, which is macOS-only, so `{ desktop: true }` on Linux or Windows is a valid-looking configuration whose every send fails with ENOENT -- and reeve is required to run on all three. It is the one unusable shape a config file cannot reveal, so the doctor claiming those machines can page is a false assurance nothing else corrects",
+    test: "test/build-paging.test.mjs",
+    expectRed: "control: deliverability of a desktop-only profile tracks the platform, on either platform",
+    edits: [{
+      file: "src/build/paging.mjs",
+      find: "  const desktop = cfg.desktop === true && process.platform === \"darwin\";",
+      replace: "  const desktop = cfg.desktop === true && process.platform !== \"darwin\";",
     }],
   },
 ];

@@ -14,7 +14,7 @@ import { spawnSync } from "node:child_process";
 import { openHub } from "../src/build/hubdb.mjs";
 import { escalationKey } from "../src/build/announce.mjs";
 import { machineProfile, machineProfilePath, pageStandingCauses,
-         PAGES_PER_PASS } from "../src/build/paging.mjs";
+         PAGING_BUDGET_MS, rotated } from "../src/build/paging.mjs";
 import { pages } from "../src/build/announce.mjs";
 import { hubFindings } from "../src/doctor.mjs";
 
@@ -354,13 +354,20 @@ const raise = (db, why, count, at) => db.prepare(
 
   const sent = [];
   const send = (a) => { sent.push(a); return { ok: true, channels: [{ name: "t", ok: true, ref: "r" }] }; };
-  const first = pageStandingCauses(db, { home, at: NOW + 100, isAlive: ALIVE, send });
-  check(sent.length === PAGES_PER_PASS,
-    `one pass attempts at most ${PAGES_PER_PASS} sends, whatever the backlog`,
-    JSON.stringify({ sent: sent.length, standing: first.standing }));
-  check(first.standing > PAGES_PER_PASS,
-    "control: there really were more causes than the bound, so the cap is what stopped it",
-    JSON.stringify({ standing: first.standing, bound: PAGES_PER_PASS }));
+  // A CLOCK THE TEST DRIVES, so the bound is exercised without waiting for it.
+  // Each send costs 10 seconds of the 30-second budget, which is checked BEFORE
+  // each attempt -- so three are made and the fourth is not.
+  let clock = 0;
+  const slowSend = (a) => { sent.push(a); clock += 10_000;
+                            return { ok: true, channels: [{ name: "t", ok: true, ref: "r" }] }; };
+  const first = pageStandingCauses(db, { home, at: NOW + 100, isAlive: ALIVE, send: slowSend,
+                                         now: () => clock });
+  check(sent.length === 3,
+    "one pass stops when its time budget is spent, whatever the backlog",
+    JSON.stringify({ sent: sent.length, standing: first.standing, budgetMs: PAGING_BUDGET_MS }));
+  check(first.standing > sent.length,
+    "control: there really were more causes than it attempted, so the budget is what stopped it",
+    JSON.stringify({ standing: first.standing, attempted: sent.length }));
 
   // NOTHING IS LOST. What was not attempted keeps announced_count unchanged and
   // is offered again -- the same mechanism that makes a refused page come back.
@@ -393,6 +400,103 @@ const raise = (db, why, count, at) => db.prepare(
   check(/--home /.test(msg) && msg.includes(home),
     "the action names the home the alert is about, so the pasted command reaches THIS hub",
     JSON.stringify(msg.split("\n").find(l => /->/.test(l)) ?? msg.slice(0, 120)));
+}
+
+// ── a bounded queue must not starve its tail ───────────────────────────────
+//
+// Read in a fixed order, a bounded queue attempts the same head every pass. Five
+// owed causes whose sender permanently rejects them consume the whole budget for
+// ever, so a sixth that WOULD deliver is never attempted -- it stays owed while
+// the log reports work being done. Ordering by `first_seen_at` makes that
+// deterministic rather than unlikely.
+{
+  const rows = [{ why: "a" }, { why: "b" }, { why: "c" }];
+  check(rotated(rows, 0).map(r => r.why).join("") === "abc",
+    "control: rotating by zero changes nothing", JSON.stringify(rotated(rows, 0)));
+  check(rotated(rows, 1).map(r => r.why).join("") === "bca",
+    "a rotation moves the head so a later cause is reached", JSON.stringify(rotated(rows, 1)));
+  check(rotated(rows, 3).map(r => r.why).join("") === "abc",
+    "control: a full turn returns to the start, so the walk is a rotation and not a shuffle",
+    JSON.stringify(rotated(rows, 3)));
+  check(rotated([], 2).length === 0, "control: an empty set rotates to itself", "[]");
+
+  // EVERY CAUSE IS REACHED ACROSS PASSES, which is the property the tail needs.
+  const home = freshHome(), db = hubOf(home);
+  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: { desktop: true } }));
+  const ids = seedTasks(db, 4);
+  for (const [i, id] of ids.entries()) raise(db, `${id}:phase:blocked:RESEARCH`, 1, NOW + i);
+  const reached = new Set();
+  // A sender that REFUSES, so nothing is ever marked announced and every pass
+  // sees the same owed set -- which is exactly the starvation condition.
+  const refuse = (a) => { reached.add(a.why); return { ok: false, why: "nope" }; };
+  let clock = 0;
+  const timed = (a) => { clock += 10_000; return refuse(a); };
+  for (let pass = 0; pass < 4; pass++) {
+    clock = 0;
+    pageStandingCauses(db, { home, at: NOW + 100 + pass, isAlive: ALIVE, send: timed,
+                             rotate: pass, now: () => clock });
+  }
+  check(reached.size === 4,
+    "every owed cause is attempted across passes, so a permanently refused head cannot starve the tail",
+    JSON.stringify({ reached: reached.size, owed: 4 }));
+  db.close();
+}
+
+// ── a desktop channel only exists where it can run ─────────────────────────
+//
+// `postViaOsascript` executes `osascript`, which is macOS-only, so
+// `{ "desktop": true }` on Linux or Windows is a valid-looking configuration
+// whose every send fails with ENOENT -- and reeve is required to run on all
+// three. This is the one unusable shape a config file cannot reveal.
+{
+  const home = freshHome();
+  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: { desktop: true } }));
+  const m = machineProfile(home);
+  if (process.platform === "darwin") {
+    check(m.profile !== null,
+      "on macOS a desktop-only profile IS deliverable, because osascript is there",
+      JSON.stringify(m.why));
+  } else {
+    check(m.profile === null && /osascript/.test(m.why ?? ""),
+      "off macOS a desktop-only profile is refused, and the refusal names why",
+      JSON.stringify(m.why));
+  }
+  // THE CONDITION ITSELF, asserted on both platforms so this test says something
+  // wherever it runs rather than only where it happens to be developed.
+  check((m.profile !== null) === (process.platform === "darwin"),
+    "control: deliverability of a desktop-only profile tracks the platform, on either platform",
+    JSON.stringify({ platform: process.platform, deliverable: m.profile !== null }));
+}
+
+// ── a partial delivery names the channel that failed ───────────────────────
+//
+// `announce` treats a page as delivered when ANY channel accepted it --
+// deliberately, so one dead channel cannot re-page the working one every pass --
+// and the result lands in `paged` with `partial: true`, NOT in `declined`. A
+// caller reading only `declined` therefore reports "paged N" while the phone has
+// been dead for hours, and the row is marked announced so nothing retries it.
+{
+  const home = freshHome(), db = hubOf(home);
+  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: { desktop: true } }));
+  raise(db, KEY, 1, NOW);
+  const half = () => ({ ok: false, channels: [{ name: "desktop", ok: true, ref: "d" },
+                                              { name: "ntfy", ok: false, why: "curl could not connect" }] });
+  const r = pageStandingCauses(db, { home, at: NOW, isAlive: ALIVE, send: half });
+
+  check(r.declined.length === 0 && r.paged.length === 1,
+    "control: a partial delivery is PAGED, not declined, which is why reading declined missed it",
+    JSON.stringify({ declined: r.declined.length, paged: r.paged.length }));
+  check(r.paged[0]?.partial === true,
+    "and it is marked partial, which is the only signal that a channel failed",
+    JSON.stringify(r.paged[0]?.partial));
+  const bad = (r.paged[0]?.channels ?? []).filter(c => !c.ok);
+  check(bad.length === 1 && /could not connect/.test(bad[0]?.why ?? ""),
+    "carrying the failed channel and its reason, so a caller can name it",
+    JSON.stringify(bad));
+  check(db.prepare("SELECT announced_count FROM escalation WHERE why=?").get(KEY).announced_count === 1,
+    "control: and the row IS marked announced, so nothing retries it and only a log line can tell anyone",
+    JSON.stringify(db.prepare("SELECT announced_count FROM escalation WHERE why=?").get(KEY)));
+  db.close();
 }
 
 // ── a pasted action is one shell command, whatever the home contains ───────

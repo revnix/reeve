@@ -2334,9 +2334,28 @@ switch (cmd) {
         // The reasons are DEDUPLICATED, because one broken channel produces the
         // same sentence for every standing cause and the log is not the place to
         // learn how many of them there were -- `p.declined.length` already says.
+        // A PARTIAL DELIVERY IS NOT A SUCCESS, and it does not arrive in
+        // `declined`. `announce` treats a page as delivered when ANY channel
+        // accepted it -- deliberately, so one dead channel cannot re-page the
+        // working one every pass -- and the result lands in `paged` carrying
+        // `partial: true` with the failed channel's reason on `channels`.
+        //
+        // Reading only `declined` therefore logged "paged N" while the phone had
+        // been dead for hours: the row IS marked announced, so it is never
+        // retried, and nothing else would ever mention it. The decision not to
+        // retry stands; the silence about it does not.
+        const partials = p.paged.filter(x => x.partial);
+        const badChannels = [...new Set(partials.flatMap(
+          x => (x.channels ?? []).filter(c => !c.ok).map(c => `${c.name}: ${c.why ?? "no reason given"}`)))];
+        // The reasons are DEDUPLICATED, because one broken channel produces the
+        // same sentence for every standing cause and the log is not the place to
+        // learn how many of them there were -- the counts already say.
         const line = p.declined.length
           ? `build run: ${p.declined.length} escalation(s) could not be delivered — ` +
             [...new Set(p.declined.map(d => d.not_sent))].join("; ")
+          : partials.length
+          ? `build run: paged ${p.paged.length} escalation(s), ${partials.length} on some channels ` +
+            `only — ${badChannels.join("; ")}`
           : p.paged.length ? `build run: paged ${p.paged.length} escalation(s)`
           : "";
         if (line !== lastPaging) { if (line) console.error(line); lastPaging = line; }

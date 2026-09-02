@@ -77,6 +77,14 @@ export const TABLE_OWNERS = {
   // provider lease on.
   project_identity:
                    { writer: "registry.mjs at admission", reader: "repoid.mjs, the guardian tick",  replayed: true,  section: "10.2" },
+  // WHICH LOG THIS IS, and `replayed: false` is the point rather than an omission.
+  // An incarnation is a property of the FILE; the log is what a restore rewinds,
+  // so a replay handler would rebuild a DEAD incarnation's id over the live one
+  // during the operation that ends it. `restoreHub` mints a fresh row after the
+  // replay instead, which is a WRITER the drill can check without a handler.
+  hub_incarnation: { writer: "migration 6, restoreHub after every replay",
+                     reader: "task dash --since, to tell a rewound log from a quiet one",
+                     replayed: false, section: "11.2" },
 };
 
 export const PROSE_TABLES = [
@@ -88,7 +96,7 @@ export const PROSE_TABLES = [
   "ownership_check", "harness_acceptance", "pr_hold", "project_authority", "repo_gate_state",
   "inbox", "outbox", "merge_decision", "singleton_lease", "writer_lease", "maintenance_lock",
   "directory_lease", "territory_lease", "provider_lease", "provider_state", "provider_measurement",
-  "project_identity", "intake_event", "escalation", "schema_version",
+  "project_identity", "intake_event", "escalation", "schema_version", "hub_incarnation",
 ];
 // task_drain is in TABLE_OWNERS and NOT in PROSE_TABLES: section 11.2 carries
 // drain_set as a column on task, and this plan makes it a child table instead

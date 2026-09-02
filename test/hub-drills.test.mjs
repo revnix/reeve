@@ -395,8 +395,21 @@ for (let i = 0; i < 500; i++) {
   check(branch.length > 200 && !/hubDamaged: true/.test(branch),
     "control: the could-not-check branch never sets the damage marker",
     `branch=${branch.length} chars`);
-  check((src.match(/hubDamaged: true/g) ?? []).length === 1,
-    "control: exactly one place in the file claims damage",
+  // TWO, and both are named here so a THIRD still trips this.
+  //
+  // A bare count is a tripwire rather than a rule: it exists so that adding a
+  // damage claim costs someone a visit to this line, where they have to say which
+  // claim they added and why it is damage. The two are:
+  //
+  //   1. `hubIntegrityError`'s verdict -- `quick_check` reported a problem
+  //   2. `hubIncarnation` on a migrated hub with an EMPTY incarnation table --
+  //      migration 6 mints a row and nothing removes one, so no row on a store
+  //      that records the migration means the store was altered outside reeve
+  //
+  // The could-not-check branch is still excluded, and by its own assertion above
+  // rather than by this count.
+  check((src.match(/hubDamaged: true/g) ?? []).length === 2,
+    "control: exactly two places in the file claim damage, and both are named here",
     String((src.match(/hubDamaged: true/g) ?? []).length));
   // AND THE THIRD ANSWER IS CLASSIFIED, not merely worded. `isOperational` is
   // what every recovery path consults, and it reads an errcode -- so a refusal

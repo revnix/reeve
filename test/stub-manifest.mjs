@@ -2223,8 +2223,8 @@ export const STUBS = [
     test: "test/hub-fault.test.mjs",
     expectRed: "told to look again before concluding damage",
     edits: [{ file: "src/build/hubfault.mjs",
-              find: "             remedy: faultKind(hist?.cause) === \"operational\"",
-              replace: "             remedy: false" }],
+              find: "               : \"re-run: a hub being created for the first time reads this way for an instant. \" +",
+              replace: "               : \"restore a snapshot (`reeve restore --hub --force`), then retry\" || \"\" +" }],
   },
   {
     name: "a-gap-above-the-known-range-is-still-a-gap",

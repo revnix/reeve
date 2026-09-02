@@ -53,7 +53,7 @@ import { openHub, HUB_SCHEMA_VERSION, HUB_BUSY_TIMEOUT_MS, completedVersion, mis
 import { historyFault } from "../src/build/hubfault.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
 import { buildTick } from "../src/build/loop.mjs";
-import { pageStandingCauses } from "../src/build/paging.mjs";
+import { pageStandingCauses, machineProfile } from "../src/build/paging.mjs";
 import { readStart, isSameProcess } from "../src/supervisor.mjs";
 import { HEARTBEAT_SECONDS } from "../src/db/ops.mjs";
 
@@ -1107,6 +1107,20 @@ switch (cmd) {
     try {
       findings = hubFindings(db, { root: opt("backups") ?? join(HOME, "backups"),
                                    now: Math.floor(Date.now() / 1000),
+                                   // PROBED HERE, or H-14 can never fire. The row was
+                                   // written to FAIL on a machine that can page nobody,
+                                   // and a call omitting this takes the not-probed
+                                   // branch instead -- so the finding existed, was
+                                   // tested, and could not reach the one command that
+                                   // reports it. Shipped is not mounted.
+                                   //
+                                   // Read-only: the profile is read and the standing
+                                   // rows counted. `builder doctor` writes nothing.
+                                   paging: (() => {
+                                     const m = machineProfile(HOME);
+                                     return { deliverable: m.profile !== null, path: m.path, why: m.why,
+                                              standing: db.prepare("SELECT count(*) c FROM escalation").get().c };
+                                   })(),
                                    // The REGISTRY's projects, not the rows the table
                                    // happens to hold. H-4 exists to report a project
                                    // that has NEVER acquired a repo_gate_state row --
@@ -2289,7 +2303,20 @@ switch (cmd) {
         // SAID ONCE, ON CHANGE. This runs every heartbeat, so logging the same
         // sentence each pass would bury the log in the state that is normal --
         // and would do it worst when nothing is wrong.
-        const line = !p.deliverable ? `build run: ${p.standing} standing escalation(s) cannot be paged — ${p.why}`
+        // THE SENDER'S VERDICT, NOT THE PROFILE'S PRESENCE. `deliverable` says only
+        // that a profile object loaded. A configured channel that REFUSES -- a
+        // missing ntfy credential, a server that is down -- comes back in
+        // `declined`, and reading presence instead of the verdict printed nothing
+        // at all for it: the page stays owed, is retried every heartbeat, and the
+        // one line that could say why never appeared. Silence is what this loop
+        // must never produce about an alarm it could not deliver.
+        //
+        // The reasons are DEDUPLICATED, because one broken channel produces the
+        // same sentence for every standing cause and the log is not the place to
+        // learn how many of them there were -- `p.declined.length` already says.
+        const line = p.declined.length
+          ? `build run: ${p.declined.length} escalation(s) could not be delivered — ` +
+            [...new Set(p.declined.map(d => d.not_sent))].join("; ")
           : p.paged.length ? `build run: paged ${p.paged.length} escalation(s)`
           : "";
         if (line !== lastPaging) { if (line) console.error(line); lastPaging = line; }

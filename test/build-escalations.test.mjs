@@ -890,7 +890,12 @@ const freshHub = () => {
 
   const r = announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
                             bodies: new Map([[key, b]]) });
-  check(r.paged.length === 1 && r.paged[0].body === b,
+  // THE SAME REPORT, not the same OBJECT. Reference identity was incidental and
+  // is now wrong on purpose: the alert renders what was STORED, so that the first
+  // page and every later one for the same cause say the same thing. Asserting
+  // `=== b` would pin an implementation that reads the caller's map, which is the
+  // second source this deliberately removed.
+  check(r.paged.length === 1 && JSON.stringify(r.paged[0]?.body) === JSON.stringify(b),
     "the announcement carries the typed body it was given", JSON.stringify(r.paged[0]?.body));
   check(/checksum mismatch/.test(sent[0]?.message ?? "") &&
         /var\/reeve\/o-a\.db/.test(sent[0]?.message ?? ""),
@@ -1395,6 +1400,118 @@ const freshHub = () => {
       "control: a toJSON that returns an object is stored, so this is about the shape produced",
       hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null);
   }
+
+// ── a credential never becomes durable ──────────────────────────────────────
+//
+// `redact` runs on the RENDERED alert, which is the last point before text
+// leaves the machine. The body goes somewhere else entirely: `escalation.body`
+// and the `escalation.raised` payload, both of which outlive the alert, ride
+// into every snapshot, appear in exported event tails, and survive the row being
+// cleared. A token echoed by a failing CI command was therefore absent from the
+// page and present verbatim, for ever, in the authority store.
+{
+  const hub = freshHub();
+  const key = escalationKey({ kind: "backup:failed" });
+  const TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0";
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                  send: () => ({ ok: true, channels: [{ name: "t", ok: true }] }),
+                  bodies: new Map([[key, body({ type: "FAILED", detail: `push failed: ${TOKEN}` })]]) });
+
+  const stored = hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "";
+  check(!stored.includes(TOKEN), "a credential is scrubbed from the STORED report", stored);
+  check(/redacted token/.test(stored),
+    "control: and the scrub actually ran, rather than the fixture carrying no token",
+    stored);
+
+  // THE ROW IMAGE TOO, which is the copy a restore replays and an export ships.
+  const image = hub.prepare(
+    "SELECT payload FROM hub_event WHERE kind='escalation.raised' ORDER BY seq DESC LIMIT 1").get().payload;
+  check(!image.includes(TOKEN),
+    "and from the replayed row image, which outlives the escalation row itself", image);
+
+  // KEYS AS WELL AS VALUES: a report built from external names can carry one in
+  // either half, and scrubbing only values leaves the other in place.
+  const hub2 = freshHub();
+  announce(hub2, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                   send: () => ({ ok: true, channels: [{ name: "t", ok: true }] }),
+                   bodies: new Map([[key, { type: "FAILED", [`saw ${TOKEN}`]: "yes" }]]) });
+  check(!(hub2.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "").includes(TOKEN),
+    "including one that arrives as a KEY rather than as a value",
+    hub2.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null);
+}
+
+// ── a report is a report, not a log ─────────────────────────────────────────
+//
+// Every pass over a standing cause re-appends the row image to `hub_event`,
+// which is append-only and is the authority store -- so an unbounded body is an
+// unbounded WRITE RATE, not merely a large row. Refused rather than truncated:
+// cutting a report in half loses the detail exactly where it was needed and
+// reports success.
+{
+  const hub = freshHub();
+  const key = escalationKey({ kind: "backup:failed" });
+  let kind = null;
+  try {
+    announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                    send: () => ({ ok: true, channels: [] }),
+                    bodies: new Map([[key, body({ type: "FAILED", detail: "x".repeat(9000) })]]) });
+  } catch (e) { kind = e.kind ?? "threw"; }
+  check(kind === "escalation_body_too_large",
+    "an oversized report is refused by its own name, not silently cut down", String(kind));
+  check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 0,
+    "control: and nothing was written, so the refusal is before the row rather than after",
+    JSON.stringify(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key)));
+
+  // CONTROL: an ordinary report is nowhere near the ceiling, so this bounds a
+  // producer that is misusing the field rather than one that is using it.
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                  send: () => ({ ok: true, channels: [] }),
+                  bodies: new Map([[key, body({ type: "FAILED", store: "/var/reeve/o-a.db",
+                                                detail: "checksum mismatch" })]]) });
+  check((hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "").length < 200,
+    "control: a real report is two orders of magnitude inside the ceiling",
+    String((hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "").length));
+}
+
+// ── the alert says what the row says ────────────────────────────────────────
+//
+// THE CASE THE EARLIER CONTROL COULD NOT REACH. It used a `toJSON` returning the
+// SAME shape as its object, so it could not tell a body read from the caller's
+// map from one read back out of the row. A `toJSON` that returns something the
+// object does not have separates them: the row stores the useful report, and the
+// object itself has no enumerable properties at all -- so the FIRST page rendered
+// nothing while every LATER page for the same cause, read from the row, carried
+// the detail. One cause, two different alerts.
+{
+  const hub = freshHub();
+  const sent = [];
+  const send = (a) => { sent.push(a); return { ok: true, channels: [{ name: "t", ok: true }] }; };
+  const key = escalationKey({ kind: "backup:failed" });
+  const hidden = { toJSON() { return { type: "FAILED", detail: "disk full" }; } };
+  check(JSON.stringify(Object.keys(hidden)) === JSON.stringify(["toJSON"]),
+    "control: walking the object's own entries yields only `toJSON` -- not the report",
+    JSON.stringify(Object.keys(hidden)));
+  check(!Object.keys(hidden).includes("detail") && "detail" in hidden.toJSON(),
+    "control: so the detail exists ONLY in what toJSON produces, which is what makes the two sources differ",
+    JSON.stringify({ own: Object.keys(hidden), produced: Object.keys(hidden.toJSON()) }));
+
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                  bodies: new Map([[key, hidden]]) });
+  check(/disk full/.test(nth(sent, 0)?.message ?? ""),
+    "the FIRST alert renders what was stored, not the object it was handed",
+    JSON.stringify(nth(sent, 0)?.message ?? null));
+  check(/FAILED/.test(nth(sent, 0)?.message ?? ""),
+    "including the failure type, which the handed object also does not carry",
+    JSON.stringify(nth(sent, 0)?.message ?? null));
+
+  // AND THE LATER PAGE AGREES WITH IT, which is the property that was broken:
+  // the two alerts came from two different sources for one value.
+  sent.length = 0;
+  announce(hub, { escalations: new Map([[key, 7]]), at: NOW + 60, isAlive: ALIVE, send });
+  check(/disk full/.test(nth(sent, 0)?.message ?? ""),
+    "and a later page for the same cause says the same thing",
+    JSON.stringify(nth(sent, 0)?.message ?? null));
+}
 }
 
 hub.close();

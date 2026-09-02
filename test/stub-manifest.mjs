@@ -2020,8 +2020,8 @@ export const STUBS = [
     expectRed: "the row is NOT marked announced, because nothing was announced",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "                    VALUES(?,?,?,?,0,?)`).run(why, count, at, at, serialiseBody(bodies?.get(why)));",
-      replace: "                    VALUES(?,?,?,?,?,?)`).run(why, count, at, at, count, serialiseBody(bodies?.get(why)));",
+      find: "                    VALUES(?,?,?,?,0,?)`).run(why, count, at, at, serialiseBody(offeredBody(bodies, why)));",
+      replace: "                    VALUES(?,?,?,?,?,?)`).run(why, count, at, at, count, serialiseBody(offeredBody(bodies, why)));",
     }],
   },
   {
@@ -2403,7 +2403,7 @@ export const STUBS = [
     expectRed: "the report is stored on the row, not only sent",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "VALUES(?,?,?,?,0,?)`).run(why, count, at, at, serialiseBody(bodies?.get(why)));",
+      find: "VALUES(?,?,?,?,0,?)`).run(why, count, at, at, serialiseBody(offeredBody(bodies, why)));",
       replace: "VALUES(?,?,?,?,0,?)`).run(why, count, at, at, null);",
     }],
   },
@@ -2425,8 +2425,8 @@ export const STUBS = [
     expectRed: "a later pass with no bodies map still renders the stored report",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "    if (bodies?.has(why)) return bodies.get(why);",
-      replace: "    if (true) return bodies?.get(why) ?? null;",
+      find: "    const offered = offeredBody(bodies, why);\n    if (offered !== null) return offered;",
+      replace: "    return offeredBody(bodies, why);",
     }],
   },
   {

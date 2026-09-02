@@ -323,9 +323,12 @@ const beat = (args) => attempt(() => heartbeatRun(db, args));
      VALUES('bt:z','p',7,'o/r','t','RESEARCH',1,'founder','z','/p','/f','h','main','private',1,
             unixepoch(),unixepoch())`);
   const tail = db.prepare(
-    "SELECT seq, at, kind, task, payload FROM hub_event WHERE kind IN ('phase_run.started','phase_run.bound') ORDER BY seq").all()
+    "SELECT seq, at, kind, task, payload FROM hub_event WHERE kind = 'phase_run.started' ORDER BY seq").all()
     .map((e) => ({ ...e, task: "bt:z", payload: JSON.stringify({ ...JSON.parse(e.payload), task: "bt:z" }) }));
-  check(tail.length > 0, "control: the tail carries started/bound events to replay", String(tail.length));
+  check(tail.length > 0, "control: the tail carries started events to replay", String(tail.length));
+  check(tail.every((e) => e.kind === "phase_run.started"),
+    "control: and ONLY started -- with bound in the tail the row is created either way, so the property could not fail",
+    JSON.stringify([...new Set(tail.map((e) => e.kind))]));
   const res = replayHub(rdb, tail);
   check(res.applied > 0, "a tail-only attempt is APPLIED rather than skipped", JSON.stringify(res));
   const rows = rdb.prepare("SELECT status, started_at, out_path FROM phase_run WHERE task='bt:z'").all();

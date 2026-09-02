@@ -223,6 +223,66 @@ const beat = (args) => attempt(() => heartbeatRun(db, args));
     JSON.stringify([p.outPath, p2.outPath]));
 }
 
+// ── a run is fenced against the task's current epoch ────────────────────────
+//
+// The foreign key says the task exists; it says nothing about the task still
+// being at the phase and generation this run was chosen for. A tick selects a
+// task, a founder cancel commits before the insert, and the stale run is
+// admitted -- the cancel saw no live run to terminate, so nothing revoked it,
+// and revocationProbe then reads the NEW row as entitled. The worker runs after
+// the cancellation, which is the one thing the revocation path exists to stop.
+{
+  // bt:b still holds the live run admitted by the control above, and this block
+  // is about the epoch rather than the live-run rule -- settled first so a
+  // refusal here can only be the one under test.
+  settleRun(db, { task: "bt:b", generation: 1, phase: "RESEARCH", slice: 0, attempt: 1,
+                  status: "succeeded", outcome: "ok", truncated: 0, isAlive: alive });
+  db.exec("UPDATE task SET phase='CANCELLING' WHERE id='bt:b'");
+  const stale = insertRun(db, { task: "bt:b", generation: 1, phase: "RESEARCH", slice: 0, attempt: 50,
+                                ...PATHS, snapshot: SNAP, drift: null, startedAt: 2000,
+                                leaseSeconds: 400, isAlive: alive });
+  check(stale.ok === false && stale.reason === "stale-epoch",
+    "a run for a phase the task has left is refused", JSON.stringify(stale));
+  check(db.prepare("SELECT count(*) c FROM phase_run WHERE task='bt:b' AND attempt=50").get().c === 0,
+    "and nothing was written, so no row can read as entitled afterwards");
+
+  const gen = insertRun(db, { task: "bt:b", generation: 9, phase: "CANCELLING", slice: 0, attempt: 51,
+                              ...PATHS, snapshot: SNAP, drift: null, startedAt: 2000,
+                              leaseSeconds: 400, isAlive: alive });
+  check(gen.ok === false && gen.reason === "stale-epoch",
+    "control: a stale GENERATION is refused too, not only a stale phase", JSON.stringify(gen));
+
+  const ok = insertRun(db, { task: "bt:b", generation: 1, phase: "CANCELLING", slice: 0, attempt: 52,
+                             ...PATHS, snapshot: SNAP, drift: null, startedAt: 2000,
+                             leaseSeconds: 400, isAlive: alive });
+  check(ok.ok === true,
+    "control: and a run that matches the task's current epoch is still admitted", JSON.stringify(ok));
+  settleRun(db, { task: "bt:b", generation: 1, phase: "CANCELLING", slice: 0, attempt: 52,
+                  status: "succeeded", outcome: "ok", truncated: 0, isAlive: alive });
+}
+
+// ── the settled event carries the whole row ─────────────────────────────────
+//
+// Replay is a primary-key upsert and phase_run.started is deliberately NOT
+// replayed, so when a snapshot predates a completed run this event is the only
+// thing that can recreate it. A partial payload reaches an INSERT and dies on
+// NOT NULL constraint failed: phase_run.started_at -- taking the whole replay
+// with it, not just this row.
+{
+  const ev = db.prepare(
+    "SELECT payload FROM hub_event WHERE kind='phase_run.settled' ORDER BY seq DESC LIMIT 1").get() ?? {};
+  const payload = (() => { try { return JSON.parse(ev.payload); } catch { return {}; } })();
+  const REQUIRED = ["task", "generation", "phase", "slice", "attempt", "status",
+                    "started_at", "heartbeat_at", "lease_expires_at", "out_path", "err_path"];
+  const missing = REQUIRED.filter((c) => !(c in payload));
+  check(missing.length === 0,
+    "the settled event carries every NOT NULL column, so a replay that has to INSERT the row can",
+    JSON.stringify({ missing, keys: Object.keys(payload) }));
+  check(payload.status === "succeeded" && payload.outcome === "ok",
+    "control: and it is the settled row rather than the row as it was inserted",
+    JSON.stringify({ status: payload.status, outcome: payload.outcome }));
+}
+
 // ── the contract snapshot is frozen, in both halves ─────────────────────────
 //
 // A freeze verified only against the half it already covered proves nothing

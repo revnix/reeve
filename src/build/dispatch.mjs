@@ -73,8 +73,16 @@ export function contractSnapshot({ cliVersion, model, effort, argv, prompt, sett
  *  task because someone upgraded the CLI. */
 export function contractDrift(snapshot, live) {
   const out = {};
-  for (const f of ["cliVersion", "modelId", "effort", "settingsHash", "toolsHash", "agentsHash", "snapshotHash"])
-    if (snapshot[f] !== live[f]) out[f] = { was: snapshot[f] ?? null, now: live[f] ?? null };
+  // EVERY FIELD THE SNAPSHOT CARRIES, derived from the snapshot itself rather
+  // than listed again here. A hand-kept list is a second spelling of
+  // `contractSnapshot`'s shape, and it had already drifted from it: `maxTurns`,
+  // `maxBudgetUsd`, `argvHash` and `promptHash` were all absent, so
+  // `contractDrift(snap, {...snap, maxTurns: 1})` measured as null -- a live
+  // profile change to the worker's own limits reported a clean dispatch.
+  //
+  // `ok` is the envelope, not a contract field.
+  for (const f of Object.keys(snapshot))
+    if (f !== "ok" && snapshot[f] !== live[f]) out[f] = { was: snapshot[f] ?? null, now: live[f] ?? null };
   // NULL, not {}. An empty object is truthy, and a caller writing `if (drift)`
   // would record drift on every clean dispatch.
   return Object.keys(out).length ? out : null;
@@ -89,10 +97,17 @@ export async function dispatchPhase(db, {
   const runKey = { task, generation, phase, slice, attempt };
   const { runDir, outPath, errPath, argvPath } = runPathsFor(home, runKey);
   mkdirSync(runDir, { recursive: true });
-  // The COMPLETE argv, not only the hash. A hash answers "did it change"; the
-  // argv answers "what changed", which is the question after a retry behaves
-  // differently from the attempt it was supposed to reproduce.
-  writeFileSync(argvPath, JSON.stringify({ argv, argvHash: snapshot.argvHash }, null, 2) + "\n");
+
+  // THE ARGV MUST BE THE ARGV THE SNAPSHOT NAMES. The snapshot is the contract
+  // the attempt is judged against and a retry reuses verbatim; if the caller
+  // rebuilt or mutated `argv` after taking it, the worker runs one command
+  // while the row, the file and every later comparison label it with the hash
+  // of another. Nothing downstream could detect that, because everything
+  // downstream trusts the hash.
+  const actualArgvHash = sha(JSON.stringify(argv));
+  if (actualArgvHash !== snapshot.argvHash)
+    return { ok: false, reason: "argv-does-not-match-the-snapshot",
+             detail: `the snapshot records ${snapshot.argvHash} and the argv about to run hashes to ${actualArgvHash}` };
 
   // THE ROW BEFORE THE PROCESS. A row written after the spawn is a window in
   // which a live worker is invisible to admission, to the reaper and to a
@@ -101,8 +116,34 @@ export async function dispatchPhase(db, {
                                    startedAt: now(), leaseSeconds, isAlive });
   if (!inserted.ok) return { ok: false, reason: inserted.reason };
 
+  // AND THE ARGV RECORD IS WRITTEN ONLY ONCE THE ROW IS GRANTED. Written first,
+  // a refused dispatch overwrote the SETTLED attempt's durable record with argv
+  // that never ran: the row kept the original `argv_hash` while the file beside
+  // it held different bytes, so the audit trail disagreed with itself and the
+  // retry evidence was gone. The row is the permission; the file is what the
+  // permission was for.
+  //
+  // The COMPLETE argv, not only the hash. A hash answers "did it change"; the
+  // argv answers "what changed", which is the question after a retry behaves
+  // differently from the attempt it was supposed to reproduce.
+  writeFileSync(argvPath, JSON.stringify({ argv, argvHash: snapshot.argvHash }, null, 2) + "\n");
+
+  // A HEARTBEAT THAT COULD NOT BE WRITTEN IS A CLAIM THAT WAS NOT RENEWED, and
+  // swallowing it lets the worker act without one. The failure is not
+  // self-correcting from the row's side: `revocationProbe` reads a
+  // lease_expires_at that is still in the future -- precisely because nobody
+  // could move it -- and answers `null`, so the worker keeps going for the rest
+  // of the lease. A live maintenance lock is the case that matters: writes are
+  // refused for the duration of a restore, which is exactly when a worker must
+  // not still be acting.
+  let heartbeatFailure = null;
   const beat = setInterval(
-    () => { try { heartbeatRun(db, { ...runKey, at: now(), leaseSeconds, isAlive }); } catch { /* a missed beat is not a reason to abort a run; the lease expiry is */ } },
+    () => {
+      try {
+        const h = heartbeatRun(db, { ...runKey, at: now(), leaseSeconds, isAlive });
+        if (!h.ok) heartbeatFailure = `the heartbeat was refused: ${h.reason}`;
+      } catch (e) { heartbeatFailure = `the heartbeat could not be written: ${e.message}`; }
+    },
     Math.max(1000, Math.floor(leaseSeconds / 4) * 1000));
 
   let result;
@@ -112,7 +153,12 @@ export async function dispatchPhase(db, {
       // FAIL CLOSED. A throw here is S1's UNBOUND path: the group is killed and
       // the worker never gets to run unobserved.
       onSpawn: ({ pid, lstart }) => bind(db, { ...runKey, pid, lstart, isAlive }),
-      isRevoked: () => revocationProbe(db, runKey),
+      // THE ROW FIRST, the heartbeat second, and the order is the classification.
+      // A cancelled row answers with a reason beginning `cancelled`, which is what
+      // makes runWorker record an operator cancel rather than a lost lease. Asking
+      // the heartbeat first would report a deliberate cancel as a lease failure
+      // whenever both were true -- the same stop, the wrong follow-up.
+      isRevoked: () => revocationProbe(db, runKey) ?? heartbeatFailure,
     });
   } catch (e) {
     // A REJECTION IS AN OUTCOME TOO, and leaving the row live is worse than any
@@ -134,7 +180,10 @@ export async function dispatchPhase(db, {
     : "failed";
   settleRun(db, { ...runKey, status, outcome: result.outcome,
                   evidence: { why: result.why, denials: result.denials ?? [], cost: result.cost ?? null },
-                  truncated: result.truncated ? 1 : 0, isAlive });
+                  truncated: result.truncated ? 1 : 0,
+                  // Learned from the worker's init event, so it arrives on the
+                  // RESULT and never at `onSpawn`, which bound a null.
+                  sessionId: result.sessionId ?? null, isAlive });
   if (result.outcome === OUTCOMES.UNBOUND)
     return { ok: false, reason: "unbound", runKey, pid: result.pid ?? null, result };
   // `runKey`, `argv` and `env` travel with the answer: they are what the tick

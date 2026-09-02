@@ -68,6 +68,23 @@ export function insertRun(db, { task, generation, phase, slice = 0, attempt, out
   return hubTx(db, () => {
     assertWritable(db, { isAlive, inTx: true });
     const k = { task, generation, phase, slice, attempt };
+    // THE TASK'S EPOCH, READ INSIDE THIS TRANSACTION. The foreign key says the
+    // task exists; it says nothing about the task still being at the phase and
+    // generation this run was chosen for. A tick selects a task, a founder
+    // cancel commits before this insert, and the stale (generation, phase) is
+    // admitted anyway -- the cancel saw no live run to terminate, so nothing
+    // revoked it, and `revocationProbe` then reads the NEW row as perfectly
+    // entitled. The worker runs after the cancellation, which is the one thing
+    // the whole revocation path exists to prevent.
+    //
+    // Read here rather than by the caller, because a check outside this
+    // transaction is a read followed by a write with the same window in it.
+    const epoch = db.prepare("SELECT generation, phase FROM task WHERE id=?").get(task);
+    if (!epoch) return { ok: false, reason: "no-such-task" };
+    if (epoch.generation !== generation || epoch.phase !== phase)
+      return { ok: false, reason: "stale-epoch",
+               detail: `the task is at generation ${epoch.generation} phase ${epoch.phase}, ` +
+                       `and this run was chosen for generation ${generation} phase ${phase}` };
     try {
       db.prepare(INSERT_SQL)
         .run(task, generation, phase, slice, attempt, startedAt, startedAt, startedAt + leaseSeconds,
@@ -145,16 +162,32 @@ export function heartbeatRun(db, { task, generation, phase, slice = 0, attempt, 
 }
 
 export function settleRun(db, { task, generation, phase, slice = 0, attempt, status, outcome = null,
-                                evidence = null, truncated = 0, isAlive = isSameProcess }) {
+                                evidence = null, truncated = 0, sessionId = null,
+                                isAlive = isSameProcess }) {
   return hubTx(db, () => {
     assertWritable(db, { isAlive, inTx: true });
     const k = { task, generation, phase, slice, attempt };
     const r = db.prepare(
-      `UPDATE phase_run SET status=?, outcome=?, evidence=?, truncated=? WHERE ${KEY_SQL} AND status IN ('live','adopted')`)
+      // COALESCE, so a settle that was not told the session leaves the binding's
+      // value alone. The id is learned from the worker's init event and comes
+      // back on the RESULT, long after `onSpawn` bound a null -- so every real
+      // row lost the session that `--resume` needs for the permitted timeout,
+      // rate-limit and BAD_REPORT retries, and lost it hardest across a daemon
+      // restart, which is exactly when resuming matters.
+      `UPDATE phase_run SET status=?, outcome=?, evidence=?, truncated=?, session_id=COALESCE(?, session_id)
+        WHERE ${KEY_SQL} AND status IN ('live','adopted')`)
       .run(status, outcome, evidence == null ? null : canonicalHub(evidence), truncated ? 1 : 0,
-           ...keyArgs(k));
+           sessionId, ...keyArgs(k));
     if (r.changes !== 1) return { ok: false, reason: "no-such-run" };
-    hubEvent(db, { kind: "phase_run.settled", task, payload: { ...k, status, outcome, truncated: truncated ? 1 : 0 } });
+    // THE WHOLE ROW, READ BACK. Replay is a primary-key upsert, and
+    // `phase_run.started` is deliberately not replayed -- so when a snapshot
+    // predates a completed run, this event is the ONLY thing that can recreate
+    // it. A partial payload then reaches an INSERT and dies on
+    // `NOT NULL constraint failed: phase_run.started_at`, taking the whole
+    // replay with it. `insertRun` already emits the full row for the same
+    // reason; a settle that emits less is the half of the pair that was missed.
+    hubEvent(db, { kind: "phase_run.settled", task,
+      payload: db.prepare(`SELECT * FROM phase_run WHERE ${KEY_SQL}`).get(...keyArgs(k)) });
     return { ok: true, reason: null };
   });
 }

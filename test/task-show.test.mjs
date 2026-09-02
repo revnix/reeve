@@ -1531,7 +1531,12 @@ const filed = {};
       "and never the `no such table: task_pr` the unguarded read produced",
       ((r.stdout ?? "") + (r.stderr ?? "")).slice(0, 300));
     check(r.status === 1, "exiting refused", `rc=${r.status}`);
-    check(/schema version 1/.test(j?.message ?? "") && new RegExp(`version ${HUB_SCHEMA_VERSION}`).test(j?.message ?? ""),
+    // THE PROPERTY, not the wording. This asserted the literal "schema version 1",
+    // which is one phrasing of "says what the store carries". The refusal is now
+    // rendered from `historyFault`, which names what it carries and what this
+    // binary expects; an operator needs both ends and does not need either
+    // sentence.
+    check(/carries 1\b/.test(j?.message ?? "") && new RegExp(`through ${HUB_SCHEMA_VERSION}`).test(j?.message ?? ""),
       "naming both versions, so an operator knows which end is behind", String(j?.message));
 
     // NEWER than the binary, which is the other direction and a different remedy.
@@ -1539,12 +1544,31 @@ const filed = {};
     mkdirSync(join(ahead, "state"), { recursive: true });
     const aheadDb = new DatabaseSync(join(ahead, "state", "hub.db"));
     aheadDb.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, at INTEGER NOT NULL)");
-    aheadDb.prepare("INSERT INTO schema_version(version, at) VALUES (?, 1)").run(HUB_SCHEMA_VERSION + 1);
+    // EVERY VERSION UP TO THE NEWER ONE, which is what a hub written by a newer
+    // binary actually looks like. This recorded ONLY `HUB_SCHEMA_VERSION + 1`, so
+    // it built a store that no binary could produce: migrations are forward-only,
+    // so a history that reached 6 carries 1 through 5 as well. The old refusal
+    // compared only the maximum and could not tell the difference; the decision
+    // now distinguishes AHEAD from ahead-and-missing, and that shape is damage.
+    // The damaged shape is covered as its own row in `test/hub-fault.test.mjs`.
+    for (let v = 1; v <= HUB_SCHEMA_VERSION + 1; v++)
+      aheadDb.prepare("INSERT INTO schema_version(version, at) VALUES (?, 1)").run(v);
     aheadDb.close();
     const a = spawnSync(process.execPath, [BIN, "task", "list", "--home", ahead, "--json"],
       { encoding: "utf8", timeout: 60_000 });
     const aj = parse(a.stdout ?? "");
-    check(aj?.kind === "hub_incompatible" && /upgrade reeve/.test(aj?.message ?? ""),
+    // Both halves, because the direction is the whole point: it must send the
+    // operator at the BINARY and must not suggest changing the store, which for a
+    // forward-only history would be a downgrade that cannot be undone.
+    // THE ACT, not the word. This asserted `!/downgrad/i` and passed against a
+    // remedy that said "run the newer binary, or restore a snapshot taken at N" --
+    // which recommends the downgrade without using the word, and would destroy a
+    // healthy forward-version store. Review caught what the assertion could not.
+    // A snapshot restore is the right remedy for every OTHER fault here, so this
+    // is the one case where its absence is the property worth asserting.
+    check(aj?.kind === "hub_incompatible" && /newer binary/.test(aj?.message ?? "")
+          && !/\bdowngrad/i.test(aj?.message ?? "")
+          && !/restore a snapshot(?! over it)/i.test(aj?.message ?? ""),
       "a hub newer than this binary is refused too, and says to upgrade reeve rather than the store",
       String(aj?.message));
 
@@ -1587,11 +1611,24 @@ const filed = {};
       check(holes.length > 0,
         "control: the fixture actually creates a hole, so the assertion below is not vacuous",
         `HUB_SCHEMA_VERSION=${HUB_SCHEMA_VERSION} holes=${holes.join(",") || "none"}`);
-      const named = /migration ([\d, ]+?) (?:is|are) missing/.exec(j?.message ?? "");
+      const named = /missing migration\(s\) ([\d, ]+?) \(/.exec(j?.message ?? "");
       const listed = named ? named[1].split(",").map(x => x.trim()).filter(Boolean) : [];
       check(named !== null && listed.length === holes.length
             && holes.every(v => listed.includes(String(v))),
         "and the refusal names WHICH migration is missing", String(j?.message));
+      // THE REMEDY, which is what #121 reported and what nothing here asserted.
+      // A HOLE and a missing TAIL both arrive as a non-empty `missing`, and only
+      // one of them migrates: `openHub` re-runs a tail and refuses a hole
+      // outright, because a migration beneath an applied one cannot be re-run
+      // over a store that has already moved past it. Sending a holed hub to the
+      // writing command sends the operator to a second refusal -- and that second
+      // refusal is the one naming the repair.
+      check(/\bHOLE\b/.test(j?.message ?? "") && /restore a snapshot/i.test(j?.message ?? ""),
+        "and a HOLE is sent to a snapshot restore, not to a command that writes",
+        String(j?.message));
+      check(!/reeve build run/.test(j?.message ?? ""),
+        "and never to `reeve build run`, which refuses a holed history",
+        String(j?.message));
       check(!/no such table/.test((r.stdout ?? "") + (r.stderr ?? "")),
         "and never the `no such table` the maximum check let through",
         ((r.stdout ?? "") + (r.stderr ?? "")).slice(0, 200));
@@ -1626,6 +1663,62 @@ const filed = {};
       check(j?.retryable === false,
         "and damage is NOT retryable, because retrying a broken file forever is the wrong advice",
         JSON.stringify(j));
+
+      // AND A HUB WHOSE schema_version ITSELF CANNOT BE READ. That is a different
+      // path from the query-time failure above: the history read fails, so the
+      // route never reaches an application query at all.
+      //
+      // ASSERTING THE CAUSE REACHES THE OPERATOR, not merely that `retryable` is
+      // a boolean. `migrationStateOf` swallows the exception, and the first
+      // version of this refusal hard-coded `retryable: false` -- which passes any
+      // assertion about the bit's VALUE while telling a client not to retry a hub
+      // another process was holding past the busy timeout. The observable that
+      // only exists when the cause survives is the cause itself, in the message.
+      // UNDER `dir`, so the teardown at the end of this file removes it. A fixture
+      // in its own `tmpdir()` tree outlives every run and accumulates one SQLite
+      // database per invocation, for ever.
+      const noHist = mkdtempSync(join(dir, "nohist-"));
+      mkdirSync(join(noHist, "state"), { recursive: true });
+      const nh = new DatabaseSync(join(noHist, "state", "hub.db"));
+      nh.exec("CREATE TABLE placeholder (x INTEGER)");
+      nh.close();
+      const nr = spawnSync(process.execPath, [BIN, "task", "list", "--home", noHist, "--json"],
+        { encoding: "utf8", timeout: 60_000 });
+      const nj = parse(nr.stdout ?? "");
+      check(nj?.kind === "hub_unreadable",
+        "a hub whose schema_version cannot be read is a typed refusal",
+        ((nr.stdout ?? "") + (nr.stderr ?? "")).slice(0, 300));
+      check(/no such table: schema_version/.test(nj?.message ?? ""),
+        "an unreadable schema_version is refused WITH the reason it could not be read",
+        `the reason is what decides whether retrying can help, and it is the thing a swallowed exception loses: ${JSON.stringify(nj?.message)}`);
+      check(typeof nj?.retryable === "boolean",
+        "control: and it still carries a retryable bit", JSON.stringify(nj));
+
+      // AND A MARKER NO READER CAN REPRESENT. `schema_version` is an INTEGER
+      // PRIMARY KEY, so a value beyond JavaScript's safe range is valid SQLite and
+      // `node:sqlite` throws ERR_OUT_OF_RANGE reading it. That exception carries
+      // no SQLite errcode, so `faultKind` calls it operational -- which is why
+      // `retryable` is the assertion that matters here: every retry reproduces it.
+      const bigv = mkdtempSync(join(dir, "bigversion-"));
+      mkdirSync(join(bigv, "state"), { recursive: true });
+      {
+        const b = new DatabaseSync(join(bigv, "state", "hub.db"));
+        b.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, at INTEGER NOT NULL)");
+        b.prepare("INSERT INTO schema_version(version, at) VALUES (?, 1)").run(9223372036854775807n);
+        b.close();
+      }
+      const bv = spawnSync(process.execPath, [BIN, "task", "list", "--home", bigv, "--json"],
+        { encoding: "utf8", timeout: 60_000 });
+      const bj = parse(bv.stdout ?? "");
+      check(bj?.kind === "hub_unreadable",
+        "a schema_version value no reader can represent is a typed refusal",
+        ((bv.stdout ?? "") + (bv.stderr ?? "")).slice(0, 300));
+      check(bj?.retryable === false,
+        "and it is NOT retryable, because the value is the fault and every read reproduces it",
+        JSON.stringify(bj));
+      check(/move the hub aside/.test(bj?.message ?? ""),
+        "and the refusal carries the move-aside remedy, which is the one that can actually be run",
+        String(bj?.message));
 
       // THE PROJECT PREFILTER READS THE SAME BROKEN STORE. It ran outside the
       // guard, so `--project` was the one path that still escaped as a trace.

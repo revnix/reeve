@@ -162,6 +162,42 @@ export const GRANDFATHERED = [
 
 export const STUBS = [
   {
+    name: "an-unsupported-runtime-is-refused",
+    why: "accept any Node version. package.json requires >=24.10 for `node:sqlite` to be unflagged, and the shell default on the documented host is v22 -- the block this replaced prepended the Node 24 path for exactly that reason. A bare shebang inherits PATH, so without this the script produces a confident full report, and runs the sweep, under a runtime the suite cannot run on",
+    test: "test/state-script.test.mjs",
+    expectRed: "the documented host's DEFAULT node is refused",
+    edits: [{ file: "scripts/state.mjs",
+              find: "    if ((got[i] ?? 0) < floor[i]) return `this script needs Node >=${floor.join(\".\")} and is running ${version}`;",
+              replace: "    if (false) return `this script needs Node >=${floor.join(\".\")} and is running ${version}`;" }],
+  },
+  {
+    name: "a-mistyped-flag-is-not-a-silent-skip",
+    why: "ignore an argument this script does not know. `--swep` would then skip the verification and exit 0, so an ABSENT gate looks exactly like an ordinary clean report -- which is the failure mode this whole file exists to prevent, arriving through the argument parser",
+    test: "test/state-script.test.mjs",
+    expectRed: "a MISTYPED flag is refused rather than ignored",
+    edits: [{ file: "scripts/state.mjs",
+              find: "  const bad = (argv ?? []).filter(a => !known.has(a));",
+              replace: "  const bad = [];" }],
+  },
+  {
+    name: "a-log-line-is-not-a-liveness-proof",
+    why: "read a pid where launchctl reports none. `reeve.log` is append-only and its startup record precedes the daemon's own Node-floor assertion, so a process that started and immediately exited leaves a line indistinguishable from a healthy one. Without the pid this prints `daemon running <sha>` for ever about a process that is gone",
+    test: "test/state-script.test.mjs",
+    expectRed: "a loaded job with NO pid is not a running one",
+    edits: [{ file: "scripts/state.mjs",
+              find: "  const m = /^\\s*pid\\s*=\\s*(\\d+)/m.exec(String(launchctlOut ?? \"\"));",
+              replace: "  const m = /(\\d+)/.exec(String(launchctlOut ?? \"\"));" }],
+  },
+  {
+    name: "an-incomplete-verification-still-stops-the-caller",
+    why: "let an unrunnable sweep entry exit zero. Separating an environment failure from a code finding is right, but an entry that could not RUN produced no evidence either way -- so reporting it as a note and returning success hands a resumed session an incomplete verification wearing a clean exit, which is the same absence-as-success shape one level up from the defect this script was written after",
+    test: "test/state-script.test.mjs",
+    expectRed: "an incomplete verification STOPS the caller",
+    edits: [{ file: "scripts/state.mjs",
+              find: "  if (unrunnable.length) return { level: \"environment\", stop: true,",
+              replace: "  if (unrunnable.length) return { level: \"environment\", stop: false," }],
+  },
+  {
     name: "an-absent-running-commit-is-not-a-value",
     why: "answer an empty string instead of null when the daemon log records no start. The shell block this replaced piped through `tail`, which exits 0 on empty input -- so a missing log, an unreadable one and one with no such record all printed a blank line that read as a measurement. An empty string flows onward and prints as a field with nothing in it; null is a refusal the caller has to handle",
     test: "test/state-script.test.mjs",
@@ -176,8 +212,8 @@ export const STUBS = [
     test: "test/state-script.test.mjs",
     expectRed: "the LAST start wins",
     edits: [{ file: "scripts/state.mjs",
-              find: "hits[hits.length - 1][1]",
-              replace: "hits[0][1]" }],
+              find: "  const hits = [...String(logText ?? \"\").matchAll(/running commit ([0-9a-f]{7,40})/g)];\n  return hits.length ? hits[hits.length - 1][1] : null;",
+              replace: "  const hits = [...String(logText ?? \"\").matchAll(/running commit ([0-9a-f]{7,40})/g)];\n  return hits.length ? hits[0][1] : null;" }],
   },
   {
     name: "an-unrunnable-entry-is-not-a-finding",
@@ -203,7 +239,7 @@ export const STUBS = [
     test: "test/state-script.test.mjs",
     expectRed: "a branch claimed by a pull request is not unopened work",
     edits: [{ file: "scripts/state.mjs",
-              find: "  const claimed = new Set(prHeadRefs ?? []);",
+              find: "  const claimed = new Set(claimedOids ?? []);",
               replace: "  const claimed = new Set();" }],
   },
   {

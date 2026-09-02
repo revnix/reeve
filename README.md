@@ -148,6 +148,30 @@ with zero false blocks**, not on a date.
 for f in test/*.test.mjs; do ~/.nvm/versions/node/v24.17.0/bin/node "$f" || echo "FAILED $f"; done
 ```
 
+### What is true right now
+
+```sh
+node scripts/state.mjs            # main, this checkout, the daemon, open work
+node scripts/state.mjs --sweep    # the above, plus a full stub sweep of the default branch
+```
+
+**Start here when you pick the work up again.** It measures rather than
+remembers: the default branch and how far this checkout is from it, whether the
+daemon is actually running and which commit that process loaded, the hub schema
+version, open pull requests, and branches carrying commits that no pull request
+claims.
+
+Every reading is a measurement or a refusal, and there is no third thing. A read
+that fails says so and sets a non-zero exit; it never reaches you as an empty
+answer, because empty reads as good news -- no unopened branches, no open work,
+nothing to do. `--sweep` stops you on an incomplete verification as well as on a
+finding, since an entry that could not run produced no evidence either way.
+
+It replaced a shell block that lived in a handoff document, where nothing tested
+it and the stub sweep could not see it. That block shipped two guards that
+alarmed on success and would have halted a resumed session on a healthy
+repository. Keep this here, where it is covered.
+
 Conventions the tests hold, each of which exists because breaking it cost
 something real:
 

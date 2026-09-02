@@ -186,7 +186,7 @@ export const STUBS = [
     expectRed: "a loaded job with NO pid is not a running one",
     edits: [{ file: "scripts/state.mjs",
               find: "  const m = /^\\s*pid\\s*=\\s*(\\d+)/m.exec(String(launchctlOut ?? \"\"));",
-              replace: "  const m = /(\\d+)/.exec(String(launchctlOut ?? \"\"));" }],
+              replace: "  const m = /(\\d*)/.exec(String(launchctlOut ?? \"\"));" }],
   },
   {
     name: "an-incomplete-verification-still-stops-the-caller",
@@ -237,7 +237,7 @@ export const STUBS = [
     name: "a-branch-with-a-pull-request-is-not-unopened-work",
     why: "ignore which branches already have a pull request. main is squash-merged, so a merged branch's commits are literally absent from main's history and every one of them counts as ahead: measured 2026-09-02, filtering this way reported 136 branches where 8 were real. A list that long is one nobody reads, which fails in the same direction as reporting nothing at all",
     test: "test/state-script.test.mjs",
-    expectRed: "a branch claimed by a pull request is not unopened work",
+    expectRed: "a branch whose HEAD COMMIT a pull request claims is not unopened work",
     edits: [{ file: "scripts/state.mjs",
               find: "  const claimed = new Set(claimedOids ?? []);",
               replace: "  const claimed = new Set();" }],

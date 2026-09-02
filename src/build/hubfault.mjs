@@ -111,10 +111,20 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
              // has to stop being the live hub before anything will touch it, so
              // the remedy names the move, and the move keeps the file as evidence
              // rather than deleting it.
+             // ALL THREE FILES, because a hub is not one file. `openHub` forces
+             // `journal_mode = WAL`, so a live store is `hub.db`, `hub.db-wal`
+             // and `hub.db-shm` -- measured: three files while open, one after a
+             // clean close. A crash or a reader still holding the file leaves the
+             // WAL behind with COMMITTED pages in it, which is exactly the state
+             // this remedy is reached in. Moving only the `.db` splits the
+             // evidence I just told them to keep, and leaves a stale `-wal`
+             // beside whatever the restore puts back.
              remedy: "no binary will repair this in place: a restore refuses a store recording a " +
                      "newer version, and a newer binary refuses a history with a gap. Stop the daemon, " +
-                     "move the hub aside (keep it -- it is the evidence), then `reeve restore --hub " +
-                     "--force` installs the newest usable snapshot in its place" };
+                     "move the hub aside -- `hub.db` AND `hub.db-wal` AND `hub.db-shm`, together, since " +
+                     "a WAL database is all three and the -wal can hold committed pages -- and keep " +
+                     "them, they are the evidence. Then `reeve restore --hub --force` installs the " +
+                     "newest usable snapshot in their place" };
 
   // NO SNAPSHOT REMEDY FOR A HEALTHY NEWER HUB, and this is the one case where
   // offering the usual repair is dangerous rather than merely unhelpful.

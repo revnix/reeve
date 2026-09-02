@@ -87,8 +87,16 @@ check(new Set(TABLE.map(r => r.kind)).size === 7 && TABLE.length === 8,
   check(/no binary will repair this in place/i.test(ahd.remedy),
     "control: and it says plainly that neither a restore nor an upgrade repairs it where it stands",
     ahd.remedy);
-  check(/keep it/i.test(ahd.remedy),
-    "control: and to KEEP the moved file, because it is the evidence of what happened",
+  // ALL THREE, because a hub is not one file. `openHub` forces WAL, so a live
+  // store is `.db`, `.db-wal` and `.db-shm`; a crash or a reader still holding it
+  // leaves the WAL behind with committed pages, which is the state this remedy is
+  // reached in. Naming only the `.db` splits the evidence and leaves a stale -wal
+  // beside whatever the restore puts back.
+  check(/hub\.db-wal/.test(ahd.remedy) && /hub\.db-shm/.test(ahd.remedy),
+    "and the move names all THREE files of a WAL database, not just the .db",
+    ahd.remedy);
+  check(/keep them/i.test(ahd.remedy),
+    "control: and to KEEP them, because they are the evidence of what happened",
     ahd.remedy);
 
   const holed = historyFault(hist({ have: [1, 3], missing: [2, 4, 5], holed: true, version: 3 }), { expect: EXPECT });

@@ -105,6 +105,38 @@ check(new Set(TABLE.map(r => r.kind)).size === 8 && TABLE.length === 9,
   check(/if it persists/i.test(unreadable.remedy),
     "control: with a restore named only as what a PERSISTENT failure earns", unreadable.remedy);
 
+  // ALL THREE KINDS THE CLASSIFIER RETURNS, because a yes/no question of a
+  // three-valued answer sends the third to the fallback. `faultKind` reports FULL
+  // as its own value precisely because it is resource exhaustion rather than
+  // damage, and `openHub`'s own full branch says a restore needs MORE room rather
+  // than less.
+  const full = historyFault({ readable: false, missing: [], have: [], holed: false, invalid: [], version: 0,
+                              cause: Object.assign(new Error("database or disk is full"), { errcode: 13 }) },
+                            { expect: EXPECT });
+  check(!/reeve restore --hub --force/.test(full.remedy),
+    "a history unreadable because the store is FULL is never sent to a restore",
+    `nothing is wrong with the file, and a restore needs more room rather than less: ${full.remedy}`);
+  check(/free space/i.test(full.remedy) && /max_page_count/.test(full.remedy),
+    "control: it names both causes of a full store — the filesystem and the database's own page limit",
+    full.remedy);
+
+  // RETRYABILITY TRAVELS WITH THE SENTENCE. A hub read during its own creation
+  // answers errcode 1, which `faultKind` calls damage -- so a caller deriving the
+  // bit separately said `retryable: false` beside a remedy that said to look
+  // again.
+  const initWindow = historyFault({ readable: false, missing: [], have: [], holed: false, invalid: [], version: 0,
+                                    cause: Object.assign(new Error("no such table: schema_version"), { errcode: 1 }) },
+                                  { expect: EXPECT });
+  check(initWindow.retryable === true,
+    "a history that may be a hub mid-creation is RETRYABLE, matching the remedy beside it",
+    `remedy says: ${initWindow.remedy}`);
+  const neverRetry = historyFault({ readable: false, missing: [], have: [], holed: false, invalid: [], version: 0,
+                                    cause: Object.assign(new Error("Value is too large"), { code: "ERR_OUT_OF_RANGE" }) },
+                                  { expect: EXPECT });
+  check(neverRetry.retryable === false,
+    "control: and the one unreadable case that is never worth retrying says so",
+    "the value itself is the fault, so every read reproduces it exactly");
+
   const busy = historyFault({ readable: false, missing: [], have: [], holed: false, invalid: [], version: 0,
                               cause: Object.assign(new Error("database is locked"), { errcode: 5 }) },
                             { expect: EXPECT });

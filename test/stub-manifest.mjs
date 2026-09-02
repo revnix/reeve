@@ -2493,4 +2493,26 @@ export const STUBS = [
       replace: "    \"unknown-event\": \"is ahead of this hub's log (it was restored)\",",
     }],
   },
+  {
+    name: "identity-is-asked-before-the-sequence",
+    why: "classify an out-of-range sequence before consulting the incarnation. A restore from a SHORTER snapshot -- the common one -- leaves the log below the saved cursor, so both arms match and the sequence wins: the digest reports `ahead`, which is the symptom, and discards the identity sitting beside it, which is the cause. The proof this whole change adds is thrown away in precisely the case it was added for",
+    test: "test/build-dash.test.mjs",
+    expectRed: "a restore to a SHORTER log is judged by identity, not reported as merely `ahead`",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "      : provable && since.incarnation !== incarnation ? \"different-log\"\n      : since.seq > highWater ? \"ahead\"",
+      replace: "      : since.seq > highWater ? \"ahead\"\n      : provable && since.incarnation !== incarnation ? \"different-log\"",
+    }],
+  },
+  {
+    name: "an-unproven-answer-names-what-could-not-prove-it",
+    why: "print one note for both reasons an answer is unproven. A legacy cursor and a hub that cannot supply an identity are opposite faults with opposite advice, and the shared note tells the second operator that the cursor above carries an id and the next call will be provable -- both false, since next_cursor was formatted with no identity at all",
+    test: "test/build-dash.test.mjs",
+    expectRed: "the note blames the HUB, which is what cannot supply the identity",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "  if (m.cursor_proof === \"timestamp\" && m.incarnation !== null)",
+      replace: "  if (m.cursor_proof === \"timestamp\")",
+    }],
+  },
 ];

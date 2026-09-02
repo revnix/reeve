@@ -189,16 +189,23 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
   const provable = since !== null && since.incarnation !== null && incarnation !== null;
   const atOf = (seq) => db.prepare("SELECT at FROM phase_event WHERE seq = ?").get(seq)?.at ?? null;
   const namesAKnownEvent = () => since.seq === 0 || atOf(since.seq) === since.at;
+  //
+  // IDENTITY IS ASKED FIRST, because it is the only conclusive answer available
+  // and every other arm is a guess beside it. Asking `ahead` first threw the
+  // proof away in the COMMON restore -- one to a shorter snapshot, which leaves
+  // the log below the saved cursor. That reported `ahead` ("the log is shorter"),
+  // which is a symptom, while the identity sitting right there said `restored`,
+  // which is the cause. The sequence arms only ever run once identity has failed
+  // to decide, or could not be consulted at all.
   const verdict =
     since === null ? null
+      : provable && since.incarnation !== incarnation ? "different-log"
       : since.seq > highWater ? "ahead"
-      : provable
-        ? (since.incarnation !== incarnation ? "restored"
-           : namesAKnownEvent() ? "ok" : "unknown-event")
-        // WITHOUT AN IDENTITY THE TWO CANNOT BE TOLD APART, which is the whole of
-        // the defect this closes. A changed event is reported as exactly that --
-        // neither diagnosis claimed -- rather than asserted to be a restore.
-        : namesAKnownEvent() ? "ok" : "changed-event";
+      : namesAKnownEvent() ? "ok"
+      // WITHOUT AN IDENTITY THE TWO CANNOT BE TOLD APART, which is the whole of
+      // the defect this closes. A changed event is reported as exactly that --
+      // neither diagnosis claimed -- rather than asserted to be a restore.
+      : provable ? "unknown-event" : "changed-event";
   // UNCHANGED IN MEANING: do not trust the movement list. Every verdict but `ok`
   // says the cursor cannot be resolved against this log, which is what the exit
   // status and the withheld list have always keyed off.
@@ -480,9 +487,10 @@ export function renderDash(m) {
   // diagnosis for three of the four verdicts -- and the restore case this whole
   // change exists to catch is precisely one where the cursor is NOT ahead.
   const WHY_UNUSABLE = {
-    ahead: "is ahead of this hub's log, so the log is shorter than when the cursor was issued",
-    restored: "belongs to a PREVIOUS incarnation of this hub: it was restored, and the log that " +
-              "issued this cursor no longer exists",
+    ahead: "names a sequence beyond this hub's log, and carries no identity that could say why",
+    "different-log": "does not belong to this hub's log. Either this hub was restored since the " +
+                     "cursor was issued, or the cursor came from a different hub — the identities " +
+                     "differ, which settles that it is not this log without saying which of the two",
     "unknown-event": "does not name an event this hub has, though it carries this hub's identity — " +
                      "the cursor itself is wrong rather than the log",
     "changed-event": "names an event this hub does not have. It carries no incarnation, so whether " +
@@ -511,10 +519,14 @@ export function renderDash(m) {
   if (m.incarnation_damaged)
     out.push(`  HUB DAMAGED: ${m.incarnation_damaged.split("\n")[0]}`,
              ...m.incarnation_damaged.split("\n").slice(1).map(l => `  ${l.trim()}`));
-  if (m.cursor_proof === "timestamp")
+  if (m.cursor_proof === "timestamp" && m.incarnation !== null)
     out.push("  note: this cursor predates the hub's incarnation id, so a restore is " +
              "inferred from timestamps and a same-second restore can pass unseen. " +
              "The cursor above carries the id; the next call is provable.");
+  else if (m.cursor_proof === "timestamp")
+    out.push("  note: this HUB cannot supply an incarnation id, so a restore is inferred from " +
+             "timestamps and a same-second restore can pass unseen. The cursor above carries " +
+             "no id either, so the next call is no better until the hub's identity is restored.");
 
   // Per task, the facts a digest owes beside the state: what is draining, what
   // territory is pinned and until when, and every UNKNOWN said out loud.

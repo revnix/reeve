@@ -16,7 +16,7 @@ import { openHub } from "../src/build/hubdb.mjs";
 import { openHubAsGuest } from "../src/build/hubguest.mjs";
 import { open as openGuardianStore } from "../src/db/ops.mjs";
 import { announceable } from "../src/daemon.mjs";
-import { notify, readNtfyResponse } from "../src/notify.mjs";
+import { notify, readNtfyResponse, scrub } from "../src/notify.mjs";
 import {
   FAILURE_TYPES, IDENTITY_SHAPES, PAGES, escalationKey, shapeOf, body,
   assertHub, builderAnnounceable, pages, announce, subjectOf, ACTION_FOR, actionFor,
@@ -1400,6 +1400,125 @@ const freshHub = () => {
       "control: a toJSON that returns an object is stored, so this is about the shape produced",
       hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null);
   }
+
+// ── the report that is stored is the whole report the caller supplied ───────
+//
+// `JSON.stringify` DROPS an undefined, a function and a symbol from an object
+// without a word, and turns a non-finite number into null. So a body could
+// serialise cleanly, pass every shape check, be stored and be marked DELIVERED
+// while quietly missing a fact the caller put in it. Serialising without error is
+// not proof that the whole report survived.
+{
+  const hub = freshHub();
+  const key = escalationKey({ kind: "backup:failed" });
+  const send = () => ({ ok: true, channels: [{ name: "t", ok: true }] });
+  for (const [what, detail] of [["undefined", undefined],
+                                ["a function", () => 1],
+                                ["a symbol", Symbol("s")],
+                                ["Infinity", Infinity],
+                                ["NaN", NaN]]) {
+    let k = null;
+    try {
+      announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                      bodies: new Map([[key, { type: "FAILED", detail }]]) });
+    } catch (e) { k = e.kind ?? "threw"; }
+    check(k === "escalation_body_value",
+      `a detail of ${what} is refused rather than silently dropped from the report`, String(k));
+  }
+  check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 0,
+    "control: none of them was stored, so the refusal precedes the write",
+    JSON.stringify(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key)));
+
+  // CONTROL: the values JSON carries faithfully are still accepted, so this
+  // refuses what would be LOST rather than refusing richness.
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                  bodies: new Map([[key, { type: "FAILED", n: 0, ok: false, s: "x",
+                                           nested: { a: [1, "b", null] } }]]) });
+  const kept = JSON.parse(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body);
+  check(kept.n === 0 && kept.ok === false && kept.nested.a.length === 3,
+    "control: numbers, booleans, nulls and nested arrays all survive intact",
+    JSON.stringify(kept));
+
+  // A VALUE REFERENCED TWICE IS NOT A CYCLE. The walk carries a set to detect
+  // circularity, and a set that only ever grows refuses `{ x: shared, y: shared }`
+  // -- ordinary JSON, which stringify serialises perfectly by writing it twice.
+  // The set therefore tracks the PATH from the root and is unwound on the way out.
+  const shared = { a: 1 };
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                  bodies: new Map([[key, { type: "FAILED", x: shared, y: shared }]]) });
+  const twice = JSON.parse(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body);
+  check(twice.x?.a === 1 && twice.y?.a === 1,
+    "a value referenced twice as siblings is stored twice, not refused as circular",
+    JSON.stringify(twice));
+}
+
+// ── the ceiling is measured in the unit it promises ─────────────────────────
+//
+// `String.length` counts UTF-16 code units. The cap and the message both say
+// BYTES, and the two diverge most where it matters: about 4000 CJK characters
+// measure as 4000 and occupy roughly 12KB, so a body three times over the ceiling
+// passed the check whose entire purpose is bounding what gets written.
+{
+  const hub = freshHub();
+  const key = escalationKey({ kind: "backup:failed" });
+  const wide = "漢".repeat(2000);            // 2000 UTF-16 units, 6000 UTF-8 bytes
+  check(wide.length < 4096 && Buffer.byteLength(wide, "utf8") > 4096,
+    "control: the fixture is inside the cap by code units and outside it by bytes",
+    JSON.stringify({ units: wide.length, bytes: Buffer.byteLength(wide, "utf8") }));
+  let k = null;
+  try {
+    announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                    send: () => ({ ok: true, channels: [] }),
+                    bodies: new Map([[key, { type: "FAILED", detail: wide }]]) });
+  } catch (e) { k = e.kind ?? "threw"; }
+  check(k === "escalation_body_too_large",
+    "a body measured in bytes is refused though its code-unit count is inside the cap", String(k));
+}
+
+// ── a scrubbed key never displaces another field ────────────────────────────
+//
+// Two credential-shaped keys reduce to the SAME replacement, and building the
+// object in one pass keeps only the last -- dropping a field from a report that
+// was otherwise entirely valid. Losing a fact to the guard protecting it is the
+// failure this column exists to prevent.
+{
+  const hub = freshHub();
+  const key = escalationKey({ kind: "backup:failed" });
+  const A = "ghp_" + "A".repeat(24), B = "ghp_" + "B".repeat(24);
+  check(scrub(`k${A}`) === scrub(`k${B}`),
+    "control: the two keys really do scrub to one name, so a collision is possible",
+    JSON.stringify([scrub(`k${A}`), scrub(`k${B}`)]));
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                  send: () => ({ ok: true, channels: [{ name: "t", ok: true }] }),
+                  bodies: new Map([[key, { type: "FAILED", [`k${A}`]: "first", [`k${B}`]: "second" }]]) });
+  const stored = JSON.parse(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body);
+  const values = Object.values(stored).filter(v => v === "first" || v === "second");
+  check(values.length === 2,
+    "both values survive a key collision, under distinct names", JSON.stringify(stored));
+}
+
+// ── toJSON is called the way JSON.stringify calls it ────────────────────────
+//
+// `JSON.stringify` hands `toJSON` the property name -- "" at the root. Calling it
+// with no argument is a different call, so an implementation branching on `key`
+// would persist something other than what stringify would have produced, and the
+// scrub would have changed the report's MEANING rather than only its credentials.
+{
+  const hub = freshHub();
+  const key = escalationKey({ kind: "backup:failed" });
+  const MARK = "root-" + Math.random().toString(36).slice(2, 8);
+  const keyed = { toJSON(k) { return k === "" ? { type: "FAILED", detail: MARK }
+                                              : { type: "FAILED", detail: "fallback" }; } };
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                  send: () => ({ ok: true, channels: [{ name: "t", ok: true }] }),
+                  bodies: new Map([[key, keyed]]) });
+  check((hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "").includes(MARK),
+    "a toJSON that reads its key gets the root key, as JSON.stringify would give it",
+    hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null);
+  check(JSON.stringify(keyed).includes(MARK),
+    "control: and that is exactly what plain JSON.stringify produces for it",
+    JSON.stringify(keyed));
+}
 
 // ── the vocabulary is enforced where every body passes, not only in body() ──
 //

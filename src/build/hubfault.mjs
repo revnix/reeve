@@ -46,7 +46,8 @@ import { HUB_SCHEMA_VERSION, faultKind } from "./hubdb.mjs";
  *     migrating -- which cannot repair a marker that is not a version
  *
  * @param {{readable:boolean, missing:number[], have:number[], holed:boolean, invalid:number[], version:number}} hist
- * @returns {{kind:string, detail:string, remedy:string}|null}
+ * @returns {{kind:string, detail:string, remedy:string,
+ *            snapshotRestore:"forbidden"|"in-place"|"aside-first"|"unneeded"}|null}
  */
 /**
  * How to install a snapshot over a store this binary may not touch.
@@ -77,7 +78,26 @@ import { HUB_SCHEMA_VERSION, faultKind } from "./hubdb.mjs";
 const outOfRange = (cause) =>
   cause?.code === "ERR_OUT_OF_RANGE" || /too large to be represented/i.test(cause?.message ?? "");
 
-const restoreAdvice = (plainRestoreRefused) => plainRestoreRefused
+/**
+ * WHERE A REMEDY'S MEANING LIVES. Every fault here takes one of four stances
+ * toward installing a snapshot over the live store, and the stance is a FIELD
+ * rather than a sentence:
+ *
+ *   "forbidden"    the store is healthy; a restore would destroy what it holds
+ *   "in-place"     the store is broken; `reeve restore --hub --force` repairs it
+ *   "aside-first"  a restore is right but refuses in place; move the hub first
+ *   "unneeded"     migrating repairs it; no snapshot is involved
+ *
+ * The assertion guarding the "forbidden" case has been rewritten three times and
+ * passed a remedy recommending the downgrade twice. It asserted the WORD
+ * ("downgrade") against a sentence that recommended the act without it; then the
+ * PHRASE ("restore a snapshot over it"), which exempted the phrase and left the
+ * "Do NOT" carrying the meaning unasserted; then the literal forbidding clause,
+ * which goes red on a correct reword to "on top of it". Word, phrase, longer
+ * phrase: each a smaller target for the same miss, because prose was the only
+ * place the meaning existed. It is here now, and a reword cannot move it.
+ */
+const restoreAdvice = (stance) => stance === "aside-first"
   ? "no binary will repair this in place: a restore refuses a store recording a newer version, " +
     "and a newer binary refuses a history it cannot read. Stop the daemon, move the hub aside -- " +
     "`hub.db` AND `hub.db-wal` AND `hub.db-shm`, together, since a WAL database is all three and " +
@@ -113,7 +133,8 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
     return { kind: "unreadable-marker",
              detail: "its schema_version holds a value no reader can represent " +
                      `(${hist.cause.message}), so the migration history cannot be read at all`,
-             remedy: restoreAdvice(true),
+             remedy: restoreAdvice("aside-first"),
+             snapshotRestore: "aside-first",
              // THE ONLY UNREADABLE CASE THAT IS NEVER WORTH RETRYING: the value
              // itself is the fault, so every read reproduces it exactly.
              retryable: false };
@@ -149,16 +170,19 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
              ...(() => {
                const kind = faultKind(hist?.cause);
                if (kind === "operational")
-                 return { remedy: "another process may hold the file, or its permissions may be wrong. " +
+                 return { snapshotRestore: "forbidden",
+                          remedy: "another process may hold the file, or its permissions may be wrong. " +
                                   "Find out which and re-run. Do NOT restore over it on this evidence: " +
                                   "nothing here says the store is damaged, and a restore would replace a " +
                                   "healthy hub to fix a lock" };
                if (kind === "full")
-                 return { remedy: "the store ran out of room. Free space on the filesystem holding it, or " +
+                 return { snapshotRestore: "forbidden",
+                          remedy: "the store ran out of room. Free space on the filesystem holding it, or " +
                                   "check `PRAGMA max_page_count` against `PRAGMA page_count` if the database " +
                                   "has hit its own limit, then re-run. Do NOT restore over it: nothing is " +
                                   "wrong with the file, and a restore needs more room rather than less" };
-               return { remedy: "re-run: a hub being created for the first time reads this way for an " +
+               return { snapshotRestore: "in-place",
+                        remedy: "re-run: a hub being created for the first time reads this way for an " +
                                 "instant. If it persists, the store is damaged and `reeve restore --hub " +
                                 "--force` installs the newest usable snapshot" };
              })(),
@@ -168,12 +192,17 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
   // is an INTEGER PRIMARY KEY, so a hand-edited `-1` is valid SQLite -- and a store
   // recording `[-1, 6]` is not a newer hub, it is a damaged one that also happens
   // to carry a high number. Comparing versions first declared it healthy.
-  if (hist.invalid.length)
+  if (hist.invalid.length) {
+    // ONE const for both, because a field that restates a condition the sentence
+    // computes separately is two facts that can drift apart.
+    const restore = hist.version > expect ? "aside-first" : "in-place";
     return { kind: "invalid",
              detail: `it records ${hist.invalid.join(", ")} in schema_version, which is not a migration ` +
                      `number this binary can act on (they run 1 through ${expect})`,
              remedy: "the marker itself is wrong, so migrating cannot repair it: " +
-                     restoreAdvice(hist.version > expect) };
+                     restoreAdvice(restore),
+             snapshotRestore: restore };
+  }
 
   // AHEAD **AND SOUND**. A forward-only history that reached version N carries
   // every version below it, so a store that is ahead AND missing one of the
@@ -207,7 +236,8 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
              // has to stop being the live hub before anything will touch it, so
              // the remedy names the move, and the move keeps the file as evidence
              // rather than deleting it.
-             remedy: restoreAdvice(true) };
+             remedy: restoreAdvice("aside-first"),
+             snapshotRestore: "aside-first" };
 
   // NO SNAPSHOT REMEDY FOR A HEALTHY NEWER HUB, and this is the one case where
   // offering the usual repair is dangerous rather than merely unhelpful.
@@ -228,7 +258,8 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
                      "Migrations are forward-only, so this binary cannot read it",
              remedy: "run the newer binary. Do NOT restore a snapshot over it: this store is " +
                      "healthy and this binary is old, so an older snapshot would discard whatever " +
-                     "the newer one wrote to fix nothing" };
+                     "the newer one wrote to fix nothing",
+             snapshotRestore: "forbidden" };
 
   if (!hist.missing.length) return null;
 
@@ -238,10 +269,12 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
 
   // THE TWO REMEDIES, and the whole reason this module exists. `openHub` re-runs
   // a missing TAIL and refuses a HOLE, so only one of these two faults migrates.
+  const restore = hist.version > expect ? "aside-first" : "in-place";
   return hist.holed
     ? { kind: "hole", detail,
         remedy: "this is a HOLE, not a missing tail, so migrating cannot repair it: the migrations " +
-                "beneath the ones already applied cannot be re-run. " + restoreAdvice(hist.version > expect) }
+                "beneath the ones already applied cannot be re-run. " + restoreAdvice(restore),
+        snapshotRestore: restore }
     // THE COMMAND IS THE CALLER'S, the DECISION is not -- and so are its backticks.
     //
     // The two hints are not the same shape: one is a bare command, the other is a
@@ -258,5 +291,6 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
     // contextual advice with a generic instruction to run something else, which a
     // control in `migration-history` caught immediately.
     : { kind: "tail", detail,
-        remedy: `run a command that writes (for example ${migrateWith}) to migrate, then retry` };
+        remedy: `run a command that writes (for example ${migrateWith}) to migrate, then retry`,
+        snapshotRestore: "unneeded" };
 }

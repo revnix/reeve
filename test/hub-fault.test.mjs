@@ -12,6 +12,7 @@
 // wrong branch", and a table is the only form where adding a shape is one line and
 // the neighbours stay visible beside it.
 import { historyFault } from "../src/build/hubfault.mjs";
+import { recommendsRestore } from "./restore-stance.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -220,6 +221,74 @@ check(new Set(TABLE.map(r => r.kind)).size === 8 && TABLE.length === 9,
   check(!/``/.test(t("`reeve task file` without --dry-run")),
     "control: the hint is not double-wrapped, which no assertion about the WORDS would notice",
     t("`reeve task file` without --dry-run"));
+}
+
+// ── the stance is a FIELD, and the prose only has to agree with it ───────────
+//
+// THE THIRD DESIGN FOR ONE ASSERTION, and the first that does not live in prose.
+// The forward-version fault is the one case here whose correct advice is the
+// ABSENCE of a restore, and the guard for it has now been written three ways:
+// the WORD "downgrade", which a sentence recommending the act without it walked
+// straight past; the PHRASE "restore a snapshot over it", exempted by a lookahead
+// so the message's own forbidding clause could pass, which left "Do NOT" -- the
+// two words carrying the meaning -- unasserted; and the literal forbidding
+// clause, which is sound but goes red on a correct reword to "on top of it".
+// Word, phrase, longer phrase: each a smaller target for the same miss, because
+// prose was the only place the meaning existed.
+//
+// It is a field now. The rows below say what each fault's stance IS, and the
+// paired assertion says the sentence has not drifted from it.
+{
+  const unreadable = (msg, extra) => ({ readable: false, missing: [], have: [], holed: false,
+                                        invalid: [], version: 0,
+                                        cause: Object.assign(new Error(msg), extra) });
+  const ROWS = [
+    { name: "a healthy newer hub forbids it", stance: "forbidden",
+      h: hist({ have: [1, 2, 3, 4, 5, 6], version: 6 }) },
+    { name: "a lock forbids it, because nothing here says the store is damaged", stance: "forbidden",
+      h: unreadable("database is locked", { errcode: 5 }) },
+    { name: "a full disk forbids it, because a restore needs more room rather than less", stance: "forbidden",
+      h: unreadable("database or disk is full", { errcode: 13 }) },
+    { name: "damage takes the restore in place", stance: "in-place",
+      h: unreadable("no such table: schema_version", { errcode: 1 }) },
+    { name: "a hole beneath this binary takes the restore in place", stance: "in-place",
+      h: hist({ have: [1, 3], missing: [2, 4, 5], holed: true, version: 3 }) },
+    { name: "an unreadable marker has to be moved aside first", stance: "aside-first",
+      h: unreadable("Value is too large to be represented as a JavaScript number: 1",
+                    { code: "ERR_OUT_OF_RANGE" }) },
+    { name: "ahead AND holed has to be moved aside first", stance: "aside-first",
+      h: hist({ have: [1, 6], missing: [2, 3, 4, 5], holed: true, version: 6 }) },
+    { name: "an invalid marker above this binary has to be moved aside first", stance: "aside-first",
+      h: hist({ have: [6], missing: [1, 2, 3, 4, 5], invalid: [-1], version: 6 }) },
+    { name: "a missing tail needs no snapshot at all", stance: "unneeded",
+      h: hist({ have: [1, 2, 3, 4], missing: [5], version: 4 }) },
+  ];
+
+  for (const { name, stance, h } of ROWS) {
+    const f = historyFault(h, { expect: EXPECT });
+    check(f?.snapshotRestore === stance, `stance: ${name}`, `${f?.kind} -> ${f?.snapshotRestore}`);
+    const rec = recommendsRestore(f?.remedy ?? "");
+    check(stance === "forbidden" || stance === "unneeded" ? !rec : rec,
+      `the remedy agrees with the field: ${name}`, f?.remedy);
+    // A remedy that says to move the hub aside must name what "the hub" IS.
+    // `openHub` forces WAL, so a live store is three files, and a crash leaves
+    // the -wal holding committed pages -- which is the state this is reached in.
+    if (stance === "aside-first")
+      check(/hub\.db\b/.test(f.remedy) && /hub\.db-wal/.test(f.remedy) && /hub\.db-shm/.test(f.remedy),
+        `moving aside names all three files, because a WAL database is all three: ${name}`, f.remedy);
+  }
+
+  // DISCRIMINATION, against the exact texts that beat the two previous designs.
+  // Without these the rule is a shape that happens to agree with today's wording.
+  const ahead = historyFault(hist({ have: [1, 2, 3, 4, 5, 6], version: 6 }), { expect: EXPECT });
+  check(!recommendsRestore(ahead.remedy),
+    "control: the real forward-version remedy is not read as a recommendation", ahead.remedy);
+  check(recommendsRestore(ahead.remedy.replace("Do NOT restore", "Restore")),
+    "the rule catches the remedy with its negation removed, which the PHRASE assertion accepted");
+  check(recommendsRestore("run the newer binary, or restore a snapshot taken at 6"),
+    "and the remedy that one replaced, which the WORD assertion accepted");
+  check(!recommendsRestore(ahead.remedy.replace("over it", "on top of it")),
+    "and a correct REWORD still passes, which the literal-clause assertion did not");
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

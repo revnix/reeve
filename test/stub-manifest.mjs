@@ -3131,8 +3131,8 @@ export const STUBS = [
     expectRed: "the pass surveys EVERY standing row, so no cause can quietly become a clearing candidate",
     edits: [{
       file: "src/build/paging.mjs",
-      find: "    db.prepare(\"SELECT why, count FROM escalation ORDER BY first_seen_at\")",
-      replace: "    db.prepare(\"SELECT why, count FROM escalation WHERE announced_count = 0 ORDER BY first_seen_at\")",
+      find: "  const rows = db.prepare(\"SELECT why, count FROM escalation ORDER BY first_seen_at, why\").all();",
+      replace: "  const rows = db.prepare(\"SELECT why, count FROM escalation WHERE announced_count = 0 ORDER BY first_seen_at, why\").all();",
     }],
   },
   {
@@ -3164,8 +3164,8 @@ export const STUBS = [
     expectRed: "five delivery passes do not move last_seen_at, because none of them saw the cause",
     edits: [{
       file: "src/build/paging.mjs",
-      find: "                                examined: null, observe: false, limit,",
-      replace: "                                examined: null, limit,",
+      find: "                                examined: null, observe: false, budgetMs,",
+      replace: "                                examined: null, budgetMs,",
     }],
   },
   {
@@ -3208,8 +3208,8 @@ export const STUBS = [
     expectRed: "ntfy with no credentialFile is not deliverable, so the doctor cannot report it as healthy",
     edits: [{
       file: "src/build/paging.mjs",
-      find: "  const usable = (ntfy && credential !== null) || cfg.desktop === true;",
-      replace: "  const usable = ntfy || cfg.desktop === true;",
+      find: "  const usable = (ntfy && credential !== null) || desktop;",
+      replace: "  const usable = ntfy || desktop;",
     }],
   },
   {

@@ -182,6 +182,15 @@ const check = (ok, name, detail) => {
     "and so is one short of complete");
   check(sweepVerdict({ ok: true, out: "280/280 stub(s) caught" }).level === "refusal",
     "a verdict with NO coverage line means the sweep did not finish");
+  // EQUALITY IS NOT ENOUGH. `0/0 caught` satisfies it while having measured
+  // nothing, and a coverage line whose entry count disagrees with the verdict's
+  // total describes a different run than the one that just reported.
+  check(sweepVerdict({ ok: true, out: "0/0 stub(s) caught\n0 entries over 30 of 125 test file(s)" }).level === "refusal",
+    "a sweep that ran NO stubs is a refusal, however equal its counts");
+  check(sweepVerdict({ ok: true, out: "229/229 stub(s) caught\n305 entries over 30 of 125 test file(s)" }).level === "refusal",
+    "and a coverage line that counts different entries describes a different run");
+  check(sweepVerdict({ ok: true, out: "229/229 stub(s) caught\n229 entries over 30 of 125 test file(s)" }).level === "ok",
+    "control: agreeing counts over a non-zero total is the only clean pass");
   // `die()` writes the actionable reason to stderr only.
   check(/manifest is unusable/.test(sweepVerdict({ ok: false, out: "", err: "the manifest is unusable" }).lines.join(" ")),
     "a refusal carries the stderr that says what to do about it");

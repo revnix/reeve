@@ -162,6 +162,33 @@ export const GRANDFATHERED = [
 
 export const STUBS = [
   {
+    name: "a-sweep-that-ran-nothing-is-not-a-pass",
+    why: "accept `0/0 stub(s) caught`. Equality alone is satisfied by a run that measured nothing at all -- an entry filter that matched no names, a manifest that failed to load its list -- and the caller then continues on a verification that never happened. The whole point of requiring positive evidence is that a shape which merely LOOKS like a verdict is not one",
+    test: "test/state-script.test.mjs",
+    expectRed: "a sweep that ran NO stubs is a refusal",
+    edits: [{ file: "scripts/state.mjs",
+              find: "  if (ok && (!summary || !cov || total === 0 || caught !== total || entries !== total))",
+              replace: "  if (ok && (!summary || !cov || caught !== total))" }],
+  },
+  {
+    name: "the-coverage-line-must-describe-the-same-run",
+    why: "stop checking that the coverage line's entry count agrees with the verdict's total. Those two numbers come from different points in the sweep, so a mismatch means the output describes two runs -- one that reported and one that counted -- and reading either as the answer is a coin flip nobody knows they are tossing",
+    test: "test/state-script.test.mjs",
+    expectRed: "a coverage line that counts different entries describes a different run",
+    edits: [{ file: "scripts/state.mjs",
+              find: "  const cov = /(\\d+) entries over \\d+ of \\d+ test file\\(s\\)/.exec(text0);",
+              replace: "  const cov = /(\\d+) entries over \\d+ of \\d+ test file\\(s\\)/.exec(text0) ?? [\"\", String(Number((/(\\d+)\\/(\\d+) stub\\(s\\) caught/.exec(text0) ?? [0,0,0])[2]))];" }],
+  },
+  {
+    name: "a-refusal-keeps-its-whole-diagnostic",
+    why: "keep only the last line of stderr. `stub-sweep`'s preflight refusals are multi-line: the affected entry, the file it names, and what to do about it. The final line is the advice, so dropping the rest leaves a reader holding a remedy with no subject -- and this is the one output whose entire purpose is saying which entry could not be placed",
+    test: "test/state-script.test.mjs",
+    expectRed: "a refusal carries the stderr that says what to do about it",
+    edits: [{ file: "scripts/state.mjs",
+              find: "      const all = String(e.stderr || e.message).split(\"\\n\").filter(Boolean);\n      return { ok: false, out: String(e.stdout ?? \"\").trim(),\n               err: (all.length ? all.join(\" | \") : \"failed\").slice(0, 1200) };",
+              replace: "      const all = String(e.stderr || e.message).split(\"\\n\").filter(Boolean);\n      return { ok: false, out: String(e.stdout ?? \"\").trim(),\n               err: (all.pop() ?? \"failed\").slice(0, 1200) };" }],
+  },
+  {
     name: "an-unreadable-commit-is-a-record-not-a-miss",
     why: "treat the daemon's own `unreadable` marker as no record, so the scan falls back to an OLDER start. `runningCommit()` returns that literal deliberately when its git rev-parse fails; skipping it attributes a previous start's commit to the process running now, which is worse than answering nothing because it looks like a measurement",
     test: "test/state-script.test.mjs",
@@ -185,8 +212,8 @@ export const STUBS = [
     test: "test/state-script.test.mjs",
     expectRed: "a clean exit that printed NO verdict is a refusal, not a pass",
     edits: [{ file: "scripts/state.mjs",
-              find: "  if (ok && (!summary || !coverage || summary[1] !== summary[2])) return { level: \"refusal\", stop: true,",
-              replace: "  if (false) return { level: \"refusal\", stop: true," }],
+              find: "  if (ok && (!summary || !cov || total === 0 || caught !== total || entries !== total))\n    return { level: \"refusal\", stop: true,",
+              replace: "  if (false)\n    return { level: \"refusal\", stop: true," }],
   },
   {
     name: "unrunnable-does-not-blame-dependencies",

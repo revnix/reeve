@@ -37,8 +37,13 @@ export function runner(cwd = process.cwd()) {
         ...(env ? { env } : {}),
         maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] }).trim() };
     } catch (e) {
+      // THE WHOLE DIAGNOSTIC, not its last line. `stub-sweep`'s preflight
+      // refusals are multi-line -- the affected entry, the file, and what to do
+      // about it -- and keeping only the final line drops everything that says
+      // WHICH entry, leaving a reader with the advice and not the subject.
+      const all = String(e.stderr || e.message).split("\n").filter(Boolean);
       return { ok: false, out: String(e.stdout ?? "").trim(),
-               err: (String(e.stderr || e.message).split("\n").filter(Boolean).pop() ?? "failed").slice(0, 200) };
+               err: (all.length ? all.join(" | ") : "failed").slice(0, 1200) };
     }
   };
 }
@@ -181,16 +186,25 @@ export function sweepVerdict({ ok, out, err }) {
   // written to prevent it.
   const text0 = String(out ?? "");
   const summary = /(\d+)\/(\d+) stub\(s\) caught/.exec(text0);
-  const coverage = /\d+ entries over \d+ of \d+ test file\(s\)/.test(text0);
+  const cov = /(\d+) entries over \d+ of \d+ test file\(s\)/.exec(text0);
   // A SUMMARY IS NOT A PASSING SUMMARY. `0/280 stub(s) caught` matches the shape
   // and means every entry failed; the coverage line can also be absent entirely
   // after an early return. Both halves have to be there and the counts have to
   // agree before a zero exit means anything.
-  if (ok && (!summary || !coverage || summary[1] !== summary[2])) return { level: "refusal", stop: true,
-    lines: [!summary ? "the sweep exited 0 but printed no verdict, so nothing was actually measured"
-                     : !coverage ? "the sweep printed a verdict but no coverage line, so it did not finish"
-                     : `the sweep exited 0 reporting ${summary[1]} of ${summary[2]} caught, which is not a pass`,
-            "-> a clean exit is only a pass when every stub was caught and the coverage line is present"] };
+  // EVERY WAY A CLEAN EXIT CAN MEAN NOTHING. `0/0 stub(s) caught` satisfies
+  // equality while having measured nothing at all, and a coverage line whose
+  // entry count disagrees with the verdict's total describes a different run
+  // than the one that just reported.
+  const caught = summary ? Number(summary[1]) : 0, total = summary ? Number(summary[2]) : 0;
+  const entries = cov ? Number(cov[1]) : 0;
+  if (ok && (!summary || !cov || total === 0 || caught !== total || entries !== total))
+    return { level: "refusal", stop: true,
+      lines: [!summary ? "the sweep exited 0 but printed no verdict, so nothing was actually measured"
+                       : !cov ? "the sweep printed a verdict but no coverage line, so it did not finish"
+                       : total === 0 ? "the sweep exited 0 having run NO stubs, which measures nothing"
+                       : caught !== total ? `the sweep exited 0 reporting ${caught} of ${total} caught, which is not a pass`
+                       : `the verdict counts ${total} stubs and the coverage line counts ${entries} entries, so they describe different runs`,
+              "-> a clean exit is a pass only when a non-zero number of stubs all caught, and the coverage line agrees"] };
   if (ok) return { level: "ok", stop: false,
                    lines: [(out ?? "").split("\n").filter(Boolean).slice(-2).join(" | ")] };
   const text = String(out ?? "");
@@ -355,6 +369,8 @@ function main(argv) {
     if (uncounted) refuse(`${uncounted} branch(es) could not be compared, so that list is not complete`);
   }
 
+  const finish = () => { if (out.length) console.log(out.join("\n")); return refusals ? 1 : 0; };
+
   // PRINTED BEFORE THE SWEEP, because the sweep takes roughly twenty minutes and
   // everything above is a "right now" reading. Buffering it to one write at the
   // end means main can advance, a pull request can open and the daemon can
@@ -364,9 +380,17 @@ function main(argv) {
   out.length = 0;
 
   if (args.sweep) {
+    // RESOLVED FIRST, then everything else uses the sha. Remote-tracking refs
+    // are shared across worktrees, so another session's fetch during the
+    // worktree creation or the `npm ci` moves `origin/<branch>` -- and the
+    // checkout would then be one commit and the diff base another, from two
+    // different moments, with nothing saying so.
+    const tip = run("git", ["rev-parse", `origin/${branch}`]);
+    const base = tip.ok ? run("git", ["rev-parse", `${tip.out}~1`]) : { ok: false, err: tip.err };
     const dir = mkdtempSync(join(tmpdir(), "reeve-state-sweep-"));
     try {
-      const added = run("git", ["worktree", "add", "-q", "--detach", dir, `origin/${branch}`]);
+      if (!tip.ok || !base.ok) { refuse(`could not pin a sweep checkout and base: ${tip.err ?? base.err}`); return finish(); }
+      const added = run("git", ["worktree", "add", "-q", "--detach", dir, tip.out]);
       if (!added.ok) refuse(`could not create the sweep worktree: ${added.err}`);
       else {
         // INSTALL, because the sweep runs the suite and part of it imports a
@@ -383,19 +407,12 @@ function main(argv) {
           // process: an operator invoking the script with the Node 24 binary while
           // PATH still holds the host default would run the authoritative sweep
           // under Node 22, which is the runtime the floor exists to refuse.
-          // RESOLVED TO A SHA, because `origin/<branch>~1` is a symbolic ref in a
-          // repository three sessions share: another fetch during the twenty
-          // minutes this runs moves it, and the sweep then compares against a
-          // base that is not the one the worktree was created from.
-          const baseRef = run("git", ["rev-parse", `origin/${branch}~1`]);
-          if (!baseRef.ok) refuse(`could not resolve a sweep base: ${baseRef.err}`);
-          const swept = !baseRef.ok ? null : runner(dir)(process.execPath, ["scripts/stub-sweep.mjs"],
-            { timeout: 3_600_000, env: { ...process.env, STUB_SWEEP_BASE: baseRef.out } });
-          if (swept !== null) {
-            const verdict = sweepVerdict(swept);
-            say("", `sweep           ${verdict.level}`, ...verdict.lines.map(l => `  ${l}`));
-            if (verdict.stop) refusals++;
-          }
+          const swept = runner(dir)(process.execPath, ["scripts/stub-sweep.mjs"],
+            { timeout: 3_600_000, env: { ...process.env, STUB_SWEEP_BASE: base.out } });
+          const verdict = sweepVerdict(swept);
+          say("", `sweep           ${verdict.level} (${tip.out.slice(0, 10)} against ${base.out.slice(0, 10)})`,
+              ...verdict.lines.map(l => `  ${l}`));
+          if (verdict.stop) refusals++;
         }
       }
     } finally {
@@ -404,8 +421,7 @@ function main(argv) {
     }
   }
 
-  if (out.length) console.log(out.join("\n"));
-  return refusals ? 1 : 0;
+  return finish();
 }
 
 if (import.meta.filename === process.argv[1]) process.exit(main(process.argv.slice(2)));

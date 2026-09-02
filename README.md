@@ -151,8 +151,11 @@ for f in test/*.test.mjs; do ~/.nvm/versions/node/v24.17.0/bin/node "$f" || echo
 ### What is true right now
 
 ```sh
-node scripts/state.mjs            # main, this checkout, the daemon, open work
-node scripts/state.mjs --sweep    # the above, plus a full stub sweep of the default branch
+# The absolute path, not a bare `node`: the shell default here is v22 and the
+# script refuses below v24.10, so `node scripts/state.mjs` exits before it
+# measures anything. The launchd job names the same path for the same reason.
+~/.nvm/versions/node/v24.17.0/bin/node scripts/state.mjs            # main, this checkout, the daemon, open work
+~/.nvm/versions/node/v24.17.0/bin/node scripts/state.mjs --sweep    # the above, plus a full stub sweep
 ```
 
 **Start here when you pick the work up again.** It measures rather than

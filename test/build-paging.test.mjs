@@ -82,19 +82,18 @@ const raise = (db, why, count, at) => db.prepare(
 {
   const home = freshHome(), db = hubOf(home);
   raise(db, KEY, 1, NOW);
-  raise(db, escalationKey({ kind: "probe:merged" }), 2, NOW);
   const send = () => ({ ok: true, channels: [{ name: "t", ok: true, ref: "r" }] });
   pageStandingCauses(db, { home, at: NOW, isAlive: ALIVE, send });
   const r = pageStandingCauses(db, { home, at: NOW + 150, isAlive: ALIVE, send });
 
   const rows = db.prepare("SELECT count(*) c FROM escalation").get().c;
-  check(r.standing === rows && rows === 2,
+  check(r.standing === rows && rows === 1,
     "the pass surveys EVERY standing row, so no cause can quietly become a clearing candidate",
     JSON.stringify({ surveyed: r.standing, rows }));
   check(r.cleared.length === 0, "and nothing is retired", JSON.stringify(r.cleared));
-  check(rows === 2,
-    "control: the causes are still standing, so the absence of a clear is not an empty hub",
-    String(rows));
+  check(rows === 1 && db.prepare("SELECT announced_count FROM escalation WHERE why=?").get(KEY).announced_count > 0,
+    "control: the cause is standing AND already announced, which is exactly what a filter would exclude",
+    JSON.stringify(db.prepare("SELECT why, announced_count FROM escalation").all()));
   db.close();
 }
 

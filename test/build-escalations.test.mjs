@@ -16,7 +16,7 @@ import { openHub } from "../src/build/hubdb.mjs";
 import { openHubAsGuest } from "../src/build/hubguest.mjs";
 import { open as openGuardianStore } from "../src/db/ops.mjs";
 import { announceable } from "../src/daemon.mjs";
-import { notify, readNtfyResponse } from "../src/notify.mjs";
+import { notify, readNtfyResponse, scrub } from "../src/notify.mjs";
 import {
   FAILURE_TYPES, IDENTITY_SHAPES, PAGES, escalationKey, shapeOf, body,
   assertHub, builderAnnounceable, pages, announce, subjectOf, ACTION_FOR, actionFor,
@@ -33,6 +33,19 @@ const check = (ok, name, detail) => {
 // remaining assertions unreported -- which is indistinguishable, to the stub
 // sweep, from a run that was never a measurement. `nth` never throws, so a wrong
 // size fails exactly the assertions that are about size.
+// A CALL THAT MAY THROW, TURNED INTO A VALUE.
+//
+// Every assertion here runs under the stub sweep, which reintroduces a defect and
+// expects the NAMED assertion to go red. A bare call that the stub makes throw
+// kills the file instead: the run stops, and every assertion after it is
+// unmeasured -- which reads exactly like passing. That has now happened three
+// times in this file, each time to a newly written test, so it is closed here
+// rather than wrapped again at the fourth site.
+const attempt = (fn) => {
+  try { return { ok: true, value: fn(), kind: null }; }
+  catch (e) { return { ok: false, value: undefined, kind: e?.kind ?? "threw" }; }
+};
+
 const nth = (arr, i) => (Array.isArray(arr) ? arr[i] : undefined) ?? "";
 
 const refused = (args) => {
@@ -890,7 +903,12 @@ const freshHub = () => {
 
   const r = announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
                             bodies: new Map([[key, b]]) });
-  check(r.paged.length === 1 && r.paged[0].body === b,
+  // THE SAME REPORT, not the same OBJECT. Reference identity was incidental and
+  // is now wrong on purpose: the alert renders what was STORED, so that the first
+  // page and every later one for the same cause say the same thing. Asserting
+  // `=== b` would pin an implementation that reads the caller's map, which is the
+  // second source this deliberately removed.
+  check(r.paged.length === 1 && JSON.stringify(r.paged[0]?.body) === JSON.stringify(b),
     "the announcement carries the typed body it was given", JSON.stringify(r.paged[0]?.body));
   check(/checksum mismatch/.test(sent[0]?.message ?? "") &&
         /var\/reeve\/o-a\.db/.test(sent[0]?.message ?? ""),
@@ -1235,6 +1253,499 @@ const freshHub = () => {
   check(sent.length === 1 && /CLEARED/.test(sent[0]?.title ?? ""),
     "control: a cause that was announced still gets its recovery",
     JSON.stringify(sent.map(x => x.title)));
+}
+
+
+// ── the report is durable, not just delivered ──────────────────────────────
+//
+// The identity is the bare cause by design; the report is what a bare key makes
+// possible rather than an addition to it. Until the column existed the detail
+// reached the phone and nothing else, so `task show` and `task why` could not
+// recover afterwards what an alert had said — and a process-scoped cause could
+// not name the repository it was about, which is what decides whose channel
+// pages for it.
+{
+  const hub = freshHub();
+  const sent = [];
+  const send = (a) => { sent.push(a); return { ok: true, channels: [{ name: "t", ok: true }] }; };
+  const key = escalationKey({ kind: "backup:failed" });
+  const b = body({ type: "FAILED", store: "/var/reeve/o-a.db", detail: "checksum mismatch" });
+
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                  bodies: new Map([[key, b]]) });
+
+  const stored = hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null;
+  check(typeof stored === "string", "the report is stored on the row, not only sent",
+    JSON.stringify(stored));
+  check(JSON.stringify(JSON.parse(stored)) === JSON.stringify(b),
+    "and round-trips as the same value", String(stored));
+
+  // IN THE ROW IMAGE, or a restore empties the column while reporting success.
+  const image = JSON.parse(hub.prepare(
+    "SELECT payload FROM hub_event WHERE kind='escalation.raised' ORDER BY seq DESC LIMIT 1").get().payload);
+  check(image.body === stored,
+    "and rides in the escalation.raised image, so a replay restores what the alert said",
+    JSON.stringify(image.body));
+
+  // THE CASE THAT MATTERS MOST: a pass that offers no bodies at all. That is
+  // every cause `applyTransition` raises, which is most of them.
+  sent.length = 0;
+  announce(hub, { escalations: new Map([[key, 4]]), at: NOW + 60, isAlive: ALIVE, send });
+  check(/checksum mismatch/.test(nth(sent, 0)?.message ?? ""),
+    "a later pass with no bodies map still renders the stored report",
+    JSON.stringify(nth(sent, 0)?.message ?? null));
+  check(/var\/reeve\/o-a\.db/.test(nth(sent, 0)?.message ?? ""),
+    "including the subject a process-scoped cause cannot put in its key",
+    JSON.stringify(nth(sent, 0)?.message ?? null));
+
+  // A LATER REPORT REPLACES AN EARLIER ONE, because the row should say what is
+  // true now — but a pass that offers none leaves the stored one alone, since
+  // absence of a report this pass is not evidence the report is gone.
+  const b2 = body({ type: "FAILED", store: "/var/reeve/o-a.db", detail: "disk full" });
+  announce(hub, { escalations: new Map([[key, 9]]), at: NOW + 120, isAlive: ALIVE, send,
+                  bodies: new Map([[key, b2]]) });
+  check(/disk full/.test(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body),
+    "a newer report replaces the stored one",
+    hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body);
+  announce(hub, { escalations: new Map([[key, 11]]), at: NOW + 180, isAlive: ALIVE, send });
+  check(/disk full/.test(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body),
+    "control: and a pass offering none does not erase it",
+    hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body);
+
+  // A KEY MAPPED TO NOTHING IS NOT AN OFFER, and the two sides of this seam once
+  // disagreed about that. The persist side asked whether the body serialised to
+  // null and kept the stored one; the alert side asked `bodies.has(why)`, which
+  // is true for a key mapped to `undefined`. So the row kept its report and the
+  // alert paged bare -- the exact loss the column exists to prevent, reached by
+  // the ordinary way of building this map, where one item simply has no body:
+  //
+  //     new Map(items.map(i => [i.why, i.body]))
+  sent.length = 0;
+  announce(hub, { escalations: new Map([[key, 13]]), at: NOW + 240, isAlive: ALIVE, send,
+                  bodies: new Map([[key, undefined]]) });
+  check(/disk full/.test(nth(sent, 0)?.message ?? ""),
+    "a key mapped to nothing is not an offer, so the alert still renders the stored report",
+    JSON.stringify(nth(sent, 0)?.message ?? null));
+  check(/disk full/.test(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? ""),
+    "control: and the row keeps it too, so both sides read that absence the same way",
+    hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null);
+}
+
+// ── a body that cannot be stored is refused by name ────────────────────────
+//
+// The column carries a `json_valid` CHECK, so an unserialisable body would fail
+// at the write with a message naming a constraint rather than the caller's
+// mistake — and the report, which exists precisely because the key refuses
+// detail, would be lost at the moment it mattered.
+{
+  const hub = freshHub();
+  const key = escalationKey({ kind: "backup:failed" });
+  const cyclic = { type: "FAILED" }; cyclic.self = cyclic;
+  let kind = null;
+  try {
+    announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                    send: () => ({ ok: true, channels: [] }), bodies: new Map([[key, cyclic]]) });
+  } catch (e) { kind = e.kind ?? "threw"; }
+  check(kind === "escalation_body_shape",
+    "a body that cannot serialise is refused with its own kind, not a constraint error",
+    String(kind));
+
+  // CONTROL: the refusal is about serialisability, not about bodies. A plain one
+  // is stored.
+  const ok = body({ type: "FAILED", detail: "fine" });
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                  send: () => ({ ok: true, channels: [] }), bodies: new Map([[key, ok]]) });
+  check(/fine/.test(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? ""),
+    "control: a serialisable body is stored");
+
+  // AND THE DATABASE REFUSES NONSENSE INDEPENDENTLY, so the guard above is a
+  // better error rather than the only one.
+  let dbRefused = false;
+  try {
+    hub.prepare(`INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count,body)
+                 VALUES('bt:zz:infeasible',1,1,1,0,'not json')`).run();
+  } catch { dbRefused = true; }
+  check(dbRefused, "control: the column's own CHECK refuses a body that is not JSON");
+
+  // AND A BODY THAT IS NOT AN OBJECT, refused for the same reason and by the
+  // same name. The alert renders a body by walking its entries, so a string
+  // pages one line per letter, an array pages its indices, and a number pages
+  // NOTHING -- which loses the report while every other signal says the alert
+  // was delivered. Each of these serialises and each satisfies `json_valid`, so
+  // this refusal is the only thing standing between them and a rendered alert.
+  for (const [what, value] of [["a string", "checksum mismatch"],
+                               ["an array", ["a", "b"]],
+                               ["a number", 42]]) {
+    let k = null;
+    try {
+      announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                      send: () => ({ ok: true, channels: [] }), bodies: new Map([[key, value]]) });
+    } catch (e) { k = e.kind ?? "threw"; }
+    check(k === "escalation_body_shape",
+      `${what} is refused as a body, not rendered as one`, String(k));
+  }
+
+  // AND A BODY WHOSE `toJSON` REPLACES IT, which is the case a check on the
+  // INPUT cannot see. A `Date` is an object and is not an array, so it passes any
+  // test of the value handed in -- then `JSON.stringify` asks its `toJSON`, gets
+  // a STRING, and stores that. The alert renders no detail, because
+  // `Object.entries(new Date())` is empty; the next pass parses the stored scalar
+  // back, finds it unrenderable, and drops it. The report is lost with every
+  // other signal reporting success, which is the single outcome this column
+  // exists to prevent. So the check is on what is STORED, not on what was passed.
+  {
+    let k = null;
+    try {
+      announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                      send: () => ({ ok: true, channels: [] }),
+                      bodies: new Map([[key, new Date(NOW)]]) });
+    } catch (e) { k = e.kind ?? "threw"; }
+    check(k === "escalation_body_shape",
+      "a body whose toJSON returns a scalar is refused, though the body itself is an object",
+      String(k));
+
+    // CONTROL: an object that merely HAS a toJSON is fine when it returns one, so
+    // the refusal is about the produced shape rather than about the method.
+    const shaped = { type: "FAILED", detail: "x", toJSON() { return { type: "FAILED", detail: "x" }; } };
+    announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                    send: () => ({ ok: true, channels: [] }), bodies: new Map([[key, shaped]]) });
+    check(/"detail":"x"/.test(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? ""),
+      "control: a toJSON that returns an object is stored, so this is about the shape produced",
+      hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null);
+  }
+
+// ── the report that is stored is the whole report the caller supplied ───────
+//
+// `JSON.stringify` DROPS an undefined, a function and a symbol from an object
+// without a word, and turns a non-finite number into null. So a body could
+// serialise cleanly, pass every shape check, be stored and be marked DELIVERED
+// while quietly missing a fact the caller put in it. Serialising without error is
+// not proof that the whole report survived.
+{
+  const hub = freshHub();
+  const key = escalationKey({ kind: "backup:failed" });
+  const send = () => ({ ok: true, channels: [{ name: "t", ok: true }] });
+  for (const [what, detail] of [["undefined", undefined],
+                                ["a function", () => 1],
+                                ["a symbol", Symbol("s")],
+                                ["Infinity", Infinity],
+                                ["NaN", NaN]]) {
+    let k = null;
+    try {
+      announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                      bodies: new Map([[key, { type: "FAILED", detail }]]) });
+    } catch (e) { k = e.kind ?? "threw"; }
+    check(k === "escalation_body_value",
+      `a detail of ${what} is refused rather than silently dropped from the report`, String(k));
+  }
+  check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 0,
+    "control: none of them was stored, so the refusal precedes the write",
+    JSON.stringify(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key)));
+
+  // CONTROL: the values JSON carries faithfully are still accepted, so this
+  // refuses what would be LOST rather than refusing richness.
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                  bodies: new Map([[key, { type: "FAILED", n: 0, ok: false, s: "x",
+                                           nested: { a: [1, "b", null] } }]]) });
+  const kept = JSON.parse(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body);
+  check(kept.n === 0 && kept.ok === false && kept.nested.a.length === 3,
+    "control: numbers, booleans, nulls and nested arrays all survive intact",
+    JSON.stringify(kept));
+
+  // A VALUE REFERENCED TWICE IS NOT A CYCLE. The walk carries a set to detect
+  // circularity, and a set that only ever grows refuses `{ x: shared, y: shared }`
+  // -- ordinary JSON, which stringify serialises perfectly by writing it twice.
+  // The set therefore tracks the PATH from the root and is unwound on the way out.
+  // A BOXED PRIMITIVE DOES NOT SERIALISE AS THE VALUE IT WRAPS -- `new Number(5)`
+  // walks as an ordinary object and stores as {}, `new String("abc")` as a map of
+  // character indices. Refused rather than emulated: nobody puts one in a report
+  // on purpose, and quietly storing 5 for it would be inventing the caller's
+  // intent from a mistake.
+  for (const [what, value] of [["a boxed Number", new Number(5)],
+                               ["a boxed String", new String("abc")],
+                               ["a boxed Boolean", new Boolean(true)]]) {
+    let k = null;
+    try {
+      announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                      bodies: new Map([[key, { type: "FAILED", v: value }]]) });
+    } catch (e) { k = e.kind ?? "threw"; }
+    check(k === "escalation_body_value",
+      `${what} is refused rather than stored as something else`, String(k));
+  }
+
+  // AN OWN `__proto__` KEY, which `JSON.parse` produces and an ordinary object
+  // cannot hold: assigning it invokes the legacy prototype setter, so the field
+  // is silently absent from the stored report while plain serialisation keeps it.
+  const withProto = JSON.parse('{"type":"FAILED","__proto__":{"a":1},"d":"kept"}');
+  check(Object.hasOwn(withProto, "__proto__"),
+    "control: the fixture really carries __proto__ as an OWN key, which only JSON.parse makes",
+    JSON.stringify(Object.keys(withProto)));
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                  bodies: new Map([[key, withProto]]) });
+  const protoRow = hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "";
+  check(protoRow === JSON.stringify(withProto),
+    "an own __proto__ key survives, exactly as plain JSON.stringify keeps it",
+    JSON.stringify({ stored: protoRow, plain: JSON.stringify(withProto) }));
+
+  // A `toJSON` PROPERTY IS THE HOOK, NOT A DETAIL. The serialiser calls it and
+  // then omits it, so refusing every function rejected a body that stringifies
+  // perfectly -- and the refusal was for a value nothing would have lost.
+  const selfy = { type: "FAILED", detail: "kept", toJSON() { return this; } };
+  const selfyRun = attempt(() => announce(hub, { escalations: new Map([[key, 1]]), at: NOW,
+                                                 isAlive: ALIVE, send,
+                                                 bodies: new Map([[key, selfy]]) }));
+  check(selfyRun.ok &&
+        (hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "") === JSON.stringify(selfy),
+    "a self-returning toJSON is stored exactly as plain JSON.stringify stores it",
+    JSON.stringify({ refused: selfyRun.kind,
+                     stored: hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body,
+                     native: JSON.stringify(selfy) }));
+  // CONTROL: a function that is a real DETAIL is still refused, so the exemption
+  // is the hook and not functions in general.
+  {
+    let k = null;
+    try {
+      announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                      bodies: new Map([[key, { type: "FAILED", detail: () => 1 }]]) });
+    } catch (e) { k = e.kind ?? "threw"; }
+    check(k === "escalation_body_value",
+      "control: a function as an ordinary detail is still refused, so this exempts the hook alone",
+      String(k));
+  }
+
+  const shared = { a: 1 };
+  let sharedRefused = null;
+  try {
+    announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                    bodies: new Map([[key, { type: "FAILED", x: shared, y: shared }]]) });
+  } catch (e) { sharedRefused = e.kind ?? "threw"; }
+  const twiceRow = hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "null";
+  const twice = JSON.parse(twiceRow);
+  check(sharedRefused === null && twice?.x?.a === 1 && twice?.y?.a === 1,
+    "a value referenced twice as siblings is stored twice, not refused as circular",
+    JSON.stringify({ refused: sharedRefused, stored: twice }));
+}
+
+// ── the ceiling is measured in the unit it promises ─────────────────────────
+//
+// `String.length` counts UTF-16 code units. The cap and the message both say
+// BYTES, and the two diverge most where it matters: about 4000 CJK characters
+// measure as 4000 and occupy roughly 12KB, so a body three times over the ceiling
+// passed the check whose entire purpose is bounding what gets written.
+{
+  const hub = freshHub();
+  const key = escalationKey({ kind: "backup:failed" });
+  const wide = "漢".repeat(2000);            // 2000 UTF-16 units, 6000 UTF-8 bytes
+  check(wide.length < 4096 && Buffer.byteLength(wide, "utf8") > 4096,
+    "control: the fixture is inside the cap by code units and outside it by bytes",
+    JSON.stringify({ units: wide.length, bytes: Buffer.byteLength(wide, "utf8") }));
+  let k = null;
+  try {
+    announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                    send: () => ({ ok: true, channels: [] }),
+                    bodies: new Map([[key, { type: "FAILED", detail: wide }]]) });
+  } catch (e) { k = e.kind ?? "threw"; }
+  check(k === "escalation_body_too_large",
+    "a body measured in bytes is refused though its code-unit count is inside the cap", String(k));
+}
+
+// ── a scrubbed key never displaces another field ────────────────────────────
+//
+// Two credential-shaped keys reduce to the SAME replacement, and building the
+// object in one pass keeps only the last -- dropping a field from a report that
+// was otherwise entirely valid. Losing a fact to the guard protecting it is the
+// failure this column exists to prevent.
+{
+  const hub = freshHub();
+  const key = escalationKey({ kind: "backup:failed" });
+  const A = "ghp_" + "A".repeat(24), B = "ghp_" + "B".repeat(24);
+  check(scrub(`k${A}`) === scrub(`k${B}`),
+    "control: the two keys really do scrub to one name, so a collision is possible",
+    JSON.stringify([scrub(`k${A}`), scrub(`k${B}`)]));
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                  send: () => ({ ok: true, channels: [{ name: "t", ok: true }] }),
+                  bodies: new Map([[key, { type: "FAILED", [`k${A}`]: "first", [`k${B}`]: "second" }]]) });
+  const stored = JSON.parse(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body);
+  const values = Object.values(stored).filter(v => v === "first" || v === "second");
+  check(values.length === 2,
+    "both values survive a key collision, under distinct names", JSON.stringify(stored));
+}
+
+// ── toJSON is the SERIALISER's to call, and it calls it once ────────────────
+//
+// `JSON.stringify` hands `toJSON` the property name -- "" at the root. Calling it
+// with no argument is a different call, so an implementation branching on `key`
+// would persist something other than what stringify would have produced, and the
+// scrub would have changed the report's MEANING rather than only its credentials.
+{
+  const hub = freshHub();
+  const key = escalationKey({ kind: "backup:failed" });
+  const MARK = "root-" + Math.random().toString(36).slice(2, 8);
+  const keyed = { toJSON(k) { return k === "" ? { type: "FAILED", detail: MARK }
+                                              : { type: "FAILED", detail: "fallback" }; } };
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                  send: () => ({ ok: true, channels: [{ name: "t", ok: true }] }),
+                  bodies: new Map([[key, keyed]]) });
+  check((hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "").includes(MARK),
+    "a toJSON that reads its key gets the root key, as JSON.stringify would give it",
+    hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null);
+  check(JSON.stringify(keyed).includes(MARK),
+    "control: and that is exactly what plain JSON.stringify produces for it",
+    JSON.stringify(keyed));
+}
+
+// ── the vocabulary is enforced where every body passes, not only in body() ──
+//
+// `body()` checked the failure type; `announce` took the `bodies` map as given.
+// A caller building that map directly -- which the exported signature invites --
+// bypassed the vocabulary, and the value was persisted AND marked delivered while
+// producing an alert carrying no type and no detail. A rule only a convenience
+// constructor applies is a suggestion.
+{
+  const hub = freshHub();
+  const key = escalationKey({ kind: "backup:failed" });
+  const send = () => ({ ok: true, channels: [{ name: "t", ok: true }] });
+  for (const [what, value] of [["an empty object", {}],
+                               ["an Error, which serialises to {}", new Error("boom")],
+                               ["a type outside the vocabulary", { type: "UNKNOWN_VALUE", detail: "x" }],
+                               ["a type of the wrong case", { type: "failed", detail: "x" }]]) {
+    let k = null;
+    try {
+      announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                      bodies: new Map([[key, value]]) });
+    } catch (e) { k = e.kind ?? "threw"; }
+    check(k === "escalation_body_type",
+      `${what} is refused at the announce boundary, not only by body()`, String(k));
+  }
+  check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 0,
+    "control: and none of them was persisted, so the refusal precedes the write",
+    JSON.stringify(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key)));
+
+  // CONTROL: every type the vocabulary DOES name is accepted, so this bounds the
+  // vocabulary rather than the field.
+  for (const t of FAILURE_TYPES) {
+    const h = freshHub();
+    announce(h, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                  bodies: new Map([[key, { type: t, detail: "d" }]]) });
+    check(/"type"/.test(h.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? ""),
+      `control: ${t} is accepted, so the check names a vocabulary and not a single value`,
+      h.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null);
+  }
+}
+
+// ── a credential never becomes durable ──────────────────────────────────────
+//
+// `redact` runs on the RENDERED alert, which is the last point before text
+// leaves the machine. The body goes somewhere else entirely: `escalation.body`
+// and the `escalation.raised` payload, both of which outlive the alert, ride
+// into every snapshot, appear in exported event tails, and survive the row being
+// cleared. A token echoed by a failing CI command was therefore absent from the
+// page and present verbatim, for ever, in the authority store.
+{
+  const hub = freshHub();
+  const key = escalationKey({ kind: "backup:failed" });
+  const TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0";
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                  send: () => ({ ok: true, channels: [{ name: "t", ok: true }] }),
+                  bodies: new Map([[key, body({ type: "FAILED", detail: `push failed: ${TOKEN}` })]]) });
+
+  const stored = hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "";
+  check(!stored.includes(TOKEN), "a credential is scrubbed from the STORED report", stored);
+  check(/redacted token/.test(stored),
+    "control: and the scrub actually ran, rather than the fixture carrying no token",
+    stored);
+
+  // THE ROW IMAGE TOO, which is the copy a restore replays and an export ships.
+  const image = hub.prepare(
+    "SELECT payload FROM hub_event WHERE kind='escalation.raised' ORDER BY seq DESC LIMIT 1").get().payload;
+  check(!image.includes(TOKEN),
+    "and from the replayed row image, which outlives the escalation row itself", image);
+
+  // KEYS AS WELL AS VALUES: a report built from external names can carry one in
+  // either half, and scrubbing only values leaves the other in place.
+  const hub2 = freshHub();
+  announce(hub2, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                   send: () => ({ ok: true, channels: [{ name: "t", ok: true }] }),
+                   bodies: new Map([[key, { type: "FAILED", [`saw ${TOKEN}`]: "yes" }]]) });
+  check(!(hub2.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "").includes(TOKEN),
+    "including one that arrives as a KEY rather than as a value",
+    hub2.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null);
+}
+
+// ── a report is a report, not a log ─────────────────────────────────────────
+//
+// Every pass over a standing cause re-appends the row image to `hub_event`,
+// which is append-only and is the authority store -- so an unbounded body is an
+// unbounded WRITE RATE, not merely a large row. Refused rather than truncated:
+// cutting a report in half loses the detail exactly where it was needed and
+// reports success.
+{
+  const hub = freshHub();
+  const key = escalationKey({ kind: "backup:failed" });
+  let kind = null;
+  try {
+    announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                    send: () => ({ ok: true, channels: [] }),
+                    bodies: new Map([[key, body({ type: "FAILED", detail: "x".repeat(9000) })]]) });
+  } catch (e) { kind = e.kind ?? "threw"; }
+  check(kind === "escalation_body_too_large",
+    "an oversized report is refused by its own name, not silently cut down", String(kind));
+  check(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key).c === 0,
+    "control: and nothing was written, so the refusal is before the row rather than after",
+    JSON.stringify(hub.prepare("SELECT count(*) c FROM escalation WHERE why=?").get(key)));
+
+  // CONTROL: an ordinary report is nowhere near the ceiling, so this bounds a
+  // producer that is misusing the field rather than one that is using it.
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                  send: () => ({ ok: true, channels: [] }),
+                  bodies: new Map([[key, body({ type: "FAILED", store: "/var/reeve/o-a.db",
+                                                detail: "checksum mismatch" })]]) });
+  check((hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "").length < 200,
+    "control: a real report is two orders of magnitude inside the ceiling",
+    String((hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "").length));
+}
+
+// ── the alert says what the row says ────────────────────────────────────────
+//
+// THE CASE THE EARLIER CONTROL COULD NOT REACH. It used a `toJSON` returning the
+// SAME shape as its object, so it could not tell a body read from the caller's
+// map from one read back out of the row. A `toJSON` that returns something the
+// object does not have separates them: the row stores the useful report, and the
+// object itself has no enumerable properties at all -- so the FIRST page rendered
+// nothing while every LATER page for the same cause, read from the row, carried
+// the detail. One cause, two different alerts.
+{
+  const hub = freshHub();
+  const sent = [];
+  const send = (a) => { sent.push(a); return { ok: true, channels: [{ name: "t", ok: true }] }; };
+  const key = escalationKey({ kind: "backup:failed" });
+  const DETAIL = ["disk", "full"].join("-") + "-" + Math.random().toString(36).slice(2, 8);
+  const TYPE = "FAILED";
+  const hidden = { toJSON() { return { type: TYPE, detail: DETAIL }; } };
+  check(JSON.stringify(Object.keys(hidden)) === JSON.stringify(["toJSON"]),
+    "control: walking the object's own entries yields only `toJSON` -- not the report",
+    JSON.stringify(Object.keys(hidden)));
+  check(!Object.keys(hidden).includes("detail") && "detail" in hidden.toJSON(),
+    "control: so the detail exists ONLY in what toJSON produces, which is what makes the two sources differ",
+    JSON.stringify({ own: Object.keys(hidden), produced: Object.keys(hidden.toJSON()) }));
+
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                  bodies: new Map([[key, hidden]]) });
+  check((nth(sent, 0)?.message ?? "").includes(DETAIL),
+    "the FIRST alert renders what was stored, not the object it was handed",
+    JSON.stringify(nth(sent, 0)?.message ?? null));
+  check(/\[FAILED\]/.test(nth(sent, 0)?.message ?? ""),
+    "including the failure type, which the handed object also does not carry",
+    JSON.stringify(nth(sent, 0)?.message ?? null));
+
+  // AND THE LATER PAGE AGREES WITH IT, which is the property that was broken:
+  // the two alerts came from two different sources for one value.
+  sent.length = 0;
+  announce(hub, { escalations: new Map([[key, 7]]), at: NOW + 60, isAlive: ALIVE, send });
+  check((nth(sent, 0)?.message ?? "").includes(DETAIL),
+    "and a later page for the same cause says the same thing",
+    JSON.stringify(nth(sent, 0)?.message ?? null));
+}
 }
 
 hub.close();

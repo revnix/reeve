@@ -112,6 +112,12 @@ const LIVE = { cliVersion: "1.2.3", model: "claude-fable-4-5-20260101", effort: 
 // ── the row exists before the process, and is settled after it ───────────────
 const KEY = { task: "bt:d", generation: 1, phase: "RESEARCH", slice: 0, attempt: 1 };
 const DISPATCH_ARGV = ["-p", "go"];
+// A STUB CAN MAKE THE SEAM REJECT, and an awaited rejection ends the file --
+// so every assertion after it is unmeasured, and one that never ran reads in
+// the log exactly like one that passed. `ok: null` is neither true nor false,
+// so whichever direction the consuming assertion tests, it goes red instead.
+const dispatched = (opts) => dispatchPhase(db, opts).then(
+  (r) => r, (e) => ({ ok: null, reason: null, threw: String(e.message) }));
 const base = (over = {}) => ({
   ...KEY, home: dir, argv: DISPATCH_ARGV, env: {}, cwd: dir,
   snapshot: contractSnapshot({ ...LIVE, argv: DISPATCH_ARGV }), drift: null, leaseSeconds: 400, budgetMs: 1000,
@@ -122,7 +128,7 @@ const base = (over = {}) => ({
 
 {
   let sawRowDuringRun = null;
-  const r = await dispatchPhase(db, base({
+  const r = await dispatched(base({
     run: async ({ onSpawn }) => {
       onSpawn({ pid: 4242, lstart: "42" });
       // The property: by the time a process exists, the row already does.
@@ -155,7 +161,7 @@ const base = (over = {}) => ({
 // stops progressing.
 {
   const K2 = { ...KEY, attempt: 2 };
-  const r = await dispatchPhase(db, base({ attempt: 2, run: async () => { throw new Error("spawn exploded"); } }));
+  const r = await dispatched(base({ attempt: 2, run: async () => { throw new Error("spawn exploded"); } }));
   check(r.ok === false && r.reason === "dispatch-threw",
     "a dispatch that throws answers with a refusal rather than propagating", JSON.stringify(r));
   check(runStatus(db, K2) === "failed",
@@ -165,7 +171,7 @@ const base = (over = {}) => ({
     JSON.stringify(liveRuns(db).map((x) => [x.task, x.attempt, x.status])));
 
   // The proof that it matters: the next attempt is admitted.
-  const next = await dispatchPhase(db, base({
+  const next = await dispatched(base({
     attempt: 3, run: async () => ({ outcome: OUTCOMES.OK, why: "ok", truncated: false }),
   }));
   check(next.ok === true, "and the task can dispatch again", JSON.stringify(next).slice(0, 120));
@@ -174,7 +180,7 @@ const base = (over = {}) => ({
 // ── UNBOUND is a refusal, and the row still settles ──────────────────────────
 {
   const K4 = { ...KEY, attempt: 4 };
-  const r = await dispatchPhase(db, base({
+  const r = await dispatched(base({
     attempt: 4,
     run: async () => ({ outcome: OUTCOMES.UNBOUND, why: "could not record pid", pid: 99, truncated: false }),
   }));
@@ -189,7 +195,7 @@ const base = (over = {}) => ({
   const K5 = { ...KEY, attempt: 5 };
   let spawned = false;
   // attempt 1 is settled, so re-using its number is a duplicate-attempt refusal.
-  const r = await dispatchPhase(db, base({ attempt: 1, run: async () => { spawned = true; return { outcome: OUTCOMES.OK }; } }));
+  const r = await dispatched(base({ attempt: 1, run: async () => { spawned = true; return { outcome: OUTCOMES.OK }; } }));
   check(r.ok === false && r.reason === "duplicate-attempt",
     "an insert the database refuses is answered with its reason", JSON.stringify(r));
   check(spawned === false,
@@ -200,7 +206,7 @@ const base = (over = {}) => ({
 
 // ── the argv that runs is the argv the snapshot names ────────────────────────
 {
-  const r = await dispatchPhase(db, base({ attempt: 7, argv: ["-p", "something-else"] }));
+  const r = await dispatched(base({ attempt: 7, argv: ["-p", "something-else"] }));
   check(r.ok === false && r.reason === "argv-does-not-match-the-snapshot",
     "argv the snapshot does not name is refused before anything is granted", JSON.stringify(r).slice(0, 150));
   check(runStatus(db, { ...KEY, attempt: 7 }) === null,
@@ -223,7 +229,7 @@ const base = (over = {}) => ({
   // what makes an overwrite observable. Re-dispatching the same argv writes
   // identical bytes and the assertion cannot see the defect it is here for.
   const OTHER = ["-p", "a-retry-that-never-ran"];
-  const r = await dispatchPhase(db, base({ attempt: 1, argv: OTHER,
+  const r = await dispatched(base({ attempt: 1, argv: OTHER,
                                            snapshot: contractSnapshot({ ...LIVE, argv: OTHER }) }));
   check(r.ok === false && r.reason === "duplicate-attempt", "control: the re-dispatch is refused", JSON.stringify(r));
   check(readOr(argvPath) === before,
@@ -234,7 +240,7 @@ const base = (over = {}) => ({
 // ── the session id is learned late, and is persisted ─────────────────────────
 {
   const K8 = { ...KEY, attempt: 8 };
-  const r = await dispatchPhase(db, base({
+  const r = await dispatched(base({
     attempt: 8,
     // The real runWorker binds a null at onSpawn and learns the id from the
     // worker's init event, so it arrives here and nowhere earlier.
@@ -260,7 +266,7 @@ const base = (over = {}) => ({
 {
   const K9 = { ...KEY, attempt: 9 };
   let probes = 0, sawRevocation = null;
-  const r = await dispatchPhase(db, base({
+  const r = await dispatched(base({
     attempt: 9,
     // Real time, so the lease is genuinely live while this runs -- a frozen
     // clock makes revocationProbe report an expiry and answer first, which
@@ -311,7 +317,7 @@ const base = (over = {}) => ({
   const paths = runPathsFor(dir, K10);
   mkdirSync(paths.argvPath, { recursive: true });
   let spawned = false;
-  const r = await dispatchPhase(db, base({ attempt: 10, run: async () => { spawned = true; return { outcome: OUTCOMES.OK }; } }));
+  const r = await dispatched(base({ attempt: 10, run: async () => { spawned = true; return { outcome: OUTCOMES.OK }; } }));
   check(r.ok === false && r.reason === "argv-record-failed",
     "a failed argv write is answered with a refusal", JSON.stringify(r).slice(0, 140));
   check(spawned === false, "control: and nothing was spawned", String(spawned));
@@ -325,7 +331,7 @@ const base = (over = {}) => ({
 // ── either stream truncated makes the record incomplete ─────────────────────
 {
   const K11 = { ...KEY, attempt: 11 };
-  const r = await dispatchPhase(db, base({
+  const r = await dispatched(base({
     attempt: 11,
     // runWorker reports stdout truncation as `truncated` and stderr's
     // separately, and classifies a stderr-only truncation as FAILED for the same

@@ -48,7 +48,10 @@ const check = (ok, name, detail) => {
 // The format is owned by src/daemon.mjs, which writes
 //   reeve daemon starting — node vX, pid N, running commit <sha|unreadable>
 {
-  const LINE = (pid, c) => `reeve daemon starting — node v24.17.0, pid ${pid}, running commit ${c}`;
+  // THE SHAPE THE DAEMON ACTUALLY WRITES, timestamp included. `log()` prefixes an
+  // ISO stamp, so a record never starts its line -- an earlier `^reeve daemon`
+  // anchor matched nothing at all and the script refused on a healthy daemon.
+  const LINE = (pid, c) => `2026-09-02T11:29:05.914Z reeve daemon starting — node v24.17.0, pid ${pid}, running commit ${c}`;
 
   const r = startupRecordFrom(`noise\n${LINE(63207, "a939cb1")}\nmore`);
   check(r?.pid === 63207 && r?.commit === "a939cb1", "pid and commit come from the SAME startup line", JSON.stringify(r));
@@ -74,6 +77,12 @@ const check = (ok, name, detail) => {
   // reported NOT_CAUGHT; a fixture that cannot exhibit the defect proves nothing.
   check(startupRecordFrom(`${LINE(5, "aaaaaaa")}\ncheck failed: build at pid 999, running commit deadbee`)?.commit === "aaaaaaa",
     "a later line merely CONTAINING the phrase is not read as a startup record");
+  // ANCHORING ON THE PHRASE WAS NOT ENOUGH. A first fix required `reeve daemon
+  // starting` and still accepted it mid-line; only ^...$ closes it.
+  check(startupRecordFrom(`${LINE(5, "aaaaaaa")}\nfailing: reeve daemon starting x pid 999, running commit deadbee`)?.commit === "aaaaaaa",
+    "nor is a decision line that QUOTES the whole phrase inside itself");
+  check(startupRecordFrom(`${LINE(7, "ccccccc")}, tree clean`)?.commit === "ccccccc",
+    "a newer daemon's appended tree state does not break the read");
 
   check(startupRecordFrom("") === null, "an empty log answers null rather than a value");
   check(startupRecordFrom(null) === null, "and so does no log at all");
@@ -106,6 +115,10 @@ const check = (ok, name, detail) => {
   // did not have.
   check(schemaVersionFrom("export const HUB_SCHEMA_VERSION = 6;\nexport const OTHER = 9;") === 6,
     "control: it takes the version it names, not the next number in the file");
+  // THE DECLARATION, not any mention of it. A comment carrying an example before
+  // the real line would otherwise decide the next migration number.
+  check(schemaVersionFrom("// for example HUB_SCHEMA_VERSION = 3\nexport const HUB_SCHEMA_VERSION = 7;") === 7,
+    "an example in a comment does not outrank the exported declaration");
 }
 
 // ── unopened work, keyed on the COMMIT ───────────────────────────────────────
@@ -128,7 +141,7 @@ const check = (ok, name, detail) => {
 // what sent a session hunting a defect in a healthy repository. main's CI was
 // green on the same commit the block called broken.
 {
-  const SUMMARY = "229/229 stub(s) caught";
+  const SUMMARY = "229/229 stub(s) caught\n229 entries over 30 of 125 test file(s)";
   const notCaught = { ok: false, out: "228/229 stub(s) caught\n  · some-entry: NOT_CAUGHT" };
   const unrunnable = { ok: false, out: "228/229 stub(s) caught\n  · lint-rule-reports-a-pathname-read: UNRUNNABLE" };
 
@@ -160,6 +173,18 @@ const check = (ok, name, detail) => {
   check(sweepVerdict({ ok: true, out: "" }).level === "refusal",
     "a clean exit that printed NO verdict is a refusal, not a pass",
     JSON.stringify(sweepVerdict({ ok: true, out: "" })));
+  // A SUMMARY IS NOT A PASSING SUMMARY. `0/280 caught` matches the shape and
+  // means every entry failed; and the coverage line can be absent after an early
+  // return even when a verdict printed.
+  check(sweepVerdict({ ok: true, out: "0/280 stub(s) caught\n280 entries over 31 of 126 test file(s)" }).level === "refusal",
+    "a zero exit reporting 0 of 280 caught is a refusal, not a pass");
+  check(sweepVerdict({ ok: true, out: "279/280 stub(s) caught\n280 entries over 31 of 126 test file(s)" }).level === "refusal",
+    "and so is one short of complete");
+  check(sweepVerdict({ ok: true, out: "280/280 stub(s) caught" }).level === "refusal",
+    "a verdict with NO coverage line means the sweep did not finish");
+  // `die()` writes the actionable reason to stderr only.
+  check(/manifest is unusable/.test(sweepVerdict({ ok: false, out: "", err: "the manifest is unusable" }).lines.join(" ")),
+    "a refusal carries the stderr that says what to do about it");
   check(sweepVerdict({ ok: true, out: "" }).stop === true, "and it stops the caller");
   check(sweepVerdict({ ok: true, out: "built fine, nothing to do" }).level === "refusal",
     "control: output without the `N/M stub(s) caught` line is still an absence");

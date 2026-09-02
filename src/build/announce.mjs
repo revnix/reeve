@@ -13,7 +13,7 @@
  */
 import { HOLD_ESCALATION, PHASES } from "./phases.mjs";
 import { hubTx, hubEvent } from "./hubdb.mjs";
-import { printable, redact } from "../notify.mjs";
+import { printable, redact, scrub } from "../notify.mjs";
 import { assertWritable } from "./locks.mjs";
 
 /**
@@ -98,6 +98,41 @@ const raised = (db, why) => hubEvent(db, {
     .get(why),
 });
 
+/**
+ * The ceiling on a stored report, in serialised bytes.
+ *
+ * Generous for what a report IS -- a failure type and a handful of named facts --
+ * and small enough that re-appending it on every pass cannot outgrow the store.
+ * Not shared with `notify`'s alert cap: that one exists because a phone is not a
+ * log viewer, this one because an append-only authority table is not a spool, and
+ * two limits that happen to be numbers are not one limit.
+ */
+const BODY_LIMIT = 4096;
+
+/**
+ * Every string in a report, scrubbed of credentials -- keys included.
+ *
+ * SCRUBBED BEFORE IT IS DURABLE, not on the way to the phone. `redact` runs on
+ * the rendered alert, which is the last point before the text leaves the machine
+ * -- but the body is written to `escalation.body` AND to the `escalation.raised`
+ * payload, so an echoed token in a CI excerpt would be absent from the page and
+ * present verbatim in the hub, in every snapshot of it, and in exported event
+ * tails, surviving the escalation row being cleared.
+ *
+ * VALUE BY VALUE, never over the serialised text: a replacement landing across a
+ * JSON escape boundary could corrupt the document, and a body that no longer
+ * parses is a report lost to the guard that was protecting it.
+ */
+const scrubDeep = (v) =>
+  typeof v === "string" ? scrub(v)
+    : Array.isArray(v) ? v.map(scrubDeep)
+    : v && typeof v === "object" && !(typeof v.toJSON === "function")
+      ? Object.fromEntries(Object.entries(v).map(([k, x]) => [scrub(k), scrubDeep(x)]))
+      // A value with its own `toJSON` decides its own serialisation, so scrub what
+      // that PRODUCES rather than its enumerable shape, which may be empty.
+      : v && typeof v === "object" ? scrubDeep(v.toJSON())
+      : v;
+
 /** What the caller passed, named the way the caller would recognise it. */
 const describeBody = (body) =>
   Array.isArray(body) ? "an array"
@@ -137,8 +172,23 @@ const offeredBody = (bodies, why) => {
 const serialiseBody = (body) => {
   if (body === null || body === undefined) return null;
   let text;
-  try { text = JSON.stringify(body); }
+  try { text = JSON.stringify(scrubDeep(body)); }
   catch { text = undefined; }
+  // A REPORT, NOT A LOG. Every pass over a standing cause re-appends the row
+  // image to `hub_event`, which is append-only and is the authority store, so an
+  // unbounded body is an unbounded write rate: a megabyte of CI excerpt
+  // re-measured once a minute is gigabytes a day, and the file it exhausts is the
+  // one everything else depends on.
+  //
+  // REFUSED RATHER THAN TRUNCATED, and that is the same trade as everywhere else
+  // here: silently cutting a report in half loses the detail at exactly the point
+  // it was needed, and reports success. A producer over this cap is putting a log
+  // where a summary belongs, which is a defect in the producer.
+  if (typeof text === "string" && text.length > BODY_LIMIT)
+    throw refuse("escalation_body_too_large",
+      `an escalation body must serialise to at most ${BODY_LIMIT} bytes; this one is ${text.length}. ` +
+      "Every pass over a standing cause re-appends it to the append-only log, so an unbounded report " +
+      "is an unbounded write rate. Put a summary here and the full output in the run's artifacts.");
   // THE SERIALISED FORM IS WHAT GETS STORED, so it is the form that has to be a
   // renderable object -- not the value handed in. Checking the input instead is
   // one check on the wrong side of the boundary: `toJSON` decides what
@@ -550,8 +600,18 @@ export function announce(db, {
    * row had the report all along.
    */
   const bodyFor = (why) => {
-    const offered = offeredBody(bodies, why);
-    if (offered !== null) return offered;
+    // THE STORED ROW, ALWAYS -- never the object the caller handed in, because
+    // the two can differ and the stored one is what everything else will see.
+    // `toJSON` decides what is persisted, so a body whose `toJSON` replaces its
+    // shape stored the useful report and paged the ORIGINAL: an object with no
+    // enumerable properties renders as nothing, so the FIRST alert carried
+    // neither the failure type nor the detail while the row held both, and every
+    // LATER alert for the same cause -- read from the row -- disagreed with it.
+    //
+    // `builderAnnounceable` has already written this pass's body by the time
+    // anything dispatches, and a clearing reads this before the row is deleted,
+    // so the row is available to both and is the one answer they share. Preferring
+    // the caller's map was a second source for a value that has one.
     const stored = db.prepare("SELECT body FROM escalation WHERE why = ?").get(why)?.body ?? null;
     if (stored === null) return null;
     // A row that cannot be parsed is reported as having no body rather than

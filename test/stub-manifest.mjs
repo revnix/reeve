@@ -2434,8 +2434,8 @@ export const STUBS = [
     expectRed: "a later pass with no bodies map still renders the stored report",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "    const offered = offeredBody(bodies, why);\n    if (offered !== null) return offered;",
-      replace: "    return offeredBody(bodies, why);",
+      find: "    const stored = db.prepare(\"SELECT body FROM escalation WHERE why = ?\").get(why)?.body ?? null;",
+      replace: "    const stored = null;",
     }],
   },
   {
@@ -2445,8 +2445,8 @@ export const STUBS = [
     expectRed: "a body that cannot serialise is refused with its own kind, not a constraint error",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "  try { text = JSON.stringify(body); }\n  catch { text = undefined; }",
-      replace: "  try { text = JSON.stringify(body); }\n  catch { text = \"{}\"; }",
+      find: "  try { text = JSON.stringify(scrubDeep(body)); }\n  catch { text = undefined; }",
+      replace: "  try { text = JSON.stringify(scrubDeep(body)); }\n  catch { text = \"{}\"; }",
     }],
   },
   {
@@ -2456,8 +2456,8 @@ export const STUBS = [
     expectRed: "a key mapped to nothing is not an offer, so the alert still renders the stored report",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "    const offered = offeredBody(bodies, why);\n    if (offered !== null) return offered;",
-      replace: "    if (bodies?.has(why)) return bodies.get(why);",
+      find: "        if (body === null)\n          db.prepare(\"UPDATE escalation SET count=?, last_seen_at=? WHERE why=?\").run(count, at, why);",
+      replace: "        if (false)\n          db.prepare(\"UPDATE escalation SET count=?, last_seen_at=? WHERE why=?\").run(count, at, why);",
     }],
   },
   {
@@ -2491,6 +2491,39 @@ export const STUBS = [
       file: "src/build/hubdb.mjs",
       find: "    return db.prepare(\"SELECT COUNT(*) n FROM schema_version WHERE version >= ?\")",
       replace: "    return db.prepare(\"SELECT COUNT(*) n FROM schema_version WHERE version = ?\")",
+    }],
+  },
+  {
+    name: "a-credential-never-becomes-durable",
+    why: "store the report without scrubbing it, leaving `redact` to catch credentials on the way to the phone. The body goes somewhere the alert does not: `escalation.body` and the `escalation.raised` payload, which outlive the alert, ride into every snapshot, appear in exported event tails and survive the row being cleared -- so an echoed token is absent from the page and present verbatim, for ever, in the authority store",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a credential is scrubbed from the STORED report",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  try { text = JSON.stringify(scrubDeep(body)); }",
+      replace: "  try { text = JSON.stringify(body); }",
+    }],
+  },
+  {
+    name: "a-report-is-bounded",
+    why: "accept a report of any size. Every pass over a standing cause re-appends the row image to the append-only authority table, so an unbounded body is an unbounded WRITE RATE rather than merely a large row -- a megabyte of CI excerpt re-measured once a minute is gigabytes a day, and the file it exhausts is the one everything else depends on",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "an oversized report is refused by its own name, not silently cut down",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  if (typeof text === \"string\" && text.length > BODY_LIMIT)",
+      replace: "  if (false)",
+    }],
+  },
+  {
+    name: "the-alert-says-what-the-row-says",
+    why: "render the body the caller handed in rather than the one that was stored. `toJSON` decides what is persisted, so an object whose toJSON replaces its shape stores the useful report and pages the ORIGINAL -- whose own enumerable entries are the toJSON method itself. The first alert then carries neither the failure type nor the detail, and disagrees with every later alert for the same cause, which reads from the row",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "the FIRST alert renders what was stored, not the object it was handed",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    const stored = db.prepare(\"SELECT body FROM escalation WHERE why = ?\").get(why)?.body ?? null;\n    if (stored === null) return null;",
+      replace: "    const offered = offeredBody(bodies, why);\n    if (offered !== null) return offered;\n    const stored = db.prepare(\"SELECT body FROM escalation WHERE why = ?\").get(why)?.body ?? null;\n    if (stored === null) return null;",
     }],
   },
 ];

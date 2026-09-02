@@ -17,7 +17,7 @@ import { canonical } from "../db/ops.mjs";
 // `migrationPlan` hashes each migration's `up` so the freeze test has a stable,
 // INERT representation of what migration 1 is. Exporting MIGRATIONS itself would
 // hand callers runnable `up` functions.
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 // ONE module-level schema URL. Both `openHub`'s migration 1 and `HUB_TABLES`
 // read it; two spellings of the same path is how they drift.
@@ -31,7 +31,17 @@ const SCHEMA_VERSION_DDL = `CREATE TABLE IF NOT EXISTS schema_version (
   applied_at INTEGER NOT NULL
 ) STRICT`;
 
-export const HUB_SCHEMA_VERSION = 5;
+export const HUB_SCHEMA_VERSION = 6;
+
+/**
+ * The migration that created `hub_incarnation`.
+ *
+ * Named rather than spelled `6` at the one site that needs it, because that site
+ * is asking a question about THIS table and a bare number there reads as a
+ * coincidence. `IDENTITY_SINCE` in `repoid.mjs` is the same shape for the same
+ * reason.
+ */
+export const INCARNATION_SINCE = 6;
 
 /**
  * Forward-only. Each entry runs exactly once, in order, in its own transaction,
@@ -394,7 +404,135 @@ const MIGRATIONS = [
       // derived is a defect nothing would report.
       backfillProjectIdentities(db);
     } },
+  { version: 6, up: (db) => {
+      // WHICH LOG IS THIS. `phase_event.seq` is monotonic within one hub and not
+      // across a restore: replacing the store with an older snapshot puts the
+      // high-water mark below a cursor issued before it, and the log then regrows
+      // through the same numbers. A reader holding `<seq>.<at>` cannot tell an
+      // event that survived from a different event wearing its number, because
+      // `at` is integer seconds with no uniqueness -- so a log restored and
+      // regrown to the same sequence WITHIN ONE SECOND presents an identical pair
+      // and every event of the new incarnation through that sequence is skipped
+      // for ever, reported as a quiet period.
+      //
+      // ONE ROW, enforced by the schema rather than by convention. `only = 1` as
+      // the primary key makes a second incarnation row unstorable; a table that
+      // merely happens to hold one row is one INSERT away from two answers to a
+      // question that must have exactly one.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS hub_incarnation (
+          only       INTEGER PRIMARY KEY CHECK (only = 1),
+          -- 128 BITS OF LOWERCASE HEX, not merely 32 characters. A length check
+          -- alone accepts "z" repeated 32 times, and the writer here is not the
+          -- only way in: an import, a hand repair or a direct statement can store
+          -- one. The id is the whole proof a cursor carries, so a value no
+          -- hexadecimal parser will accept leaves the hub unable to issue one.
+          -- NOT GLOB '*[^0-9a-f]*' is the SQLite idiom for "every character is in
+          -- this class"; a bare GLOB would only constrain the first.
+          -- (No backticks in here: this SQL lives inside a template literal.)
+          id         TEXT    NOT NULL CHECK (length(id) = 32 AND id NOT GLOB '*[^0-9a-f]*'),
+          started_at INTEGER NOT NULL CHECK (started_at > 0)
+        ) STRICT;
+      `);
+      // MINTED HERE, so no hub is ever without one. A NULL incarnation would have
+      // to mean "cannot tell", and a reader that treats it as "matches" accepts
+      // every stale cursor while a reader that treats it as "differs" rejects
+      // every good one. Neither is better than the ambiguity this replaces.
+      mintIncarnation(db);
+    } },
 ];
+
+/**
+ * Begin a new incarnation of this hub, replacing any previous one.
+ *
+ * An incarnation is a property of the FILE, not of the log. That distinction is
+ * the whole design: the log is exactly what a restore rewinds, so recording the
+ * incarnation as a `hub_event` would put the fact inside the thing it exists to
+ * distinguish -- and worse, a replayable event would rebuild a DEAD incarnation's
+ * id over the live one during the very operation that ends it. So this is a row
+ * with no event and no replay handler, and `tables.mjs` declares it
+ * `replayed: false` for that reason.
+ *
+ * `INSERT OR REPLACE` rather than UPDATE: the row may not exist yet (migration 6
+ * on a fresh hub) and it must be replaced when it does (a restore). An UPDATE
+ * that matches nothing changes nothing and reports success, which here means a
+ * restored hub keeping the identity of the incarnation it replaced -- the exact
+ * failure this table exists to prevent, arriving silently.
+ *
+ * 128 bits from the system CSPRNG. The id is compared for equality and never
+ * ordered or parsed, so it needs no structure; it needs only to be unguessable
+ * enough that two incarnations never collide. A timestamp would collide inside
+ * one second, which is the resolution the defect this closes is made of.
+ */
+export function mintIncarnation(db, { at = null } = {}) {
+  const id = randomBytes(16).toString("hex");
+  const startedAt = at ?? db.prepare("SELECT unixepoch() n").get().n;
+  db.prepare("INSERT OR REPLACE INTO hub_incarnation(only, id, started_at) VALUES(1, ?, ?)")
+    .run(id, startedAt);
+  return { id, startedAt };
+}
+
+/**
+ * This hub's incarnation, or null if it predates the table.
+ *
+ * NULL IS A REAL ANSWER and callers must handle it: a hub migrated by an older
+ * binary, or read before migration 6 has run, genuinely has no incarnation. A
+ * reader comparing cursors must treat that as "cannot prove", which is the same
+ * answer it already gives for a cursor carrying no incarnation -- unproven, and
+ * reported rather than inferred either way.
+ */
+/**
+ * Does this hub PREDATE the incarnation table?
+ *
+ * Stated once, because two callers need it and they are the two halves of one
+ * rule: the table can be absent, or present and empty, and both mean "no
+ * incarnation" without saying WHY. Only `schema_version` says why.
+ *
+ * A POSITIVE READING, never an absence. It must read the column AND find the
+ * migration missing. If the read itself fails, the answer is not "old" -- it is
+ * "cannot tell", and the caller must not turn that into a claim about the hub's
+ * age.
+ */
+function predatesIncarnation(db) {
+  try {
+    return db.prepare("SELECT COUNT(*) n FROM schema_version WHERE version = ?")
+             .get(INCARNATION_SINCE)?.n === 0;
+  } catch { return false; }
+}
+
+export function hubIncarnation(db) {
+  let row;
+  try {
+    row = db.prepare("SELECT id, started_at FROM hub_incarnation WHERE only = 1").get();
+  } catch (e) {
+    // THE PRE-v6 CASE THIS FUNCTION PROMISES, and it did not honour it: on a hub
+    // older than migration 6 the table is absent and the prepare THROWS, so a
+    // caller told to expect null for an older hub got an exception instead.
+    if (!/no such table/i.test(e?.message ?? "")) throw e;
+    if (predatesIncarnation(db)) return null;
+    throw e;
+  }
+  if (row) return { id: row.id, startedAt: row.started_at };
+
+  // AN EMPTY TABLE ON A MIGRATED HUB IS DAMAGE, and this is the same rule as the
+  // catch above, one row further down. Review found both, in that order: the
+  // first fix answered null for a missing TABLE on a v6 hub, this one for a
+  // missing ROW -- `DELETE FROM hub_incarnation` from a hand repair, or a
+  // partially applied restore. Either way a broken current hub reads as an
+  // ordinary older store, and a cursor reader downstream files it under "cannot
+  // prove" and carries on.
+  //
+  // Migration 6 mints, and nothing else ever deletes: `mintIncarnation` replaces
+  // rather than removes. So on a hub that records the migration there is no
+  // legitimate way to have no row.
+  if (predatesIncarnation(db)) return null;
+  throw Object.assign(new Error(
+    `the hub records migration ${INCARNATION_SINCE} but hub_incarnation is empty. ` +
+    `Migration ${INCARNATION_SINCE} mints a row and nothing removes one, so this store has been ` +
+    `altered outside reeve.\n` +
+    `  recover  reeve restore --hub --force installs the newest usable snapshot`),
+    { hubDamaged: true });
+}
 
 /**
  * The highest COMPLETED migration for a hub, or 0.
@@ -841,10 +979,28 @@ export function openHub(path, { skipIntegrity = false } = {}) {
     // evidence of a damaged file. Only corruption earns the recovery advice.
     const kind = faultKind(e);
     throw new Error(
+      // NAMES THE SNAPSHOT, like the quick_check verdict below does.
+      //
+      // There are TWO damage refusals in this function and only one of them used
+      // to name a path. This one fires when a pragma WRITE hits a damaged page;
+      // the other when `quick_check` reads one. Which of the two an operator gets
+      // depends on where the damage happens to lie, so the weaker message was
+      // reachable by luck -- and "installs the newest usable snapshot" without
+      // naming it is precisely the generic advice `hub-drills` says tells an
+      // operator nothing.
+      //
+      // Found because a new table changed the file's layout: the drill corrupts
+      // the LAST page, which was a page `quick_check` read and became one the
+      // pragma write touches. The behaviour did not regress -- the injury moved,
+      // and the refusal it moved to was weaker than the interface this file
+      // promises.
       kind === "damage"
         ? `the hub at ${path} cannot be read (${e.message}).\n` +
-          `  recover  reeve restore --hub --force installs the newest usable snapshot\n` +
-          `           pass --tail from a durable export-events --hub to carry history forward`
+          (newestHubSnapshot(path)
+            ? `  recover  reeve restore --hub --force --from ${newestHubSnapshot(path)}\n` +
+              `           pass --tail from a durable export-events --hub to carry history forward`
+            : `  recover  reeve restore --hub --force installs the newest usable snapshot\n` +
+              `           pass --tail from a durable export-events --hub to carry history forward`)
         : kind === "full"
         ? `the hub at ${path} could not be written because the store is full (${e.message}).\n` +
           `  the file itself answered, so this is not damage: it ran out of room.\n` +

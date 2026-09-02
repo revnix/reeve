@@ -145,7 +145,7 @@ const beat = (args) => attempt(() => heartbeatRun(db, args));
   check(again.ok === false && again.reason === "duplicate-attempt",
     "re-inserting a settled attempt number is refused, not an upsert over the record of what happened",
     JSON.stringify(again));
-  check(db.prepare("SELECT status FROM phase_run WHERE task='bt:a' AND attempt=1").get().status === "succeeded",
+  check((db.prepare("SELECT status FROM phase_run WHERE task='bt:a' AND attempt=1").get() ?? {}).status === "succeeded",
     "and attempt 1 still says what it said");
 }
 
@@ -155,7 +155,7 @@ const beat = (args) => attempt(() => heartbeatRun(db, args));
   const drift = { modelId: { was: "claude-fable-4-5-20260101", now: "other" }, maxTurns: { was: 60, now: 10 } };
   const r = ins({ attempt: 3, startedAt: 1500, drift });
   check(r.ok === true, "a run records the contract it was dispatched under", JSON.stringify(r));
-  const row = db.prepare("SELECT cli_version, model_id, effort, max_turns, snapshot_hash, contract_drift FROM phase_run WHERE task='bt:a' AND attempt=3").get();
+  const row = db.prepare("SELECT cli_version, model_id, effort, max_turns, snapshot_hash, contract_drift FROM phase_run WHERE task='bt:a' AND attempt=3").get() ?? {};
   check(row.cli_version === "1.2.3" && row.model_id === SNAP.modelId && row.effort === "high" &&
         row.max_turns === 60 && row.snapshot_hash === SNAP.snapshotHash,
     "and the snapshot columns are the values it was given", JSON.stringify(row));
@@ -164,7 +164,9 @@ const beat = (args) => attempt(() => heartbeatRun(db, args));
   // key whitelist applied at every level, not an ordering -- every nested
   // object empties, and the column would record WHICH fields drifted while
   // destroying what they drifted to. That is the only thing the column is for.
-  const back = JSON.parse(row.contract_drift);
+  // JSON.parse of a missing column throws for the same reason, so it is read
+  // through a guard that answers {} instead of ending the file.
+  const back = (() => { try { return JSON.parse(row.contract_drift); } catch { return {}; } })();
   check(back.modelId && back.modelId.was === "claude-fable-4-5-20260101" && back.modelId.now === "other",
     "the drift's nested values SURVIVE serialisation", row.contract_drift);
   check(back.maxTurns && back.maxTurns.was === 60 && back.maxTurns.now === 10,

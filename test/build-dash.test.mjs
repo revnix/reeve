@@ -1308,6 +1308,64 @@ const T = {};
   rmSync(dhome, { recursive: true, force: true });
 }
 
+// ── sequence zero survives a restore, because it names no event ────────────
+//
+// A first digest taken before any phase event exists issues a cursor at sequence
+// 0. If the hub is restored or re-minted before events arrive, the identity
+// differs -- and rejecting the cursor there withholds every transition since,
+// permanently, because the operator dutifully resyncs to the new high-water mark.
+// Sequence 0 names the BEGINNING of any log rather than an event in a particular
+// one, so `movedSince(db, 0)` is always the right answer.
+{
+  const high = db.prepare("SELECT COALESCE(max(seq),0) s FROM phase_event").get().s;
+  const foreign = "b".repeat(32);
+  check(foreign !== hubIncarnation(db).id,
+    "control: the cursor carries an identity this hub does not have", foreign);
+
+  const zero = dash({ since: cur(0, 0, foreign) });
+  check(zero.cursor_verdict === "ok",
+    "a cursor at sequence 0 is accepted even though its incarnation differs",
+    JSON.stringify({ verdict: zero.cursor_verdict, rewound: zero.cursor_rewound }));
+  check(zero.since_you_looked.length > 0 && zero.since_you_looked.length === high,
+    "and it returns the WHOLE current log, which is what someone who has seen nothing needs",
+    JSON.stringify({ returned: zero.since_you_looked.length, high }));
+
+  // CONTROL: the same foreign identity at a NON-zero sequence is still refused,
+  // so this exempts sequence zero rather than exempting a mismatch.
+  const nonZero = dash({ since: cur(high - 1, atOfSeq(high - 1), foreign) });
+  check(nonZero.cursor_verdict === "different-log",
+    "control: the same foreign identity at a real sequence is still refused",
+    String(nonZero.cursor_verdict));
+}
+
+// ── the proof names the evidence that actually decided it ──────────────────
+//
+// A legacy cursor beyond the high-water mark is settled by the sequence alone:
+// no event is looked up and no timestamp compared. Reporting `timestamp` there
+// made the renderer print a note about a restore inferred from timestamps
+// directly beneath a line saying the cause could not be told apart -- naming
+// evidence that was never consulted, which is this change's own subject.
+{
+  const high = db.prepare("SELECT COALESCE(max(seq),0) s FROM phase_event").get().s;
+  const beyond = dash({ since: cur(high + 1000, 0) });
+  check(beyond.cursor_verdict === "ahead",
+    "control: a legacy cursor past the log is `ahead`, decided without any event lookup",
+    String(beyond.cursor_verdict));
+  check(beyond.cursor_proof === "sequence",
+    "and the proof says SEQUENCE, because that is what settled it",
+    String(beyond.cursor_proof));
+  check(!/inferred from timestamps/.test(renderDash(beyond)),
+    "so the text does not claim a timestamp inference that never happened",
+    renderDash(beyond).split("\n").find(l => /note:/.test(l)) ?? "(no note)");
+
+  // CONTROL: a legacy cursor INSIDE the log really is decided by the timestamp,
+  // and still says so.
+  const inside = dash({ since: cur(high - 1, atOfSeq(high - 1)) });
+  check(inside.cursor_proof === "timestamp",
+    "control: a legacy cursor inside the log is still decided by the timestamp",
+    String(inside.cursor_proof));
+}
+
 // ── the cursor an operator needs next is in the TEXT ───────────────────────
 {
   const m = dash();

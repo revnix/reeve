@@ -510,7 +510,12 @@ export function hubIncarnation(db) {
     // caller told to expect null for an older hub got an exception instead.
     if (!/no such table/i.test(e?.message ?? "")) throw e;
     if (predatesIncarnation(db)) return null;
-    throw e;
+    throw Object.assign(new Error(
+      `the hub records migration ${INCARNATION_SINCE} but hub_incarnation is absent. ` +
+      `Migration ${INCARNATION_SINCE} creates that table and nothing drops it, so this store has ` +
+      `been altered outside reeve.\n` +
+      `  recover  reeve restore --hub --force installs the newest usable snapshot`),
+      { hubDamaged: true, cause: e });
   }
   if (row) return { id: row.id, startedAt: row.started_at };
 

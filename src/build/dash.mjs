@@ -208,6 +208,7 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
   const beyond = since !== null && since.seq > highWater;
   const verdict =
     since === null ? null
+      : since.seq === 0 ? "ok"
       : provable && since.incarnation !== incarnation ? "different-log"
       : beyond || !namesAKnownEvent()
         ? (provable ? "unknown-event" : beyond ? "ahead" : "changed-event")
@@ -361,7 +362,10 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
     // anything deciding whether to trust the movement list. Reporting the
     // stronger and the weaker answer as one value is the defect this closes.
     // `null` where no cursor was given: there was nothing to prove.
-    cursor_proof: since === null ? null : provable ? "incarnation" : "timestamp",
+    cursor_proof: since === null ? null
+      : provable ? "incarnation"
+      : verdict === "ahead" ? "sequence"
+      : "timestamp",
     // The hub's own identity, so a client holding several cursors can tell which
     // of them belong to this log without asking for each in turn.
     incarnation,

@@ -343,6 +343,32 @@ const beat = (args) => attempt(() => heartbeatRun(db, args));
   rdb.close();
 }
 
+// ── an overdue beat does not revive an expired lease ───────────────────────
+//
+// A blocked or suspended event loop delivers a heartbeat whose `at` is already
+// past the lease it renews. Renewing it converts a lost lease back into an
+// apparently valid one BEFORE runWorker's poll observes the expiry -- and
+// another actor may have adopted the run by then, so the worker would continue
+// against a claim someone else holds.
+{
+  const K70 = { ...KEY, attempt: 70 };
+  const r = attempt(() => insertRun(db, { ...K70, ...PATHS, snapshot: SNAP, drift: null,
+                                          startedAt: 5000, leaseSeconds: 100, isAlive: alive }));
+  check(r.ok === true, "control: a run is admitted with a lease to 5100", JSON.stringify(r));
+  const early = beat({ ...K70, at: 5050, leaseSeconds: 100, isAlive: alive });
+  check(early.ok === true && early.expiresAt === 5150,
+    "control: a beat INSIDE the lease still renews it", JSON.stringify(early));
+
+  const overdue = beat({ ...K70, at: 5200, leaseSeconds: 100, isAlive: alive });
+  check(overdue.ok === false && overdue.reason === "no-such-run",
+    "a beat arriving after the lease expired is REFUSED, not honoured", JSON.stringify(overdue));
+  const row = db.prepare("SELECT lease_expires_at FROM phase_run WHERE task='bt:a' AND attempt=70").get() ?? {};
+  check(row.lease_expires_at === 5150,
+    "and the expiry is unchanged, so a lost lease cannot be revived into a valid one",
+    JSON.stringify(row));
+  attempt(() => settleRun(db, { ...K70, status: "killed", outcome: "lease lost", truncated: 0, isAlive: alive }));
+}
+
 // ── the contract snapshot is frozen, in both halves ─────────────────────────
 //
 // A freeze verified only against the half it already covered proves nothing

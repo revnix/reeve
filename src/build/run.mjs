@@ -160,8 +160,20 @@ export function heartbeatRun(db, { task, generation, phase, slice = 0, attempt, 
     // shrinks with every beat and expires under a worker that is answering.
     const expiresAt = at + leaseSeconds;
     const r = db.prepare(
-      `UPDATE phase_run SET heartbeat_at=?, lease_expires_at=? WHERE ${KEY_SQL} AND status IN ('live','adopted')`)
-      .run(at, expiresAt, ...keyArgs(k));
+      // AND THE OLD EXPIRY MUST STILL BE IN THE FUTURE. A blocked or suspended
+      // event loop delivers a beat whose `at` is already past the lease it is
+      // renewing -- and renewing it converts a lost lease back into an
+      // apparently valid one, before runWorker's poll ever observes the expiry.
+      // Another actor may have adopted the run by then, so the worker would
+      // continue against a claim someone else holds.
+      //
+      // Fenced IN the statement rather than checked before it: a read then a
+      // write is two moments, and the whole point of a lease is that it can
+      // lapse between them. The refusal falls through to the dispatcher's
+      // failed-heartbeat path, which terminates the worker.
+      `UPDATE phase_run SET heartbeat_at=?, lease_expires_at=?
+        WHERE ${KEY_SQL} AND status IN ('live','adopted') AND lease_expires_at > ?`)
+      .run(at, expiresAt, ...keyArgs(k), at);
     // A BEAT FOR NOTHING IS A REFUSAL, never a silent no-op: the caller is a
     // loop that would otherwise go on beating for a run that has been settled
     // or killed, and never learn it is no longer entitled to its process.

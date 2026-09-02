@@ -526,7 +526,16 @@ export function mintIncarnation(db, { at = null } = {}) {
  */
 function predatesIncarnation(db) {
   try {
-    return db.prepare("SELECT COUNT(*) n FROM schema_version WHERE version = ?")
+    // AT OR ABOVE, not the exact version. While 6 was the newest migration, its
+    // absence did prove the store predated it. It stopped proving that the moment
+    // a 7 existed: a damaged history recording 1-5 and 7 has no 6 either, and the
+    // exact-match reading classified that HOLED CURRENT store as an old one --
+    // handing back null, which callers read as "cannot prove", and suppressing
+    // the only evidence of damage they had.
+    //
+    // `>=` is also what keeps this true for the next migration, rather than
+    // needing a revisit each time one lands.
+    return db.prepare("SELECT COUNT(*) n FROM schema_version WHERE version >= ?")
              .get(INCARNATION_SINCE)?.n === 0;
   } catch { return false; }
 }

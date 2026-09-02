@@ -2445,8 +2445,8 @@ export const STUBS = [
     expectRed: "a body that cannot serialise is refused with its own kind, not a constraint error",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "  if (typeof text !== \"string\")",
-      replace: "  if (false)",
+      find: "  try { text = JSON.stringify(body); }\n  catch { text = undefined; }",
+      replace: "  try { text = JSON.stringify(body); }\n  catch { text = \"{}\"; }",
     }],
   },
   {
@@ -2467,8 +2467,30 @@ export const STUBS = [
     expectRed: "a string is refused as a body, not rendered as one",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "  if (typeof body !== \"object\" || Array.isArray(body))\n",
+      find: "  if (shape === null || typeof shape !== \"object\" || Array.isArray(shape))\n",
       replace: "  if (false)\n",
+    }],
+  },
+  {
+    name: "a-body-is-checked-after-serialisation",
+    why: "check the shape of the value HANDED IN rather than the shape that is STORED. `toJSON` decides what `JSON.stringify` produces, so a Date passes as an object and stores as a bare JSON string: the alert renders no detail because Object.entries of it is empty, and the next pass parses the scalar back, finds it unrenderable and drops it -- the report lost while every other signal reports success",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a body whose toJSON returns a scalar is refused, though the body itself is an object",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  if (shape === null || typeof shape !== \"object\" || Array.isArray(shape))",
+      replace: "  if (body === null || typeof body !== \"object\" || Array.isArray(body))",
+    }],
+  },
+  {
+    name: "a-holed-current-store-is-not-an-old-one",
+    why: "prove the store predates the incarnation by the ABSENCE OF EXACTLY migration 6, which stopped being proof the moment a 7 existed. A damaged history recording 1-5 and 7 has no 6 either, so a holed CURRENT store is classified as an old one and answers null -- which callers read as `cannot prove`, suppressing the only evidence of damage they had",
+    test: "test/hub-incarnation.test.mjs",
+    expectRed: "a holed CURRENT store propagates damage rather than answering null like an old one",
+    edits: [{
+      file: "src/build/hubdb.mjs",
+      find: "    return db.prepare(\"SELECT COUNT(*) n FROM schema_version WHERE version >= ?\")",
+      replace: "    return db.prepare(\"SELECT COUNT(*) n FROM schema_version WHERE version = ?\")",
     }],
   },
 ];

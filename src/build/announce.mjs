@@ -98,6 +98,16 @@ const raised = (db, why) => hubEvent(db, {
     .get(why),
 });
 
+/** What the caller passed, named the way the caller would recognise it. */
+const describeBody = (body) =>
+  Array.isArray(body) ? "an array"
+    : typeof body !== "object" ? `a ${typeof body}`
+    // NAMED SPECIFICALLY, because "an object" would be actively misleading here:
+    // the value IS one, and the reason it is refused is invisible without saying
+    // that its `toJSON` replaced it.
+    : typeof body.toJSON === "function" ? `${body.constructor?.name ?? "an object"} (its toJSON does not return an object)`
+    : "an object";
+
 /**
  * The report, as the column stores it, or null where there is none.
  *
@@ -126,24 +136,29 @@ const offeredBody = (bodies, why) => {
 
 const serialiseBody = (body) => {
   if (body === null || body === undefined) return null;
-  // AN OBJECT, because the alert renders a body by WALKING ITS ENTRIES. A string
-  // reaches `Object.entries` as its characters and pages one line per letter; an
-  // array pages its indices; a number has no entries at all and pages nothing,
-  // losing the report while reporting success. All three are the ordinary slip
-  // of passing the message instead of the report, all three serialise, and the
-  // `json_valid` CHECK accepts every one of them -- so nothing downstream
-  // refuses them and the damage is not visible until an alert is read.
-  if (typeof body !== "object" || Array.isArray(body))
-    throw refuse("escalation_body_shape",
-      `an escalation body must be an object; ${Array.isArray(body) ? "an array" : typeof body} ` +
-      "cannot be rendered as one. `body({ type, ...detail })` builds one and names the failure type.");
   let text;
   try { text = JSON.stringify(body); }
-  catch (e) { text = undefined; }
-  if (typeof text !== "string")
+  catch { text = undefined; }
+  // THE SERIALISED FORM IS WHAT GETS STORED, so it is the form that has to be a
+  // renderable object -- not the value handed in. Checking the input instead is
+  // one check on the wrong side of the boundary: `toJSON` decides what
+  // `JSON.stringify` produces, and a `Date` returns a STRING from it. Such a body
+  // is an object, is not an array, and serialises perfectly -- then stores as a
+  // bare JSON string, renders NO detail because `Object.entries(new Date())` is
+  // empty, and is rejected as unrenderable when the next pass reads it back.
+  // The report is lost silently, which is the one outcome this column exists to
+  // prevent.
+  //
+  // ONE CHECK, on the value that is actually persisted. It subsumes the input
+  // cases -- a string, an array, a number and an unserialisable value all fail it
+  // -- so there are not two rules here that can drift apart.
+  let shape;
+  if (typeof text === "string") { try { shape = JSON.parse(text); } catch { shape = undefined; } }
+  if (shape === null || typeof shape !== "object" || Array.isArray(shape))
     throw refuse("escalation_body_shape",
-      `an escalation body must serialise to JSON; ${typeof body} did not. Detail belongs in the ` +
-      `body precisely because the key refuses it, so a body that cannot be stored loses the report.`);
+      `an escalation body must serialise to a JSON object; ${describeBody(body)} did not. ` +
+      "The alert renders a body by walking its entries, so anything else pages its characters " +
+      "or pages nothing at all. `body({ type, ...detail })` builds one and names the failure type.");
   return text;
 };
 

@@ -2406,6 +2406,7 @@ export const STUBS = [
               replace: "             retryable: false };" }],
   },
   {
+<<<<<<< HEAD
     name: "an-escalations-report-is-durable",
     why: "send the report and store nothing. The identity is the bare cause by design, so the report is what makes a bare key affordable rather than an addition to it — and until it is on the row, `task show` and `task why` cannot recover afterwards what an alert said, and a process-scoped cause cannot name the repository it is about, which is what decides whose channel pages for it. The detail reaching a phone and nothing else is the half that scrolls past",
     test: "test/build-escalations.test.mjs",
@@ -2590,6 +2591,60 @@ export const STUBS = [
       file: "src/build/announce.mjs",
       find: "    const out = Object.create(null);",
       replace: "    const out = {};",
+=======
+    name: "a-standing-cause-is-actually-paged",
+    why: "remove the call from the heartbeat loop, which is the state this whole change ends. Every unit assertion about the pass still passes -- they call it directly -- while nothing in production invokes it, so escalations accumulate in the hub and reach nobody. An alarm system nothing reads is indistinguishable from a system with nothing to report",
+    test: "test/build-paging.test.mjs",
+    expectRed: "and calls it in the heartbeat loop, after the tick",
+    edits: [{
+      file: "bin/reeve",
+      find: "        const p = pageStandingCauses(db, { home: HOME });",
+      replace: "        const p = { deliverable: true, standing: 0, paged: [], why: null };",
+    }],
+  },
+  {
+    name: "an-undeliverable-page-is-held-not-lost",
+    why: "skip the pass when no profile is configured, rather than running it with a sender that refuses by name. `announce` leaves announced_count at 0 for a refused page, so every cause standing while no channel exists is delivered by the first pass after one is configured -- and skipping the pass loses both that and the record that it could not be made",
+    test: "test/build-paging.test.mjs",
+    expectRed: "and the cause is DECLINED rather than dropped",
+    edits: [{
+      file: "src/build/paging.mjs",
+      find: "  const sender = send ?? (alert => (profile ? notify({ profile, alert }) : { ok: false, why }));",
+      replace: "  const sender = send ?? (() => ({ ok: true, channels: [{ name: \"none\", ok: true, ref: \"x\" }] }));",
+    }],
+  },
+  {
+    name: "a-pass-that-examined-nothing-retires-nothing",
+    why: "let the pass vouch for every cause it surveyed by passing the surveyed set as `examined`. The builder tick refreshes gate state and evaluates no task, so it examined none of them -- retiring on that silence announces `resolved` for something nobody looked at, and re-announces it on the next pass that did look",
+    test: "test/build-paging.test.mjs",
+    expectRed: "a pass that examined nothing retires nothing",
+    edits: [{
+      file: "src/build/paging.mjs",
+      find: "  const result = announce(db, { escalations, at, isAlive, send: sender, profile, examined: null });",
+      replace: "  const result = announce(db, { escalations, at, isAlive, send: sender, profile,\n    examined: new Set([...escalations.keys()].map(w => w.replace(/:.*$/, \"\"))) });",
+    }],
+  },
+  {
+    name: "an-unprobed-paging-state-is-not-a-pass",
+    why: "report a machine whose paging was never probed as healthy. `null` means NOT PROBED on every other input to this surface, and answering it as a pass is the instrument reporting a smaller question as success -- exactly the shape the doctor exists to avoid",
+    test: "test/build-paging.test.mjs",
+    expectRed: "an unprobed paging state is reported as UNKNOWN rather than as healthy",
+    edits: [{
+      file: "src/doctor.mjs",
+      find: "    out.push({ id: \"H-14\", severity: \"warn\", classification: \"unknown\",",
+      replace: "    out.push({ id: \"H-14\", severity: \"pass\", classification: \"configuration\",",
+    }],
+  },
+  {
+    name: "the-machine-cannot-page-is-a-failure",
+    why: "report a machine that can reach nobody as a warning. A standing alarm with no channel is indistinguishable from having nothing to report, which is the worst shape an alarm system takes -- a warn is what an operator scrolls past",
+    test: "test/build-paging.test.mjs",
+    expectRed: "H-14 FAILS when no alarm could reach anyone",
+    edits: [{
+      file: "src/doctor.mjs",
+      find: "      : { id: \"H-14\", severity: \"fail\", classification: \"configuration\",",
+      replace: "      : { id: \"H-14\", severity: \"warn\", classification: \"configuration\",",
+>>>>>>> 4b22a2f (feat(build): an escalation reaches a human, which none of them did before)
     }],
   },
   {

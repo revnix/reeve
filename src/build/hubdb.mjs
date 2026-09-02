@@ -31,7 +31,7 @@ const SCHEMA_VERSION_DDL = `CREATE TABLE IF NOT EXISTS schema_version (
   applied_at INTEGER NOT NULL
 ) STRICT`;
 
-export const HUB_SCHEMA_VERSION = 6;
+export const HUB_SCHEMA_VERSION = 7;
 
 /**
  * The migration that created `hub_incarnation`.
@@ -440,6 +440,37 @@ const MIGRATIONS = [
       // every good one. Neither is better than the ambiguity this replaces.
       mintIncarnation(db);
     } },
+  // ---------------------------------------------------------------- 7
+  // AN ESCALATION GETS SOMEWHERE TO PUT ITS REPORT.
+  //
+  // The identity is the bare cause and carries no detail, by design: a key that
+  // moves when the detail moves turns one standing cause into a new one every
+  // time it is re-measured, and a channel that re-announces a standing cause
+  // gets muted. But the report has to go somewhere, and there was nowhere -- so
+  // every producer faced the same three-way choice between putting detail in the
+  // key, putting it in the log where no phone reads it, or losing it. One site
+  // already takes the first of those.
+  //
+  // The consequence was not only cosmetic. A process-scoped cause with no report
+  // cannot say WHICH repository it is about, so it cannot say whose notify
+  // profile should page for it -- and two stores failing to back up collapse
+  // into one cause where one recovering clears both.
+  //
+  // RE-RUNNABLE, like every migration here: `ALTER TABLE ... ADD COLUMN` has no
+  // IF NOT EXISTS, and a hub whose `schema_version` rows are lost while its
+  // tables survive replays every migration over a store that already has them.
+  { version: 7, up: (db) => {
+      const hasColumn = (t, c) =>
+        db.prepare(`SELECT count(*) n FROM pragma_table_info(?) WHERE name = ?`).get(t, c).n > 0;
+      // VALIDATED AT THE BOUNDARY, not by the reader. `hub_event.payload` holds
+      // canonical JSON with no CHECK, and matching that convention including its
+      // lack of validation would be copying the wrong half: a body that is not
+      // JSON is discovered by whoever tries to parse it, which is the alert path.
+      // NULL is a real answer -- most escalations carry no report at all.
+      if (!hasColumn("escalation", "body"))
+        db.exec("ALTER TABLE escalation ADD COLUMN body TEXT " +
+                "CHECK (body IS NULL OR json_valid(body))");
+    } },
 ];
 
 /**
@@ -495,7 +526,16 @@ export function mintIncarnation(db, { at = null } = {}) {
  */
 function predatesIncarnation(db) {
   try {
-    return db.prepare("SELECT COUNT(*) n FROM schema_version WHERE version = ?")
+    // AT OR ABOVE, not the exact version. While 6 was the newest migration, its
+    // absence did prove the store predated it. It stopped proving that the moment
+    // a 7 existed: a damaged history recording 1-5 and 7 has no 6 either, and the
+    // exact-match reading classified that HOLED CURRENT store as an old one --
+    // handing back null, which callers read as "cannot prove", and suppressing
+    // the only evidence of damage they had.
+    //
+    // `>=` is also what keeps this true for the next migration, rather than
+    // needing a revisit each time one lands.
+    return db.prepare("SELECT COUNT(*) n FROM schema_version WHERE version >= ?")
              .get(INCARNATION_SINCE)?.n === 0;
   } catch { return false; }
 }

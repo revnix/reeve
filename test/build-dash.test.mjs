@@ -1145,8 +1145,8 @@ const T = {};
   check(stillOurs.cursor_verdict === "unknown-event",
     "a cursor carrying THIS hub's identity but naming an event it does not have is a corrupt cursor",
     JSON.stringify({ verdict: stillOurs.cursor_verdict, proof: stillOurs.cursor_proof }));
-  check(stillOurs.cursor_verdict !== "restored",
-    "and is NEVER diagnosed as a restore, which would send an operator hunting damage that is not there",
+  check(stillOurs.cursor_verdict !== "different-log",
+    "and is NEVER reported as a different log, which would send an operator hunting damage that is not there",
     String(stillOurs.cursor_verdict));
   check(stillOurs.since_you_looked.length === 0 && stillOurs.cursor_rewound === true,
     "while the movement list is still withheld, because an unresolvable cursor cannot produce one",

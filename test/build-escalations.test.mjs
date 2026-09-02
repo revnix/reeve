@@ -1293,6 +1293,24 @@ const freshHub = () => {
   check(/disk full/.test(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body),
     "control: and a pass offering none does not erase it",
     hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body);
+
+  // A KEY MAPPED TO NOTHING IS NOT AN OFFER, and the two sides of this seam once
+  // disagreed about that. The persist side asked whether the body serialised to
+  // null and kept the stored one; the alert side asked `bodies.has(why)`, which
+  // is true for a key mapped to `undefined`. So the row kept its report and the
+  // alert paged bare -- the exact loss the column exists to prevent, reached by
+  // the ordinary way of building this map, where one item simply has no body:
+  //
+  //     new Map(items.map(i => [i.why, i.body]))
+  sent.length = 0;
+  announce(hub, { escalations: new Map([[key, 13]]), at: NOW + 240, isAlive: ALIVE, send,
+                  bodies: new Map([[key, undefined]]) });
+  check(/disk full/.test(nth(sent, 0)?.message ?? ""),
+    "a key mapped to nothing is not an offer, so the alert still renders the stored report",
+    JSON.stringify(nth(sent, 0)?.message ?? null));
+  check(/disk full/.test(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? ""),
+    "control: and the row keeps it too, so both sides read that absence the same way",
+    hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null);
 }
 
 // ── a body that cannot be stored is refused by name ────────────────────────
@@ -1330,6 +1348,24 @@ const freshHub = () => {
                  VALUES('bt:zz:infeasible',1,1,1,0,'not json')`).run();
   } catch { dbRefused = true; }
   check(dbRefused, "control: the column's own CHECK refuses a body that is not JSON");
+
+  // AND A BODY THAT IS NOT AN OBJECT, refused for the same reason and by the
+  // same name. The alert renders a body by walking its entries, so a string
+  // pages one line per letter, an array pages its indices, and a number pages
+  // NOTHING -- which loses the report while every other signal says the alert
+  // was delivered. Each of these serialises and each satisfies `json_valid`, so
+  // this refusal is the only thing standing between them and a rendered alert.
+  for (const [what, value] of [["a string", "checksum mismatch"],
+                               ["an array", ["a", "b"]],
+                               ["a number", 42]]) {
+    let k = null;
+    try {
+      announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                      send: () => ({ ok: true, channels: [] }), bodies: new Map([[key, value]]) });
+    } catch (e) { k = e.kind ?? "threw"; }
+    check(k === "escalation_body_shape",
+      `${what} is refused as a body, not rendered as one`, String(k));
+  }
 }
 
 hub.close();

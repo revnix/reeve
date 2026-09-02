@@ -337,7 +337,11 @@ const base = (over = {}) => ({
   const t = applyTransition(db, { taskId: "bt:d", expectedPhase: "RESEARCH", expectedGeneration: 1,
     evidence: { kind: "founder.cancel", reason: "the founder cancelled" }, op: "task.cancelling" });
   check(t.applied === true && t.to === "CANCELLING", "the cancel transition applied", JSON.stringify(t));
-  check(db.prepare("SELECT status FROM phase_run WHERE task='bt:d' AND attempt=6").get().status === "killed",
+  // `?? {}` because a stub earlier in this file can leave a row live, which
+  // refuses this attempt's insert -- and the read then answers undefined. The
+  // property access ended the file four assertions before the headline, and an
+  // assertion that never ran reads exactly like one that passed.
+  check((db.prepare("SELECT status FROM phase_run WHERE task='bt:d' AND attempt=6").get() ?? {}).status === "killed",
     "and `terminate-worker` marked the row killed -- which is ALL it does");
 
   // THE ASSERTION. runWorker polls isRevoked every 2,000 ms and then sends

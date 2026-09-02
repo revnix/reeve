@@ -3472,10 +3472,56 @@ export function announceable(db, escalations, { covered = null, waiting = null, 
  * A commit that cannot be read is reported as unreadable, never guessed: an
  * invented value here is worse than the checkout reading it replaces.
  */
+/**
+ * Whether the tree this process is about to load from is CLEAN, recorded at
+ * startup beside the commit.
+ *
+ * The commit alone does not describe what a running process holds. A doctor
+ * reading the tree LATER sees a different thing: an edit made after startup
+ * produces a false alarm, and a daemon started from a dirty tree that was since
+ * reverted reads as clean while the process retains uncommitted code. Neither is
+ * recoverable after the fact, so the only moment this can be established is now.
+ */
+export function treeState(from = dirname(fileURLToPath(import.meta.url))) {
+  try {
+    // `--untracked-files=all`, because a checkout carrying
+    // `status.showUntrackedFiles=no` reports a tree with new, uncommitted source
+    // files in it as clean -- and a committed module that imports one of them
+    // executes code no commit contains. The same flag is already used at the
+    // other status probe in this file, for the same reason.
+    //
+    // GIT_DIR and GIT_WORK_TREE cleared, because they OVERRIDE `-C`: a daemon
+    // that inherited either would record the tree state of some other repository
+    // entirely, and `GIT_NEUTRALISE` only strips git's config-injection
+    // variables.
+    const { GIT_DIR, GIT_WORK_TREE, ...env } = process.env;
+    const git = (args) => execFileSync("git", ["-C", from, ...GIT_NEUTRALISE, ...args],
+                                       { encoding: "utf8", timeout: 10_000, env });
+    if (git(["status", "--porcelain", "--untracked-files=all"]).trim()) return "dirty";
+
+    // AN INDEX BIT CAN HIDE A MODIFIED FILE FROM `status` ENTIRELY. A tracked
+    // file marked `assume-unchanged` or `skip-worktree` reports nothing however
+    // it is edited, so a clean `status` over such a tree establishes nothing --
+    // and the daemon could load altered source while recording `tree clean`.
+    // `ls-files -v` is where those bits are visible: lowercase tags mark
+    // assume-unchanged, `S` marks skip-worktree.
+    //
+    // The answer is `unreadable` rather than `dirty`, because we do not know
+    // that anything WAS modified -- only that we cannot tell. R-17 turns that
+    // into "whether it loaded a clean tree is unknown", which is the true
+    // statement.
+    if (git(["ls-files", "-v"]).split("\n").some(l => /^[a-z]/.test(l) || l.startsWith("S ")))
+      return "unreadable";
+    return "clean";
+  } catch { return "unreadable"; }
+}
+
 export function runningCommit(from = dirname(fileURLToPath(import.meta.url))) {
   try {
+    // Same override hazard as `treeState`: `-C` loses to GIT_DIR.
+    const { GIT_DIR, GIT_WORK_TREE, ...env } = process.env;
     return execFileSync("git", ["-C", from, ...GIT_NEUTRALISE, "rev-parse", "--short", "HEAD"],
-                        { encoding: "utf8", timeout: 10_000 }).trim() || "unreadable";
+                        { encoding: "utf8", timeout: 10_000, env }).trim() || "unreadable";
   } catch { return "unreadable"; }
 }
 
@@ -3494,7 +3540,11 @@ export async function run(ctx) {
   //
   // A commit that cannot be read is recorded as unreadable, never guessed. An
   // invented value here would be worse than the checkout it replaces.
-  log(logPath, `reeve daemon starting — node ${process.version}, pid ${process.pid}, running commit ${runningCommit()}`);
+  // APPENDED, never inserted. `tree` goes after `running commit` so every reader
+  // written against the older line keeps matching; a reader that wants the tree
+  // state asks for it and treats its absence as "an older daemon wrote this".
+  log(logPath, `reeve daemon starting — node ${process.version}, pid ${process.pid}, ` +
+               `running commit ${runningCommit()}, tree ${treeState()}`);
 
   // Assert the floor rather than trusting the environment: node on this machine's
   // PATH is v22, and launchd never sources a shell profile.

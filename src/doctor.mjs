@@ -18,7 +18,8 @@ import { GIT_NEUTRALISE_FOUNDER, founderGitEnv } from "./gitguard.mjs";
 import { readOauthToken } from "./workerenv.mjs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync, statSync, realpathSync,
+         openSync, readSync, closeSync, fstatSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 // The remediation must name the home the token check actually used.
@@ -772,11 +773,72 @@ function currentPolicy(profile, { read = readCanaryState, stateDir = null, nwo =
 // and is the only half that can tell those two apart.
 
 /** git in the founder's own checkout, exactly as `founderGit` runs it. */
+/**
+ * The launchd job as INSTALLED, or null when nothing is installed to read.
+ *
+ * Deliberately the file in LaunchAgents rather than the repository's
+ * `deploy/com.revnix.reeve.plist`. The repo copy records what someone meant to
+ * install; this one is what launchd executes, and macOS rewrites it on load --
+ * measured 2026-09-02, the installed copy had the same values in a different key
+ * order with every comment stripped.
+ *
+ * On a machine with no launchd this returns null, and the caller reports UNKNOWN
+ * rather than OK: "no job is installed" and "the job is fine" must not be the
+ * same answer. reeve is meant to run on Linux and Windows too, where the
+ * supervisor is not launchd; until this rule learns those, saying so plainly is
+ * the honest reading rather than a silent pass.
+ */
+/** What launchd currently holds for the job, or null when it holds nothing. */
+function readLoadedJob() {
+  try {
+    return execFileSync("launchctl", ["print", `gui/${process.getuid()}/com.revnix.reeve`],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 20_000 });
+  } catch { return null; }
+}
+
+/**
+ * The tail of a log, bounded, for the startup record.
+ *
+ * Scanned backward in a GROWING window: the log is append-only and unrotated, so
+ * reading it whole is unbounded -- and a fixed tail is not the fix either, since
+ * the last start can be older than any window. Measured 2026-09-02: 256KB of a
+ * log written since 08-30 contained no startup line at all.
+ */
+function readLogTail(path, { chunk = 256 * 1024, max = 64 * 1024 * 1024 } = {}) {
+  let fd = null;
+  try {
+    fd = openSync(path, "r");
+    const size = fstatSync(fd).size;
+    for (let window = Math.min(chunk, size); ; window = Math.min(window * 4, size)) {
+      const buf = Buffer.alloc(window);
+      readSync(fd, buf, 0, window, size - window);
+      const text = buf.toString("utf8");
+      if (startupRecordFrom(text)) return text;
+      if (window >= size || window >= max) return text;
+    }
+  } catch { return null; } finally { if (fd !== null) try { closeSync(fd); } catch { /* gone */ } }
+}
+
+function readInstalledPlist(path = join(homedir(), "Library", "LaunchAgents", "com.revnix.reeve.plist")) {
+  try { return readFileSync(path, "utf8"); } catch { return null; }
+}
+
+/**
+ * GIT_DIR and GIT_WORK_TREE OVERRIDE `-C`, so a doctor that inherited either
+ * would inspect an environment-selected repository while reporting on the path
+ * it was asked about. `founderGitEnv` strips git's config-INJECTION variables
+ * and not these.
+ */
+function withoutRepositoryOverride(env) {
+  const { GIT_DIR, GIT_WORK_TREE, ...rest } = env;
+  return rest;
+}
+
 function founderRun(cwd, args, { input = null, timeout = 20_000 } = {}) {
   try {
     return { ok: true, out: execFileSync("git", ["-C", cwd, ...GIT_NEUTRALISE_FOUNDER, ...args],
       { encoding: "utf8", stdio: [input === null ? "ignore" : "pipe", "pipe", "pipe"],
-        ...(input === null ? {} : { input }), env: founderGitEnv(), timeout }).trim() };
+        ...(input === null ? {} : { input }), env: withoutRepositoryOverride(founderGitEnv()), timeout }).trim() };
   } catch (e) {
     const line = String(e.stderr || e.message).split("\n").filter(Boolean).pop() ?? "git failed";
     return { ok: false, out: "", err: line.slice(0, 140) };
@@ -1114,9 +1176,306 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
   return { id, level: OK, title, lines };
 }
 
+
+// ── R-17: what code is the daemon actually running? ───────────────────────
+//
+// STALE BY ACCIDENT AND PINNED ON PURPOSE LOOKED IDENTICAL FROM OUTSIDE, and that
+// ambiguity is the defect this answers. Measured 2026-09-02: the launchd job was
+// running a commit from three days and 43 merges earlier, and establishing that
+// took reading the plist, grepping the daemon for update logic that does not
+// exist, and comparing two checkouts by hand.
+//
+// FOUR FACTS THAT DISAGREE, and two review rounds were spent separating them:
+//
+//   the LOADED job       what launchd is running now. It caches its configuration
+//                        at bootstrap, so an edited plist does not reach a live
+//                        job. Nothing here may say "runs" without it.
+//   the INSTALLED plist  what the NEXT load will use. A difference is a finding.
+//   the STARTUP RECORD   what the live process loaded, from its own log: the
+//                        commit AND whether the tree was clean at that moment.
+//   the checkout NOW     what the next start would load. Its dirtiness describes
+//                        the tree today, never what the process holds.
+//
+// THE TREE STATE HAD TO BE RECORDED RATHER THAN INFERRED. Reading `git status`
+// here answers a question about a different moment: an edit made after startup is
+// a false alarm, and a daemon started from a dirty tree that was since reverted
+// reads clean while the process retains uncommitted code. `src/daemon.mjs` now
+// writes it at startup, where it is the only moment it can be established.
+
+const XML_ENTITIES = { "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&apos;": "'" };
+
+/** A plist string node's real value. `&` is escaped in any valid plist. */
+export function decodeXml(text) {
+  return String(text ?? "").replace(/&(?:amp|lt|gt|quot|apos);/g, (m) => XML_ENTITIES[m]);
+}
+
+/**
+ * The daemon's own startup record: the commit it loaded and the tree it loaded from.
+ *
+ * ANCHORED ON THE WHOLE LINE. A bare `running commit <sha>` matches anywhere in a
+ * shared log whose later lines carry externally influenced text -- a failing check
+ * named `running commit abcdef1` reaches the log through `describe()`, and an
+ * unanchored scan would let a check name decide what the guardian is reported to
+ * be running.
+ *
+ * `unreadable` IS A RECORD. The daemon writes that literal when its own
+ * `git rev-parse` fails, so skipping it to find an older start would attribute
+ * that start's commit to the process running now.
+ *
+ * `tree` is absent from records written by an older daemon, and absent is not
+ * clean: it becomes null, and the caller must not claim what it does not have.
+ */
+export function startupRecordFrom(logText) {
+  // ONE LINE, END TO END. Requiring the phrase was not anchoring: a decision
+  // line ENDING in `reeve daemon starting pid 5, running commit <sha>, tree
+  // clean` matched it. `log()` writes an ISO stamp first, so `^` alone is too
+  // strict; the record is `<stamp> reeve daemon starting — node <ver>, pid N,
+  // running commit <sha>[, tree <state>]` and nothing else is.
+  const re = /^\S+ reeve daemon starting — node \S+, pid (\d+), running commit (\S+?)(?:, tree (\w+))?$/gm;
+  const hits = [...String(logText ?? "").matchAll(re)];
+  if (!hits.length) return null;
+  const [, pid, commit, tree] = hits[hits.length - 1];
+  return { pid: Number(pid), commit: commit === "unreadable" ? null : commit,
+           tree: tree === undefined || tree === "unreadable" ? null : tree };
+}
+
+/**
+ * The checkout a `.../bin/reeve` argument implies, or null if none does.
+ *
+ * RESOLVED, and resolved from the JOB's working directory. launchd may invoke a
+ * symlink whose target lives in the checkout -- stripping the textual path would
+ * name `/usr/local` and report BROKEN for a healthy tree -- and a job configured
+ * as `node bin/reeve` with a WorkingDirectory has a relative argument that means
+ * nothing from wherever doctor happens to be running.
+ */
+export function checkoutFromArgs(args, { realpath = (p) => realpathSync(p), cwd = null } = {}) {
+  const bin = (args ?? []).find(a => typeof a === "string" && /(^|\/)bin\/reeve$/.test(a));
+  if (!bin) return null;
+  const absolute = bin.startsWith("/") ? bin : (cwd ? join(cwd, bin) : null);
+  if (!absolute) return null;
+  let resolved = absolute;
+  try { resolved = realpath(absolute); } catch { /* not on this machine; the path is all there is */ }
+  return /(^|\/)bin\/reeve$/.test(resolved) ? resolved.replace(/\/bin\/reeve$/, "")
+                                            : absolute.replace(/\/bin\/reeve$/, "");
+}
+
+/** ProgramArguments from a launchd plist, decoded. */
+export function programArguments(plistText) {
+  const block = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(plistText ?? "");
+  if (!block) return null;
+  return [...block[1].matchAll(/<string>([\s\S]*?)<\/string>/g)].map(m => decodeXml(m[1].trim()));
+}
+
+/** ProgramArguments as launchd currently holds them, from `launchctl print`. */
+export function loadedArguments(printOut) {
+  const block = /arguments\s*=\s*\{([\s\S]*?)\n\s*\}/.exec(String(printOut ?? ""));
+  if (!block) return null;
+  return block[1].split("\n").map(l => l.trim()).filter(Boolean);
+}
+
+/**
+ * Where the daemon writes its log, from the JOB rather than from doctor's own home.
+ *
+ * `bin/reeve` resolves it as `opt("log") ?? join(HOME, "reeve.log")`, so both the
+ * `--log` argument and the job's `REEVE_HOME` move it. Reading doctor's
+ * `resolveHome()` instead finds a stale record from another invocation, or none.
+ */
+export function daemonLogPath(args, env, fallbackHome) {
+  const i = (args ?? []).indexOf("--log");
+  if (i >= 0 && args[i + 1]) return args[i + 1];
+  // `--home` OUTRANKS the environment, because `bin/reeve` derives HOME from the
+  // flag first and only then falls back to REEVE_HOME. A job started with
+  // `--home /custom` and no `--log` writes /custom/reeve.log, and reading the
+  // environment instead finds a stale record from another invocation, or none --
+  // on which this rule refuses about a perfectly healthy daemon.
+  const h = (args ?? []).indexOf("--home");
+  const home = (h >= 0 && args[h + 1]) ? args[h + 1] : (env?.REEVE_HOME || fallbackHome);
+  return home ? join(home, "reeve.log") : null;
+}
+
+/**
+ * The job's working directory, as launchd holds it.
+ *
+ * `launchctl print` reports it as a TOP-LEVEL field -- measured:
+ *   working directory = /Users/mobeen/Work/Products/reeve
+ * and not inside the `environment` block, which is where a first version looked
+ * for a `PWD` that launchd does not set. A job configured as `node bin/reeve`
+ * with a WorkingDirectory would then resolve to nothing and a healthy
+ * deployment would be reported UNKNOWN.
+ */
+export function loadedWorkingDirectory(printOut) {
+  const m = /^\s*working directory\s*=\s*(.+)$/m.exec(String(printOut ?? ""));
+  return m ? m[1].trim() : null;
+}
+
+/** The live pid launchd reports for the job, or null when it holds none. */
+export function loadedPid(printOut) {
+  const m = /^\s*pid\s*=\s*(\d+)/m.exec(String(printOut ?? ""));
+  return m ? Number(m[1]) : null;
+}
+
+/** REEVE_HOME as launchd holds it for the job. */
+export function loadedEnvironment(printOut) {
+  const block = /environment\s*=\s*\{([\s\S]*?)\n\s*\}/.exec(String(printOut ?? ""));
+  if (!block) return {};
+  return Object.fromEntries([...block[1].matchAll(/^\s*(\w+)\s*=>\s*(.*)$/gm)].map(m => [m[1], m[2].trim()]));
+}
+
+export function checkDaemonProvenance({ run = founderRun, plist = readInstalledPlist,
+                                        launchctl = null, readLog = null, home = null,
+                                        alive = (pid) => { try { process.kill(pid, 0); return true; }
+                                                           catch (e) { return e.code === "EPERM"; } } } = {}) {
+  const id = "R-17", title = "daemon code provenance";
+  const printed = launchctl ? launchctl() : null;
+  const loaded = printed === null ? null : loadedArguments(printed);
+  const text = plist();
+
+  if (text === null && loaded === null) return { id, level: UNKNOWN, title,
+    lines: ["no launchd job is installed for reeve on this machine, and none is loaded",
+            "-> nothing runs the guardian here, so there is no code to account for"] };
+
+  // NOTHING BELOW MAY SAY "RUNS" WITHOUT A LOADED JOB. The installed file
+  // describes the next load; a plist read alone cannot establish that any daemon
+  // exists, and reporting OK from it would certify a guardian that is not there.
+  const declared = programArguments(text);
+  if (loaded === null) {
+    const where = declared ? checkoutFromArgs(declared) : null;
+    return { id, level: UNKNOWN, title,
+      lines: [printed === null
+                ? "launchctl could not be asked what is loaded"
+                : "launchctl reports no loaded job for com.revnix.reeve",
+              where ? `the installed plist would run reeve from ${where} at the next load`
+                    : "and the installed plist names no reeve checkout either",
+              "-> the file says what WOULD run; nothing here establishes that anything is running"] };
+  }
+
+  const args = loaded;
+  const env = loadedEnvironment(printed);
+  const root = checkoutFromArgs(args, { cwd: loadedWorkingDirectory(printed) ?? env.PWD ?? null });
+  if (!root) return { id, level: UNKNOWN, title,
+    // `args ?? []` so a stub that removes the loaded-job guard FAILS the
+    // assertion below rather than throwing here and taking the file with it --
+    // an assertion that never ran reads exactly like one that passed.
+    lines: [`the loaded launchd job runs ${(args ?? []).join(" ") || "(nothing)"}`,
+            "none of its arguments resolves to a path ending in bin/reeve",
+            "-> the daemon is started some other way, and this rule cannot say from where"] };
+
+  const lines = [`launchd runs reeve from ${root}`];
+  const declaredRoot = declared ? checkoutFromArgs(declared) : null;
+  if (declaredRoot && declaredRoot !== root)
+    lines.push(`the INSTALLED plist names ${declaredRoot} instead -- the job has not been reloaded since it was edited`);
+
+  const head = run(root, ["rev-parse", "HEAD"]);
+  if (!head.ok) return { id, level: BROKEN, title,
+    lines: [...lines, `that path is not a readable git checkout${head.err ? `: ${head.err}` : ""}`,
+            "-> the guardian is enforcing rules from code with no commit behind it"] };
+  // NOT "promoted": nothing on this machine records a deployment, and an earlier
+  // version called every readable HEAD a promoted commit -- including a checkout
+  // merely behind because nobody pulled.
+  lines.push(`checkout commit ${head.out.slice(0, 10)}`);
+
+  // THE SOURCE CHECKOUT'S OWN BRANCH, not the guarded repository's. `root` is
+  // derived from the reeve executable, so a profile whose project uses `develop`
+  // would have sent these probes looking for `origin/develop` in reeve's tree.
+  const symbolic = run(root, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
+  const branch = symbolic.ok && symbolic.out ? symbolic.out.replace(/^origin\//, "") : "main";
+
+  // THE JOB MUST ACTUALLY BE RUNNING, and the record must be ITS record. A job
+  // can stay loaded with its process down, and a manually started daemon writes
+  // to the same log -- so the newest startup line can belong to something else
+  // entirely, and attributing it to the launchd job can end in OK about a
+  // process that is not there.
+  // A PID launchctl STILL REPORTS MAY BE DEAD. It retains the last one after a
+  // `bootout`, and the stale startup record naturally carries that same pid --
+  // so the pid match below would agree with itself and the rule would run on to
+  // OK about a daemon that does not exist. Signal 0 asks the kernel instead.
+  const pid = loadedPid(printed);
+  if (pid !== null && !alive(pid)) return { id, level: DEGRADED, title,
+    lines: [...lines, `launchctl still reports pid ${pid}, but no such process is running`,
+            "-> the job was booted out and the record left behind; nothing is enforcing anything here"] };
+  if (pid === null) return { id, level: DEGRADED, title,
+    lines: [...lines, "the job is loaded but launchctl reports no running process",
+            "-> nothing is enforcing anything here; the commit above is what the NEXT start would load"] };
+
+  const logPath = daemonLogPath(args, env, home);
+  const record = logPath && readLog ? startupRecordFrom(readLog(logPath)) : null;
+  // AN UNREADABLE STARTUP IS NOT A HEALTHY ONE. Appending a warning and returning
+  // OK lets doctor exit healthy while admitting it cannot say what is running,
+  // which is the one thing this rule exists to answer.
+  if (record === null) return { id, level: UNKNOWN, title,
+    lines: [...lines, `no startup record could be read${logPath ? ` from ${logPath}` : ""}`,
+            "-> what the RUNNING process loaded cannot be established, so neither can its provenance"] };
+  // Optional chaining for the same reason: the guard above returns on a null
+  // record, so this only ever runs with one -- but a stub that removes that guard
+  // must reach an assertion rather than a TypeError.
+  if (record?.pid !== undefined && record.pid !== pid) return { id, level: UNKNOWN, title,
+    lines: [...lines, `launchd reports pid ${pid} but the newest startup record is pid ${record.pid}`,
+            "-> that record belongs to another process, so it says nothing about what is running here"] };
+  if (record?.commit == null) return { id, level: UNKNOWN, title,
+    lines: [...lines, "the daemon recorded its own commit as unreadable at startup",
+            "-> the process is running, and nothing says from which commit"] };
+
+  lines.push(`the running process loaded ${record.commit}` +
+             (record.tree === null ? " (an older daemon, which did not record its tree state)"
+                                   : `, from a ${record.tree} tree`));
+  // AN ABSENT TREE STATE CANNOT END IN OK. A record written before this field
+  // existed never established whether the process loaded uncommitted code --
+  // the exact fact the field was added for. Annotating the output and passing
+  // anyway asserts the reassuring half of something nobody measured.
+  if (record.tree === null) return { id, level: DEGRADED, title,
+    lines: [...lines, "-> restart the daemon on a binary that records it; until then, whether it loaded a clean tree is unknown"] };
+  // RECORDED AT STARTUP, not read now. `git status` here describes today's tree.
+  if (record.tree === "dirty") return { id, level: BROKEN, title,
+    lines: [...lines, "-> it loaded uncommitted code, so what runs is not that commit and is not any commit"] };
+
+  // THE RUNNING REVISION IS THE ONE THAT MATTERS. Returning DEGRADED for any
+  // divergence before the ancestry checks let a daemon running an unreviewed
+  // commit escape BROKEN as soon as the checkout moved to a reviewed HEAD.
+  const localRef = run(root, ["rev-parse", `origin/${branch}`]);
+  const liveRef = run(root, ["ls-remote", "origin", `refs/heads/${branch}`]);
+  const live = liveRef.ok ? (liveRef.out.split(/\s+/)[0] ?? "") : "";
+  if (!localRef.ok || !live) return { id, level: UNKNOWN, title,
+    lines: [...lines, `cannot resolve origin/${branch} to compare against${liveRef.err ? `: ${liveRef.err}` : ""}`,
+            `-> until that resolves, whether the running commit is on origin/${branch} is unknown`] };
+  if (localRef.out !== live) return { id, level: UNKNOWN, title,
+    lines: [...lines, `this checkout's origin/${branch} is ${localRef.out.slice(0, 10)} but the remote is at ${live.slice(0, 10)}`,
+            `-> fetch in ${root} and re-run; comparing against a stale ref would report reviewed code as unreviewed`] };
+
+  // TWO COUNTS RATHER THAN `merge-base --is-ancestor`, whose FALSE answer and
+  // whose FAILURE are both a non-zero exit.
+  const aheadOfRunning = run(root, ["rev-list", "--count", `origin/${branch}..${record.commit}`]);
+  if (!aheadOfRunning.ok) return { id, level: UNKNOWN, title,
+    lines: [...lines, `cannot place ${record.commit} against origin/${branch}${aheadOfRunning.err ? `: ${aheadOfRunning.err}` : ""}`,
+            "-> the running commit's provenance is unknown"] };
+  if (Number(aheadOfRunning.out) > 0) return { id, level: BROKEN, title,
+    lines: [...lines, `that commit carries ${aheadOfRunning.out} change(s) origin/${branch} has never seen`,
+            `-> the guardian is enforcing rules from code no review looked at`] };
+
+  if (!head.out.startsWith(record.commit) && !record.commit.startsWith(head.out.slice(0, record.commit.length)))
+    return { id, level: DEGRADED, title,
+      lines: [...lines, `the checkout has since moved to ${head.out.slice(0, 10)}`,
+              "-> the tree moved after the daemon started; restart it to run the code that is here"] };
+
+  const behind = run(root, ["rev-list", "--count", `${record.commit}..origin/${branch}`]);
+  if (!behind.ok) return { id, level: UNKNOWN, title,
+    lines: [...lines, `cannot measure the distance to origin/${branch}`] };
+
+  // DISTANCE IS REPORTED; INTENT IS NOT CLAIMED. An earlier version said
+  // "pinned, not drifting", asserting a decision nothing on this machine records.
+  return { id, level: OK, title,
+    lines: [...lines,
+            Number(behind.out) === 0
+              ? `which is origin/${branch}`
+              : `which is ${behind.out} commit(s) behind origin/${branch}`,
+            ...(Number(behind.out) === 0 ? [] : [
+              "being behind is not itself a fault: a guardian held at a commit you deployed is working as intended",
+              "-> but nothing here RECORDS a deployment, so a deliberate pin and an unpulled checkout read identically"])] };
+}
+
+
 // ── driver ────────────────────────────────────────────────────────────────
 
-export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null, baselineIo = {}, stateDir = null, canaryIo = {}, keychainIo = {}, reachIo = {} }) {
+export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null, baselineIo = {}, stateDir = null, canaryIo = {}, keychainIo = {}, reachIo = {}, provenanceIo = {} }) {
   const checks = [
     checkMergeAuthority(nwo),
     pluginCacheRoot ? checkArtifactDrift(pluginCacheRoot, repoPluginDir) : null,
@@ -1131,6 +1490,12 @@ export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null
     checkCanary(nwo, { stateDir, currentPolicyHash: currentPolicy(profile, { ...canaryIo, stateDir, nwo }), ...canaryIo }),
     checkKeychain({ isolation: profile.worker?.isolation, ...keychainIo }),
     checkRemoteReach(profile, reachIo),
+    // NO BRANCH FROM THE PROFILE. The profile describes the GUARDED repository,
+    // and these probes run in reeve's own source checkout -- a project on
+    // `develop` would have sent them looking for `origin/develop` in the wrong
+    // tree. R-17 asks that checkout what its own default branch is.
+    checkDaemonProvenance({ launchctl: readLoadedJob, readLog: readLogTail,
+                            home: resolveHome(), ...provenanceIo }),
   ].filter(Boolean);
 
   const broken = checks.filter(c => c.level === BROKEN);

@@ -2412,8 +2412,8 @@ export const STUBS = [
     expectRed: "a cursor from a PREVIOUS incarnation is rewound, though its (seq, at) still matches",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "     (provable\n       ? since.incarnation !== incarnation\n       : (since.seq > 0 && atOf(since.seq) !== since.at)));",
-      replace: "     (since.seq > 0 && atOf(since.seq) !== since.at));",
+      find: "        ? (since.incarnation !== incarnation ? \"restored\"",
+      replace: "        ? (false ? \"restored\"",
     }],
   },
   {
@@ -2451,13 +2451,13 @@ export const STUBS = [
   },
   {
     name: "identity-replaces-the-timestamp-rule",
-    why: "keep BOTH rules and OR them together, which is the plausible way to write this and passes every other assertion about the cursor. A log whose row clock was corrected then reports a RESTORE that never happened -- the identity matches, so the log IS the one that issued the cursor, and the timestamp half overrules the proof",
+    why: "OR the two rules together, which is the plausible way to write this and refuses the same cursors. It reports a RESTORE for a cursor whose identity MATCHES -- so the log IS the one that issued it and only the cursor is wrong -- sending an operator to hunt damage that is not there instead of to re-copy a mistyped bookmark",
     test: "test/build-dash.test.mjs",
-    expectRed: "a cursor whose identity matches is NOT rewound though its timestamp does not",
+    expectRed: "and is NEVER diagnosed as a restore, which would send an operator hunting damage that is not there",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "     (provable\n       ? since.incarnation !== incarnation\n       : (since.seq > 0 && atOf(since.seq) !== since.at)));",
-      replace: "     (provable\n       ? since.incarnation !== incarnation || (since.seq > 0 && atOf(since.seq) !== since.at)\n       : (since.seq > 0 && atOf(since.seq) !== since.at)));",
+      find: "        ? (since.incarnation !== incarnation ? \"restored\"\n           : namesAKnownEvent() ? \"ok\" : \"unknown-event\")",
+      replace: "        ? (since.incarnation !== incarnation || !namesAKnownEvent() ? \"restored\"\n           : \"ok\")",
     }],
   },
   {
@@ -2469,6 +2469,28 @@ export const STUBS = [
       file: "src/build/dash.mjs",
       find: "    if (!e?.hubDamaged) throw e;\n    incarnationDamaged = e.message;",
       replace: "    throw e;",
+    }],
+  },
+  {
+    name: "a-cursor-that-names-no-known-event-is-refused",
+    why: "trust the sequence once the incarnation matches, checking the pair no further. A paste that alters one digit of the sequence while leaving the identity intact is then accepted, and `movedSince` silently skips every transition between the real mark and the altered one -- reported as a quiet period, which is this surface's worst failure and the one it exists to prevent",
+    test: "test/build-dash.test.mjs",
+    expectRed: "a cursor carrying THIS hub's identity but naming an event it does not have is a corrupt cursor",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "           : namesAKnownEvent() ? \"ok\" : \"unknown-event\")",
+      replace: "           : \"ok\")",
+    }],
+  },
+  {
+    name: "an-unusable-cursor-is-not-always-called-ahead",
+    why: "render one sentence for every unusable cursor, the way this surface did before: `is ahead of this hub's log (it was restored)`. Three of the four verdicts are not ahead at all, and the restore this whole change exists to catch is precisely one whose sequence is INSIDE the log -- so the operator is handed a false diagnosis in the case that matters most",
+    test: "test/build-dash.test.mjs",
+    expectRed: "and the text says the cursor is wrong rather than that the hub was restored",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "    \"unknown-event\": \"does not name an event this hub has, though it carries this hub's identity — \" +\n                     \"the cursor itself is wrong rather than the log\",",
+      replace: "    \"unknown-event\": \"is ahead of this hub's log (it was restored)\",",
     }],
   },
 ];

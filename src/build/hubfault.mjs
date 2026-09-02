@@ -22,7 +22,7 @@
 // Text, not booleans, because the remedy is the product. A caller handed
 // `{ holed: true }` has to know what a hole implies, which is exactly the
 // knowledge that went missing from one of the two sites.
-import { HUB_SCHEMA_VERSION } from "./hubdb.mjs";
+import { HUB_SCHEMA_VERSION, faultKind } from "./hubdb.mjs";
 
 /**
  * The fault in a migration history, or null when there is none.
@@ -122,9 +122,25 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
              // again can help.
              detail: "its schema_version cannot be read, so which migrations it carries is unknown" +
                      (hist?.cause?.message ? ` — ${hist.cause.message}` : ""),
-             remedy: "re-run: a hub being created for the first time reads this way for an instant. " +
-                     "If it persists, the store is damaged and `reeve restore --hub --force` installs " +
-                     "the newest usable snapshot" };
+             // PERSISTENCE IS NOT DAMAGE, and this said it was. A `SQLITE_BUSY`
+             // from another process holding the file persists for exactly as long
+             // as the holder holds it, and telling the operator to force-restore
+             // then replaces a HEALTHY hub to fix a lock. The refusal that renders
+             // this already knows better -- it derives `retryable` from
+             // `faultKind` -- so the remedy was contradicting the bit beside it.
+             //
+             // `faultKind` is the same classifier, asked here rather than
+             // re-derived: an error with no SQLite errcode is the situation
+             // failing, not the file, and `hubIntegrityError` says as much in its
+             // own could-not-check branch. Damage is the only verdict that earns a
+             // restore.
+             remedy: faultKind(hist?.cause) === "operational"
+               ? "another process may hold the file, or its permissions may be wrong. Find out which " +
+                 "and re-run. Do NOT restore over it on this evidence: nothing here says the store is " +
+                 "damaged, and a restore would replace a healthy hub to fix a lock"
+               : "re-run: a hub being created for the first time reads this way for an instant. " +
+                 "If it persists, the store is damaged and `reeve restore --hub --force` installs " +
+                 "the newest usable snapshot" };
 
   // AN INVALID MARKER COMES FIRST, before the version comparison. `schema_version`
   // is an INTEGER PRIMARY KEY, so a hand-edited `-1` is valid SQLite -- and a store

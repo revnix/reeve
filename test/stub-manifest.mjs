@@ -2223,8 +2223,8 @@ export const STUBS = [
     test: "test/hub-fault.test.mjs",
     expectRed: "told to look again before concluding damage",
     edits: [{ file: "src/build/hubfault.mjs",
-              find: "             remedy: \"re-run: a hub being created for the first time reads this way for an instant. \" +",
-              replace: "             remedy: \"restore a snapshot (`reeve restore --hub --force`), then retry\" || \"\" +" }],
+              find: "             remedy: faultKind(hist?.cause) === \"operational\"",
+              replace: "             remedy: false" }],
   },
   {
     name: "a-gap-above-the-known-range-is-still-a-gap",
@@ -2279,5 +2279,14 @@ export const STUBS = [
     edits: [{ file: "bin/reeve",
               find: "            fail(\"hub_unreadable\", said, { exit: EXITS.refused, retryable: false });",
               replace: "            fail(\"hub_unreadable\", said, { exit: EXITS.refused, retryable: faultKind(hist.cause) === \"operational\" });" }],
+  },
+  {
+    name: "a-lock-is-not-damage",
+    why: "send every unreadable history to the restore, whatever made it unreadable. A SQLITE_BUSY from another process holding the file persists for exactly as long as the holder holds it, so `if it persists, the store is damaged` is false for it -- and force-restoring then replaces a HEALTHY hub to fix a lock. The refusal that renders this already derives `retryable` from `faultKind`, so a remedy ignoring the cause contradicted the bit printed beside it",
+    test: "test/hub-fault.test.mjs",
+    expectRed: "unreadable because something HOLDS the file is never sent to a restore",
+    edits: [{ file: "src/build/hubfault.mjs",
+              find: "             remedy: faultKind(hist?.cause) === \"operational\"",
+              replace: "             remedy: false" }],
   },
 ];

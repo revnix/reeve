@@ -2445,8 +2445,8 @@ export const STUBS = [
     expectRed: "a body that cannot serialise is refused with its own kind, not a constraint error",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "  try { text = JSON.stringify(cleaned); }\n  catch { text = undefined; }",
-      replace: "  try { text = JSON.stringify(cleaned); }\n  catch { text = \"{}\"; }",
+      find: "      throw refuse(\"escalation_body_shape\",\n        \"an escalation body must serialise to JSON; this one is circular.",
+      replace: "      return null; refuse(\"escalation_body_shape\",\n        \"an escalation body must serialise to JSON; this one is circular.",
     }],
   },
   {

@@ -10,6 +10,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import { openHub } from "../src/build/hubdb.mjs";
 import { escalationKey } from "../src/build/announce.mjs";
 import { machineProfile, machineProfilePath, pageStandingCauses } from "../src/build/paging.mjs";
@@ -31,6 +32,7 @@ const freshHome = () => {
   return home;
 };
 const hubOf = (home) => openHub(join(home, "state", "hub.db"));
+const CLI = fileURLToPath(new URL("../bin/reeve", import.meta.url));
 const KEY = escalationKey({ kind: "backup:failed" });
 const raise = (db, why, count, at) => db.prepare(
   `INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count)
@@ -171,13 +173,67 @@ const raise = (db, why, count, at) => db.prepare(
   ddb.close();
 }
 
+// ── a refused CHANNEL is reported, not just a missing profile ──────────────
+//
+// `deliverable` says only that a profile object loaded. A configured channel that
+// REFUSES -- no credential, server down -- comes back in `declined`, and the loop
+// once read presence instead of the verdict: it printed nothing, the page stayed
+// owed, and it was retried every heartbeat with no line saying why.
+{
+  const home = freshHome(), db = hubOf(home);
+  raise(db, KEY, 1, NOW);
+  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: { provider: "ntfy" } }));
+  const r = pageStandingCauses(db, { home, at: NOW, isAlive: ALIVE });
+  check(r.deliverable === true,
+    "control: a profile IS loaded here, so presence alone would have reported success",
+    JSON.stringify({ deliverable: r.deliverable, why: r.why }));
+  check(r.declined.length === 1,
+    "yet the send is DECLINED, which is the fact the log has to carry",
+    JSON.stringify(r.declined));
+  check(typeof r.declined[0]?.not_sent === "string" && r.declined[0].not_sent.length > 0,
+    "and it carries a reason, so the line the loop prints can name the channel's failure",
+    JSON.stringify(r.declined[0]?.not_sent));
+  check(db.prepare("SELECT announced_count FROM escalation WHERE why=?").get(KEY).announced_count === 0,
+    "control: and the page is still owed, so silence here would hide a retry loop",
+    JSON.stringify(db.prepare("SELECT announced_count FROM escalation WHERE why=?").get(KEY)));
+  db.close();
+}
+
+// ── `builder doctor` actually emits H-14, which the unit rows cannot show ───
+//
+// Every H-14 assertion above calls `hubFindings` directly and passes `paging`.
+// All of them pass on a repository where the doctor ROUTE omits it -- and it did,
+// so the row was written to fail on a machine that can page nobody and could not
+// reach the one command that reports it. The finding existed, was tested, and was
+// unmounted.
+{
+  const home = freshHome();
+  hubOf(home).close();
+  writeFileSync(join(home, "projects.json"), "{}");
+  const r = spawnSync(process.execPath, [CLI, "builder", "doctor", "--home", home, "--json"],
+    { encoding: "utf8", timeout: 60_000 });
+  const out = (r.stdout ?? "") + (r.stderr ?? "");
+  let h14 = null, parsed = null;
+  try { parsed = JSON.parse(r.stdout || "null"); } catch { parsed = null; }
+  if (Array.isArray(parsed)) h14 = parsed.find(x => x.id === "H-14") ?? null;
+  check(Array.isArray(parsed) && parsed.length > 0,
+    "control: the command produced a findings array, so a missing H-14 is a missing ROW",
+    out.slice(0, 200));
+  check(h14 !== null, "`builder doctor` emits an H-14 row at all", out.slice(0, 300));
+  check(h14?.severity === "fail",
+    "and it FAILS on a machine with no notify profile, rather than reporting it unprobed",
+    JSON.stringify(h14));
+  check(/profile\.json/.test(h14?.action ?? ""),
+    "naming where to write the profile", String(h14?.action));
+}
+
 // ── the wiring exists, which no unit test above can see ─────────────────────
 //
 // Every assertion so far calls `pageStandingCauses` directly. All of them pass
 // on a repository where `bin/reeve` never invokes it -- which is precisely the
 // state this change exists to end.
 {
-  const cli = readFileSync(fileURLToPath(new URL("../bin/reeve", import.meta.url)), "utf8");
+  const cli = readFileSync(CLI, "utf8");
   check(/\bpageStandingCauses\b/.test(cli) && /build\/paging\.mjs/.test(cli),
     "bin/reeve imports pageStandingCauses from build/paging.mjs");
   const runRoute = cli.slice(cli.indexOf("const tick = await buildTick"));

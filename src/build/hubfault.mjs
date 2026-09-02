@@ -61,10 +61,23 @@ import { HUB_SCHEMA_VERSION } from "./hubdb.mjs";
  * property of WHICH fault was diagnosed; it is a property of the STORE, so it is
  * asked once here and every damage branch consults it.
  *
- * `aheadOfUs` is `hist.version > expect`: the one fact that decides whether the
- * plain command can run at all.
+ * `plainRestoreRefused` is the question, not one of its causes. There are two so
+ * far -- a store recording a version above this binary's, and a `schema_version`
+ * marker outside JavaScript's safe integer range, which `restoreHub` re-reads the
+ * same way and refuses with the same error. Both were found the same way: a
+ * remedy that read correctly and could not be executed.
  */
-const restoreAdvice = (aheadOfUs) => aheadOfUs
+/**
+ * Is this failure a marker no reader can represent?
+ *
+ * By CODE first, since that is what `node:sqlite` sets, with the message as a
+ * fallback for a cause that arrived wrapped. Not by `instanceof RangeError`: a
+ * cause that crossed a module boundary can fail that while carrying the code.
+ */
+const outOfRange = (cause) =>
+  cause?.code === "ERR_OUT_OF_RANGE" || /too large to be represented/i.test(cause?.message ?? "");
+
+const restoreAdvice = (plainRestoreRefused) => plainRestoreRefused
   ? "no binary will repair this in place: a restore refuses a store recording a newer version, " +
     "and a newer binary refuses a history it cannot read. Stop the daemon, move the hub aside -- " +
     "`hub.db` AND `hub.db-wal` AND `hub.db-shm`, together, since a WAL database is all three and " +
@@ -85,6 +98,23 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
   // So the refusal stands -- nothing may proceed against a history it cannot read
   // -- and the remedy is to look again before concluding anything. A restore is
   // named only as what a PERSISTENT failure earns.
+  // A MARKER NO READER CAN HOLD IS NOT A TRANSIENT VIEW. `schema_version` is an
+  // INTEGER PRIMARY KEY, so a value beyond JavaScript's safe range is valid
+  // SQLite -- and `node:sqlite` throws ERR_OUT_OF_RANGE reading it. Re-running
+  // cannot help, because the value is the fault; and the plain restore cannot
+  // help either, because `restoreHub` reads versions the same way.
+  //
+  // MEASURED, in both directions: a hub carrying 9223372036854775807 makes
+  // `migrationStateOf` answer unreadable with that cause, `restoreHub` refuses it
+  // with "could not be examined (Value is too large...)", and moving all three
+  // files aside and restoring then SUCCEEDS, leaving a hub at version 5 with the
+  // evidence beside it.
+  if (hist?.readable !== true && outOfRange(hist?.cause))
+    return { kind: "unreadable-marker",
+             detail: "its schema_version holds a value no reader can represent " +
+                     `(${hist.cause.message}), so the migration history cannot be read at all`,
+             remedy: restoreAdvice(true) };
+
   if (!hist || hist.readable !== true)
     return { kind: "unreadable",
              detail: "its schema_version cannot be read, so which migrations it carries is unknown",

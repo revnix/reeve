@@ -67,7 +67,12 @@ const check = (ok, name, detail) => {
   // A bare `running commit <sha>` matches anywhere in a shared log whose later
   // lines carry externally influenced text -- a GitHub check named
   // "running commit abcdef1" reaches the log through describe().
-  check(startupRecordFrom(`${LINE(5, "aaaaaaa")}\ncheck failed: running commit deadbee`)?.commit === "aaaaaaa",
+  // THE INJECTED LINE MUST CARRY THE SHAPE THE LOOSE PATTERN WOULD MATCH.
+  // A first version wrote `check failed: running commit deadbee`, which has no
+  // `pid N,` -- so an unanchored `pid (\d+), running commit (\S+)` did not match
+  // it either and the fixture passed with the anchor removed. The stub sweep
+  // reported NOT_CAUGHT; a fixture that cannot exhibit the defect proves nothing.
+  check(startupRecordFrom(`${LINE(5, "aaaaaaa")}\ncheck failed: build at pid 999, running commit deadbee`)?.commit === "aaaaaaa",
     "a later line merely CONTAINING the phrase is not read as a startup record");
 
   check(startupRecordFrom("") === null, "an empty log answers null rather than a value");

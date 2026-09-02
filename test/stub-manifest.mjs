@@ -2020,8 +2020,8 @@ export const STUBS = [
     expectRed: "the row is NOT marked announced, because nothing was announced",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "                    VALUES(?,?,?,?,0)`).run(why, count, at, at);",
-      replace: "                    VALUES(?,?,?,?,?)`).run(why, count, at, at, count);",
+      find: "                    VALUES(?,?,?,?,0,?)`).run(why, count, at, at, serialiseBody(bodies?.get(why)));",
+      replace: "                    VALUES(?,?,?,?,?,?)`).run(why, count, at, at, count, serialiseBody(bodies?.get(why)));",
     }],
   },
   {
@@ -2177,8 +2177,8 @@ export const STUBS = [
     test: "test/hub-incarnation.test.mjs",
     expectRed: "a freshly created hub carries an incarnation",
     edits: [{ file: "src/build/hubdb.mjs",
-              find: "      mintIncarnation(db);\n    } },\n];",
-              replace: "    } },\n];" }],
+              find: "      mintIncarnation(db);\n",
+              replace: "" }],
   },
   {
     name: "incarnation-row-is-unique",

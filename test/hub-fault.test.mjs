@@ -42,6 +42,12 @@ const TABLE = [
   { name: "a gap ABOVE this binary's range is still not a newer hub",
     h: hist({ have: [1, 2, 3, 4, 5, 7], holed: true, version: 7 }), kind: "ahead-and-holed",
     why: "missing is about 1..expect and reports none here, so only `holed` sees the gap at 6" },
+  { name: "a marker no reader can represent is not a transient view",
+    h: { readable: false, missing: [], have: [], holed: false, invalid: [], version: 0,
+         cause: Object.assign(new Error("Value is too large to be represented as a JavaScript number: 9223372036854775807"),
+                              { code: "ERR_OUT_OF_RANGE" }) },
+    kind: "unreadable-marker",
+    why: "re-running cannot help because the value IS the fault, and restoreHub reads versions the same way" },
   { name: "an unreadable history is its own answer",
     h: { readable: false, missing: [], have: [], holed: false, invalid: [], version: 0 }, kind: "unreadable" },
 ];
@@ -49,8 +55,8 @@ for (const row of TABLE) {
   const got = kindOf(row.h);
   check(got === row.kind, row.name, `got ${got}, expected ${row.kind}${row.why ? ` — ${row.why}` : ""}`);
 }
-check(new Set(TABLE.map(r => r.kind)).size === 7 && TABLE.length === 8,
-  "control: eight rows over seven DISTINCT answers, so it is not asserting one branch eight times",
+check(new Set(TABLE.map(r => r.kind)).size === 8 && TABLE.length === 9,
+  "control: nine rows over eight DISTINCT answers, so it is not asserting one branch nine times",
   [...new Set(TABLE.map(r => r.kind))].join(","));
 
 // ── the remedies that must NOT be given ──────────────────────────────────────
@@ -65,6 +71,22 @@ check(new Set(TABLE.map(r => r.kind)).size === 7 && TABLE.length === 8,
     `it is not broken -- this binary is old -- so an older snapshot discards what the newer one wrote: ${ahead.remedy}`);
   check(/newer binary/.test(ahead.remedy),
     "control: and it is told to run the newer binary instead", ahead.remedy);
+
+  // THE OUT-OF-RANGE MARKER GETS THE RUNNABLE FORM, and "runnable" here is
+  // measured rather than argued. A hub carrying 9223372036854775807 makes
+  // `restoreHub` refuse with "could not be examined (Value is too large...)", and
+  // moving all three files aside and restoring then succeeds, leaving a hub at the
+  // current version with the evidence beside it.
+  const marker = historyFault({ readable: false, missing: [], have: [], holed: false, invalid: [], version: 0,
+                                cause: Object.assign(new Error("Value is too large to be represented as a JavaScript number: 1"),
+                                                     { code: "ERR_OUT_OF_RANGE" }) },
+                              { expect: EXPECT });
+  check(/move the hub aside/.test(marker.remedy),
+    "an out-of-range marker is told to move the store aside, because the restore reads it the same way",
+    marker.remedy);
+  check(!/^re-run/.test(marker.remedy),
+    "control: and is NOT told to re-run, because the value is the fault rather than a moment in time",
+    marker.remedy);
 
   const unreadable = historyFault({ readable: false, missing: [], have: [], holed: false, invalid: [], version: 0 },
                                   { expect: EXPECT });

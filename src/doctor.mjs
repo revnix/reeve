@@ -1170,7 +1170,8 @@ export function render({ verdict, checks }, nwo) {
 export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), snapshotFor,
                                   newestCandidate = () => null,
                                   freshMinutes = 60, snapshotMaxHours = 24, offDevice = null,
-                                  projects = [], projectsKnown = false }) {
+                                  projects = [], projectsKnown = false,
+                                  paging = null }) {
   const out = [];
   const snap = snapshotFor("hub");
   if (!snap) {
@@ -1310,6 +1311,33 @@ export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), sna
         title: "no off-device copy is configured",
         detail: "same-disk snapshots only; this machine is still a single point of failure",
         action: "choose a destination (LAN machine, NAS or external disk; never cloud, never a git repository)" });
+
+  // H-14: CAN THIS MACHINE PAGE ANYONE AT ALL. Every escalation the builder
+  // raises is written to the hub and then offered to the machine's notify
+  // profile; with no profile there is no channel, and the alarms accumulate
+  // silently. That is the worst shape an alarm system takes, because it is
+  // indistinguishable from having nothing to report -- so it is a FAIL rather
+  // than a warn, and it names the standing count so the cost of the gap is
+  // visible rather than abstract.
+  //
+  // `null` means NOT PROBED, and is reported as such rather than as a pass.
+  if (paging !== null) {
+    out.push(paging.deliverable
+      ? { id: "H-14", severity: "pass", classification: "configuration",
+          title: "the machine can page: a notify profile is configured",
+          detail: paging.path, action: null }
+      : { id: "H-14", severity: "fail", classification: "configuration",
+          title: paging.standing
+            ? `${paging.standing} standing escalation(s) can reach nobody`
+            : "no builder alarm could reach anyone",
+          detail: paging.why,
+          action: `write a notify block to ${paging.path}` });
+  } else {
+    out.push({ id: "H-14", severity: "warn", classification: "unknown",
+      title: "whether this machine can page anyone was not probed",
+      detail: "no paging state was supplied to hubFindings, so this says nothing either way",
+      action: null });
+  }
 
   // A held lease whose holder is gone still occupies a slot until something reaps
   // it, and a scheduler full of dead holders looks exactly like a busy one.

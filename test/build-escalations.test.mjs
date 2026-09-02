@@ -1067,6 +1067,15 @@ const freshHub = () => {
     JSON.stringify(msg));
   check(!/ghp_A{20,}/.test(msg) && /redacted/.test(msg),
     "and a credential shape is redacted rather than sent", JSON.stringify(msg));
+  // WHICH LAYER DID IT, said out loud. The body is scrubbed where it is STORED,
+  // with the same SECRETS list, so the credential is already gone before an alert
+  // is assembled -- `redact` here is defence in depth for this path rather than
+  // the only barrier, and an assertion that cannot tell them apart would report
+  // one layer's work as the other's.
+  check(!/ghp_A{20,}/.test(
+    hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? ""),
+    "control: and it was already gone from the STORED body, which is the first layer",
+    hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null);
   // CONTROL: sanitising is not deleting. The parts that are not dangerous still
   // arrive, or an operator gets a clean message that says nothing.
   check(/line one/.test(msg) && /FAILED/.test(msg),
@@ -1091,7 +1100,11 @@ const freshHub = () => {
                   bodies: new Map([[key, huge]]) });
   const msg = sent[0]?.message ?? "";
   check(/truncated/.test(msg),
-    "control: the body really is long enough to be truncated", String(msg.length));
+    "the outbound message is capped, which is what the alert boundary still uniquely applies",
+    JSON.stringify({ length: msg.length, tail: msg.slice(-40) }));
+  check(msg.length < 2000,
+    "control: and it is genuinely shorter than the body it carried, so the cap did the work",
+    JSON.stringify({ message: msg.length, body: 2000 }));
   check(/reeve task why bt:0C/.test(msg),
     "and the action still arrives, because it is above the detail rather than after it",
     JSON.stringify(msg.slice(0, 200)));
@@ -1277,12 +1290,14 @@ const freshHub = () => {
   const stored = hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null;
   check(typeof stored === "string", "the report is stored on the row, not only sent",
     JSON.stringify(stored));
-  check(JSON.stringify(JSON.parse(stored)) === JSON.stringify(b),
-    "and round-trips as the same value", String(stored));
+  const roundTrip = attempt(() => JSON.stringify(JSON.parse(stored)));
+  check(roundTrip.value === JSON.stringify(b),
+    "and round-trips as the same value", JSON.stringify({ stored, threw: roundTrip.kind }));
 
   // IN THE ROW IMAGE, or a restore empties the column while reporting success.
-  const image = JSON.parse(hub.prepare(
-    "SELECT payload FROM hub_event WHERE kind='escalation.raised' ORDER BY seq DESC LIMIT 1").get().payload);
+  const imageRow = hub.prepare(
+    "SELECT payload FROM hub_event WHERE kind='escalation.raised' ORDER BY seq DESC LIMIT 1").get();
+  const image = attempt(() => JSON.parse(imageRow?.payload ?? "null")).value ?? {};
   check(image.body === stored,
     "and rides in the escalation.raised image, so a replay restores what the alert said",
     JSON.stringify(image.body));
@@ -1565,10 +1580,11 @@ const freshHub = () => {
   announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
                   send: () => ({ ok: true, channels: [{ name: "t", ok: true }] }),
                   bodies: new Map([[key, { type: "FAILED", [`k${A}`]: "first", [`k${B}`]: "second" }]]) });
-  const stored = JSON.parse(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body);
-  const values = Object.values(stored).filter(v => v === "first" || v === "second");
+  const storedRow = hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null;
+  const stored = attempt(() => JSON.parse(storedRow)).value;
+  const values = Object.values(stored ?? {}).filter(v => v === "first" || v === "second");
   check(values.length === 2,
-    "both values survive a key collision, under distinct names", JSON.stringify(stored));
+    "both values survive a key collision, under distinct names", JSON.stringify(storedRow));
 }
 
 // ── toJSON is the SERIALISER's to call, and it calls it once ────────────────

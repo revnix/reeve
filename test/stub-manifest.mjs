@@ -2071,9 +2071,9 @@ export const STUBS = [
   },
   {
     name: "an-alert-is-sanitised-before-it-leaves-the-machine",
-    why: "assemble the outbound message without `redact`. The boundary is two properties, not one, and this is the half that neutralises SECRET SHAPES and applies the length cap — a credential echoed into CI output then leaves the machine in a notification. `buildAlert` applies it and `notify` itself does not, so a second producer of alerts is a second place it has to be applied. The control-character half lives in the per-part `clean`, which is why this entry names the redaction assertion and not the escaping one",
+    why: "assemble the outbound message without `redact`. It carries two properties -- neutralising secret SHAPES, and the length cap -- and the entry now names the CAP, because the first is no longer this boundary's alone: the body is scrubbed where it is stored, with the same SECRETS list, so a credential is gone before an alert is assembled and removing this one no longer exposes it. The cap is not applied there and must not be, since truncating a durable report destroys what it protects. An uncapped alert reaches a phone as a wall of CI output with the action somewhere inside it. The control-character half lives in the per-part `clean`, which is why this names neither escaping nor redaction",
     test: "test/build-escalations.test.mjs",
-    expectRed: "and a credential shape is redacted rather than sent",
+    expectRed: "the outbound message is capped, which is what the alert boundary still uniquely applies",
     edits: [{
       file: "src/build/announce.mjs",
       find: "    const message = redact(raw);",
@@ -2110,8 +2110,8 @@ export const STUBS = [
     expectRed: "and no placeholder survives into something a founder is asked to run",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "  return subject === null ? action : action.replaceAll(\"<id>\", subject);",
-      replace: "  return action;",
+      find: "  const named = subject === null ? action : action.replaceAll(\"<id>\", subject);",
+      replace: "  const named = action;",
     }],
   },
   {
@@ -2755,7 +2755,7 @@ export const STUBS = [
     edits: [{
       file: "src/build/dash.mjs",
       find: "  if (m.cursor_proof === \"timestamp\" && m.incarnation !== null)",
-      replace: "  if (m.cursor_proof === \"timestamp\")",
+      replace: "  if (m.cursor_proof === \"timestamp\" || m.incarnation === null)",
     }],
   },
   {
@@ -3101,5 +3101,159 @@ export const STUBS = [
     edits: [{ file: "src/build/run.mjs",
               find: " AND lease_expires_at > ?`)",
               replace: "`)" }],
+  },
+  {
+    name: "a-standing-cause-is-actually-paged",
+    why: "remove the call from the heartbeat loop, which is the state this whole change ends. Every unit assertion about the pass still passes -- they call it directly -- while nothing in production invokes it, so escalations accumulate in the hub and reach nobody. An alarm system nothing reads is indistinguishable from a system with nothing to report",
+    test: "test/build-paging.test.mjs",
+    expectRed: "and calls it in the heartbeat loop, after the tick",
+    edits: [{
+      file: "bin/reeve",
+      find: "        const p = pageStandingCauses(db, { home: HOME });",
+      replace: "        const p = { deliverable: true, standing: 0, paged: [], why: null };",
+    }],
+  },
+  {
+    name: "an-undeliverable-page-is-held-not-lost",
+    why: "skip the pass when no profile is configured, rather than running it with a sender that refuses by name. `announce` leaves announced_count at 0 for a refused page, so every cause standing while no channel exists is delivered by the first pass after one is configured -- and skipping the pass loses both that and the record that it could not be made",
+    test: "test/build-paging.test.mjs",
+    expectRed: "and the cause is DECLINED rather than dropped",
+    edits: [{
+      file: "src/build/paging.mjs",
+      find: "  const sender = send ?? (alert => (profile ? notify({ profile, alert }) : { ok: false, why }));",
+      replace: "  const sender = send ?? (() => ({ ok: true, channels: [{ name: \"none\", ok: true, ref: \"x\" }] }));",
+    }],
+  },
+  {
+    name: "the-survey-covers-every-standing-cause",
+    why: "survey only the rows this pass has not yet announced, which reads like an optimisation and is not one. A cause becomes a CLEARING CANDIDATE by being absent from the pass's map while standing in the hub, so any filter here quietly turns already-announced causes into candidates -- and the only thing then between that and announcing `resolved` for something nobody examined is `examined: null`, one guard deep",
+    test: "test/build-paging.test.mjs",
+    expectRed: "the pass surveys EVERY standing row, so no cause can quietly become a clearing candidate",
+    edits: [{
+      file: "src/build/paging.mjs",
+      find: "  const rows = db.prepare(\"SELECT why, count FROM escalation ORDER BY first_seen_at, why\").all();",
+      replace: "  const rows = db.prepare(\"SELECT why, count FROM escalation WHERE announced_count = 0 ORDER BY first_seen_at, why\").all();",
+    }],
+  },
+  {
+    name: "an-unprobed-paging-state-is-not-a-pass",
+    why: "report a machine whose paging was never probed as healthy. `null` means NOT PROBED on every other input to this surface, and answering it as a pass is the instrument reporting a smaller question as success -- exactly the shape the doctor exists to avoid",
+    test: "test/build-paging.test.mjs",
+    expectRed: "an unprobed paging state is reported as UNKNOWN rather than as healthy",
+    edits: [{
+      file: "src/doctor.mjs",
+      find: "    out.push({ id: \"H-14\", severity: \"warn\", classification: \"unknown\",",
+      replace: "    out.push({ id: \"H-14\", severity: \"pass\", classification: \"configuration\",",
+    }],
+  },
+  {
+    name: "the-machine-cannot-page-is-a-failure",
+    why: "report a machine that can reach nobody as a warning. A standing alarm with no channel is indistinguishable from having nothing to report, which is the worst shape an alarm system takes -- a warn is what an operator scrolls past",
+    test: "test/build-paging.test.mjs",
+    expectRed: "H-14 FAILS when no alarm could reach anyone",
+    edits: [{
+      file: "src/doctor.mjs",
+      find: "      : { id: \"H-14\", severity: \"fail\", classification: \"configuration\",",
+      replace: "      : { id: \"H-14\", severity: \"warn\", classification: \"configuration\",",
+    }],
+  },
+  {
+    name: "delivering-is-not-observing",
+    why: "let the delivery pass record an observation for every row it re-reads. It has seen nothing -- the rows came from the table -- so `last_seen_at` moves forward on every heartbeat and a condition observed once reads as continuously present, which is the one fact that column carries. It also appends a row image per standing cause per pass: at a 2.5-minute cadence, hundreds of events a day for a log that recorded one event",
+    test: "test/build-paging.test.mjs",
+    expectRed: "five delivery passes do not move last_seen_at, because none of them saw the cause",
+    edits: [{
+      file: "src/build/paging.mjs",
+      find: "                                examined: null, observe: false, budgetMs,",
+      replace: "                                examined: null, budgetMs,",
+    }],
+  },
+  {
+    name: "a-notify-block-is-not-a-channel",
+    why: "treat the presence of a `notify` block as deliverability. `{ \"notify\": {} }` parses and configures nothing -- notify builds no channels and declines every page -- so the doctor reports a machine that can reach NOBODY as healthy, which is the one assurance H-14 exists to withhold",
+    test: "test/build-paging.test.mjs",
+    expectRed: "an empty notify block is not deliverable, so the doctor cannot report it as healthy",
+    edits: [{
+      file: "src/build/paging.mjs",
+      find: "  if (!usable)",
+      replace: "  if (false)",
+    }],
+  },
+  {
+    name: "one-pass-cannot-block-the-heartbeat",
+    why: "send the whole backlog in one pass. Sending is synchronous and ONE notify call sends on every configured channel in turn, so a page against two dead channels costs two 8-second timeouts -- and `build run` calls this inline before its sleep, so a deep backlog stalls the loop past the 120-second singleton lease and the daemon can lose the authority it holds while waiting to finish paging",
+    test: "test/build-paging.test.mjs",
+    expectRed: "one pass stops when its time budget is spent, whatever the backlog",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    if (attempted >= limit || spent() >= budgetMs) continue;\n",
+      replace: "",
+    }],
+  },
+  {
+    name: "a-pasted-action-reaches-the-hub-it-is-about",
+    why: "render the action without the home it concerns. The command is meant to be pasted, and pasted outside the daemon's environment a bare `reeve task why bt:...` resolves the DEFAULT home -- so an operator whose daemon runs with --home inspects a different hub, where the likeliest answer is that the task does not exist. An alert that sends someone to the wrong store is worse than one carrying no command, because they will believe what they find",
+    test: "test/build-paging.test.mjs",
+    expectRed: "the action names the home the alert is about, so the pasted command reaches THIS hub",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  if (!home) return named;",
+      replace: "  return named; if (!home) return named;",
+    }],
+  },
+  {
+    name: "a-credential-is-part-of-the-channel",
+    why: "call an ntfy channel usable without a readable credential. `notify` refuses to publish to an unauthenticated topic deterministically, so that channel declines EVERY send while the doctor reports the machine able to page -- the same false assurance an empty notify block gave, one field deeper",
+    test: "test/build-paging.test.mjs",
+    expectRed: "ntfy with no credentialFile is not deliverable, so the doctor cannot report it as healthy",
+    edits: [{
+      file: "src/build/paging.mjs",
+      find: "  const usable = (ntfy && credential !== null) || desktop;",
+      replace: "  const usable = ntfy || desktop;",
+    }],
+  },
+  {
+    name: "a-pasted-action-is-one-shell-command",
+    why: "append the home to the action STRING. Every action is `<command> — <why it matters>`, so the argument lands after the prose and no shell will take it -- a fix for pasteability that destroys it. The command up to the em dash has to run on its own",
+    test: "test/build-paging.test.mjs",
+    expectRed: "and it sits in the COMMAND rather than after the prose, which no shell would accept",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  return cut === -1 ? named + arg : named.slice(0, cut) + arg + named.slice(cut);",
+      replace: "  return named + arg;",
+    }],
+  },
+  {
+    name: "a-home-with-a-space-stays-one-argument",
+    why: "interpolate the home unquoted. A path containing a space -- an external volume, most obviously -- splits into two words, so `--home` consumes only the first and the command SUCCEEDS against a different hub. That is worse than failing: the likeliest answer there is that the task does not exist, and an operator will believe it",
+    test: "test/build-paging.test.mjs",
+    expectRed: "the home is quoted, so a path containing a space stays one argument",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  const arg = ` --home ${shellQuote(home)}`;",
+      replace: "  const arg = ` --home ${home}`;",
+    }],
+  },
+  {
+    name: "a-bounded-queue-does-not-starve-its-tail",
+    why: "read the standing set in a fixed order under a bounded budget. The same head is attempted every pass, so causes whose sender permanently rejects them consume the whole budget for ever and a later cause that WOULD deliver is never attempted -- it stays owed while the log reports work being done. Ordering by first_seen_at makes that deterministic rather than unlikely",
+    test: "test/build-paging.test.mjs",
+    expectRed: "every owed cause is attempted across passes, so a permanently refused head cannot starve the tail",
+    edits: [{
+      file: "src/build/paging.mjs",
+      find: "  const escalations = new Map(rotated(rows, rotate).map(r => [r.why, r.count]));",
+      replace: "  const escalations = new Map(rows.map(r => [r.why, r.count]));",
+    }],
+  },
+  {
+    name: "a-desktop-channel-only-exists-where-it-can-run",
+    why: "count a desktop channel as usable on every platform. `postViaOsascript` executes osascript, which is macOS-only, so `{ desktop: true }` on Linux or Windows is a valid-looking configuration whose every send fails with ENOENT -- and reeve is required to run on all three. It is the one unusable shape a config file cannot reveal, so the doctor claiming those machines can page is a false assurance nothing else corrects",
+    test: "test/build-paging.test.mjs",
+    expectRed: "control: deliverability of a desktop-only profile tracks the platform, on either platform",
+    edits: [{
+      file: "src/build/paging.mjs",
+      find: "  const desktop = cfg.desktop === true && process.platform === \"darwin\";",
+      replace: "  const desktop = cfg.desktop === true && process.platform !== \"darwin\";",
+    }],
   },
 ];

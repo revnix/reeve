@@ -482,7 +482,8 @@ export function assertHub(db) {
  * @returns {{fresh: {why: string, count: number}[], cleared: string[]}}
  */
 export function builderAnnounceable(db, escalations, {
-  at = Math.floor(Date.now() / 1000), isAlive, examined = null, bodies = null } = {}) {
+  at = Math.floor(Date.now() / 1000), isAlive, examined = null, bodies = null,
+  observe = true } = {}) {
   assertHub(db);
   // EXPLICIT, never defaulted. `assertWritable` reads the restore lock and asks
   // whether its holder is alive; a predicate that always answered true would
@@ -502,6 +503,25 @@ export function builderAnnounceable(db, escalations, {
 
     for (const [why, count] of escalations) {
       const prev = standing.get(why);
+      // A DELIVERY PASS IS NOT AN OBSERVATION. A caller that re-reads the
+      // standing rows and hands them back has SEEN nothing -- it has no evidence
+      // the cause is still true, only that nobody retired it. Recording that as a
+      // sighting moves `last_seen_at` forward on every pass, so a condition
+      // observed once reads as continuously present, and appends a row image per
+      // standing cause per pass: at a heartbeat cadence, hundreds of events a day
+      // for a log that recorded one.
+      //
+      // So `observe: false` writes nothing ABOUT the cause and decides only what
+      // is owed. Marking an announcement is still a write and still happens,
+      // because that is what such a pass actually did.
+      if (!observe) {
+        // A survey of the standing rows cannot DISCOVER a cause: everything it
+        // holds came from the table. A key that is not standing is a caller error
+        // rather than an arrival, and inventing a row for it would record an
+        // observation this pass certainly did not make.
+        if (prev && prev.announced_count !== count) fresh.push({ why, count });
+        continue;
+      }
       if (!prev) {
         // ANNOUNCED_COUNT 0: RAISED, NOT YET ANNOUNCED. Writing `count` here
         // claimed the announcement before anything had been sent, so a page the
@@ -670,11 +690,48 @@ export const ACTION_FOR = Object.freeze({
  * command they cannot paste -- under a shell `<id>` is input redirection -- and
  * makes them reconstruct the very identifier the alert is holding.
  */
-export const actionFor = (key) => {
+/**
+ * A path as one shell word, whatever is in it.
+ *
+ * A PASTED COMMAND IS RUN BY A SHELL, so a home containing a space -- an external
+ * volume, most obviously -- splits into two arguments and `--home` takes the
+ * first. The command then succeeds against a different hub, which is worse than
+ * failing: the likeliest answer there is that the task does not exist, and an
+ * operator will believe it.
+ *
+ * Single quotes with the `'\''` escape, because a POSIX shell reads everything
+ * between them literally and that idiom is the only way to include the quote
+ * itself. Nothing in a pathname can end the quoting or be re-interpreted.
+ */
+const shellQuote = (s) => `'${String(s).replaceAll("'", "'\\''")}'`;
+
+export const actionFor = (key, { home = null } = {}) => {
   const action = ACTION_FOR[shapeOf(key)] ?? null;
   if (action === null) return null;
   const subject = subjectOf(key);
-  return subject === null ? action : action.replaceAll("<id>", subject);
+  const named = subject === null ? action : action.replaceAll("<id>", subject);
+  // THE HOME THE ALERT IS ABOUT, when it is not the one a bare command finds.
+  //
+  // A daemon started with `--home /custom` raises causes about THAT hub, and the
+  // action is meant to be pasted. Pasted later, outside the daemon's environment,
+  // a bare `reeve task why bt:...` resolves the default `~/.reeve` -- so the
+  // operator inspects a different hub, and the most likely answer there is that
+  // the task does not exist. An alert that sends someone to the wrong store is
+  // worse than one carrying no command at all, because they will believe what
+  // they find.
+  //
+  // Only when it differs: appending the default to every action would be noise
+  // on the ordinary path, and noise in a command is how a command stops being
+  // read.
+  if (!home) return named;
+  // INTO THE COMMAND, NOT ONTO THE SENTENCE. Every action is `<command> — <why it
+  // matters>`, so appending put `--home` after the prose and produced something
+  // no shell would accept: a fix for pasteability that destroyed it. The em dash
+  // is this module's own separator, not anything a caller supplies, so splitting
+  // on it is reading our own format rather than parsing someone else's.
+  const cut = named.indexOf(" — ");
+  const arg = ` --home ${shellQuote(home)}`;
+  return cut === -1 ? named + arg : named.slice(0, cut) + arg + named.slice(cut);
 };
 
 /**
@@ -697,14 +754,15 @@ export const actionFor = (key) => {
  */
 export function announce(db, {
   escalations, at = Math.floor(Date.now() / 1000), isAlive, send,
-  profile = null, examined = null, bodies = null } = {}) {
+  profile = null, examined = null, bodies = null, observe = true, limit = Infinity,
+  homeArg = null, budgetMs = Infinity, now = () => Date.now() } = {}) {
   if (typeof send !== "function")
     throw refuse("not_writable",
       "announce needs a send function: whether a page reached anyone is the one thing this " +
       "cannot infer, and a default that silently succeeded would report delivery it never made.");
 
   const { fresh, cleared, clearable } =
-    builderAnnounceable(db, escalations, { at, isAlive, examined, bodies });
+    builderAnnounceable(db, escalations, { at, isAlive, examined, bodies, observe });
 
   /**
    * The report for a cause: this pass's, else the one the row already holds.
@@ -780,7 +838,7 @@ export function announce(db, {
     // command that changes it, a page read at night is a notification the reader
     // can only file away -- and a channel whose alerts cannot be acted on is one
     // that gets muted, which is the outcome the closed page list exists to avoid.
-    const action = actionFor(why);
+    const action = actionFor(why, { home: homeArg });
     // THE ACTION GOES ABOVE THE DETAIL, and that ordering is load-bearing rather
     // than cosmetic. `redact` caps a message at its own limit and truncates the
     // TAIL, so an action appended after an externally supplied body is the first
@@ -840,6 +898,30 @@ export function announce(db, {
     return null;
   };
 
+  // BOUNDED, because sending is synchronous and a caller may be a heartbeat loop
+  // holding a lease. Each attempt can take the sender's own timeout, so an
+  // unbounded backlog against a dead channel blocks that caller for as long as
+  // the backlog is deep -- and an alarm that costs a daemon its authority has
+  // cost more than it reported.
+  //
+  // STOPPING LOSES NOTHING. An undelivered cause keeps `announced_count`
+  // unchanged and is offered again next pass, which is the same mechanism that
+  // makes a refused page come back. The DIGEST is not bounded: it writes no
+  // channel and cannot block, and withholding it would hide a cause from the
+  // durable surface to save time that was never spent.
+  // A COUNT CANNOT BOUND WORK, and that is what the first version got wrong. One
+  // `notify` call sends on EVERY configured channel in turn, so a machine with
+  // both ntfy and desktop configured spends up to two 8-second timeouts on a
+  // single page -- five pages is 80 seconds, not the 40 the count was chosen for,
+  // and the loop's own sleep then puts the lease in reach again. A third channel
+  // would move the number once more.
+  //
+  // A DEADLINE bounds it whatever the channels do. It is checked BEFORE each
+  // send, so the worst case is the budget plus one send already in flight, and
+  // that overshoot is the only part a caller has to reason about.
+  const startedAt = now();
+  const spent = () => now() - startedAt;
+  let attempted = 0;
   for (const f of fresh) {
     const body = bodyFor(f.why);
     if (!pages(f.why)) {
@@ -849,6 +931,8 @@ export function announce(db, {
       markAnnounced(f.why, f.count);
       continue;
     }
+    if (attempted >= limit || spent() >= budgetMs) continue;
+    attempted++;
     const sent = dispatch(f.why, f.count, "raised", body);
     // ONLY ON SUCCESS. A refused page leaves `announced_count` where it was, so
     // the next pass raises it again rather than treating silence as delivery.
@@ -861,6 +945,11 @@ export function announce(db, {
   // of losing it.
   const retired = [...cleared];
   for (const why of clearable) {
+    // THE SAME BOUND. A clearing sends too, so a backlog of them blocks a caller
+    // exactly as a backlog of raises does -- and a clearing that waits costs
+    // nothing, because the row stands until one is delivered.
+    if (attempted >= limit || spent() >= budgetMs) break;
+    attempted++;
     const sent = dispatch(why, 0, "cleared", bodyFor(why));
     if (!sent) continue;
     clearEscalation(db, why, { isAlive, at });

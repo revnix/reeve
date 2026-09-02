@@ -53,6 +53,8 @@ import { openHub, HUB_SCHEMA_VERSION, HUB_BUSY_TIMEOUT_MS, completedVersion, mis
 import { historyFault } from "../src/build/hubfault.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
 import { buildTick } from "../src/build/loop.mjs";
+import { pageStandingCauses, machineProfile } from "../src/build/paging.mjs";
+import { pages } from "../src/build/announce.mjs";
 import { readStart, isSameProcess } from "../src/supervisor.mjs";
 import { HEARTBEAT_SECONDS } from "../src/db/ops.mjs";
 
@@ -1106,6 +1108,30 @@ switch (cmd) {
     try {
       findings = hubFindings(db, { root: opt("backups") ?? join(HOME, "backups"),
                                    now: Math.floor(Date.now() / 1000),
+                                   // PROBED HERE, or H-14 can never fire. The row was
+                                   // written to FAIL on a machine that can page nobody,
+                                   // and a call omitting this takes the not-probed
+                                   // branch instead -- so the finding existed, was
+                                   // tested, and could not reach the one command that
+                                   // reports it. Shipped is not mounted.
+                                   //
+                                   // Read-only: the profile is read and the standing
+                                   // rows counted. `builder doctor` writes nothing.
+                                   paging: (() => {
+                                     const m = machineProfile(HOME);
+                                     // THE CAUSES THAT WOULD HAVE PAGED, not every
+                                     // standing row. H-14 reports what a missing
+                                     // channel COSTS, and a digest-only cause --
+                                     // `bt:<id>:infeasible` among them -- is never
+                                     // sent to any channel by design, so counting it
+                                     // inflates the harm. `pages()` is the predicate
+                                     // the SENDER consults, so the figure and the
+                                     // behaviour cannot drift apart.
+                                     const standing = db.prepare("SELECT why FROM escalation").all()
+                                       .filter(r => pages(r.why)).length;
+                                     return { deliverable: m.profile !== null, path: m.path, why: m.why,
+                                              standing };
+                                   })(),
                                    // The REGISTRY's projects, not the rows the table
                                    // happens to hold. H-4 exists to report a project
                                    // that has NEVER acquired a repo_gate_state row --
@@ -2226,6 +2252,9 @@ switch (cmd) {
     // What the last tick could not refresh, so a CHANGE is reported and a steady
     // state is not repeated every heartbeat.
     let lastSkipped = null;
+    // Beside `lastSkipped`, and for the same reason: this loop runs every
+    // heartbeat, so an unchanged sentence must not be repeated into the log.
+    let lastPaging = null;
     while (running) {
       // A heartbeat that fails means the row is no longer ours -- a takeover, or
       // a restore that replaced the file. Authority is gone, so the loop stops
@@ -2278,6 +2307,60 @@ switch (cmd) {
         }
       } catch (e) {
         console.error(`build run: tick failed (${e.message}); the lease is still held, continuing`);
+      }
+      // AND THEN A HUMAN IS TOLD. Until this call existed, every escalation the
+      // builder raised was written to the hub and delivered to nobody: the
+      // vocabulary, the page list and the sender were all complete, and nothing
+      // in production invoked them. A system with an alarm nothing reads is
+      // indistinguishable from a system with nothing to report.
+      //
+      // ITS OWN TRY, for the same reason the tick has one -- a send that throws
+      // must not kill a daemon holding the lease -- and SEPARATE from the tick's,
+      // because a tick that failed still leaves standing causes worth paging and
+      // a page that failed must not suppress the next tick.
+      try {
+        const p = pageStandingCauses(db, { home: HOME });
+        // SAID ONCE, ON CHANGE. This runs every heartbeat, so logging the same
+        // sentence each pass would bury the log in the state that is normal --
+        // and would do it worst when nothing is wrong.
+        // THE SENDER'S VERDICT, NOT THE PROFILE'S PRESENCE. `deliverable` says only
+        // that a profile object loaded. A configured channel that REFUSES -- a
+        // missing ntfy credential, a server that is down -- comes back in
+        // `declined`, and reading presence instead of the verdict printed nothing
+        // at all for it: the page stays owed, is retried every heartbeat, and the
+        // one line that could say why never appeared. Silence is what this loop
+        // must never produce about an alarm it could not deliver.
+        //
+        // The reasons are DEDUPLICATED, because one broken channel produces the
+        // same sentence for every standing cause and the log is not the place to
+        // learn how many of them there were -- `p.declined.length` already says.
+        // A PARTIAL DELIVERY IS NOT A SUCCESS, and it does not arrive in
+        // `declined`. `announce` treats a page as delivered when ANY channel
+        // accepted it -- deliberately, so one dead channel cannot re-page the
+        // working one every pass -- and the result lands in `paged` carrying
+        // `partial: true` with the failed channel's reason on `channels`.
+        //
+        // Reading only `declined` therefore logged "paged N" while the phone had
+        // been dead for hours: the row IS marked announced, so it is never
+        // retried, and nothing else would ever mention it. The decision not to
+        // retry stands; the silence about it does not.
+        const partials = p.paged.filter(x => x.partial);
+        const badChannels = [...new Set(partials.flatMap(
+          x => (x.channels ?? []).filter(c => !c.ok).map(c => `${c.name}: ${c.why ?? "no reason given"}`)))];
+        // The reasons are DEDUPLICATED, because one broken channel produces the
+        // same sentence for every standing cause and the log is not the place to
+        // learn how many of them there were -- the counts already say.
+        const line = p.declined.length
+          ? `build run: ${p.declined.length} escalation(s) could not be delivered — ` +
+            [...new Set(p.declined.map(d => d.not_sent))].join("; ")
+          : partials.length
+          ? `build run: paged ${p.paged.length} escalation(s), ${partials.length} on some channels ` +
+            `only — ${badChannels.join("; ")}`
+          : p.paged.length ? `build run: paged ${p.paged.length} escalation(s)`
+          : "";
+        if (line !== lastPaging) { if (line) console.error(line); lastPaging = line; }
+      } catch (e) {
+        console.error(`build run: paging failed (${e.message}); the lease is still held, continuing`);
       }
       // `sleep` is not a global -- spelled out here.
       await new Promise(r => setTimeout(r, HEARTBEAT_SECONDS * 1000));

@@ -309,7 +309,7 @@ export const STUBS = [
     name: "the-startup-record-is-anchored-to-the-whole-line",
     why: "match `running commit <sha>` anywhere instead of the daemon's whole startup line. The log is shared and later lines carry externally influenced text -- a failing check named `running commit abcdef1` reaches it through `describe()` -- so an unanchored pattern lets a check NAME decide what the guardian is reported to be running",
     test: "test/doctor-provenance.test.mjs",
-    expectRed: "a later line merely CONTAINING the phrase is not read as a startup record",
+    expectRed: "nor is a decision line that ends in the whole startup shape",
     edits: [{ file: "src/doctor.mjs",
               find: "  const re = /^\\S+ reeve daemon starting \u2014 node \\S+, pid (\\d+), running commit (\\S+?)(?:, tree (\\w+))?$/gm;",
               replace: "  const re = /\\S+ reeve daemon starting[^\\n]*?pid (\\d+), running commit (\\S+?)(?:, tree (\\w+))?$/gm;" }],

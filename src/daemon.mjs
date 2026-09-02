@@ -3484,15 +3484,29 @@ export function announceable(db, escalations, { covered = null, waiting = null, 
  */
 export function treeState(from = dirname(fileURLToPath(import.meta.url))) {
   try {
-    return execFileSync("git", ["-C", from, ...GIT_NEUTRALISE, "status", "--porcelain"],
-                        { encoding: "utf8", timeout: 10_000 }).trim() ? "dirty" : "clean";
+    // `--untracked-files=all`, because a checkout carrying
+    // `status.showUntrackedFiles=no` reports a tree with new, uncommitted source
+    // files in it as clean -- and a committed module that imports one of them
+    // executes code no commit contains. The same flag is already used at the
+    // other status probe in this file, for the same reason.
+    //
+    // GIT_DIR and GIT_WORK_TREE cleared, because they OVERRIDE `-C`: a daemon
+    // that inherited either would record the tree state of some other repository
+    // entirely, and `GIT_NEUTRALISE` only strips git's config-injection
+    // variables.
+    const { GIT_DIR, GIT_WORK_TREE, ...env } = process.env;
+    return execFileSync("git", ["-C", from, ...GIT_NEUTRALISE,
+                                "status", "--porcelain", "--untracked-files=all"],
+                        { encoding: "utf8", timeout: 10_000, env }).trim() ? "dirty" : "clean";
   } catch { return "unreadable"; }
 }
 
 export function runningCommit(from = dirname(fileURLToPath(import.meta.url))) {
   try {
+    // Same override hazard as `treeState`: `-C` loses to GIT_DIR.
+    const { GIT_DIR, GIT_WORK_TREE, ...env } = process.env;
     return execFileSync("git", ["-C", from, ...GIT_NEUTRALISE, "rev-parse", "--short", "HEAD"],
-                        { encoding: "utf8", timeout: 10_000 }).trim() || "unreadable";
+                        { encoding: "utf8", timeout: 10_000, env }).trim() || "unreadable";
   } catch { return "unreadable"; }
 }
 

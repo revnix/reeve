@@ -823,11 +823,22 @@ function readInstalledPlist(path = join(homedir(), "Library", "LaunchAgents", "c
   try { return readFileSync(path, "utf8"); } catch { return null; }
 }
 
+/**
+ * GIT_DIR and GIT_WORK_TREE OVERRIDE `-C`, so a doctor that inherited either
+ * would inspect an environment-selected repository while reporting on the path
+ * it was asked about. `founderGitEnv` strips git's config-INJECTION variables
+ * and not these.
+ */
+function withoutRepositoryOverride(env) {
+  const { GIT_DIR, GIT_WORK_TREE, ...rest } = env;
+  return rest;
+}
+
 function founderRun(cwd, args, { input = null, timeout = 20_000 } = {}) {
   try {
     return { ok: true, out: execFileSync("git", ["-C", cwd, ...GIT_NEUTRALISE_FOUNDER, ...args],
       { encoding: "utf8", stdio: [input === null ? "ignore" : "pipe", "pipe", "pipe"],
-        ...(input === null ? {} : { input }), env: founderGitEnv(), timeout }).trim() };
+        ...(input === null ? {} : { input }), env: withoutRepositoryOverride(founderGitEnv()), timeout }).trim() };
   } catch (e) {
     const line = String(e.stderr || e.message).split("\n").filter(Boolean).pop() ?? "git failed";
     return { ok: false, out: "", err: line.slice(0, 140) };
@@ -1267,8 +1278,20 @@ export function loadedArguments(printOut) {
 export function daemonLogPath(args, env, fallbackHome) {
   const i = (args ?? []).indexOf("--log");
   if (i >= 0 && args[i + 1]) return args[i + 1];
-  const home = env?.REEVE_HOME || fallbackHome;
+  // `--home` OUTRANKS the environment, because `bin/reeve` derives HOME from the
+  // flag first and only then falls back to REEVE_HOME. A job started with
+  // `--home /custom` and no `--log` writes /custom/reeve.log, and reading the
+  // environment instead finds a stale record from another invocation, or none --
+  // on which this rule refuses about a perfectly healthy daemon.
+  const h = (args ?? []).indexOf("--home");
+  const home = (h >= 0 && args[h + 1]) ? args[h + 1] : (env?.REEVE_HOME || fallbackHome);
   return home ? join(home, "reeve.log") : null;
+}
+
+/** The live pid launchd reports for the job, or null when it holds none. */
+export function loadedPid(printOut) {
+  const m = /^\s*pid\s*=\s*(\d+)/m.exec(String(printOut ?? ""));
+  return m ? Number(m[1]) : null;
 }
 
 /** REEVE_HOME as launchd holds it for the job. */
@@ -1336,6 +1359,16 @@ export function checkDaemonProvenance({ run = founderRun, plist = readInstalledP
   const symbolic = run(root, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
   const branch = symbolic.ok && symbolic.out ? symbolic.out.replace(/^origin\//, "") : "main";
 
+  // THE JOB MUST ACTUALLY BE RUNNING, and the record must be ITS record. A job
+  // can stay loaded with its process down, and a manually started daemon writes
+  // to the same log -- so the newest startup line can belong to something else
+  // entirely, and attributing it to the launchd job can end in OK about a
+  // process that is not there.
+  const pid = loadedPid(printed);
+  if (pid === null) return { id, level: DEGRADED, title,
+    lines: [...lines, "the job is loaded but launchctl reports no running process",
+            "-> nothing is enforcing anything here; the commit above is what the NEXT start would load"] };
+
   const logPath = daemonLogPath(args, env, home);
   const record = logPath && readLog ? startupRecordFrom(readLog(logPath)) : null;
   // AN UNREADABLE STARTUP IS NOT A HEALTHY ONE. Appending a warning and returning
@@ -1347,6 +1380,9 @@ export function checkDaemonProvenance({ run = founderRun, plist = readInstalledP
   // Optional chaining for the same reason: the guard above returns on a null
   // record, so this only ever runs with one -- but a stub that removes that guard
   // must reach an assertion rather than a TypeError.
+  if (record?.pid !== undefined && record.pid !== pid) return { id, level: UNKNOWN, title,
+    lines: [...lines, `launchd reports pid ${pid} but the newest startup record is pid ${record.pid}`,
+            "-> that record belongs to another process, so it says nothing about what is running here"] };
   if (record?.commit == null) return { id, level: UNKNOWN, title,
     lines: [...lines, "the daemon recorded its own commit as unreadable at startup",
             "-> the process is running, and nothing says from which commit"] };
@@ -1354,6 +1390,12 @@ export function checkDaemonProvenance({ run = founderRun, plist = readInstalledP
   lines.push(`the running process loaded ${record.commit}` +
              (record.tree === null ? " (an older daemon, which did not record its tree state)"
                                    : `, from a ${record.tree} tree`));
+  // AN ABSENT TREE STATE CANNOT END IN OK. A record written before this field
+  // existed never established whether the process loaded uncommitted code --
+  // the exact fact the field was added for. Annotating the output and passing
+  // anyway asserts the reassuring half of something nobody measured.
+  if (record.tree === null) return { id, level: DEGRADED, title,
+    lines: [...lines, "-> restart the daemon on a binary that records it; until then, whether it loaded a clean tree is unknown"] };
   // RECORDED AT STARTUP, not read now. `git status` here describes today's tree.
   if (record.tree === "dirty") return { id, level: BROKEN, title,
     lines: [...lines, "-> it loaded uncommitted code, so what runs is not that commit and is not any commit"] };

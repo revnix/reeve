@@ -53,6 +53,7 @@ import { openHub, HUB_SCHEMA_VERSION, HUB_BUSY_TIMEOUT_MS, completedVersion, mis
 import { historyFault } from "../src/build/hubfault.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
 import { buildTick } from "../src/build/loop.mjs";
+import { pageStandingCauses } from "../src/build/paging.mjs";
 import { readStart, isSameProcess } from "../src/supervisor.mjs";
 import { HEARTBEAT_SECONDS } from "../src/db/ops.mjs";
 
@@ -2217,6 +2218,9 @@ switch (cmd) {
     // What the last tick could not refresh, so a CHANGE is reported and a steady
     // state is not repeated every heartbeat.
     let lastSkipped = null;
+    // Beside `lastSkipped`, and for the same reason: this loop runs every
+    // heartbeat, so an unchanged sentence must not be repeated into the log.
+    let lastPaging = null;
     while (running) {
       // A heartbeat that fails means the row is no longer ours -- a takeover, or
       // a restore that replaced the file. Authority is gone, so the loop stops
@@ -2269,6 +2273,28 @@ switch (cmd) {
         }
       } catch (e) {
         console.error(`build run: tick failed (${e.message}); the lease is still held, continuing`);
+      }
+      // AND THEN A HUMAN IS TOLD. Until this call existed, every escalation the
+      // builder raised was written to the hub and delivered to nobody: the
+      // vocabulary, the page list and the sender were all complete, and nothing
+      // in production invoked them. A system with an alarm nothing reads is
+      // indistinguishable from a system with nothing to report.
+      //
+      // ITS OWN TRY, for the same reason the tick has one -- a send that throws
+      // must not kill a daemon holding the lease -- and SEPARATE from the tick's,
+      // because a tick that failed still leaves standing causes worth paging and
+      // a page that failed must not suppress the next tick.
+      try {
+        const p = pageStandingCauses(db, { home: HOME });
+        // SAID ONCE, ON CHANGE. This runs every heartbeat, so logging the same
+        // sentence each pass would bury the log in the state that is normal --
+        // and would do it worst when nothing is wrong.
+        const line = !p.deliverable ? `build run: ${p.standing} standing escalation(s) cannot be paged — ${p.why}`
+          : p.paged.length ? `build run: paged ${p.paged.length} escalation(s)`
+          : "";
+        if (line !== lastPaging) { if (line) console.error(line); lastPaging = line; }
+      } catch (e) {
+        console.error(`build run: paging failed (${e.message}); the lease is still held, continuing`);
       }
       // `sleep` is not a global -- spelled out here.
       await new Promise(r => setTimeout(r, HEARTBEAT_SECONDS * 1000));

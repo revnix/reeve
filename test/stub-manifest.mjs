@@ -2526,4 +2526,15 @@ export const STUBS = [
       replace: "    const offered = offeredBody(bodies, why);\n    if (offered !== null) return offered;\n    const stored = db.prepare(\"SELECT body FROM escalation WHERE why = ?\").get(why)?.body ?? null;\n    if (stored === null) return null;",
     }],
   },
+  {
+    name: "the-failure-vocabulary-is-enforced-at-the-boundary",
+    why: "enforce the failure type only in `body()`, leaving `announce` to take the bodies map as given. The exported signature invites a caller to build that map directly, and an empty object, an Error that serialises to {}, or a type outside the vocabulary is then persisted and marked DELIVERED while producing an alert with no type and no detail -- the type being what tells `it stopped` from `it may have stopped`",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "an empty object is refused at the announce boundary, not only by body()",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "      !FAILURE_TYPES.includes(shape.type))",
+      replace: "      false)",
+    }],
+  },
 ];

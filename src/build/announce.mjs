@@ -204,6 +204,25 @@ const serialiseBody = (body) => {
   // -- so there are not two rules here that can drift apart.
   let shape;
   if (typeof text === "string") { try { shape = JSON.parse(text); } catch { shape = undefined; } }
+  // THE WHOLE CONTRACT, AT THE BOUNDARY EVERY BODY CROSSES. `body()` checked the
+  // failure type and `announce` accepted whatever the `bodies` map held, so a
+  // caller building that map directly -- which the exported signature invites --
+  // bypassed the vocabulary entirely. `{}`, an Error that serialises to `{}`, and
+  // `{ type: "UNKNOWN_VALUE" }` were all persisted and marked delivered while
+  // producing an alert with no type and no detail.
+  //
+  // This is the THIRD instance of one shape in this file: validating the value
+  // handed in rather than the value stored, validating the render source rather
+  // than the stored source, and now a vocabulary enforced by a helper nobody is
+  // obliged to call. A rule that only a convenience constructor applies is a
+  // suggestion. `body()` stays as the ergonomic way to build one and is no longer
+  // the only thing that checks it.
+  if (shape !== null && typeof shape === "object" && !Array.isArray(shape) &&
+      !FAILURE_TYPES.includes(shape.type))
+    throw refuse("escalation_body_type",
+      `an escalation body must name a failure type (${FAILURE_TYPES.join(", ")}); this one says ` +
+      `${JSON.stringify(shape.type)}. The type is what tells "it stopped" from "it may have stopped", ` +
+      "and an alert without one asks a human to guess which.");
   if (shape === null || typeof shape !== "object" || Array.isArray(shape))
     throw refuse("escalation_body_shape",
       `an escalation body must serialise to a JSON object; ${describeBody(body)} did not. ` +

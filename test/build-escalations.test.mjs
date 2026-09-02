@@ -1443,6 +1443,37 @@ const freshHub = () => {
   // circularity, and a set that only ever grows refuses `{ x: shared, y: shared }`
   // -- ordinary JSON, which stringify serialises perfectly by writing it twice.
   // The set therefore tracks the PATH from the root and is unwound on the way out.
+  // A BOXED PRIMITIVE DOES NOT SERIALISE AS THE VALUE IT WRAPS -- `new Number(5)`
+  // walks as an ordinary object and stores as {}, `new String("abc")` as a map of
+  // character indices. Refused rather than emulated: nobody puts one in a report
+  // on purpose, and quietly storing 5 for it would be inventing the caller's
+  // intent from a mistake.
+  for (const [what, value] of [["a boxed Number", new Number(5)],
+                               ["a boxed String", new String("abc")],
+                               ["a boxed Boolean", new Boolean(true)]]) {
+    let k = null;
+    try {
+      announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                      bodies: new Map([[key, { type: "FAILED", v: value }]]) });
+    } catch (e) { k = e.kind ?? "threw"; }
+    check(k === "escalation_body_value",
+      `${what} is refused rather than stored as something else`, String(k));
+  }
+
+  // AN OWN `__proto__` KEY, which `JSON.parse` produces and an ordinary object
+  // cannot hold: assigning it invokes the legacy prototype setter, so the field
+  // is silently absent from the stored report while plain serialisation keeps it.
+  const withProto = JSON.parse('{"type":"FAILED","__proto__":{"a":1},"d":"kept"}');
+  check(Object.hasOwn(withProto, "__proto__"),
+    "control: the fixture really carries __proto__ as an OWN key, which only JSON.parse makes",
+    JSON.stringify(Object.keys(withProto)));
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                  bodies: new Map([[key, withProto]]) });
+  const protoRow = hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "";
+  check(protoRow === JSON.stringify(withProto),
+    "an own __proto__ key survives, exactly as plain JSON.stringify keeps it",
+    JSON.stringify({ stored: protoRow, plain: JSON.stringify(withProto) }));
+
   const shared = { a: 1 };
   let sharedRefused = null;
   try {
@@ -1501,7 +1532,7 @@ const freshHub = () => {
     "both values survive a key collision, under distinct names", JSON.stringify(stored));
 }
 
-// ── toJSON is called the way JSON.stringify calls it ────────────────────────
+// ── toJSON is the SERIALISER's to call, and it calls it once ────────────────
 //
 // `JSON.stringify` hands `toJSON` the property name -- "" at the root. Calling it
 // with no argument is a different call, so an implementation branching on `key`

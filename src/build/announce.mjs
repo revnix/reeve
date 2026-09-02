@@ -123,29 +123,25 @@ const BODY_LIMIT = 4096;
  * JSON escape boundary could corrupt the document, and a body that no longer
  * parses is a report lost to the guard that was protecting it.
  */
-const scrubDeep = (v, key = "", seen = new WeakSet()) => {
-  // A CYCLE IS DETECTED HERE, not by `JSON.stringify` further down. This walk now
-  // runs BEFORE the serialisation and outside its try, so a circular body would
-  // recurse until the stack gave out -- a crash where the surrounding code has
-  // always produced a named refusal.
-  if (v !== null && typeof v === "object") {
-    // Removed again on the way OUT of each value, so this tracks the path from the
-    // root rather than everything seen: a value referenced twice as siblings is
-    // ordinary JSON and must not read as a cycle.
-    if (seen.has(v))
-      throw refuse("escalation_body_shape",
-        "an escalation body must serialise to JSON; this one is circular. Detail belongs in the " +
-        "body precisely because the key refuses it, so a body that cannot be stored loses the report.");
-    seen.add(v);
-  }
-  // `toJSON` DECIDES THE SERIALISATION, AND IT IS HANDED THE KEY. `JSON.stringify`
-  // passes "" at the root and the property name for nested values, so calling it
-  // with no argument is a DIFFERENT call: an implementation that branches on
-  // `key` would persist something other than what stringify would have produced,
-  // and the scrub would have changed the report's meaning rather than only its
-  // credentials.
-  if (v && typeof v === "object" && typeof v.toJSON === "function")
-    { const r = scrubDeep(v.toJSON(key), key, seen); seen.delete(v); return r; }
+const BOXED = new Set(["[object Number]", "[object String]", "[object Boolean]", "[object BigInt]"]);
+
+/**
+ * The scrub, run as `JSON.stringify`'s own replacer.
+ *
+ * A REPLACER RATHER THAN A SECOND TRAVERSAL, and that is the whole design. The
+ * first version walked the value itself, which meant reimplementing
+ * `JSON.stringify`'s semantics -- and it diverged in the corners, every time in
+ * the direction of storing something other than what the caller supplied:
+ * `toJSON` was re-applied to its own result, where the serialiser applies it
+ * once; a boxed `new Number(5)` became `{}` and a `new String("abc")` became a
+ * map of character indices; a self-returning `toJSON` was refused as circular
+ * though it serialises perfectly.
+ *
+ * The serialiser calls `toJSON` FIRST and this second, so this sees exactly what
+ * would have been written and nothing else. Cycles, `undefined` in arrays and
+ * every other rule stay the serialiser's, where they were already correct.
+ */
+function scrubbing(_key, v) {
   if (typeof v === "string") return scrub(v);
   if (v === null || typeof v === "boolean") return v;
   // NON-FINITE NUMBERS BECOME `null` IN JSON, silently. A report that said
@@ -154,40 +150,50 @@ const scrubDeep = (v, key = "", seen = new WeakSet()) => {
   if (typeof v === "number") {
     if (!Number.isFinite(v))
       throw refuse("escalation_body_value",
-        `an escalation body cannot carry ${String(v)} at ${key ? `\`${key}\`` : "its root"}: ` +
-        "JSON turns it into null, so the report would be stored having quietly lost the number.");
+        `an escalation body cannot carry ${String(v)}: JSON turns it into null, so the report ` +
+        "would be stored having quietly lost the number.");
     return v;
   }
-  if (Array.isArray(v)) {
-    const r = v.map((x, i) => scrubDeep(x, String(i), seen));
-    seen.delete(v);
-    return r;
-  }
   if (typeof v === "object") {
-    // SCRUBBED KEYS CAN COLLIDE. Two credential-shaped keys reduce to the same
-    // replacement, and building the object in one pass keeps only the last --
-    // dropping a field from a report that was otherwise entirely valid. Each
-    // survives under a distinct name instead, because losing a fact to the guard
-    // that was protecting it is the failure this whole column exists to avoid.
-    const out = {};
+    // A BOXED PRIMITIVE SERIALISES AS SOMETHING ELSE AGAIN, and refusing is
+    // honest where emulating would be guesswork: nobody puts `new Number(5)` in a
+    // report on purpose, and silently storing `5` for it would be inventing the
+    // caller's intent.
+    const tag = Object.prototype.toString.call(v);
+    if (BOXED.has(tag))
+      throw refuse("escalation_body_value",
+        `an escalation body cannot carry a boxed ${tag.slice(8, -1)}: it does not serialise as the ` +
+        "value it wraps, so the stored report would differ from the one supplied.");
+    if (Array.isArray(v)) return v;
+    // KEYS ARE SCRUBBED HERE, which a replacer cannot do in place -- it may
+    // replace a VALUE and never rename a key. So a plain object is rebuilt with
+    // safe names and the serialiser walks the rebuild.
+    //
+    // A NULL PROTOTYPE, because `out.__proto__ = x` on an ordinary object calls
+    // the legacy setter instead of creating a property: a report carrying an own
+    // `__proto__` key -- which `JSON.parse` produces -- would be accepted and
+    // silently stored without that field.
+    const out = Object.create(null);
     for (const [k, x] of Object.entries(v)) {
       const safe = scrub(k);
+      // SCRUBBED KEYS CAN COLLIDE. Two credential-shaped keys reduce to the same
+      // replacement, and one assignment would overwrite the other -- dropping a
+      // field from a report that was otherwise entirely valid.
       let name = safe;
       for (let n = 2; Object.hasOwn(out, name); n++) name = `${safe} (${n})`;
-      out[name] = scrubDeep(x, k, seen);
+      out[name] = x;
     }
-    seen.delete(v);
     return out;
   }
-  // undefined, a function, a symbol, a bigint. `JSON.stringify` DROPS the first
-  // three from an object without a word and throws on the last, so a detail the
-  // caller supplied would simply not be in the stored report while the call
-  // succeeded and was marked delivered. Serialising without error is not proof
-  // that the whole report survived.
+  // undefined, a function, a symbol, a bigint. The first three are dropped from
+  // an object by the serialiser without a word and the last one throws, so a
+  // detail the caller supplied would simply not be in the stored report while the
+  // call succeeded and was marked delivered. Serialising without error is not
+  // proof that the whole report survived.
   throw refuse("escalation_body_value",
-    `an escalation body cannot carry ${typeof v} at ${key ? `\`${key}\`` : "its root"}: ` +
-    "JSON discards it, so the report would be stored having quietly lost that detail.");
-};
+    `an escalation body cannot carry ${typeof v}: JSON discards it, so the report would be ` +
+    "stored having quietly lost that detail.");
+}
 
 /** What the caller passed, named the way the caller would recognise it. */
 const describeBody = (body) =>
@@ -227,15 +233,15 @@ const offeredBody = (bodies, why) => {
 
 const serialiseBody = (body) => {
   if (body === null || body === undefined) return null;
-  // SCRUBBED FIRST, OUTSIDE THE TRY. The walk refuses by name -- a circular body,
-  // a detail JSON would discard -- and running it inside the catch below swallowed
-  // every one of those and reported them all as "did not serialise", replacing a
-  // precise diagnosis with a generic one. The try covers `JSON.stringify` and
-  // nothing else, which is the only thing it was ever meant to cover.
-  const cleaned = scrubDeep(body);
+  // THE SCRUB'S OWN REFUSALS SURVIVE THE CATCH. They are thrown from inside the
+  // replacer, so they come out of `JSON.stringify` like any other error -- and a
+  // bare catch reported every one of them as "did not serialise", replacing a
+  // precise diagnosis with a generic one. A refusal carries `kind`; a cycle or
+  // any other serialiser failure does not, and only those become the shape
+  // refusal below.
   let text;
-  try { text = JSON.stringify(cleaned); }
-  catch { text = undefined; }
+  try { text = JSON.stringify(body, scrubbing); }
+  catch (e) { if (e?.kind) throw e; text = undefined; }
   // A REPORT, NOT A LOG. Every pass over a standing cause re-appends the row
   // image to `hub_event`, which is append-only and is the authority store, so an
   // unbounded body is an unbounded write rate: a megabyte of CI excerpt

@@ -39,8 +39,10 @@ export const OUTCOMES = {
 // ps prints lstart in the CALLER's timezone and locale. So the same process read
 // under TZ=UTC and under TZ=Asia/Karachi gave two different tokens, and a CLI run
 // in another timezone called a live daemon dead and suggested --takeover. The
-// token is read pinned to UTC and the C locale, so every caller gets the same one.
+// token is read pinned to UTC and the C locale, so every caller gets the same
+// one, and it ends in " UTC": that says what it is, and it marks it as current.
 const PINNED = { TZ: "UTC", LC_ALL: "C" };
+const CURRENT = " UTC";
 
 function psStart(pid, env) {
   // stderr is piped, not inherited: ps writes "process id too large" for an
@@ -51,7 +53,45 @@ function psStart(pid, env) {
 
 /** Identity token for a pid. Non-zero exit means dead; a differing string means reused. */
 export function readStart(pid) {
-  return psStart(pid, { ...process.env, ...PINNED });
+  const utc = psStart(pid, { ...process.env, ...PINNED });
+  return utc === null ? null : `${utc}${CURRENT}`;
+}
+
+// The UTC offsets, in minutes, that real timezones use at an instant. Cached by
+// quarter hour, because offsets change only at transitions on those boundaries,
+// and a sweep over many old records would otherwise repeat the same work.
+const OFFSETS = new Map();
+function offsetsInUseAt(ms) {
+  const key = Math.floor(ms / 900000);
+  if (OFFSETS.has(key)) return OFFSETS.get(key);
+  if (OFFSETS.size > 256) OFFSETS.clear();
+  const offsets = new Set();
+  for (const timeZone of Intl.supportedValuesOf("timeZone")) {
+    const p = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone, hourCycle: "h23",
+      year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" })
+      .formatToParts(ms).map((x) => [x.type, x.value]));
+    offsets.add(Math.round((Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - ms) / 60000));
+  }
+  OFFSETS.set(key, offsets);
+  return offsets;
+}
+
+/**
+ * Does a token recorded before the pin name the same start as `current`?
+ *
+ * Such a token is lstart as its recorder saw it, in the recorder's own timezone,
+ * which nothing recorded. So it names the process when its wall-clock time is
+ * the process's true start shifted by an offset some real timezone used at that
+ * moment, to the second. A stranger that reused the pid would have to have
+ * started exactly one such offset apart. Only unmarked tokens are read this way,
+ * and those stop existing as the leases and runs recorded before the upgrade end.
+ */
+export function oldTokenNames(stored, current) {
+  const start = Date.parse(current);
+  const wall = Date.parse(`${stored} UTC`);
+  if (!Number.isFinite(start) || !Number.isFinite(wall)) return false;
+  const diff = wall - start;
+  return diff % 60000 === 0 && offsetsInUseAt(start).has(diff / 60000);
 }
 
 /** The last `n` bytes of a file, read from the end: a 64 MiB stderr must not be decoded whole for a 4 KB tail. */
@@ -78,11 +118,13 @@ export function isSameProcess(pid, storedStart) {
   const now = readStart(pid);
   if (now === null) return false;
   if (now === storedStart) return true;
-  // A token recorded before the pin was written in the recorder's own timezone.
-  // Read the same way it still matches, so the upgrade doesn't make every live
-  // daemon and worker look dead, which would invite a takeover or a second
-  // worker on the same task. Remove once no stored record predates the pin.
-  return psStart(pid, process.env) === storedStart;
+  // A current token that differs names a different process. The looser reading
+  // below is for tokens recorded before the pin, and only for them.
+  if (typeof storedStart !== "string" || storedStart.endsWith(CURRENT)) return false;
+  // Otherwise the upgrade would make every live daemon and worker look dead at
+  // once, which invites a takeover or a second worker on the same task. Remove
+  // once no stored record predates the pin.
+  return oldTokenNames(storedStart, now);
 }
 
 /**

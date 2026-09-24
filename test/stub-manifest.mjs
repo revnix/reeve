@@ -3362,6 +3362,15 @@ export const STUBS = [
               replace: "" }],
   },
   {
+    name: "daemon-stop-ends-the-sleep",
+    why: "sleep out the rest of the interval after a stop request. A stop between ticks then takes up to 90 more seconds, past the time systemd gives a service to exit, so the daemon is killed and the unit recorded as failed",
+    test: "test/daemon-stop.test.mjs",
+    expectRed: "a stop request ends the sleep between ticks, and the daemon exits cleanly at once",
+    edits: [{ file: "src/daemon.mjs",
+              find: "    await new Promise(r => { const t = setTimeout(r, intervalMs); wake = () => { clearTimeout(t); r(); }; });\n",
+              replace: "    await new Promise(r => setTimeout(r, intervalMs));\n" }],
+  },
+  {
     name: "process-identity-pinned-to-utc",
     why: "read a process's start time in the caller's own timezone again. The same live daemon then has a different identity for a CLI in another timezone, which calls it dead and suggests --takeover",
     test: "test/process-identity.test.mjs",

@@ -116,6 +116,10 @@ directory and spend every tick watching the wrong project.
 On Linux and WSL2 it runs as a systemd user service, `deploy/reeve.service`,
 which follows the same rules: an absolute interpreter and an explicit repository.
 
+Edit the file first. `run nextlyhq/nextly` names the repository the daemon
+watches, so change it to yours, and change the node and checkout paths if they
+live elsewhere. Then:
+
 ```sh
 mkdir -p ~/.config/systemd/user
 cp deploy/reeve.service ~/.config/systemd/user/
@@ -125,11 +129,29 @@ sudo loginctl enable-linger "$USER"   # keep it running after you log out
 systemctl --user status reeve
 ```
 
-Edit the two paths in the file first if node or the checkout live elsewhere.
 Without lingering, systemd stops the service when your last session ends. On
 WSL2, systemd must be enabled (`[boot] systemd=true` in `/etc/wsl.conf`), and
 keeping the daemon awake holds only the Linux side: Windows decides when the
 host sleeps.
+
+To stop it and remove it:
+
+```sh
+systemctl --user disable --now reeve
+rm ~/.config/systemd/user/reeve.service
+systemctl --user daemon-reload
+sudo loginctl disable-linger "$USER"  # only if reeve alone needed it
+```
+
+On macOS:
+
+```sh
+launchctl bootout gui/$(id -u)/com.revnix.reeve
+rm ~/Library/LaunchAgents/com.revnix.reeve.plist
+```
+
+Either way, `~/.reeve`, the state and the logs, stays in place. Delete it only
+when you're done with reeve on this machine.
 
 ## Runbook
 

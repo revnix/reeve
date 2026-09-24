@@ -1,7 +1,11 @@
 # The reeve daemon as a systemd user service, for Linux and WSL2. The macOS
 # equivalent is com.revnix.reeve.plist, and this file follows the same rules.
 #
-# Install (README, "Run it in the background"):
+# Before installing, edit ExecStart: `run nextlyhq/nextly` names the repository
+# the daemon watches, so change it to yours. Change the node and checkout paths
+# too if they live elsewhere.
+#
+# Install (README, "Running it unattended"):
 #   mkdir -p ~/.config/systemd/user
 #   cp deploy/reeve.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
@@ -10,6 +14,11 @@
 # Check it:
 #   systemctl --user status reeve
 #   tail -f ~/.reeve/reeve.log
+# Remove it (this leaves ~/.reeve, the state and logs, in place):
+#   systemctl --user disable --now reeve
+#   rm ~/.config/systemd/user/reeve.service
+#   systemctl --user daemon-reload
+#   sudo loginctl disable-linger "$USER"   # only if reeve alone needed it
 
 [Unit]
 Description=reeve daemon
@@ -24,10 +33,11 @@ StartLimitIntervalSec=0
 # and nvm is a shell function, so a bare `node` finds the system's node or none.
 # v24 is required: node:sqlite is unflagged there.
 #
-# The repository is stated, never inferred. With no repository, `reeve run`
-# reads WorkingDirectory's git remote and watches whatever checkout it starts
-# in. Neither --enforce nor --execute appears: the shadow period publishes
-# neutral conclusions and dispatches nothing, and both flags are opt-in.
+# The repository is stated, never inferred, and is the one value every install
+# changes. With no repository, `reeve run` reads WorkingDirectory's git remote
+# and watches whatever checkout it starts in. Neither --enforce nor --execute
+# appears: the shadow period publishes neutral conclusions and dispatches
+# nothing, and both flags are opt-in.
 ExecStart=%h/.nvm/versions/node/v24.21.0/bin/node %h/code/nextly-workspace/reeve/bin/reeve run nextlyhq/nextly
 WorkingDirectory=%h/code/nextly-workspace/reeve
 

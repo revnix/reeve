@@ -139,8 +139,8 @@ export function detectCommands(dir, language, packageManager) {
 }
 
 /**
- * CI. An empty workflows directory is `none`, not `github-actions`: 4re's
- * .github/workflows exists and contains nothing, so presence proves nothing.
+ * CI. An empty workflows directory is `none`, not `github-actions`: one client
+ * repo's .github/workflows exists and contains nothing, so presence proves nothing.
  */
 export function detectCi(root) {
   const dir = join(root, ".github", "workflows");

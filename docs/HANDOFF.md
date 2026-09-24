@@ -139,7 +139,7 @@ what needs a human to ntfy and to this Mac.
 
 Every project is **product** or **client**, and the kind changes the defaults.
 Product (nextly, ranknaut, rext, ficonz, upkit): best foundation, fast to market,
-higher autonomy ceiling. Client (21c, 4re, mc, tby, comfy): quality and best
+higher autonomy ceiling. Client (five client projects): quality and best
 practice always, lower ceiling, high-risk work always human.
 
 ---
@@ -248,7 +248,7 @@ Full analysis in `docs/2026-08-20-portfolio-readiness.md`.
   all 23 private repos. reeve can **attest** but never **enforce** outside
   `nextlyhq/nextly`, which is public. A billing decision, not an engineering one.
 - The App reaches **one repo**. Every other probe returns `no installation … 404`.
-- **Outside nextly and Comfy-Org, no workflow triggers on a pull request.** They
+- **Outside nextly and one client org, no workflow triggers on a pull request.** They
   are deploy-on-push pipelines, so every PR would read UNKNOWN and block forever.
   **Writing PR-gating CI is a prerequisite**, and worth doing regardless of reeve.
 - Client work happens in `revnix/*` and is **re-committed** to the client org

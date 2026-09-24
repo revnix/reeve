@@ -26,7 +26,7 @@ export const PROJECT_KIND = ["product", "client"];
 // client:  quality and best practice always, lower ceiling, no artifacts committed.
 
 export const AUTHORITY_POLICY = ["owner", "propose_and_merge", "propose_and_wait", "propose_only"];
-// May sit BELOW the detected permission. Admin on ComfyUI is real, but its
+// May sit BELOW the detected permission. Admin on a client's repo is real, but its
 // unreviewed-merge detector files a compliance issue, so CAN is not MAY.
 
 export const PROFILE_LOCATION = ["committed", "sidecar"];
@@ -166,7 +166,7 @@ const UNIT = describe(v => {
   if (typeof v !== "object" || v === null) return "must be an object";
   for (const k of ["id", "root", "language"]) { const e = isStr(v[k]); if (e) return `${k} ${e}`; }
   // packageManager is AUTO from the lockfile EXCEPT where two lockfiles disagree:
-  // 21century tracks package-lock.json (nextly alpha.20) AND pnpm-lock.yaml (alpha.30).
+  // one client site tracks package-lock.json (nextly alpha.20) AND pnpm-lock.yaml (alpha.30).
   const e = optional(isStr)(v.packageManager); if (e) return `packageManager ${e}`;
   // toolPins is not optional in spirit: ruff 0.13.0 finds 14 errors on ranknaut
   // where 0.16.3 finds 151. An unpinned linter is a verdict that moves on its own.
@@ -258,7 +258,7 @@ export const FIELDS = {
   schemaVersion:            [true,  isSchemaVersion],
   "project.kind":           [true,  oneOf(PROJECT_KIND)],
   "identity.key":           [true,  isStr],            // owner/repo from the REMOTE, never the path
-  "identity.prHost":        [false, isStr],            // 4re: PRs and the checkout are different repos
+  "identity.prHost":        [false, isStr],            // client work: PRs and the checkout are different repos
   "identity.defaultBranch": [true,  isStr],
   "identity.baseBranch":    [false, isStr],            // rext promotes feature -> stage -> main
   "identity.visibility":    [true,  oneOf(["public", "private"])],

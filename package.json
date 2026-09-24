@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Agent-ops control plane: durable state, leases, verdicts, and a straight answer about what is true",
+  "license": "Apache-2.0",
   "bin": {
     "reeve": "./bin/reeve"
   },

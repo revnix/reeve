@@ -62,7 +62,9 @@ have already said to go ahead.
 - **Claim a new task first:** `node scripts/claim.mjs --issue <n>`.
   - It assigns you and posts a claim comment with a random session id.
   - The earliest claim since the last release wins, so two sessions under
-    one account can't both take the task.
+    one account can't both take the task. A claim counts only while its
+    author is still assigned.
+  - A session that loses to another account gives up its assignment.
   - It refuses tasks that are closed, blocked or held by someone else.
   - `--release` gives the task back.
 - **Use a git worktree,** never the main checkout.
@@ -84,5 +86,5 @@ where you stopped:
 node scripts/checkpoint.mjs --issue <n> --done "…" --remaining "…" --validation "…" --next "…"
 ```
 
-It refuses if the branch has uncommitted or unpushed work, because a checkpoint
-that points at one machine's disk can't be resumed anywhere else.
+It refuses if the branch has uncommitted, unpushed or stashed work, because a
+checkpoint that points at one machine's disk can't be resumed anywhere else.

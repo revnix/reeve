@@ -108,98 +108,23 @@ jobs:
           for f in test/*.test.mjs; do node "$f" >/dev/null || { echo "FAILED under TZ=$TZ: $f"; fail=1; }; done
           exit $fail
 
-  sweep:
-    # Does the suite actually TEST what it claims to?
-    #
-    # A separate job from `test` on purpose. A green suite and a suite that could
-    # never go red look identical, and folding this into the same job would let one
-    # explain the other's failure. Kept apart, "the tests pass" and "the tests can
-    # fail" are two answers.
-    #
-    # This exists because three assertions in one pull request proved a mechanism
-    # existed without proving it was REACHED — a count where both readings were
-    # zero, a bound whose caller never passed one, and a guard whose fixture
-    # filtered the row out before the guarded line ran. All three were green,
-    # plausible, and worthless, and all three were caught by hand. A verification
-    # step that depends on someone remembering is the fallible read.
-    name: Stub sweep
-    runs-on: ubuntu-latest
-    steps:
-      # `fetch-depth: 0`, and the sweep FAILS without it rather than passing.
-      #
-      # The default is a single commit: no history, no default branch, no merge base.
-      # The sweep refuses to grandfather a test file you are editing, and to know
-      # which files those are it needs a diff -- and a diff against a base that
-      # cannot be resolved does not error. It yields NOTHING. An empty change set
-      # intersects an empty grandfather list and the check passes: green, fast, and
-      # measuring nothing, which is the precise failure the sweep exists to catch,
-      # arriving through the checkout configuration rather than through the logic.
-      #
-      # So the refusal is deliberate and it names this line, because the symptom
-      # otherwise is a red gate over a diff that looks perfectly clean.
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
-        with:
-          node-version: '24'
-      # THE SWEEP NEEDS THE DEPENDENCIES TOO, and putting the install only in the
-      # other job was half a repair. This runner executes the test files the manifest
-      # names, one of which imports eslint to exercise the lint rule; without the
-      # install that import fails, the sweep classifies the entry UNRUNNABLE, and the
-      # job goes red for a missing package rather than for anything it measured.
-      - name: Install
-        run: npm ci
-
-      # The sweep refuses a dirty tree, so this asserts the precondition rather
-      # than discovering it as a confusing refusal further down.
-      - name: The checkout must be clean
-        run: |
-          set -euo pipefail
-          dirty="$(git status --porcelain)"
-          if [ -n "$dirty" ]; then echo "::error::the checkout is not clean"; echo "$dirty"; exit 1; fi
-      - name: Break the code on purpose and check the tests notice
-        env:
-          TZ: UTC
-          # THE BASE TO DIFF AGAINST, and it differs by event for a reason.
-          #
-          # On a pull request the base branch's tip is the right comparison. On a PUSH
-          # to the default branch the checkout puts HEAD and origin/main at the same
-          # commit, so a merge base against origin/main IS HEAD, the change set comes
-          # out empty, and the grandfathering gate passes without looking at anything.
-          # A direct commit to main could then edit a grandfathered test, or add a new
-          # test straight to the list, unopposed.
-          #
-          # `github.event.before` is the commit the branch was at, which is the diff a
-          # person would draw by hand. The sweep refuses outright if the base still
-          # resolves to HEAD, so this value being wrong fails loudly rather than
-          # silently disabling the gate.
-          STUB_SWEEP_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: node scripts/stub-sweep.mjs
-
   gate:
     # The aggregate. `if: always()` plus an explicit failure check is what makes a
     # skipped or cancelled dependency block rather than silently pass: a needs:
     # clause alone treats "skipped" as success.
+    #
+    # The stub sweep is not a dependency any more. It takes about 35 minutes and
+    # runs nightly and on demand in stub-sweep.yml; a red nightly run is tracked as
+    # an issue rather than holding every pull request (#151).
     name: CI Gate
     runs-on: ubuntu-latest
-    needs: [test, sweep]
+    needs: [test]
     if: always()
     steps:
       - name: Refuse anything that is not a success
         run: |
           echo "test:  ${{ needs.test.result }}"
-          echo "sweep: ${{ needs.sweep.result }}"
-          fail=0
           if [ "${{ needs.test.result }}" != "success" ]; then
             echo "::error::CI Gate refuses: test concluded '${{ needs.test.result }}'"
-            fail=1
+            exit 1
           fi
-          # The sweep is REQUIRED, not advisory. An advisory line saying the tests
-          # cannot fail is a line someone eventually stops reading, which is how
-          # this class of defect survived three times in one pull request.
-          if [ "${{ needs.sweep.result }}" != "success" ]; then
-            echo "::error::CI Gate refuses: stub sweep concluded '${{ needs.sweep.result }}'"
-            fail=1
-          fi
-          exit $fail

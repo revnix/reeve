@@ -3262,4 +3262,22 @@ export const STUBS = [
               find: "  return comments.some((c, i) => c.body.startsWith(CLAIM) && c.who === me && !releasedAfter(comments, i, me));",
               replace: "  return false;" }],
   },
+  {
+    name: "process-identity-pinned-to-utc",
+    why: "read a process's start time in the caller's own timezone again. The same live daemon then has a different identity for a CLI in another timezone, which calls it dead and suggests --takeover",
+    test: "test/process-identity.test.mjs",
+    expectRed: "a process's identity is the same in every timezone",
+    edits: [{ file: "src/supervisor.mjs",
+              find: "  return psStart(pid, { ...process.env, ...PINNED });",
+              replace: "  return psStart(pid, process.env);" }],
+  },
+  {
+    name: "process-identity-old-tokens-still-match",
+    why: "stop recognising tokens recorded before the pin. On upgrade every live daemon and worker then looks dead at once, which invites a takeover or a second worker on the same task",
+    test: "test/process-identity.test.mjs",
+    expectRed: "a token recorded before the pin still identifies its process",
+    edits: [{ file: "src/supervisor.mjs",
+              find: "  return psStart(pid, process.env) === storedStart;",
+              replace: "  return false;" }],
+  },
 ];

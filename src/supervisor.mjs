@@ -12,7 +12,7 @@
 //     every timeout as a clean exit.
 //   · pids churn at ~963/s here and a genuine wrap-around reuse was forced in
 //     192 seconds, so a stored pid alone eventually names a stranger. The
-//     identity token is `ps -o lstart= -p <pid>`.
+//     identity token is `ps -o lstart= -p <pid>`, read in UTC and the C locale.
 //   · `--output-format stream-json` REQUIRES `--verbose` under `-p`; without it
 //     the process exits 1 having written nothing, which looks exactly like a hang.
 //   · a worker whose tool calls were DENIED still exits 0 with is_error:false and
@@ -36,12 +36,22 @@ export const OUTCOMES = {
   LEASE_LOST: "lease_lost",       // the run lease expired or was taken; the worker was terminated
 };
 
-/** Identity token for a pid. Non-zero exit means dead; a differing string means reused. */
-export function readStart(pid) {
+// ps prints lstart in the CALLER's timezone and locale. So the same process read
+// under TZ=UTC and under TZ=Asia/Karachi gave two different tokens, and a CLI run
+// in another timezone called a live daemon dead and suggested --takeover. The
+// token is read pinned to UTC and the C locale, so every caller gets the same one.
+const PINNED = { TZ: "UTC", LC_ALL: "C" };
+
+function psStart(pid, env) {
   // stderr is piped, not inherited: ps writes "process id too large" for an
   // out-of-range pid, and a liveness probe must not print anything.
-  try { return execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() || null; }
+  try { return execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env }).trim() || null; }
   catch { return null; }
+}
+
+/** Identity token for a pid. Non-zero exit means dead; a differing string means reused. */
+export function readStart(pid) {
+  return psStart(pid, { ...process.env, ...PINNED });
 }
 
 /** The last `n` bytes of a file, read from the end: a 64 MiB stderr must not be decoded whole for a 4 KB tail. */
@@ -66,7 +76,13 @@ function tailOf(path, n) {
  */
 export function isSameProcess(pid, storedStart) {
   const now = readStart(pid);
-  return now !== null && now === storedStart;
+  if (now === null) return false;
+  if (now === storedStart) return true;
+  // A token recorded before the pin was written in the recorder's own timezone.
+  // Read the same way it still matches, so the upgrade doesn't make every live
+  // daemon and worker look dead, which would invite a takeover or a second
+  // worker on the same task. Remove once no stored record predates the pin.
+  return psStart(pid, process.env) === storedStart;
 }
 
 /**

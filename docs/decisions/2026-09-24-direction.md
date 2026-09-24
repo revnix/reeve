@@ -38,7 +38,12 @@ the thing that judges it can be trusted.
 | Worker login | The person's own, unmodified CLI login, or an API key. Reeve never reads or stores login tokens. Unattended Codex runs on public repositories use an API key. |
 | Authority | Four separate authorities (below). A worker's own report is never independent verification. An agent saying "approved" is never an approval. |
 | Recovery | Safe retries and reconciliation, not "exactly once". Before repeating an external effect, check what actually happened. For example, adopt a pull request that GitHub already created. |
-| Auditing the Gate | Shadow periods count false passes as well as false blocks, using an audited sample plus a set of known-bad cases. |
+| Auditing the Gate | Shadow periods count false passes as well as false blocks. Every decision is audited against GitHub's own record, and a set of known-bad cases runs as well. Time alone doesn't pass a shadow period: it must also see each kind of case at least once. |
+| Self-approval | Reeve never approves changes to its own authority code: the kernel, policy, evidence, sandbox and gate. A person does, even in a tier that otherwise merges automatically. |
+| Verdicts and advice | PASS, BLOCK and UNKNOWN are only ever about evidence. Planning or product workflows produce recommendations (go, park or kill), never verdicts. |
+| UNKNOWN | Each UNKNOWN names its kind and the next action: waiting, retry, missing evidence, or needs a person. Only the last reaches a person. |
+| Workers | A worker can end a run with "I can't do this", and Reeve treats that as a question for a person. Harnesses and sandboxes are separate adapters. |
+| Learning | Small, curated skills and rules that a person approves. No skills a model wrote for itself, and no reinforcement learning. |
 | Stack | Node 24, SQLite and a hand-written core. TypeScript arrives gradually, alongside useful changes. No agent framework goes in the core. |
 | Platforms | Linux and WSL2 first; keep macOS; native Windows later, behind a platform adapter. |
 | License and visibility | Apache-2.0. The repository is public but not promoted until an MVP works. "Reeve" is a working name. |
@@ -77,3 +82,10 @@ The four authorities:
 - **Discovery, product and go-to-market workflows, a hosted version, a desktop
   app, or reinforcement learning, now.** These come later, and only once the
   first milestone's metrics hold.
+- **A web UI on the first milestone's path.** Until the loop works, GitHub and
+  the `resume-work` snapshot show what needs a person. The read-only UI (#169)
+  stays in Phase 1, off that path.
+- **A general work-store abstraction, or a task format beside the issue
+  forms.** One small interface, implemented only for what is used.
+- **Accepting some false blocks during a shadow period.** The first customer's
+  own policy requires zero.

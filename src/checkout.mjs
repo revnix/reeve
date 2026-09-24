@@ -179,21 +179,38 @@ export function canCloneFiles(nearPath, host = platform) {
  * Copy a dependency tree into the run's checkout, sharing blocks where the
  * filesystem allows it. Returns `{ ok, why, cow }`; `cow` says whether the cheap
  * path was taken, so the caller can report honestly rather than assume.
+ *
+ * `to` must not exist yet. `cp -R from to` copies INTO a directory that already
+ * exists, one level too deep, and still succeeds. So an existing destination is
+ * refused, and what a failed attempt made is removed: before the plain retry,
+ * and when the copy fails for good.
  */
-export function copyDeps(from, to, { cow = null, host = platform } = {}) {
+export function copyDeps(from, to, { cow = null, host = platform, exec = execFileSync } = {}) {
   if (!existsSync(from)) return { ok: true, why: "nothing to copy", cow: false, skipped: true };
+  if (present(to)) return { ok: false, why: `${to} is already in the checkout, and copying there would put the dependencies one level too deep; leave it out with worker.dependencyPaths`, cow: false };
   const useCow = cow ?? canCloneFiles(from.replace(/\/[^/]+$/, "") || "/tmp", host);
-  const args = host.copyTreeArgs(from, to, useCow);
+  const failed = (e) => {
+    rmSync(to, { recursive: true, force: true });       // what the failed copy made; `to` didn't exist before
+    return { ok: false, why: `could not copy dependencies: ${String(e.stderr || e.message).trim()}`, cow: false };
+  };
   try {
-    execFileSync("cp", args, { stdio: ["ignore", "ignore", "pipe"] });
+    exec("cp", host.copyTreeArgs(from, to, useCow), { stdio: ["ignore", "ignore", "pipe"] });
     return { ok: true, why: null, cow: useCow };
   } catch (e) {
-    // A failed copy-on-write copy is retried as a plain one: the host may be
-    // APFS while this particular pair of paths crosses volumes.
-    if (!useCow) return { ok: false, why: `could not copy dependencies: ${String(e.stderr || e.message).trim()}`, cow: false };
-    try { execFileSync("cp", host.copyTreeArgs(from, to, false), { stdio: ["ignore", "ignore", "pipe"] }); return { ok: true, why: null, cow: false }; }
-    catch (e2) { return { ok: false, why: `could not copy dependencies: ${String(e2.stderr || e2.message).trim()}`, cow: false }; }
+    if (!useCow) return failed(e);
+    // A failed copy-on-write copy is retried as a plain one: the source may
+    // clone while this pair of paths crosses volumes. The failed attempt can
+    // already have made `to` and part of the tree, and a retry into that would
+    // nest, so it goes first.
+    rmSync(to, { recursive: true, force: true });
+    try { exec("cp", host.copyTreeArgs(from, to, false), { stdio: ["ignore", "ignore", "pipe"] }); return { ok: true, why: null, cow: false }; }
+    catch (e2) { return failed(e2); }
   }
+}
+
+/** Is anything at `p`, a dangling symlink included? `existsSync` follows links. */
+function present(p) {
+  try { lstatSync(p); return true; } catch { return false; }
 }
 
 /**

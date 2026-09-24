@@ -110,7 +110,7 @@ owner/repo from the REMOTE, never the path
 
 **optional**
 
-client-b: PRs and the checkout are different repos
+client work: PRs and the checkout are different repos
 
 ### `identity.baseBranch`
 

@@ -7,7 +7,7 @@
 // Usage: node snapshot.mjs [--repo owner/name] [--limit 5]
 // Exit codes: 0 printed, 2 GitHub could not be asked, 64 usage.
 import { gh, repoFromGit, isRepo, parseArgs, listComments, triagePullRequest, closersByIssue,
-         sortTasks, parseCheckpoint, describeCheckpoint, CHECKPOINT } from "./lib.mjs";
+         completePhase, sortTasks, nextSteps, parseCheckpoint, describeCheckpoint, CHECKPOINT } from "./lib.mjs";
 
 process.on("uncaughtException", (err) => {
   console.error(`snapshot: GitHub could not be asked (${err.message})`);
@@ -46,7 +46,7 @@ const prs = allPages(`query($owner:String!,$name:String!,$after:String){ reposit
     pageInfo{ hasNextPage endCursor } nodes{
     number title isDraft author{ login } reviewDecision mergeable
     closingIssuesReferences(first:25){ nodes{ number repository{ nameWithOwner } } }
-    reviewThreads(first:100){ nodes{ isResolved } }
+    reviewThreads(first:100){ totalCount nodes{ isResolved } }
     commits(last:1){ nodes{ commit{ statusCheckRollup{ contexts(first:100){ totalCount nodes{
       __typename ... on CheckRun{ name status conclusion } ... on StatusContext{ context state } } } } } } }
   } } } }`, (d) => d.repository.pullRequests);
@@ -56,9 +56,14 @@ const issues = allPages(`query($owner:String!,$name:String!,$after:String){ repo
   issues(states:OPEN, first:100, after:$after, orderBy:{field:CREATED_AT, direction:ASC}){
     pageInfo{ hasNextPage endCursor } nodes{
     number title issueType{ name }
-    subIssues(first:100){ nodes{ number title state assignees(first:10){ nodes{ login } } } }
+    subIssues(first:100){ totalCount nodes{ number title state assignees(first:10){ nodes{ login } } } }
   } } } }`, (d) => d.repository.issues);
-const phases = issues.nodes.filter((i) => i.subIssues.nodes.length > 0 || i.issueType?.name === "Feature");
+// Every sub-issue of a phase, from the REST listing, in the shape the query returns.
+const readSubIssues = (n) => gh(["api", "--paginate", `repos/${repo}/issues/${n}/sub_issues`, "--jq",
+  ".[] | {number, title, state: (.state | ascii_upcase), assignees: {nodes: [.assignees[] | {login}]}} | @json"])
+  .split("\n").filter(Boolean).map((l) => JSON.parse(l));
+const phases = issues.nodes.filter((i) => i.subIssues.nodes.length > 0 || i.issueType?.name === "Feature")
+  .map((phase) => completePhase(phase, readSubIssues));
 
 const openBlockers = (n) => Number(gh(["api", `repos/${repo}/issues/${n}/dependencies/blocked_by`,
   "--jq", "[.[] | select(.state == \"open\")] | length"]).trim() || "0");
@@ -117,10 +122,5 @@ out.push("");
 
 out.push("NEXT");
 const held = inProgress.filter((r) => r.holders.includes(me));
-for (const line of needsMe) out.push(`  Your ${line}.`);
-if (held.length) out.push(`  Continue #${held[0].number}, which you hold.`);
-if (!needsMe.length && !held.length) {
-  out.push(ready.length ? `  Claim and start #${ready[0].number}: ${ready[0].title}` : "  Nothing is ready. Everything open is blocked, held or in review.");
-}
-if (needsPerson.length) out.push(`  Waiting for a person to merge or decide: PR #${needsPerson.join(", #")}.`);
+for (const line of nextSteps({ needsMe, held, ready, needsPerson })) out.push(`  ${line}`);
 console.log(out.join("\n"));

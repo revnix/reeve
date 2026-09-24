@@ -44,8 +44,8 @@ tool instead. For example, nextly-control has `ctl next` and `ctl status`.
 ## 4. Report, then propose
 
 Keep the report short and in plain language:
-- **Needs me:** my pull requests with unresolved review threads or failing
-  checks.
+- **Needs me:** my pull requests that are drafts, or have unresolved review
+  threads, requested changes or failing checks.
 - **Needs you:** pull requests waiting for a person to merge them or decide.
 - **Next:** the task in progress, or the first ready task, with its latest
   checkpoint.
@@ -61,12 +61,13 @@ have already said to go ahead.
   3. the next ready task.
 - **Claim a new task first:** `node scripts/claim.mjs --issue <n>`.
   - It assigns you and posts a claim comment with a random session id.
-  - The earliest claim since the last release wins, so two sessions under
-    one account can't both take the task. A claim counts only while its
-    author is still assigned.
+  - The earliest live claim wins, so two sessions under one account can't
+    both take the task. A claim is live while its author is still assigned
+    and hasn't released the task since.
   - A session that loses to another account gives up its assignment.
   - It refuses tasks that are closed, blocked or held by someone else.
-  - `--release` gives the task back.
+  - `--release` gives the task back. Running it again finishes a release
+    that stopped halfway.
 - **Use a git worktree,** never the main checkout.
 - **Handle review findings properly:**
   1. Classify each one: blocking, important, suggestion or invalid.

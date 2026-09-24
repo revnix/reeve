@@ -55,11 +55,12 @@ The skill does the following, and you can also do it by hand:
 4. Claim a new task before you change anything:
    `node .agents/skills/resume-work/scripts/claim.mjs --issue <n>`.
    - It assigns you and posts a claim comment carrying a random session id.
-   - The earliest claim since the task was last released wins, so two
-     sessions of the same account can't both take it. A claim counts only
-     while its author is still assigned.
+   - The earliest live claim wins, so two sessions of the same account can't
+     both take it. A claim is live while its author is still assigned and
+     hasn't released the task since.
    - A session that loses to another account gives up its assignment.
-   - Give a task back with `--release`.
+   - Give a task back with `--release`. If a release stops halfway, running
+     it again finishes it.
 5. Work in a git worktree, never in the main checkout, because another session
    may be using it. Remove the worktree once the pull request is pushed.
 6. If you stop partway through a task, commit and push your branch first. A

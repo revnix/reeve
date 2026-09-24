@@ -9,13 +9,17 @@
 // computes the same answer from the same comments, so nothing else needs
 // coordinating.
 //
+// A release is two writes: the assignment goes, then a release comment ends
+// this login's claims. Each is checked before it is made, so running --release
+// again finishes a release that stopped halfway.
+//
 // Usage: node claim.mjs --issue <n> [--repo owner/name]
 //        node claim.mjs --issue <n> --release [--repo owner/name]
 // Exit codes: 0 claimed or released; 1 refused (closed, blocked, held, or the
 // race was lost); 2 GitHub could not be asked; 64 usage.
 import { randomBytes } from "node:crypto";
 import { gh, repoFromGit, isRepo, parseArgs, listComments, postComment, claimOutcome,
-         CLAIM, RELEASE } from "./lib.mjs";
+         unreleasedClaim, CLAIM, RELEASE } from "./lib.mjs";
 
 process.on("uncaughtException", (err) => {
   console.error(`claim: GitHub could not be asked (${err.message})`);
@@ -35,8 +39,11 @@ const unassignMe = () => gh(["api", `repos/${repo}/issues/${issue}/assignees`, "
   "-f", `assignees[]=${me}`, "--silent"]);
 
 if (args.values.release) {
-  postComment(repo, issue, `${RELEASE}\nReleased by @${me} at ${new Date().toISOString()}.`);
-  unassignMe();
+  const assigned = JSON.parse(gh(["api", `repos/${repo}/issues/${issue}`, "--jq", "[.assignees[].login]"]));
+  if (assigned.includes(me)) unassignMe();
+  if (unreleasedClaim(listComments(repo, issue), me)) {
+    postComment(repo, issue, `${RELEASE}\nReleased by @${me} at ${new Date().toISOString()}.`);
+  }
   console.log(`released #${issue}`);
   process.exit(0);
 }

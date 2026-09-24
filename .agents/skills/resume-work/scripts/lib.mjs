@@ -117,14 +117,20 @@ export function classifyChecks(contexts) {
 // its author has to do: answer a review, fix a check, resolve a conflict.
 export function triagePullRequest(pr, me) {
   const checks = classifyChecks(pr.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts);
-  const unresolved = (pr.reviewThreads?.nodes ?? []).filter((t) => !t.isResolved).length;
+  const threads = pr.reviewThreads?.nodes ?? [];
+  const threadTotal = Math.max(pr.reviewThreads?.totalCount ?? 0, threads.length);
+  const unresolved = threads.filter((t) => !t.isResolved).length;
   const reasons = [];
+  // A draft is unfinished work, so it stays its author's move.
+  if (pr.isDraft) reasons.push("still a draft");
   if (pr.reviewDecision === "CHANGES_REQUESTED") reasons.push("changes requested");
   if (unresolved) reasons.push(`${unresolved} unresolved thread${unresolved > 1 ? "s" : ""}`);
+  // An unresolved thread may be on a page that wasn't read.
+  if (threadTotal > threads.length) reasons.push(`only ${threads.length} of ${threadTotal} review threads read`);
   if (checks.failing.length) reasons.push(`failing: ${checks.failing.join(", ")}`);
   if (pr.mergeable === "CONFLICTING") reasons.push("merge conflict");
 
-  const notes = [...(pr.isDraft ? ["draft"] : []), ...reasons];
+  const notes = [...reasons];
   // Checks are "passing" only when every one was read and every one passed.
   const settled = !checks.failing.length && !checks.unfinished && checks.read === checks.total;
   if (checks.unfinished) notes.push(`${checks.unfinished} check${checks.unfinished > 1 ? "s" : ""} not finished`);
@@ -154,6 +160,14 @@ export function closersByIssue(prs, repo) {
   return closers;
 }
 
+// A phase whose sub-issues run past the first page, completed from
+// `readAll(number)`. Otherwise its later tasks would vanish from every section.
+export function completePhase(phase, readAll) {
+  const nodes = phase.subIssues.nodes;
+  if ((phase.subIssues.totalCount ?? nodes.length) <= nodes.length) return phase;
+  return { ...phase, subIssues: { totalCount: phase.subIssues.totalCount, nodes: readAll(phase.number) } };
+}
+
 // Sort the plan's open tasks. In review: an open pull request will close it.
 // In progress: someone is assigned. Ready: nobody is assigned, and every blocker
 // is closed. `openBlockers(n)` counts task n's open blockers.
@@ -171,6 +185,19 @@ export function sortTasks(phases, closers, openBlockers) {
     }
   }
   return { inReview, inProgress, ready };
+}
+
+// What to do next, in the order AGENTS.md gives: your pull requests first, then
+// the task you hold, then a new one. A lower item is suggested only when nothing
+// above it needs you, so the snapshot never offers two next steps at once.
+export function nextSteps({ needsMe, held, ready, needsPerson }) {
+  const lines = [];
+  if (needsMe.length) lines.push(...needsMe.map((line) => `Your ${line}.`));
+  else if (held.length) lines.push(`Continue #${held[0].number}, which you hold.`);
+  else if (ready.length) lines.push(`Claim and start #${ready[0].number}: ${ready[0].title}`);
+  else lines.push("Nothing is ready. Everything open is blocked, held or in review.");
+  if (needsPerson.length) lines.push(`Waiting for a person to merge or decide: PR #${needsPerson.join(", #")}.`);
+  return lines;
 }
 
 // ── checkpoints ──────────────────────────────────────────────────────────────
@@ -223,20 +250,25 @@ export function stashedOn(branch, subjects) {
 export const CLAIM = "<!-- claim v1 ";
 export const RELEASE = "<!-- release v1 -->";
 
+// Whether the comment at index i is followed by a release from `who`. A release
+// ends its author's own claims only, so nobody can end someone else's.
+const releasedAfter = (comments, i, who) =>
+  comments.slice(i + 1).some((r) => r.body.startsWith(RELEASE) && r.who === who);
+
 // Who holds a task, from its comments (oldest first, as listComments returns
 // them) and its assignees just after this session claimed it.
 //
-// The earliest claim since the latest release wins. A claim counts only while its
-// author is still assigned. Otherwise a claim whose author was unassigned by
-// hand, without a release, would beat every later claim for good.
+// The earliest live claim wins. A claim is live while its author is still
+// assigned and hasn't released the task since. Without the assignment test, a
+// claim whose author was unassigned by hand, with no release posted, would beat
+// every later claim for good.
 //
 // A loser under the winner's account keeps the assignment, which the two share.
 // A loser under another account gives its assignment up, so it doesn't look like
 // it holds the task. The same applies when no claim could be confirmed at all.
 export function claimOutcome(comments, { session, me, assignees }) {
-  const lastRelease = comments.map((c) => c.body.startsWith(RELEASE)).lastIndexOf(true);
-  const winner = comments.slice(lastRelease + 1)
-    .find((c) => c.body.startsWith(CLAIM) && assignees.includes(c.who)) ?? null;
+  const winner = comments.find((c, i) =>
+    c.body.startsWith(CLAIM) && assignees.includes(c.who) && !releasedAfter(comments, i, c.who)) ?? null;
   const winnerSession = winner?.body.match(/session=([0-9a-f]+)/)?.[1] ?? null;
   const won = winnerSession === session;
   return {
@@ -246,4 +278,11 @@ export function claimOutcome(comments, { session, me, assignees }) {
     mine: comments.find((c) => c.body.startsWith(`${CLAIM}session=${session} -->`)) ?? null,
     unassign: !won && winner?.who !== me,
   };
+}
+
+// Whether `me` has a claim it hasn't released. A release is two writes, the
+// assignment and this marker, and --release checks each before making it. So
+// running it again finishes a release that stopped halfway.
+export function unreleasedClaim(comments, me) {
+  return comments.some((c, i) => c.body.startsWith(CLAIM) && c.who === me && !releasedAfter(comments, i, me));
 }

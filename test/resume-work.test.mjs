@@ -7,8 +7,8 @@
 // and git return, with no network. Each rule below was a real defect first; its
 // stub in test/stub-manifest.mjs puts the defect back.
 import { parseArgs, postOnce, postComment, classifyChecks, triagePullRequest, closersByIssue,
-         sortTasks, formatCheckpoint, parseCheckpoint, describeCheckpoint, stashedOn,
-         claimOutcome, CLAIM, RELEASE } from "../.agents/skills/resume-work/scripts/lib.mjs";
+         completePhase, sortTasks, nextSteps, formatCheckpoint, parseCheckpoint, describeCheckpoint,
+         stashedOn, claimOutcome, unreleasedClaim, CLAIM, RELEASE } from "../.agents/skills/resume-work/scripts/lib.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -98,6 +98,11 @@ const withChecks = (contexts) => ({ commits: { nodes: [{ commit: { statusCheckRo
     "a pull request whose checks weren't all read is not called passing", JSON.stringify(partial.notes));
   const stale = triagePullRequest(pr(withChecks(rollup(run("STALE")))), "me");
   check(stale.needsMe && !stale.needsPerson, "a pull request with a STALE check is its author's move", JSON.stringify(stale));
+  const draft = triagePullRequest(pr({ isDraft: true }), "me");
+  check(draft.needsMe && !draft.needsPerson, "an authored draft stays its author's move", JSON.stringify(draft));
+  const manyThreads = triagePullRequest(pr({ reviewThreads: { totalCount: 130, nodes: Array(100).fill({ isResolved: true }) } }), "me");
+  check(manyThreads.needsMe && !manyThreads.needsPerson,
+    "a pull request whose review threads weren't all read stays its author's move", JSON.stringify(manyThreads));
   const theirs = triagePullRequest(pr({ author: { login: "someone" }, reviewDecision: "CHANGES_REQUESTED" }), "me");
   check(!theirs.needsMe && !theirs.needsPerson, "control: someone else's pull request is neither", JSON.stringify(theirs));
 }
@@ -123,6 +128,35 @@ const withChecks = (contexts) => ({ commits: { nodes: [{ commit: { statusCheckRo
     "control: held, ready, blocked and closed tasks sort apart", JSON.stringify(s));
   check(JSON.stringify(closers.get(150)) === "[189]",
     "a reference to another repository's issue closes nothing here", JSON.stringify([...closers]));
+}
+
+// A phase's sub-issues come a page at a time. Tasks past the first page used to
+// vanish from every section, so the snapshot could say nothing was ready.
+{
+  const t = (number) => ({ number, title: `task ${number}`, state: "OPEN", assignees: { nodes: [] } });
+  const first = Array.from({ length: 100 }, (_, i) => t(i + 1));
+  const all = Array.from({ length: 150 }, (_, i) => t(i + 1));
+  const asked = [];
+  const big = completePhase({ number: 9, subIssues: { totalCount: 150, nodes: first } }, (n) => { asked.push(n); return all; });
+  check(big.subIssues.nodes.length === 150 && asked.join() === "9", "a phase with more than 100 tasks is read in full",
+    `read ${big.subIssues.nodes.length}, asked for ${asked.join() || "nothing"}`);
+  const small = { number: 8, subIssues: { totalCount: 2, nodes: [t(1), t(2)] } };
+  check(completePhase(small, () => { throw new Error("should not be asked"); }) === small,
+    "control: a phase that fits one page is used as it is");
+}
+
+// What to do next. A held task used to be suggested beside a pull request that
+// still needed its author, which is two next steps where the order allows one.
+{
+  const held = [{ number: 152 }], ready = [{ number: 153, title: "ready" }];
+  const busy = nextSteps({ needsMe: ["PR #189: changes requested"], held, ready, needsPerson: [] });
+  check(busy.length === 1 && busy[0].includes("#189"),
+    "while a pull request needs its author, no task is suggested alongside it", JSON.stringify(busy));
+  const holding = nextSteps({ needsMe: [], held, ready, needsPerson: [7] });
+  check(holding[0].includes("#152") && !holding.some((l) => l.includes("#153")) && holding[1]?.includes("#7"),
+    "control: with nothing to fix, the held task comes next, and waiting pull requests are still listed", JSON.stringify(holding));
+  const idle = nextSteps({ needsMe: [], held: [], ready, needsPerson: [] });
+  check(idle.length === 1 && idle[0].includes("#153"), "control: with nothing held, the first ready task", JSON.stringify(idle));
 }
 
 // ── checkpoints ──────────────────────────────────────────────────────────────
@@ -174,6 +208,13 @@ const withChecks = (contexts) => ({ commits: { nodes: [{ commit: { statusCheckRo
   check(handUnassigned.won, "a claim whose author is no longer assigned does not win", JSON.stringify(handUnassigned));
   const afterRelease = claimOutcome([claim("aaaa", "me"), release("me"), claim("bbbb", "me")], { session: "bbbb", me: "me", assignees: ["me"] });
   check(afterRelease.won, "control: a claim after a release wins", JSON.stringify(afterRelease));
+  const releasedByOther = claimOutcome([claim("aaaa", "alice"), release("bob"), claim("bbbb", "bob")],
+    { session: "bbbb", me: "bob", assignees: ["alice", "bob"] });
+  check(!releasedByOther.won && releasedByOther.winnerLogin === "alice",
+    "a release ends only its author's claims", JSON.stringify(releasedByOther));
+  check(unreleasedClaim([claim("aaaa", "me")], "me") && !unreleasedClaim([claim("aaaa", "me"), release("me")], "me"),
+    "a claim its author hasn't released is found, so a halfway release can be finished");
+  check(!unreleasedClaim([claim("aaaa", "alice")], "me"), "control: someone else's claim is not ours to release");
   const unconfirmed = claimOutcome([claim("bbbb", "me")], { session: "bbbb", me: "me", assignees: [] });
   check(!unconfirmed.won && unconfirmed.unassign && unconfirmed.winnerSession === null,
     "a claim that can't be confirmed holds nothing", JSON.stringify(unconfirmed));

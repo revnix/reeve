@@ -145,7 +145,13 @@ with zero false blocks**, not on a date.
 ## Working on reeve
 
 ```sh
-for f in test/*.test.mjs; do ~/.nvm/versions/node/v24.17.0/bin/node "$f" || echo "FAILED $f"; done
+# stop at the first failing file
+npm test
+# run every file, list each failure, and exit non-zero if any failed
+( fail=0; for f in test/*.test.mjs; do case "$f" in */escape.test.mjs) continue;; esac; node "$f" >/dev/null || { echo "FAILED $f"; fail=1; }; done; exit $fail )
+# the containment escape probe writes into ~/.reeve/canary and probes the macOS
+# keychain, so run it deliberately, on a quiet machine
+npm run test:escape
 ```
 
 The stub sweep checks that the tests can fail. It reintroduces each defect in
@@ -172,8 +178,10 @@ something real:
 - Timezone: the suite runs twice in CI, once under `TZ=Asia/Karachi`, because a
   test comparing against a naive local parse passes here and fails on a UTC runner.
 
-Longer context, every founder ruling and the full list of what remains:
-[`docs/HANDOFF.md`](docs/HANDOFF.md).
+How to work on reeve, where the plan and current state live, and how to resume
+work: [`AGENTS.md`](AGENTS.md). Decisions and the reasons for them are in
+[`docs/decisions/`](docs/decisions/). `docs/HANDOFF.md` and the dated handoff
+files are history, up to 2026-09-02.
 
 ## License
 

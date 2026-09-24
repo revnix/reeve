@@ -148,6 +148,16 @@ with zero false blocks**, not on a date.
 for f in test/*.test.mjs; do ~/.nvm/versions/node/v24.17.0/bin/node "$f" || echo "FAILED $f"; done
 ```
 
+The stub sweep checks that the tests can fail. It reintroduces each defect in
+`test/stub-manifest.mjs` and requires the assertion that entry names to go red.
+It takes about 35 minutes, so CI runs it nightly and on demand
+(`.github/workflows/stub-sweep.yml`), not on every pull request. To check one
+entry locally:
+
+```sh
+STUB_SWEEP_NO_DIFF=1 node scripts/stub-sweep.mjs <entry-name>
+```
+
 Conventions the tests hold, each of which exists because breaking it cost
 something real:
 

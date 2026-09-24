@@ -21,6 +21,8 @@ import { validate, withDefaults } from "./profile/schema.mjs";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { resolveHome } from "./home.mjs";
+import { statePathFor, legacyStatePathFor, adoptLegacyStore } from "./paths.mjs";
+import { open } from "./db/ops.mjs";
 
 /**
  * Where a profile belongs, given what the repo is.
@@ -293,6 +295,41 @@ export function renderPlan({ nwo, proposal, questions, notes, profile, unanswere
   return L.join("\n");
 }
 
+/**
+ * The repository's state database, as init sees it, without changing anything:
+ * "exists", "legacy" (a store at the old path, to be moved into place) or
+ * "missing".
+ */
+export function storeStatus(home, nwo) {
+  const path = statePathFor(home, nwo), legacy = legacyStatePathFor(home, nwo);
+  if (existsSync(path)) return { state: "exists", path };
+  if (existsSync(legacy)) return { state: "legacy", path, legacy };
+  return { state: "missing", path };
+}
+
+/**
+ * Make sure the repository has a state database.
+ *
+ * init creates it, and `run` never does. `run` refuses a missing store, because
+ * opening a fresh empty one on its own is how real history stops being read
+ * without anything failing. So the store is created here, where a person asked
+ * for it. An existing store is left alone, and a legacy one is moved into place
+ * rather than replaced by an empty one.
+ */
+export function ensureStore(home, nwo, { openStore = open, log = () => {} } = {}) {
+  const status = storeStatus(home, nwo);
+  if (status.state === "exists") return { changed: false, line: null };
+  if (status.state === "legacy") {
+    const used = adoptLegacyStore(status.path, status.legacy, { log });
+    return used === status.path
+      ? { changed: true, line: `moved the state database to ${status.path}` }
+      : { changed: false, line: `could not move the state database; it stays at ${used}` };
+  }
+  mkdirSync(dirname(status.path), { recursive: true });
+  openStore(status.path).close();
+  return { changed: true, line: `created the state database at ${status.path}` };
+}
+
 /** The whole flow. `write` is false for a plan-only run. */
 export function init({ root = process.cwd(), answers = {}, write = false, home = resolveHome() }) {
   const { proposal, questions, notes } = detect(root);
@@ -319,10 +356,22 @@ export function init({ root = process.cwd(), answers = {}, write = false, home =
   if (!v.ok) return { code: 1, output: output + "\n\nREFUSED\n" + v.errors.map(e => "  " + e).join("\n") };
 
   const after = JSON.stringify(profile, null, 2) + "\n";
-  if (existing === after) return { code: 0, output: output + "\n\nnothing to do", path };
-  if (!write) return { code: 2, output: output + `\n\n-> reeve init --write   to apply`, path };
+  const profileChanged = existing !== after;
+  const store = storeStatus(home, nwo);
+  if (!profileChanged && store.state === "exists") return { code: 0, output: output + "\n\nnothing to do", path };
+  if (!write) {
+    const plan = store.state === "missing" ? `\n\nthe state database will be created at ${store.path}`
+      : store.state === "legacy" ? `\n\nthe state database will be moved from ${store.legacy} to ${store.path}` : "";
+    return { code: 2, output: output + plan + `\n\n-> reeve init --write   to apply`, path };
+  }
 
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, after);
-  return { code: 2, output: output + `\n\nwrote ${path}`, path, profile };
+  let out = output;
+  if (profileChanged) {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, after);
+    out += `\n\nwrote ${path}`;
+  }
+  const made = ensureStore(home, nwo);
+  if (made.line) out += `${profileChanged ? "\n" : "\n\n"}${made.line}`;
+  return { code: 2, output: out, path, profile };
 }

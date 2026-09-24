@@ -11,7 +11,8 @@
 // system's stated primary requirement, so a key that cannot tell two of them apart
 // contradicts the whole point.
 
-import { join } from "node:path";
+import { existsSync, mkdirSync, renameSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 /**
  * A repository name made safe to put in a path.
@@ -128,4 +129,29 @@ export function runPathFor(home, taskId, { generation, phase, slice, attempt, st
       throw new Error(`a run path's ${name} must be a single path segment; ` +
                       `${JSON.stringify(String(value))} is not, and would place the file outside the task's tree`);
   return join(taskPathFor(home, taskId), "runs", `g${generation}-${phase}-s${slice}-a${attempt}.${stream}`);
+}
+
+/**
+ * Move a store from its legacy path into place, once, and return the path to use.
+ *
+ * A store at the old short-name path is moved rather than abandoned: opening a
+ * fresh empty database beside it is how real history stops being read without
+ * anything appearing to fail.
+ */
+export function adoptLegacyStore(next, legacy, { log = (m) => console.error(m) } = {}) {
+  try {
+    if (!existsSync(next) && existsSync(legacy)) {
+      mkdirSync(dirname(next), { recursive: true });
+      for (const suffix of ["", "-wal", "-shm"]) {
+        if (existsSync(legacy + suffix)) renameSync(legacy + suffix, next + suffix);
+      }
+      log(`reeve: moved ${legacy} -> ${next}`);
+    }
+  } catch (e) { log(`reeve: could not move the legacy store (${e.message}); using ${legacy}`); return legacy; }
+  return next;
+}
+
+/** What a command says when a repository has no state database, and how to make one. */
+export function missingStoreMessage(dbPath) {
+  return `no state database at ${dbPath}\n-> reeve init --write   creates it`;
 }

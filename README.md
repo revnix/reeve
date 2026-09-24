@@ -174,3 +174,7 @@ something real:
 
 Longer context, every founder ruling and the full list of what remains:
 [`docs/HANDOFF.md`](docs/HANDOFF.md).
+
+## License
+
+Apache License 2.0. See [`LICENSE`](LICENSE).

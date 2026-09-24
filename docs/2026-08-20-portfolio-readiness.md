@@ -4,6 +4,9 @@
 checkouts. Where a measurement of mine was wrong, the correction is recorded rather than the
 original quietly replaced.
 
+*Client organisations and repositories are replaced with labels (client A, B and C, and
+names such as `client-a-site`), because this repository is public.*
+
 ---
 
 ## 1. The short answer
@@ -39,7 +42,7 @@ is worth doing.
 ### 3.1 Every one of your orgs is on GitHub's free plan
 
     revnix                free        rextaihq   free       nextlyhq   free
-    client-org-a  free        client-b…   free       client-org-c  enterprise
+    client org A          free        client org B  free    client org C  enterprise
 
 A free plan exposes branch protection and rulesets on **public** repos only. Every private repo in
 the survey returns `403` for branch protection — measured, not assumed, on all 23.
@@ -59,7 +62,7 @@ attestation. This is a founder decision, not an engineering one.
 
 `Merge Policy` (App ID 4660593) is installed on `nextlyhq/nextly` only. All nine other repos probed
 return `no installation … HTTP 404`. Each additional repo needs an explicit install; each
-**org** needs an owner to approve it — and on client-org-c you hold `write`, not admin, so that is
+**org** needs an owner to approve it — and on client org C you hold `write`, not admin, so that is
 not yours to grant.
 
 Without the App, reeve cannot create check runs at all (a user token gets 403; App-only endpoint).
@@ -72,7 +75,7 @@ the publish step 404s — but "GitHub refuses" becomes "reeve advises".
 
 This is the finding that most changes the answer.
 
-Of the repos outside nextly and client-org-c that have any workflow at all, I checked what each
+Of the repos outside nextly and client org C that have any workflow at all, I checked what each
 workflow actually triggers on:
 
 | Repo | Workflow | Triggers on |
@@ -112,10 +115,10 @@ Client work is not done in the client's repo. Measured across three client famil
 
 | Family | Development repo | Delivery repo |
 |---|---|---|
-| Client A | `revnix/client-a-site` — 15 PRs, all merged via PR | `client-a/site` — **0 PRs ever**, direct push |
+| Client A, site | `revnix/client-a-site` — 15 PRs, all merged via PR | `client-a/site` — **0 PRs ever**, direct push |
 | Client A, second site | `revnix/client-a-site-2` — 94 PRs | `client-a/site-2` — 0 PRs ever |
-| Client B | `revnix/client-b-site` — 12 PRs | `client-b/site` — 0 PRs, HEAD message is literally "Deployment" |
-| Client B console | `revnix/client-b-console` — 100 PRs, 100 merged in 90d | `client-b/console` — 0 PRs |
+| Client B, site | `revnix/client-b-site` — 12 PRs | `client-b/site` — 0 PRs, HEAD message is literally "Deployment" |
+| Client B, console | `revnix/client-b-console` — 100 PRs, 100 merged in 90d | `client-b/console` — 0 PRs |
 
 The paired repos carry **identical commit messages with different SHAs** — re-committed mirrors,
 not shared history.
@@ -165,7 +168,7 @@ detector handled the polyglot correctly and flagged two genuine hazards unprompt
 Both are exactly the "green that means nothing" class reeve exists to refuse. **This is where I
 would prove the second project.**
 
-### client-c (client, client-org-c)
+### Client C (an enterprise-plan client org)
 
 | Repo | Stack (detected) | PR flow (90d) | CI | Verdict |
 |---|---|---|---|---|
@@ -175,7 +178,7 @@ would prove the second project.**
 | `client-c/private-frontend` | typescript/pnpm | — | yes | **BLOCKED** |
 | `revnix/client-c-workflows` | typescript | 0 PRs, direct push | none | **NEEDS CI** |
 
-client-c is the only place where reeve reports `enforcement: enforced` — enterprise plan, real
+Client C is the only place where reeve reports `enforcement: enforced` — enterprise plan, real
 rulesets. It is also the only place where you cannot install the App, hold `write` rather than
 admin, and would be governing someone else's repo. **reeve's realistic role here is local advisory
 only**: root-cause a red check, prepare a fix, never publish a verdict.
@@ -183,18 +186,18 @@ only**: root-cause a red check, prepare a fix, never publish a verdict.
 It is also where the detector found the most CI hazards without being asked — 18 in
 `client-c/frontend` alone (`continue-on-error` in 11 workflows, `pull_request: closed` in 5).
 
-### Client sites — client-a / client-a-2 / client-b-console / client-b
+### Client sites — clients A and B
 
 | Family | Dev repo | PRs (90d) | CI | Verdict |
 |---|---|---|---|---|
-| client-b-console | `revnix/client-b-console` | **100 merged** | **none at all** | **NEEDS CI** — busiest client repo, zero gating |
-| client-a-2 | `revnix/client-a-site-2` | 7 merged, 94 ever | deploy-only | **NEEDS CI** |
-| client-a | `revnix/client-a-site` | 15 merged | deploy-only | **NEEDS CI** |
-| client-b | `revnix/client-b-site` | 8 merged | deploy-only | **NEEDS CI** |
+| B console | `revnix/client-b-console` | **100 merged** | **none at all** | **NEEDS CI** — busiest client repo, zero gating |
+| A site 2 | `revnix/client-a-site-2` | 7 merged, 94 ever | deploy-only | **NEEDS CI** |
+| A site | `revnix/client-a-site` | 15 merged | deploy-only | **NEEDS CI** |
+| B site | `revnix/client-b-site` | 8 merged | deploy-only | **NEEDS CI** |
 | — | `client-b/dormant-repo` | 0 | none | **DORMANT** |
 | — | all four client-org mirrors | 0 PRs ever | none | **not reeve's business** — delivery targets |
 
-`client-a-site` carries the dual-lockfile hazard the handoff already recorded, and reeve's
+Client A's delivery repo `client-a/site` carries the dual-lockfile hazard the handoff already recorded, and reeve's
 detector caught it unprompted: `pnpm-lock.yaml` and `package-lock.json` both tracked, so
 `units[].packageManager` is a question rather than a default.
 
@@ -247,7 +250,7 @@ permanently high-risk-human.
 | Python | yes | yes | — |
 | **Go** | yes | **no** | `client-c/cloud-service` profiles as `go/?  (no commands)` — reeve cannot run or verify anything |
 | **Rust** | yes | **no** | none active today |
-| **PHP** | **no** | no | 8 PHP repos in `revnix` (`a-wp-plugin`, `rext-wp-plugin`, `client-a-api`, …). `composer.json` is not in `detectLanguage`, so these produce no unit at all |
+| **PHP** | **no** | no | 8 PHP repos in `revnix` (`rext-wp-plugin`, a client A API, …). `composer.json` is not in `detectLanguage`, so these produce no unit at all |
 
 Go and PHP are each roughly a day: a manifest check plus an intent table (`go test ./...`,
 `go vet`, `go build ./...`; `composer test`, `phpstan`, `phpcs`). The architecture is right —
@@ -283,7 +286,7 @@ intents, not command names — so this is filling a table, not a redesign.
 3. **Decide the enforcement question.** Free plan means attestation everywhere except nextly. Team
    on `revnix` alone would convert roughly a dozen repos from advisory to enforceable. This is
    yours to decide; I would not spend engineering effort routing around it.
-4. **Fill the Go and PHP tables** before client-c or WordPress work needs them.
+4. **Fill the Go and PHP tables** before client C or WordPress work needs them.
 5. **Then** build the research half. It is the biggest gap, but it is worth the least until the
    repos it would propose changes to have a gate that can hold those changes to a standard.
 

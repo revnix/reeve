@@ -3503,8 +3503,9 @@ export async function run(ctx) {
 
   // The assertion dies with this process, so a crashed daemon can never leave the
   // Mac permanently unable to sleep.
-  const caffeinatePid = stayAwake(process.pid);
-  if (caffeinatePid) log(logPath, `staying awake via caffeinate pid ${caffeinatePid}`);
+  const awake = stayAwake(process.pid);
+  if (awake.pid) log(logPath, `staying awake via ${awake.via} pid ${awake.pid}`);
+  else if (awake.why) log(logPath, `not keeping the machine awake: ${awake.why}`);
 
   let stop = false;
   const shutdown = sig => { log(logPath, `${sig} — finishing this tick then stopping`); stop = true; };

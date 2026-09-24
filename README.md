@@ -113,6 +113,24 @@ log**. The plist names an absolute interpreter and an explicit repository for
 exactly that reason — passing no repository made it detect one from its working
 directory and spend every tick watching the wrong project.
 
+On Linux and WSL2 it runs as a systemd user service, `deploy/reeve.service`,
+which follows the same rules: an absolute interpreter and an explicit repository.
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp deploy/reeve.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now reeve
+sudo loginctl enable-linger "$USER"   # keep it running after you log out
+systemctl --user status reeve
+```
+
+Edit the two paths in the file first if node or the checkout live elsewhere.
+Without lingering, systemd stops the service when your last session ends. On
+WSL2, systemd must be enabled (`[boot] systemd=true` in `/etc/wsl.conf`), and
+keeping the daemon awake holds only the Linux side: Windows decides when the
+host sleeps.
+
 ## Runbook
 
 **Is it alive?** `reeve status` leads with a warning when the daemon has stopped

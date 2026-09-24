@@ -43,6 +43,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, s
 import { dirname, join } from "node:path";
 import { GIT_NEUTRALISE, GIT_NEUTRALISE_FOUNDER, REFUSING_HOOK, recordConfig, reason, gitEnv, founderGitEnv } from "./gitguard.mjs";
 import { writeFileSync, chmodSync } from "node:fs";
+import { platform } from "./platform.mjs";
 
 /** Every daemon git command in a worker-controlled directory carries the neutralisers. */
 function git(cwd, args, opts) {
@@ -156,17 +157,19 @@ export function dependencyPathsFor(profile) {
 /**
  * Can this filesystem clone files copy-on-write?
  *
- * `cp -c` fails on anything but APFS (and cross-volume), which is a fact about
- * the host, not an error: the caller falls back to a plain copy and pays the
- * space. Measured once per process against the directory that will actually be
+ * The probe fails where the filesystem can't clone (anything but APFS for
+ * `cp -c` on macOS; anything without reflinks, such as ext4, on Linux). That is
+ * a fact about the host, not an error: the caller falls back to a plain copy
+ * and pays the space. Measured against the directory that will actually be
  * copied, because the answer is per-volume.
  */
-export function canCloneFiles(nearPath) {
+export function canCloneFiles(nearPath, host = platform) {
+  if (!host.cloneProbeArgs) return false;
   const probe = join(nearPath, `.reeve-cow-probe-${process.pid}`);
   const copy = `${probe}.copy`;
   try {
     writeFileSync(probe, "probe\n");
-    execFileSync("cp", ["-c", probe, copy], { stdio: ["ignore", "ignore", "pipe"] });
+    execFileSync("cp", host.cloneProbeArgs(probe, copy), { stdio: ["ignore", "ignore", "pipe"] });
     return true;
   } catch { return false; }
   finally { rmSync(probe, { force: true }); rmSync(copy, { force: true }); }
@@ -177,10 +180,10 @@ export function canCloneFiles(nearPath) {
  * filesystem allows it. Returns `{ ok, why, cow }`; `cow` says whether the cheap
  * path was taken, so the caller can report honestly rather than assume.
  */
-export function copyDeps(from, to, { cow = null } = {}) {
+export function copyDeps(from, to, { cow = null, host = platform } = {}) {
   if (!existsSync(from)) return { ok: true, why: "nothing to copy", cow: false, skipped: true };
-  const useCow = cow ?? canCloneFiles(from.replace(/\/[^/]+$/, "") || "/tmp");
-  const args = useCow ? ["-Rc", from, to] : ["-R", from, to];
+  const useCow = cow ?? canCloneFiles(from.replace(/\/[^/]+$/, "") || "/tmp", host);
+  const args = host.copyTreeArgs(from, to, useCow);
   try {
     execFileSync("cp", args, { stdio: ["ignore", "ignore", "pipe"] });
     return { ok: true, why: null, cow: useCow };
@@ -188,7 +191,7 @@ export function copyDeps(from, to, { cow = null } = {}) {
     // A failed copy-on-write copy is retried as a plain one: the host may be
     // APFS while this particular pair of paths crosses volumes.
     if (!useCow) return { ok: false, why: `could not copy dependencies: ${String(e.stderr || e.message).trim()}`, cow: false };
-    try { execFileSync("cp", ["-R", from, to], { stdio: ["ignore", "ignore", "pipe"] }); return { ok: true, why: null, cow: false }; }
+    try { execFileSync("cp", host.copyTreeArgs(from, to, false), { stdio: ["ignore", "ignore", "pipe"] }); return { ok: true, why: null, cow: false }; }
     catch (e2) { return { ok: false, why: `could not copy dependencies: ${String(e2.stderr || e2.message).trim()}`, cow: false }; }
   }
 }

@@ -33,7 +33,7 @@ the thing that judges it can be trusted.
 | Topic | Decision |
 |---|---|
 | Work state | GitHub issues own goals, tasks, claims and progress. Reeve keeps only execution state (leases, runs) and evidence locally. Nothing needed to resume work may live only on one machine. |
-| First customer | Nextly, a real product with a team. First a shadow gate on its pull requests, meaning verdicts are published but block nothing. Then small Routine tasks. Reeve's own repository runs alongside. |
+| First customer | Nextly, the founder's own open-source product (not a client), which has a team. First a shadow gate on its pull requests, meaning verdicts are published but block nothing. Then small Routine tasks. Reeve's own repository runs alongside. |
 | First milestone | One complete workflow (below), run through both harnesses. It must recover from an interruption, and nobody may have to relay CI errors or review comments by hand. |
 | Worker login | The person's own, unmodified CLI login, or an API key. Reeve never reads or stores login tokens. Unattended Codex runs on public repositories use an API key. |
 | Authority | Four separate authorities (below). A worker's own report is never independent verification. An agent saying "approved" is never an approval. |

@@ -37,11 +37,18 @@ This applies to a new session, a new machine, or coming back after a break.
 1. Read this file and [`docs/decisions/2026-09-24-direction.md`](docs/decisions/2026-09-24-direction.md).
 2. Check pull requests in review before starting anything new: `gh pr list -R revnix/reeve`.
 3. Open the current phase issue. Take the next open task that has no open
-   blockers. Its latest checkpoint comment says where the work stopped.
-4. Work in a git worktree, never in the main checkout, because another session
+   blockers and nobody assigned. Its latest checkpoint comment says where the
+   work stopped.
+4. Claim the task before you change anything:
+   1. Assign it to yourself: `gh issue edit <n> -R revnix/reeve --add-assignee @me`.
+   2. Read it again.
+   3. If someone else is also assigned, remove yourself and pick another task.
+5. Work in a git worktree, never in the main checkout, because another session
    may be using it. Remove the worktree once the pull request is pushed.
-5. If you stop partway through a task, post a checkpoint comment on it. Don't
-   write a handoff document.
+6. If you stop partway through a task, first commit and push your branch. A
+   draft pull request is fine. Then post a checkpoint comment on the task. A
+   checkpoint that points at work existing on only one machine can't be
+   resumed anywhere else. Don't write a handoff document.
 
 ```
 <!-- checkpoint v1 -->
@@ -59,7 +66,7 @@ next:
 - **No AI attribution anywhere.** That covers commits, co-author trailers,
   pull request and issue text, comments and docs.
 - **This repository is public.** Never include:
-  - client names;
+  - client names (the founder's own products, such as Nextly, aren't clients);
   - private plans, or task links from private repositories;
   - secrets.
 - **Nothing public names Reeve.** No public client or product repository may
@@ -84,7 +91,8 @@ next:
 
 | Task | Command |
 |---|---|
-| Run the tests (Node 24.10 or later) | `for f in test/*.test.mjs; do node "$f" \|\| echo "FAILED $f"; done` |
+| Run the tests, stopping at the first failure (Node 24.10 or later) | `npm test` |
+| Run every test file and list all failures (exits non-zero if any fail) | `( fail=0; for f in test/*.test.mjs; do node "$f" >/dev/null \|\| { echo "FAILED $f"; fail=1; }; done; exit $fail )` |
 | Lint | `npm run lint` |
 | Check one stub-sweep entry (the full sweep runs nightly in CI) | `STUB_SWEEP_NO_DIFF=1 node scripts/stub-sweep.mjs <entry-name>` |
 

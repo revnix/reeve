@@ -80,7 +80,6 @@ export const GRANDFATHERED = [
   "test/denial-policy.test.mjs",
   "test/deploy.test.mjs",
   "test/dispatch-e2e.test.mjs",
-  "test/docs-state-is-single-sourced.test.mjs",
   "test/doctor-body-detector.test.mjs",
   "test/doctor-containment.test.mjs",
   "test/doctor-signatures.test.mjs",
@@ -157,7 +156,6 @@ export const GRANDFATHERED = [
   "test/worker-report.test.mjs",
   "test/worker-tool-boundary.test.mjs",
   "test/workerenv.test.mjs",
-  "test/zero-agrees-with-the-code.test.mjs",
 ];
 
 export const STUBS = [

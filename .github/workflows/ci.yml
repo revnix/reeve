@@ -83,6 +83,12 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      # Codex reads .agents/skills and Claude Code reads .claude/skills, so the
+      # two copies must stay identical. A copy rather than a symlink, because Git
+      # for Windows leaves symlinks off by default.
+      - name: The skill copies are identical
+        run: diff -r .agents/skills .claude/skills
+
       - name: Run the suite
         env:
           TZ: UTC

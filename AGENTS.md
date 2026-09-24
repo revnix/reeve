@@ -34,21 +34,38 @@ The plan issues:
 
 This applies to a new session, a new machine, or coming back after a break.
 
+Use the `resume-work` skill. It is in `.agents/skills/resume-work/`, with a
+copy in `.claude/skills/`:
+- In Claude Code, type `/resume-work`.
+- In Codex, ask it to use the resume-work skill.
+
+The skill does the following, and you can also do it by hand:
+
 1. Read this file and [`docs/decisions/2026-09-24-direction.md`](docs/decisions/2026-09-24-direction.md).
-2. Check pull requests in review before starting anything new: `gh pr list -R revnix/reeve`.
-3. Open the current phase issue. Take the next open task that has no open
-   blockers and nobody assigned. Its latest checkpoint comment says where the
-   work stopped.
-4. Claim the task before you change anything:
-   1. Assign it to yourself: `gh issue edit <n> -R revnix/reeve --add-assignee @me`.
-   2. Read it again.
-   3. If someone else is also assigned, remove yourself and pick another task.
+2. Take a snapshot of where things stand:
+   `node .agents/skills/resume-work/scripts/snapshot.mjs`. It lists the open
+   pull requests and what each is waiting for, the tasks in progress and their
+   checkpoints, the ready tasks, and a suggested next step. By hand, use
+   `gh pr list -R revnix/reeve --limit 100`; the default of 30 would hide older
+   pull requests.
+3. Choose the work in this order:
+   1. Review findings and failing checks on your own pull requests.
+   2. A task assigned to you, resumed from its latest checkpoint.
+   3. The next open task that has no open blockers and nobody assigned.
+4. Claim a new task before you change anything:
+   `node .agents/skills/resume-work/scripts/claim.mjs --issue <n>`.
+   - It assigns you and posts a claim comment carrying a random session id.
+   - The earliest claim since the task was last released wins, so two
+     sessions of the same account can't both take it.
+   - Give a task back with `--release`.
 5. Work in a git worktree, never in the main checkout, because another session
    may be using it. Remove the worktree once the pull request is pushed.
-6. If you stop partway through a task, first commit and push your branch. A
-   draft pull request is fine. Then post a checkpoint comment on the task. A
-   checkpoint that points at work existing on only one machine can't be
-   resumed anywhere else. Don't write a handoff document.
+6. If you stop partway through a task, commit and push your branch first. A
+   draft pull request is fine. Then record where you stopped:
+   `node .agents/skills/resume-work/scripts/checkpoint.mjs --issue <n> --done "…" --remaining "…"`.
+   It refuses if the branch has uncommitted or unpushed work, because a
+   checkpoint that points at one machine's disk can't be resumed anywhere else.
+   Don't write a handoff document.
 
 ```
 <!-- checkpoint v1 -->
@@ -69,8 +86,9 @@ next:
   - client names (the founder's own products, such as Nextly, aren't clients);
   - private plans, or task links from private repositories;
   - secrets.
-- **Nothing public names Reeve.** No public client or product repository may
-  mention Reeve. Its App is `merge-policy`, and its branches use the prefix
+- **No other public repository names Reeve.** This repository obviously does.
+  But no other public repository, client or product, may mention Reeve. In
+  those repositories its App is `merge-policy`, and its branches use the prefix
   `mp/`.
 - **Plans say what and why; the code shows how.** Write short plans, and only
   for the next slice of work.
@@ -92,8 +110,14 @@ next:
 | Task | Command |
 |---|---|
 | Run the tests, stopping at the first failure (Node 24.10 or later) | `npm test` |
-| Run every test file and list all failures (exits non-zero if any fail) | `( fail=0; for f in test/*.test.mjs; do node "$f" >/dev/null \|\| { echo "FAILED $f"; fail=1; }; done; exit $fail )` |
+| Run every test file and list all failures (exits non-zero if any fail) | `( fail=0; for f in test/*.test.mjs; do case "$f" in */escape.test.mjs) continue;; esac; node "$f" >/dev/null \|\| { echo "FAILED $f"; fail=1; }; done; exit $fail )` |
+| The containment escape probe (run deliberately, on a quiet machine) | `npm run test:escape` |
 | Lint | `npm run lint` |
 | Check one stub-sweep entry (the full sweep runs nightly in CI) | `STUB_SWEEP_NO_DIFF=1 node scripts/stub-sweep.mjs <entry-name>` |
+
+**Why the escape probe is left out of the routine commands:** it writes decoy
+files into the `~/.reeve/canary/` folder that a running daemon reads, and on
+macOS it probes the login keychain. CI still runs it, because CI runs on a
+clean runner.
 
 CI runs the tests twice: under `TZ=UTC` and under `TZ=Asia/Karachi`.

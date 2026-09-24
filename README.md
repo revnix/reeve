@@ -148,7 +148,10 @@ with zero false blocks**, not on a date.
 # stop at the first failing file
 npm test
 # run every file, list each failure, and exit non-zero if any failed
-( fail=0; for f in test/*.test.mjs; do node "$f" >/dev/null || { echo "FAILED $f"; fail=1; }; done; exit $fail )
+( fail=0; for f in test/*.test.mjs; do case "$f" in */escape.test.mjs) continue;; esac; node "$f" >/dev/null || { echo "FAILED $f"; fail=1; }; done; exit $fail )
+# the containment escape probe writes into ~/.reeve/canary and probes the macOS
+# keychain, so run it deliberately, on a quiet machine
+npm run test:escape
 ```
 
 The stub sweep checks that the tests can fail. It reintroduces each defect in

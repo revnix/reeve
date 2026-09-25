@@ -589,27 +589,72 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
  * A failure to look is not "there is none": returning null would then create a
  * duplicate rather than lose anything, which is the harmless direction.
  */
-function existingPolicyRun(token, nwo, sha, context) {
-  const r = apiAsInstallation(token,
+function existingPolicyRun(token, nwo, sha, context, api = apiAsInstallation) {
+  const r = api(token,
     [`repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=latest`,
      "--jq", `[.check_runs[] | select(.name == "${context}") | .id] | last // empty`]);
   return r.ok && r.out ? r.out.trim() : null;
 }
 
 /**
- * Publish. Shadow publishes `neutral`, which GitHub shows and never blocks on.
- * Enforcing publishes the real conclusion.
+ * Is `context` a required status check on a branch? GitHub requires a check in
+ * two places, and both are read: the rules that apply to the branch (every
+ * ruleset, the organisation's included) and classic branch protection, whose
+ * 404 means the branch isn't protected. Returns true, false, or null when either
+ * couldn't be read, and null is never taken for "not required".
  */
-export async function publishVerdict({ nwo, verdict, shadow = true, context = "ops/merge-policy" }) {
-  const auth = await authenticate(nwo);
+export function requiredOn({ rules, protection }, context) {
+  const parse = (r, fallback) => { try { return JSON.parse(r.out || fallback); } catch { return undefined; } };
+  let byRules = null, byProtection = null;
+  if (rules?.ok) {
+    const list = parse(rules, "[]");
+    if (Array.isArray(list)) byRules = list.some((r) => r?.type === "required_status_checks"
+      && (r.parameters?.required_status_checks ?? []).some((c) => c?.context === context));
+  }
+  if (protection?.ok) {
+    const p = parse(protection, "{}");
+    if (p && typeof p === "object") byProtection = (p.contexts ?? []).includes(context) || (p.checks ?? []).some((c) => c?.context === context);
+  } else if (/\(HTTP 404\)/.test(protection?.err ?? "")) byProtection = false;
+  if (byRules === true || byProtection === true) return true;
+  if (byRules === null || byProtection === null) return null;
+  return false;
+}
+
+/**
+ * What shadow mode publishes. `neutral` shows the verdict without deciding
+ * anything, and GitHub counts it as passing a required check. So it is used only
+ * where the check is known not to be required. A required check, or one whose
+ * rules couldn't be read, gets `action_required`, which doesn't pass.
+ */
+export function shadowConclusion(required) {
+  return required === false ? "neutral" : "action_required";
+}
+
+/**
+ * Publish. Enforcing publishes the real conclusion. Shadow publishes `neutral`,
+ * which GitHub shows and never blocks on, unless the check is required on the
+ * base branch (or that can't be read): then `neutral` would pass the gate
+ * unjudged, so it publishes a conclusion that doesn't pass, says why, and
+ * returns the reason as `held` for the daemon to raise.
+ */
+export async function publishVerdict({ nwo, verdict, shadow = true, context = "ops/merge-policy", base = null,
+                                      auth: authenticateAs = authenticate, api = apiAsInstallation }) {
+  const auth = await authenticateAs(nwo);
   if (!auth.ok) return { ok: false, why: auth.why };
 
   const real = verdict.state === PASS ? "success" : verdict.state === BLOCK ? "failure" : "action_required";
-  const conclusion = shadow ? "neutral" : real;
-  const title = `${shadow ? "[shadow] " : ""}${verdict.state}: ${verdict.summary}`;
-  const body = shadow
-    ? `**Shadow mode.** This check reports what the merge policy *would* have decided. It does not block.\n\nIf enforcing, this revision would be: **${real}**\n\n${renderVerdict(verdict)}`
-    : renderVerdict(verdict);
+  const required = shadow && base ? requiredOn({
+    rules: api(auth.token, [`repos/${nwo}/rules/branches/${encodeURIComponent(base)}`]),
+    protection: api(auth.token, [`repos/${nwo}/branches/${encodeURIComponent(base)}/protection/required_status_checks`]),
+  }, context) : null;
+  const conclusion = shadow ? shadowConclusion(required) : real;
+  const held = shadow && required !== false
+    ? (required ? `${context} is required on ${base}` : `whether ${context} is required on ${base ?? "the base branch"} couldn't be read`)
+    : null;
+  const title = held ? `[shadow] not passing: ${held}` : `${shadow ? "[shadow] " : ""}${verdict.state}: ${verdict.summary}`;
+  const body = !shadow ? renderVerdict(verdict)
+    : held ? `**Shadow mode, and this check does not pass.** Shadow mode reports what the merge policy *would* decide without deciding it, and GitHub counts its usual \`neutral\` conclusion as passing a required check. Here ${held}, so \`neutral\` would leave the gate open.\n\nEither enforce the policy, or stop requiring \`${context}\` while reeve runs in shadow mode.\n\nIf enforcing, this revision would be: **${real}**\n\n${renderVerdict(verdict)}`
+    : `**Shadow mode.** This check reports what the merge policy *would* have decided. It does not block.\n\nIf enforcing, this revision would be: **${real}**\n\n${renderVerdict(verdict)}`;
 
   // Update the run already at this head rather than adding another. One head on
   // nextly had accumulated 38 of these in an afternoon: the API's default
@@ -620,12 +665,12 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = "o
     "-f", `output[title]=${title.slice(0, 250)}`,
     "-f", `output[summary]=${body.slice(0, 60000)}`,
   ];
-  const existing = existingPolicyRun(auth.token, nwo, verdict.head, context);
+  const existing = existingPolicyRun(auth.token, nwo, verdict.head, context, api);
   const res = existing
-    ? apiAsInstallation(auth.token, ["-X", "PATCH", `repos/${nwo}/check-runs/${existing}`, ...fields])
-    : apiAsInstallation(auth.token, ["-X", "POST", `repos/${nwo}/check-runs`,
+    ? api(auth.token, ["-X", "PATCH", `repos/${nwo}/check-runs/${existing}`, ...fields])
+    : api(auth.token, ["-X", "POST", `repos/${nwo}/check-runs`,
         "-f", `name=${context}`, "-f", `head_sha=${verdict.head}`, ...fields]);
   if (!res.ok) return { ok: false, why: res.err.split("\n")[0] };
   return { ok: true, id: JSON.parse(res.out).id, conclusion, wouldBe: real, shadow,
-           updated: Boolean(existing) };
+           updated: Boolean(existing), held };
 }

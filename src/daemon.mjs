@@ -1976,8 +1976,15 @@ export async function tick(ctx) {
     // Republish on every tick: a verdict is bound to a revision, so when the head
     // moves the old check stops applying to anything. Without this the shadow
     // record silently decays to nothing.
-    const pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict: e.verdict, shadow });
+    const pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict: e.verdict, shadow, base: e.baseRef });
     if (!pub.ok) log(logPath, `    could not publish: ${pub.why}`);
+    // Shadow mode found its own check required, or couldn't tell. It published a
+    // conclusion that doesn't pass rather than open the gate, and a person has to
+    // choose: enforce, or stop requiring the check. One escalation, not one per PR.
+    else if (pub.held) {
+      log(logPath, `    shadow: published a conclusion that doesn't pass, because ${pub.held}`);
+      raise(`shadow mode can't publish a passing-neutral check: ${pub.held}`);
+    }
 
     // A shared cause is one problem, not N. Four PRs blocked on a red base is a
     // single escalation, or the phone becomes noise and gets muted.

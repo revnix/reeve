@@ -253,12 +253,15 @@ const SYNTAX = ["|&", "<<<", "&>", "&>>", ">&"];
 const asked = new Map();
 /**
  * A shell, as `{ name, paths, builtins, keywords, execOptions, execEndsOptions,
- * appendAssign, pipefail, badOptionEnds, syntax }`, asked once: which of the
- * candidate words it treats as its own, whether its `exec` takes options, and
- * `--`, whether `NAME+=value` assigns, whether it has `set -o pipefail`, whether
- * a `set` option it doesn't have ends it, and which of bash's operators it has,
- * in `syntax`. Null when it can't be asked, or answers as no shell does; then
- * no script is judged.
+ * appendAssign, pipefail, badOptionEnds, syntax, unsetLastOptionWins,
+ * pTakesOperands, readonlyAssignEnds }`, asked once: which of the candidate
+ * words it treats as its own, whether its `exec` takes options, and `--`,
+ * whether `NAME+=value` assigns, whether it has `set -o pipefail`, whether a
+ * `set` option it doesn't have ends it, which of bash's operators it has, in
+ * `syntax`, whether `unset` takes the last of `-f` and `-v` where both are
+ * given, whether `readonly -p` and `export -p` take their operands, and whether
+ * assigning a read-only variable ends it. Null when it can't be asked, or
+ * answers as no shell does; then no script is judged.
  */
 export function scriptShell(path = "sh") {
   if (asked.has(path)) return asked.get(path);
@@ -269,6 +272,10 @@ export function scriptShell(path = "sh") {
     'if (x=a; x+=b; test "$x" = ab) >/dev/null 2>&1; then printf "append-assign\\tyes\\n"; fi; ' +
     'if (set -o pipefail) >/dev/null 2>&1; then printf "pipefail\\tyes\\n"; fi; ' +
     'if ! (set -o reeve-no-such-option; exit 0) >/dev/null 2>&1; then printf "bad-option-ends\\tyes\\n"; fi; ' +
+    'if (x=1; unset -fv x; test -z "${x+set}") >/dev/null 2>&1 && (x=1; unset -vf x; test -n "${x+set}") >/dev/null 2>&1; ' +
+    'then printf "unset-last-option-wins\\tyes\\n"; fi; ' +
+    'if (readonly -p x=1 >/dev/null; test "${x-}" = 1) >/dev/null 2>&1; then printf "p-takes-operands\\tyes\\n"; fi; ' +
+    'if ! (readonly x=1; x=2; exit 0) >/dev/null 2>&1; then printf "readonly-assign-ends\\tyes\\n"; fi; ' +
     // Each operator in a shell of its own, since a syntax error ends the shell
     // it's read in. dash reads `&>` as `&` and a redirection, which leaves the
     // command's output where it was.
@@ -283,7 +290,8 @@ export function scriptShell(path = "sh") {
   if (r.status === 0 && r.stdout) {
     shell = { name: basename(path), paths: [path], builtins: new Set(), keywords: new Set(),
               execOptions: false, execEndsOptions: false, appendAssign: false, pipefail: false, badOptionEnds: false,
-              syntax: Object.fromEntries(SYNTAX.map((op) => [op, false])) };
+              syntax: Object.fromEntries(SYNTAX.map((op) => [op, false])), unsetLastOptionWins: false, pTakesOperands: false,
+              readonlyAssignEnds: false };
     for (const line of r.stdout.split("\n")) {
       const tab = line.indexOf("\t");
       if (tab < 0) continue;
@@ -295,6 +303,9 @@ export function scriptShell(path = "sh") {
       else if (word === "pipefail") shell.pipefail = true;
       else if (word === "bad-option-ends") shell.badOptionEnds = true;
       else if (word === "syntax" && SYNTAX.includes(said)) shell.syntax[said] = true;
+      else if (word === "unset-last-option-wins") shell.unsetLastOptionWins = true;
+      else if (word === "p-takes-operands") shell.pTakesOperands = true;
+      else if (word === "readonly-assign-ends") shell.readonlyAssignEnds = true;
       else if (/ is a (special )?shell builtin$/.test(said)) shell.builtins.add(word);
       else if (/ is a (shell keyword|reserved word)$/.test(said)) shell.keywords.add(word);
     }
@@ -314,8 +325,10 @@ const allHave = (values) => (values.every((v) => v === true) ? true : values.eve
  * The shell a script runs under when it may be any of several, as one: a word
  * is its own when any of them has it, exec takes options when any exec does,
  * and `NAME+=value` assigns when any shell assigns it. So no word is called
- * missing that one of them has. pipefail, how a bad option ends, and bash's
- * operators are "maybe" where they differ. Null when any can't be asked.
+ * missing that one of them has. pipefail, how a bad option ends, bash's
+ * operators, how unset and -p read their options, and whether a read-only
+ * assignment ends the shell are "maybe" where they differ. Null when any can't
+ * be asked.
  */
 export function scriptShells(paths) {
   const shells = (paths ?? []).map((path) => scriptShell(path));
@@ -326,7 +339,10 @@ export function scriptShells(paths) {
            execOptions: shells.some((s) => s.execOptions), execEndsOptions: shells.some((s) => s.execEndsOptions),
            appendAssign: shells.some((s) => s.appendAssign), pipefail: allHave(shells.map((s) => s.pipefail)),
            badOptionEnds: allHave(shells.map((s) => s.badOptionEnds)),
-           syntax: Object.fromEntries(SYNTAX.map((op) => [op, allHave(shells.map((s) => s.syntax[op]))])) };
+           syntax: Object.fromEntries(SYNTAX.map((op) => [op, allHave(shells.map((s) => s.syntax[op]))])),
+           unsetLastOptionWins: allHave(shells.map((s) => s.unsetLastOptionWins)),
+           pTakesOperands: allHave(shells.map((s) => s.pTakesOperands)),
+           readonlyAssignEnds: allHave(shells.map((s) => s.readonlyAssignEnds)) };
 }
 
 const told = new Map();
@@ -751,11 +767,24 @@ function builtin(name, args, path, state, ctx) {
       }
       return OK;
     case "export": case "readonly": {
-      // -f names functions, which PATH isn't, and -p only lists. A read-only
+      // -f names functions, which PATH isn't. -p lists: dash then takes no
+      // operand at all, and bash takes them as it would without it. A read-only
       // PATH keeps its value.
-      let k = 0, r = OK;
-      for (; k < args.length && /^-[a-zA-Z]+$/.test(text[k]); k++) if (text[k].includes("f")) return OK;
+      let k = 0, r = OK, listing = false;
+      for (; k < args.length && /^-[a-zA-Z]+$/.test(text[k]); k++) {
+        if (text[k].includes("f")) return OK;
+        if (text[k].includes("p")) listing = true;
+      }
       if (text[k] === "--") k++;
+      if (listing && ctx.shell?.pTakesOperands === false) return OK;
+      if (listing && ctx.shell?.pTakesOperands !== true) {
+        // Whether PATH was given its value, or made read-only, depends on the shell.
+        if (args.slice(k).some((w) => (assignment(w, ctx.shell)?.name ?? w.text) === "PATH" || w.expansion)) {
+          state.path = null;
+          if (name === "readonly" && state.pathReadonly === false) state.pathReadonly = "maybe";
+        }
+        return UNKNOWN;
+      }
       for (const w of args.slice(k)) {
         const a = assignment(w, ctx.shell);
         if (a?.name === "PATH") r = assignPath(state, literalPath(a.value)) ?? r;
@@ -765,13 +794,21 @@ function builtin(name, args, path, state, ctx) {
     }
     case "unset": {
       // With PATH unset, dash and bash look programs up in the current folder
-      // only. -f unsets functions, which PATH isn't, and a name an expansion
-      // gives may be PATH.
-      let k = 0;
-      for (; k < args.length && /^-[a-zA-Z]+$/.test(text[k]); k++) if (text[k].includes("f")) return OK;
+      // only. -f unsets functions, which PATH isn't, and -v variables. Given
+      // both, dash takes the last, and bash refuses the command and unsets
+      // neither. A name an expansion gives may be PATH.
+      let k = 0, fn = false, vars = false, last = null;
+      for (; k < args.length && /^-[a-zA-Z]+$/.test(text[k]); k++) {
+        for (const c of text[k].slice(1)) if (c === "f" || c === "v") { last = c; if (c === "f") fn = true; else vars = true; }
+      }
       if (text[k] === "--") k++;
+      const lastWins = fn && vars ? ctx.shell?.unsetLastOptionWins : null;
+      if (lastWins === false) return UNKNOWN;
+      if (fn && (!vars || (lastWins === true && last === "f"))) return OK;
+      // Given both, in a shell that may take either.
+      const unsure = fn && vars && lastWins !== true;
       for (const w of args.slice(k)) {
-        if (w.expansion || w.glob) {
+        if (w.expansion || w.glob || (unsure && w.text === "PATH")) {
           if (state.pathReadonly !== false) return { o: "?", stop: "maybe" };
           state.path = null;
         } else if (w.text === "PATH") {
@@ -872,7 +909,11 @@ function simple(words, state, ctx) {
   if (k === words.length) {
     // Assignments alone last for the rest of the script, and end with the
     // status of a command substitution among them.
-    if (assigned) { const r = assignPath(state, path); if (r) return r; }
+    // Alone, a failed assignment to a read-only variable ends dash and bash.
+    if (assigned) {
+      const r = assignPath(state, path);
+      if (r) return r.o === "fail" ? { ...r, stop: ctx.shell?.readonlyAssignEnds ?? "maybe" } : r;
+    }
     return words.some((w) => w.expansion) ? UNKNOWN : OK;
   }
   // Before a command, an assignment to a read-only PATH fails: dash ends
@@ -963,6 +1004,13 @@ const inverted = (r) => {
   return { ...r, o, why: o === "fail" ? "always fails: '!' inverts a pipeline that succeeds" : null, negated: true };
 };
 
+// A command that writes nothing, which the next closing the pipe can't stop:
+// `true` or `:`, the shell's or the program, or assignments alone.
+const writesNothing = (cmd, shell) => {
+  const word = cmd.words.find((w) => !assignment(w, shell));
+  return !word || (!word.expansion && (word.text === "true" || word.text === ":"));
+};
+
 // A command whose redirection may fail: then it doesn't run, and fails. So it
 // never surely succeeds, and an exit or exec with one may not end the shell:
 // bash goes on, where dash ends.
@@ -1001,11 +1049,12 @@ function pipeline(list, i, state, ctx) {
   // status is the pipeline's.
   const run = (k) => redirected(list[k], simple(list[k].words, { ...state, mutated: state.mutated || list[k].subst }, ctx));
   const r = run(j);
-  // Under pipefail it fails when any of them fails. One before the last may be
-  // stopped by the next closing the pipe, so it never surely succeeds.
+  // Under pipefail it fails when any of them fails. One before the last that
+  // writes may be stopped by the next closing the pipe, so it never surely
+  // succeeds.
   let status = r;
   if (state.pipefail !== false) {
-    const each = [...list.slice(i, j).map((_, n) => { const e = run(i + n); return e.o === "ok" ? UNKNOWN : e; }), r];
+    const each = [...list.slice(i, j).map((_, n) => { const e = run(i + n); return e.o === "ok" && !writesNothing(list[i + n], ctx.shell) ? UNKNOWN : e; }), r];
     const withIt = each.findLast((e) => e.o === "fail") ?? (each.every((e) => e.o === "ok") ? OK : UNKNOWN);
     status = state.pipefail === true ? withIt : either(withIt, r);
   }

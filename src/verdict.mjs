@@ -78,10 +78,21 @@ export function computeVerdict(i) {
 
   // 1. CI at the pinned head, settled. An unsettled green is a workflow that has
   //    not scheduled its jobs yet, which reads identically to a clean run.
-  if (!i.checks) add("ci", UNKNOWN, "no check reading");
+  //
+  //    Another App's check under reeve's own name comes first, settled or not:
+  //    something is speaking for the gate, and only a person can clear that.
+  const impostors = i.checks?.impostors ?? [];
+  if (impostors.length) {
+    const who = [...new Set(impostors.map(r => (r.app ? `the App ${r.app}` : "a commit status")))].join(" and ");
+    add("ci", BLOCK, `a check under reeve's own name, ${impostors[0].name}, comes from ${who}, not from reeve`);
+  }
+  // A base that requires reeve's shadow check is gated by a result that never
+  // fails: the shadow result passes the rule whatever reeve found.
+  else if (i.checks?.shadowRequired) add("ci", BLOCK, "the base requires reeve's shadow check, whose result passes the rule whatever reeve finds");
+  else if (!i.checks) add("ci", UNKNOWN, "no check reading");
   else if (!i.checks.settled) add("ci", UNKNOWN, `checks not settled: ${i.checks.verdict}${i.checks.why ? ` (${i.checks.why})` : ""}`);
   else if (i.checks.verdict === "GREEN") add("ci", PASS, "all checks passing at the pinned head");
-  else if (i.checks.verdict === "MISSING_REQUIRED") add("ci", BLOCK, i.checks.why);
+  else if (i.checks.verdict === "MISSING_REQUIRED" || i.checks.verdict === "SKIPPED_REQUIRED") add("ci", BLOCK, i.checks.why);
   else if (i.checks.verdict === "RED") {
     const names = (i.checks.failing ?? []).map(f => f?.name).filter(Boolean).join(", ") || "an unnamed check";
     // Inherited red is still red for THIS gate: merging it does not make the base

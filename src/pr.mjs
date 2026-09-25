@@ -134,7 +134,7 @@ export function readMergeParts(nwo, baseRef, threads, { gh = ghJson, context = P
  * runs and statuses were read in full: every result under a name must pass, and
  * a failing one on a surface that went unread would leave the rest passing.
  */
-export const mergeRows = (read) => (read?.whole ? [...read.rows, ...read.reviewerRows, ...read.impostors] : null);
+export const mergeRows = (read) => (read?.ok ? [...read.rows, ...read.reviewerRows, ...read.impostors] : null);
 
 // What passes a required check, as GitHub counts it.
 const PASSING_RUN = new Set(["success", "neutral", "skipped"]);
@@ -166,6 +166,66 @@ function requiredCheckState(rows, { context, app, besideOwn = false }, now = Dat
   // Passing, but too long ago to count, or at a time that can't be read.
   if (candidates.some((r) => !(now - Date.parse(r.completedAt) <= REQUIRED_RESULT_MS))) return "expired";
   return "passing";
+}
+
+/**
+ * The checks a pull request's CI must include, as `{ context, app, origin }`:
+ * those the profile names, and those its base's rules and protection require,
+ * each with the App it's bound to and where it came from. Of the base's, reeve's
+ * own check is aside, since its
+ * rows are never evidence, and so are reviewers' statuses, which the review
+ * clauses read. `known` is false when the base's couldn't be read.
+ *
+ * `shadowRequired` says the base requires reeve's shadow check. That's no
+ * requirement to meet but one to refuse: a shadow result never fails, so it
+ * passes the rule whatever reeve found.
+ */
+export function requiredChecksOf({ nwo, baseRef, profile = {}, requirements = requiredChecksOnBase, gh = ghJson }) {
+  const base = baseRef ? requirements({ nwo, base: baseRef, gh }) : null;
+  const shadow = shadowContextOf(POLICY_CONTEXT);
+  const reviewers = new Set(profile.ci?.reviewerStatusContexts ?? []);
+  // A reviewer's status is aside, but a check bound to an App under the same
+  // name is a check run, and required like any other.
+  const aside = (c) => c.context === POLICY_CONTEXT || c.context === shadow || (c.app == null && reviewers.has(c.context));
+  const all = [...(profile.ci?.requiredChecks ?? []).map((context) => ({ context, app: null, origin: "profile" })),
+               ...(base ?? []).filter((c) => !aside(c)).map((c) => ({ ...c, origin: "base" }))];
+  // One entry per check. Where the profile and the base both name it, the base
+  // wins: its requirement may be any App's, and settles only when it reports.
+  const required = all.filter((c, i) => all.findIndex((d) => d.context === c.context && d.app === c.app) === i)
+    .map((c) => (all.some((d) => d.context === c.context && d.app === c.app && d.origin === "base") ? { ...c, origin: "base" } : c));
+  return { required, known: Array.isArray(base), shadowRequired: (base ?? []).some((c) => c.context === shadow) };
+}
+
+/**
+ * A check read, classified against the required set. A read that isn't whole
+ * passes nothing, since the surface that went unread may hold a failure; but a
+ * failure it did read is one, and stays RED.
+ */
+export function classifyRead(read, { required = [], known = true } = {}, { evidence = true } = {}) {
+  const c = classify(read?.rows ?? [], required, { requiredKnown: known, evidence });
+  if (read?.ok || c.verdict === "RED") return c;
+  return { verdict: "UNKNOWN", failing: [], running: [], why: `the checks couldn't be read in full: ${read?.why ?? "nothing was read"}` };
+}
+
+/**
+ * Whether the Apps that a head's missing required checks wait on have finished
+ * there: the App a requirement is bound to, or the profile's CI provider for one
+ * that isn't. True only when every one has, and null when one couldn't be
+ * asked. A third-party App that hasn't scheduled its run yet isn't finished
+ * because GitHub Actions is.
+ */
+export function missingSettled(nwo, sha, missing = [], profile = {}, suites = suitesComplete) {
+  // An unbound check the base requires may come from any App, or be a commit
+  // status from none, so no suite can say it has finished: its absence stays
+  // unsettled until it reports.
+  if (missing.some((c) => c?.app == null && c?.origin === "base")) return false;
+  let all = true;
+  for (const app of new Set(missing.length ? missing.map((c) => c?.app ?? null) : [null])) {
+    const done = app == null ? suites(nwo, sha, { app: profile.ci?.appSlug ?? "github-actions" }) : suites(nwo, sha, { appId: app });
+    if (done === null) return null;
+    if (!done) all = false;
+  }
+  return all;
 }
 
 /** reeve's own App id, from its credentials, or null when there are none. */
@@ -535,7 +595,10 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   const reviewerContexts = profile.ci?.reviewerStatusContexts ?? [];
   const read = readChecks(nwo, pin.sha, { reviewerContexts });
   const { rows } = read;
-  const c = classify(rows, profile.ci?.requiredChecks ?? []);
+  // Required: what the profile names and what the base requires. A skipped
+  // required check didn't run, and a read that isn't whole is UNKNOWN.
+  const req = requiredChecksOf({ nwo, baseRef, profile });
+  const c = classifyRead(read, req);
   // ONE reading, folded into what the previous tick recorded. Settlement is about
   // the check SET being stable ACROSS TIME, so it can only be established by
   // successive ticks -- this used to call settle() three times over the same
@@ -543,9 +606,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // Only asked when a required check is missing, because that is the only branch
   // whose answer depends on it and each call is an extra API round trip.
   const reading = { ...c, sha: pin.sha, rows,
-    suitesComplete: c.verdict === "MISSING_REQUIRED"
-      ? suitesComplete(nwo, pin.sha, { app: profile.ci?.appSlug ?? "github-actions" })
-      : null };
+    suitesComplete: c.verdict === "MISSING_REQUIRED" ? missingSettled(nwo, pin.sha, c.missingChecks, profile) : null };
   let s;
   if (db) {
     s = saveSettlement(db, nwo, pr, settle(loadSettlement(db, nwo, pr), reading));
@@ -563,11 +624,17 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   }
 
   const baseHead = pinHead(nwo, baseRef);
-  // Judged against the SAME required set as the head. Passing an empty list here
-  // meant every check on the base counted equally, so one cancelled ancillary job
-  // made the branch uncheckable and every open PR waited on it.
+  // Judged against the profile's required set. Passing an empty list here meant
+  // every check on the base counted equally, so one cancelled ancillary job made
+  // the branch uncheckable and every open PR waited on it.
+  //
+  // For health, not for evidence of a pass, and that is deliberate: anything but
+  // green holds every open pull request. A check the base's rules require may run
+  // only on pull requests, and a push its path filters skip is a healthy one, so
+  // neither the base's own requirements nor the head's rules about skipped checks
+  // apply. Only a partial read does: it can hide a failure.
   const base = baseHead.ok
-    ? classify(readChecks(nwo, baseHead.sha, { reviewerContexts }).rows, profile.ci?.requiredChecks ?? [])
+    ? classifyRead(readChecks(nwo, baseHead.sha, { reviewerContexts }), { required: profile.ci?.requiredChecks ?? [] }, { evidence: false })
     : { verdict: "UNKNOWN" };
 
   const threads = readThreads(nwo, pr);
@@ -644,7 +711,9 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
 
   const verdict = computeVerdict({
     head: pin.sha,
-    checks: { verdict: s.verdict, settled: s.settled, why: s.why, failing: c.failing, inherited: c.inherited },
+    checks: { verdict: s.verdict, settled: s.settled, why: s.why, failing: c.failing, inherited: c.inherited,
+              // Another App's check under reeve's own name: kept, never dropped.
+              impostors: read.impostors ?? [], shadowRequired: req.shadowRequired },
     base: { verdict: base.verdict },
     reviewers, rounds, threads, cleared: facts.cleared,
     bodyFindings: facts.bodyFindings, unreadableBodies: facts.unreadableBodies,
@@ -736,6 +805,10 @@ const HARMLESS_RULES = new Set(["creation", "deletion", "non_fast_forward", "req
  *   unevaluated       what can stop a merge that reeve doesn't evaluate: deployments,
  *                     signatures, a merge queue, a locked branch, and any rule it
  *                     doesn't know, named
+ *   checks            every required status check, reeve's own included, as
+ *                     { context, app }, with the App it is bound to or null:
+ *                     known once the rules and the branch are read, whatever
+ *                     else of protection could be
  *
  * GitHub requires things in two places, and both are read: the rules that apply to
  * the branch (every ruleset, the organisation's included, every page), and classic
@@ -744,8 +817,8 @@ const HARMLESS_RULES = new Set(["creation", "deletion", "non_fast_forward", "req
  * administrator's read. A requirement bound to another App isn't reeve's: GitHub
  * waits for that App.
  *
- * `own` is true, false, or null when it can't be told; the other three are null
- * when they can't be told. Null is never taken for "nothing required".
+ * `own` is true, false, or null when it can't be told; the others are null when
+ * they can't be told. Null is never taken for "nothing required".
  */
 export function requirementsOn({ rules, branch, protection = null }, context, { appId = null } = {}) {
   // Every page of the rules arrives as one object per line; a single array is
@@ -760,11 +833,12 @@ export function requirementsOn({ rules, branch, protection = null }, context, { 
   // App id isn't known.
   const ours = (bound) => (bound == null || Number(bound) === -1 ? true : appId == null ? null : String(bound) === String(appId));
   const verdictOf = (answers) => (answers.includes(true) ? true : answers.includes(null) ? null : false);
-  const others = [], unevaluated = [];
+  const others = [], unevaluated = [], every = [];
   let byRules = null, byProtection = null, threadResolution = false, strict = false, whole = true;
   // A required check is reeve's, another App's, or, bound to an App reeve can't
   // name, both: GitHub waits for whichever App it is.
   const required = (answers, c, bound) => {
+    if (typeof c === "string" && c) every.push({ context: c, app: bound == null || Number(bound) === -1 ? null : String(bound) });
     if (c !== context) { others.push({ context: c, app: bound == null || Number(bound) === -1 ? null : String(bound) }); return; }
     const mine = ours(bound);
     answers.push(mine);
@@ -793,12 +867,12 @@ export function requirementsOn({ rules, branch, protection = null }, context, { 
   // The branch is the one place classic protection's required checks are read,
   // so without it they are unknown, even when the rest of protection was read.
   if (!b) whole = false;
-  const checks = b?.protection?.required_status_checks;
+  const branchChecks = b?.protection?.required_status_checks;
   if (b?.protected === false) byProtection = false;
-  else if (checks && typeof checks === "object") {
+  else if (branchChecks && typeof branchChecks === "object") {
     const answers = [];
-    for (const c of checks.checks ?? []) required(answers, c?.context, c?.app_id);
-    if (!(checks.checks ?? []).length) for (const c of checks.contexts ?? []) required(answers, c, null);
+    for (const c of branchChecks.checks ?? []) required(answers, c?.context, c?.app_id);
+    if (!(branchChecks.checks ?? []).length) for (const c of branchChecks.contexts ?? []) required(answers, c, null);
     byProtection = verdictOf(answers);
   }
   if (classicProtection(b) !== false) {
@@ -817,8 +891,10 @@ export function requirementsOn({ rules, branch, protection = null }, context, { 
   }
 
   const own = byRules === true || byProtection === true ? true : byRules === null || byProtection === null ? null : false;
-  return whole ? { own, others, threadResolution, strict, unevaluated }
-    : { own, others: null, threadResolution: null, strict: null, unevaluated: null };
+  const checks = Array.isArray(list) && b
+    ? every.filter((c, i) => every.findIndex((d) => d.context === c.context && d.app === c.app) === i) : null;
+  return whole ? { own, others, threadResolution, strict, unevaluated, checks }
+    : { own, others: null, threadResolution: null, strict: null, unevaluated: null, checks };
 }
 
 const parsed = (r) => { try { return r?.ok ? JSON.parse(r.out || "{}") : undefined; } catch { return undefined; } };
@@ -837,7 +913,7 @@ const REQUIRED = new Map();
 const REQUIRED_TTL_MS = 60_000;
 
 /** Drop every kept reading, so the next question reads the base afresh. The daemon calls this as each tick starts. */
-export function clearRequirements() { REQUIRED.clear(); }
+export function clearRequirements() { REQUIRED.clear(); REQUIRED_CHECKS.clear(); }
 
 /** requirementsOn for a base branch, read with `gh` and cached for a minute. */
 export function requirementsOnBase({ nwo, base, context, gh, appId = null, now = Date.now() }) {
@@ -858,6 +934,26 @@ export function requirementsOnBase({ nwo, base, context, gh, appId = null, now =
   if (REQUIRED.size > 256) REQUIRED.clear();
   if (value.own !== null && value.others !== null) REQUIRED.set(key, { at: now, value });
   return value;
+}
+
+const REQUIRED_CHECKS = new Map();
+/**
+ * requirementsOn's `checks` for a base branch: every status check its rules and
+ * branch protection require. Read from the rules and the branch alone, so a
+ * token that can't read the rest of protection still gets it, and kept for a
+ * minute. Null when either couldn't be read.
+ */
+export function requiredChecksOnBase({ nwo, base, gh = ghJson, now = Date.now() }) {
+  const key = `${nwo}\u0000${base}`;
+  const hit = REQUIRED_CHECKS.get(key);
+  if (hit && now - hit.at < REQUIRED_TTL_MS) return hit.checks;
+  const { checks } = requirementsOn({
+    rules: gh(["--paginate", `repos/${nwo}/rules/branches/${encodeURIComponent(base)}`, "--jq", ".[]"]),
+    branch: gh([`repos/${nwo}/branches/${encodeURIComponent(base)}`]),
+  }, POLICY_CONTEXT);
+  if (REQUIRED_CHECKS.size > 256) REQUIRED_CHECKS.clear();
+  if (checks !== null) REQUIRED_CHECKS.set(key, { at: now, checks });
+  return checks;
 }
 
 /** Whether reeve's check is required on a base: requirementsOnBase's `own`. */

@@ -3856,4 +3856,22 @@ export const STUBS = [
               find: "Boolean(archived) && column !== \"Done\"",
               replace: "Boolean(archived)" }],
   },
+  {
+    name: "board-reads-found-closed-parents",
+    why: "read only the closed parents on the board when syncing starts. A closed task with sub-tasks met along the way, with no card yet, then leaves its sub-tasks unread",
+    test: "test/resume-work-board.test.mjs",
+    expectRed: "a closed task with sub-tasks met while syncing is read in its turn, card or no card, however deep",
+    edits: [{ file: ".agents/skills/resume-work/scripts/lib.mjs",
+              find: "  for (const [n] of parents) for",
+              replace: "  for (const n of [...parents.keys()]) for" }],
+  },
+  {
+    name: "board-notes-closed-parents",
+    why: "never note a closed task with sub-tasks as a parent to read. Its sub-tasks are then read only if its card was on the board from the start",
+    test: "test/resume-work-board.test.mjs",
+    expectRed: "a closed task with sub-tasks met while syncing is read in its turn, card or no card, however deep",
+    edits: [{ file: ".agents/skills/resume-work/scripts/lib.mjs",
+              find: "issue?.state === \"CLOSED\" && (issue.subIssues?.totalCount ?? 0) > 0",
+              replace: "false" }],
+  },
 ];

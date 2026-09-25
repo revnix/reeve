@@ -59,7 +59,7 @@ export function readPlan(repo, run = gh) {
     issues(states:OPEN, first:100, after:$after, orderBy:{field:CREATED_AT, direction:ASC}){
       pageInfo{ hasNextPage endCursor } nodes{
       id number title issueType{ name }
-      subIssues(first:100){ totalCount nodes{ id number title state assignees(first:10){ nodes{ login } } } }
+      subIssues(first:100){ totalCount nodes{ id number title state assignees(first:10){ nodes{ login } } subIssues{ totalCount } } }
     } } } }`, (d) => d.repository.issues);
   const phases = issues.nodes.filter((i) => i.subIssues.nodes.length > 0 || i.issueType?.name === "Feature")
     .map((phase) => completePhase(phase, (n) => readSubIssues(repo, n, run)));
@@ -70,7 +70,7 @@ export function readPlan(repo, run = gh) {
 /** Every sub-issue of an issue, from the REST listing, in the shape the plan's query returns. */
 export function readSubIssues(repo, n, run = gh) {
   return run(["api", "--paginate", `repos/${repo}/issues/${n}/sub_issues`, "--jq",
-    ".[] | {id: .node_id, number, title, state: (.state | ascii_upcase), assignees: {nodes: [.assignees[] | {login}]}} | @json"])
+    ".[] | {id: .node_id, number, title, state: (.state | ascii_upcase), assignees: {nodes: [.assignees[] | {login}]}, subIssues: {totalCount: (.sub_issues_summary.total // 0)}} | @json"])
     .split("\n").filter(Boolean).map((l) => JSON.parse(l));
 }
 

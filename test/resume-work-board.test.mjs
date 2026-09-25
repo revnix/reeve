@@ -4,7 +4,7 @@
 // pull requests, never typed, so it can't drift. These tests check each column
 // rule, and which linked project counts as the board, from plain data. The sync
 // that writes the board (scripts/board.mjs) applies exactly these functions.
-import { boardColumn, pickBoard, BOARD_COLUMNS, allNodes, incompleteRead, closedCards, closedPhases, openStrays, mustUnarchive, closersByIssue, completePullRequest, triagePullRequest } from "../.agents/skills/resume-work/scripts/lib.mjs";
+import { boardColumn, pickBoard, BOARD_COLUMNS, allNodes, incompleteRead, closedCards, closedPhases, closedParent, syncClosedParents, openStrays, mustUnarchive, closersByIssue, completePullRequest, triagePullRequest } from "../.agents/skills/resume-work/scripts/lib.mjs";
 import { readPlan, openBlockers } from "../.agents/skills/resume-work/scripts/plan.mjs";
 
 let fail = 0;
@@ -187,6 +187,18 @@ check(two.board === null && /#2, #4/.test(two.why ?? ""), "two projects that bot
   };
   const n = openBlockers("o/r", 3, run);
   check(n === 2 && seen.every((a) => a.includes("--paginate")), "a task's open blockers are counted from every page", JSON.stringify({ n, seen }));
+}
+
+// ── closed parents found while syncing ──────────────────────────────────────
+{
+  // Phase 10 is closed and on the board. Under it, task 20 closed with sub-tasks
+  // of its own and has no card, and under that, task 30 is still open.
+  const subIssues = { 10: [{ number: 20, state: "CLOSED", subIssues: { totalCount: 1 } }], 20: [{ number: 30, state: "OPEN", subIssues: { totalCount: 0 } }] };
+  const parents = new Map([[10, { number: 10 }]]), visited = new Set(), synced = [];
+  const syncTask = (task) => { visited.add(task.number); synced.push(task.number); if (closedParent(task) && !parents.has(task.number)) parents.set(task.number, task); };
+  syncClosedParents(parents, (n) => subIssues[n] ?? [], visited, syncTask);
+  check(synced.join(",") === "20,30",
+    "a closed task with sub-tasks met while syncing is read in its turn, card or no card, however deep", JSON.stringify(synced));
 }
 
 // ── an archived card ─────────────────────────────────────────────────────────

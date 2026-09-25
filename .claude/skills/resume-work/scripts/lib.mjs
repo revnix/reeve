@@ -399,6 +399,19 @@ export function closedPhases(cards) {
   return [...cards].filter(([, c]) => c.state === "CLOSED" && c.phase).map(([n, c]) => ({ number: n, ...c }));
 }
 
+/** A closed issue that has sub-issues of its own, whose sub-issues the plan doesn't read. */
+export const closedParent = (issue) => issue?.state === "CLOSED" && (issue.subIssues?.totalCount ?? 0) > 0;
+
+/**
+ * Sync the sub-issues of every closed parent in `parents`, which grows as
+ * `syncTask` meets more: a closed task with sub-tasks, at any depth, card or no
+ * card, is read in its turn. A Map is iterated in insertion order, including
+ * what is added while it is being iterated.
+ */
+export function syncClosedParents(parents, readSubIssues, visited, syncTask) {
+  for (const [n] of parents) for (const task of readSubIssues(n)) if (!visited.has(task.number)) syncTask(task);
+}
+
 /**
  * The open cards still not visited that are sub-issues of something, such as a
  * task whose phase isn't on the board. Each is set from its own issue, as a

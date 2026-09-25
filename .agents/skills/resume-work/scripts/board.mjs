@@ -8,7 +8,7 @@
 // Usage: node board.mjs [--repo owner/name]
 // Exit codes: 0 synced, or no board to sync; 2 GitHub could not be asked; 64 usage.
 import { gh, repoFromGit, isRepo, parseArgs, closersByIssue, boardColumn, pickBoard, BOARD_COLUMNS,
-         allNodes, incompleteRead, closedCards, closedPhases, openStrays, mustUnarchive } from "./lib.mjs";
+         allNodes, incompleteRead, closedCards, closedPhases, closedParent, syncClosedParents, openStrays, mustUnarchive } from "./lib.mjs";
 import { readPlan, openBlockers, readSubIssues } from "./plan.mjs";
 
 process.on("uncaughtException", (err) => {
@@ -89,9 +89,13 @@ const visited = new Set();
 const setColumn = (item, column) => gql(`mutation($p:ID!,$i:ID!,$f:ID!,$v:String!){ updateProjectV2ItemFieldValue(input:{
   projectId:$p,itemId:$i,fieldId:$f,value:{singleSelectOptionId:$v}}){ projectV2Item{ id } } }`,
 { p: board.id, i: item, f: board.status.id, v: optionFor[column] });
+// Closed issues with sub-issues, whose sub-issues the plan doesn't read: those
+// on the board, and any closed task with sub-tasks met while syncing.
+const parents = new Map(closedPhases(cards).map((c) => [c.number, c]));
 // One task: its column from its own facts, and its card added if it has none.
 const syncTask = (task, item = null) => {
   visited.add(task.number);
+  if (closedParent(task) && !parents.has(task.number)) parents.set(task.number, task);
   const open = task.state === "OPEN";
   const column = boardColumn({
     open,
@@ -113,13 +117,12 @@ for (const phase of phases) {
   visited.add(phase.number);
   for (const task of phase.subIssues.nodes) syncTask(task);
 }
-// A phase that has closed is no longer in the plan, but its card is on the
-// board. Its tasks are read from it and synced the same way, so one left open,
-// or reopened, still moves, and one closed without a card gets one, in Done.
-// The phase's own card is closed, and goes to Done below.
-for (const phase of closedPhases(cards)) {
-  for (const task of readSubIssues(repo, phase.number)) if (!visited.has(task.number)) syncTask(task);
-}
+// A closed phase, or a closed task with sub-tasks, is no longer in the plan.
+// Its sub-issues are read from it and synced the same way, so one left open, or
+// reopened, still moves, and one closed without a card gets one, in Done. A
+// closed task with sub-tasks met along the way, card or no card, is read in its
+// turn. The parents' own cards are closed, and go to Done below.
+syncClosedParents(parents, (n) => readSubIssues(repo, n), visited, syncTask);
 // An open sub-issue whose phase isn't on the board at all is set from its own
 // issue too. A card for an issue that is no sub-issue is no task, and is left.
 for (const card of openStrays(cards, visited)) syncTask({ number: card.number, state: "OPEN", assigned: card.assigned }, card.item);

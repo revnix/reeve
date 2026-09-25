@@ -215,6 +215,10 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
 /**
  * Classify a set of check rows. Never returns "green" on absence.
  *
+ * A required check is a name, or `{ context, app }` when it is bound to an App:
+ * then only that App's check runs meet it, and a commit status under the name,
+ * which names no App reeve can read, leaves it unknown.
+ *
  * `evidence` asks whether the rows show a pass, as a head's must. Then a
  * required check that was skipped or neutral never passed, and a set where
  * nothing ran shows nothing. A base is judged for health instead, which only
@@ -239,19 +243,32 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
     !UNINFORMATIVE.has(String(r.conclusion)) &&
     (!KNOWN_CONCLUSIONS.has(String(r.conclusion)) || !PASSING.has(String(r.conclusion))));
   const names = new Set(rows.map(r => r.name));
-  const missing = requiredChecks.filter(c => !names.has(c));
-  const notRun = (name) => rows.filter(r => r.name === name).every(r => r.state === "completed" && NOT_RUN.has(String(r.conclusion)));
+  const required = requiredChecks.map(c => (typeof c === "string" ? { context: c, app: null }
+    : { context: c.context, app: c.app == null ? null : String(c.app) }));
+  const requiredNames = new Set(required.map(c => c.context));
+  const named = (c) => rows.filter(r => r.name === c.context);
+  const meeting = (c) => (c.app == null ? named(c) : named(c).filter(r => r.source === "check_run" && String(r.appId) === c.app));
+  const label = (c) => (c.app == null ? c.context : `${c.context} from App ${c.app}`);
+  const notRun = (results) => results.length > 0 && results.every(r => r.state === "completed" && NOT_RUN.has(String(r.conclusion)));
 
-  if (missing.length) return { verdict: "MISSING_REQUIRED", why: `required check(s) never reported: ${missing.join(", ")}`, failing, running, missing, malformed };
+  // A failure, or a check in flight, comes before what hasn't reported: a
+  // required check may be waiting on the very job that failed, or is running.
   if (failing.length) return { verdict: "RED", why: `${failing.length} check(s) not passing`, failing, running, malformed };
   if (running.length) return { verdict: "RUNNING", why: `${running.length} check(s) still in flight`, failing, running, malformed };
-  // After RED and RUNNING, which say more: a required job skipped because the
-  // job it needs failed is the failure's to fix, not a question for a person.
-  const skipped = evidence ? requiredChecks.filter(c => names.has(c) && notRun(c)) : [];
-  if (skipped.length) return { verdict: "MISSING_REQUIRED", why: `required check(s) skipped or neutral, so they never reported a pass: ${skipped.join(", ")}`,
-    failing, running, missing: [], skipped, malformed };
+  const unreadable = required.filter(c => c.app != null && !meeting(c).length && named(c).some(r => r.source !== "check_run"));
+  if (unreadable.length) return { verdict: "UNKNOWN", failing: [], running: [], malformed,
+    why: `required check(s) bound to an App and reported only by a commit status, which names no App: ${unreadable.map(label).join(", ")}` };
+  const missing = required.filter(c => !meeting(c).length);
+  if (missing.length) return { verdict: "MISSING_REQUIRED", why: `required check(s) never reported: ${missing.map(label).join(", ")}`,
+    failing, running, missing: missing.map(c => c.context), malformed };
+  // A required job skipped because the job it needs failed was RED above, the
+  // failure's to fix. One skipped with nothing failing is terminal evidence,
+  // and settles at once.
+  const skipped = evidence ? required.filter(c => notRun(meeting(c))) : [];
+  if (skipped.length) return { verdict: "SKIPPED_REQUIRED", why: `required check(s) skipped or neutral, so they never reported a pass: ${skipped.map(label).join(", ")}`,
+    failing, running, skipped: skipped.map(c => c.context), malformed };
   // A skipped or neutral check whose name the required set may be missing.
-  const unplaced = requiredKnown || !evidence ? [] : [...names].filter(n => !requiredChecks.includes(n) && notRun(n));
+  const unplaced = requiredKnown || !evidence ? [] : [...names].filter(n => !requiredNames.has(n) && notRun(rows.filter(r => r.name === n)));
   if (unplaced.length) return { verdict: "UNKNOWN", failing: [], running: [], malformed,
     why: `${unplaced.join(", ")} skipped or neutral, and whether the base requires it couldn't be read` };
   // A head where nothing ran has no evidence at all, however many rows say so.
@@ -270,8 +287,7 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
   // ancillary, so every cancellation still refuses. Fail closed where the profile
   // is silent.
   if (uninformative.length) {
-    const req = new Set(requiredChecks);
-    const blocking = req.size ? uninformative.filter(r => req.has(r.name)) : uninformative;
+    const blocking = requiredNames.size ? uninformative.filter(r => requiredNames.has(r.name)) : uninformative;
     if (blocking.length) return {
       verdict: "UNKNOWN", failing: [], running: [], uninformative: blocking,
       why: `${blocking.length} required check(s) cancelled or stale — superseded, not failed`,
@@ -343,7 +359,9 @@ export function settle(prior, reading) {
   // GitHub may simply not have created it yet -- so it needs the same
   // corroboration a green set does. Calling it "never reported" on first sight
   // is the same absence-read-as-fact error pointed the other way.
-  if (reading.verdict === "RED")
+  // A required check that was skipped is present evidence too: it ran to its
+  // end, and waiting on the provider's other suites won't change it.
+  if (reading.verdict === "RED" || reading.verdict === "SKIPPED_REQUIRED")
     return { ...next, settled: true, verdict: reading.verdict, why: reading.why };
   // A required check that has not appeared is an ABSENCE, and an absence needs a
   // REASON to be believed rather than a number of looks. Counting was measured to

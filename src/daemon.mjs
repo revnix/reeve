@@ -1981,7 +1981,10 @@ export async function tick(ctx) {
     // A rule requires the enforcement check, which shadow mode never publishes,
     // so every pull request on that branch is blocked. A person has to choose:
     // enforce, or stop requiring the check. One escalation, not one per PR.
-    else if (pub.held) {
+    // Raised whether or not the publication succeeded: one that failed to
+    // supersede a passing result under the enforcement name says the pull
+    // request can merge unjudged, which matters most.
+    if (pub.held) {
       log(logPath, `    shadow: ${pub.held}`);
       raise(`shadow mode: ${pub.held}`);
     }

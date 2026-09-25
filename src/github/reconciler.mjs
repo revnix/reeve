@@ -158,6 +158,8 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
     // Carried so reeve can recognise its OWN check and refuse to treat it as
     // evidence. Excluding by name alone would miss anything else it publishes.
     app: c.app?.slug ?? null,
+    // And the id, which is what a required check bound to an App names.
+    appId: c.app?.id != null ? String(c.app.id) : null,
   }));
   const st = gh(`repos/${nwo}/commits/${sha}/status`, ".statuses");
   if (st.ok) parse(st.out, x => ({

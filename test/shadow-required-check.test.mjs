@@ -30,20 +30,22 @@ const FORBIDDEN = { ok: false, err: "gh: Resource not accessible by integration 
 
 // A fake GitHub: the runs already at the head, the base's rules and protection,
 // and every write, in order.
-const github = ({ runs = [], rules = RULES_NONE, branch = NOT_PROTECTED } = {}) => {
+const github = ({ runs = [], rules = RULES_NONE, branch = NOT_PROTECTED, refuse = () => false } = {}) => {
   const writes = [], reads = [];
   const api = (_token, args) => {
     const path = args.find((a) => typeof a === "string" && a.startsWith("repos/"));
     const verb = args.includes("PATCH") ? "PATCH" : args.includes("POST") ? "POST" : "GET";
     if (verb === "GET") {
       reads.push({ path, paginate: args.includes("--paginate") });
-      if (path.includes("/check-runs?")) return { ok: true, out: runs.map((r) => JSON.stringify(r)).join("\n") };
+      if (path.includes("/check-runs?")) return runs.ok === false ? runs : { ok: true, out: runs.map((r) => JSON.stringify(r)).join("\n") };
       if (path.includes("/rules/branches/")) return rules;
       if (/\/branches\/[^/]+$/.test(path)) return branch;
       return { ok: false, err: `unexpected read ${path}` };
     }
     const field = (k) => (args.find((a) => typeof a === "string" && a.startsWith(`${k}=`)) ?? "").slice(k.length + 1);
     writes.push({ verb, path, name: field("name"), conclusion: field("conclusion"), title: field("output[title]") });
+    // `refuse` names the writes that fail, the way GitHub refuses one.
+    if (refuse(verb, path)) return { ok: false, err: "gh: Resource not accessible by integration (HTTP 403)" };
     return { ok: true, out: JSON.stringify({ id: 99 }) };
   };
   return { api, writes, reads, auth: async () => ({ ok: true, token: "t", appId: APP }) };
@@ -65,6 +67,26 @@ const publish = (gh, over = {}) => publishVerdict({ nwo: NWO, verdict, shadow: t
   const patch = gh.writes.find((w) => w.verb === "PATCH" && w.path.endsWith("/check-runs/5"));
   check(patch?.conclusion === "cancelled" && /Superseded/.test(patch.title) && r.superseded,
     "a passing result an earlier version published under the enforcement name at this head is marked superseded", JSON.stringify(gh.writes));
+}
+{
+  // A passing result left under the enforcement name passes that check for as
+  // long as it stands, so a publication that can't supersede it, or can't look
+  // for it, has failed.
+  const stuck = github({ runs: [{ name: CONTEXT, id: 5, conclusion: "neutral", app: "merge-policy" }], refuse: (verb, path) => verb === "PATCH" && path.endsWith("/check-runs/5") });
+  const r = await publish(stuck);
+  check(r.ok === false && /couldn't be superseded/.test(r.why ?? "") && /403/.test(r.why ?? "") && !r.superseded,
+    "a passing result under the enforcement name that can't be superseded fails the publication, and says why", JSON.stringify(r));
+  const blind = github({ runs: { ok: false, err: "gh: HTTP 502" } });
+  const b = await publish(blind);
+  check(b.ok === false && /couldn't be read/.test(b.why ?? "") && blind.writes.some((w) => w.verb === "POST" && w.name === shadowContextOf(CONTEXT)),
+    "and so does one that can't read the runs to look for it, though its own result is still published", JSON.stringify({ b, writes: blind.writes }));
+  const exposed = github({ runs: [{ name: CONTEXT, id: 5, conclusion: "neutral", app: "merge-policy" }], rules: rulesRequiring(CONTEXT, APP),
+    refuse: (verb, path) => verb === "PATCH" && path.endsWith("/check-runs/5") });
+  const x = await publish(exposed);
+  check(/can pass that check unjudged/.test(x.held ?? ""),
+    "with a rule requiring the check, a passing result that can't be superseded is held as a pull request that can merge unjudged", JSON.stringify(x));
+  const control = await publish(github({ runs: [{ name: CONTEXT, id: 5, conclusion: "neutral", app: "merge-policy" }] }));
+  check(control.ok === true && control.superseded === true, "control: one that is superseded publishes cleanly", JSON.stringify(control));
 }
 {
   const other = github({ runs: [{ name: CONTEXT, id: 6, conclusion: "neutral", app: "someone-else" }] });
@@ -141,6 +163,16 @@ check(requiredOn({ rules: FORBIDDEN, branch: NOT_PROTECTED }, CONTEXT, { appId: 
     check(/every pull request there is blocked/.test(log) && raised.length === 1,
       "and a blocked gate shadow mode found is logged and raised once for the person, not once per pull request",
       JSON.stringify({ raised, log: log.split("\n").filter((l) => /shadow/.test(l)).slice(0, 3) }));
+
+    // A publication that failed can still carry what it held, and that is when it
+    // matters most: a passing result it couldn't supersede lets the pull request
+    // merge unjudged.
+    const unjudged = `a rule requires ${CONTEXT} on main, and the passing result an earlier version left under ${CONTEXT} at bbbbbbbb couldn't be superseded (HTTP 403), so pull request head bbbbbbbb can pass that check unjudged`;
+    const failed = await tick({ ...ctx, logPath: join(dir, "log2.txt"),
+      publish: async () => ({ ok: false, why: "published, but a passing result couldn't be superseded", held: unjudged }) });
+    const raisedAfterFailure = [...(failed.escalations?.entries?.() ?? [])].filter(([cause]) => /unjudged/.test(cause));
+    check(raisedAfterFailure.length === 1 && /could not publish/.test(readFileSync(join(dir, "log2.txt"), "utf8")),
+      "a failed publication still raises what it held, and logs the failure", JSON.stringify(raisedAfterFailure));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 

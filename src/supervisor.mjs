@@ -65,7 +65,10 @@ function offsetsInUseAt(ms) {
   const key = Math.floor(ms / 900000);
   if (OFFSETS.has(key)) return OFFSETS.get(key);
   if (OFFSETS.size > 256) OFFSETS.clear();
-  const offsets = new Set();
+  // The fixed-offset zones, Etc/GMT+12 to Etc/GMT-14, whole hours from -12:00 to
+  // +14:00. ps accepts them, and supportedValuesOf leaves them out, so a token
+  // recorded under Etc/GMT+12 had an offset no listed zone uses.
+  const offsets = new Set(Array.from({ length: 27 }, (_, i) => (i - 12) * 60));
   for (const timeZone of Intl.supportedValuesOf("timeZone")) {
     const p = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone, hourCycle: "h23",
       year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" })
@@ -118,12 +121,17 @@ export function isSameProcess(pid, storedStart) {
   const now = readStart(pid);
   if (now === null) return false;
   if (now === storedStart) return true;
-  // A current token that differs names a different process. The looser reading
-  // below is for tokens recorded before the pin, and only for them.
+  // A current token that differs names a different process. The looser readings
+  // below are for tokens recorded before the pin, and only for them.
   if (typeof storedStart !== "string" || storedStart.endsWith(CURRENT)) return false;
   // Otherwise the upgrade would make every live daemon and worker look dead at
   // once, which invites a takeover or a second worker on the same task. Remove
   // once no stored record predates the pin.
+  //
+  // First read it the way it was recorded. A caller that kept the recorder's
+  // timezone and locale gets the same string, whatever that locale spells: under
+  // ru_RU, lstart is "Пт сен 25 03:25:20 2026", which no date parser reads.
+  if (psStart(pid, process.env) === storedStart) return true;
   return oldTokenNames(storedStart, now);
 }
 

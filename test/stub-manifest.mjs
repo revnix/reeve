@@ -3298,4 +3298,22 @@ export const STUBS = [
               find: '  if (typeof storedStart !== "string" || storedStart.endsWith(CURRENT)) return false;',
               replace: '  if (typeof storedStart !== "string") return false;' }],
   },
+  {
+    name: "process-identity-fixed-offset-zones",
+    why: "take offsets only from supportedValuesOf, which leaves out the fixed-offset zones. A token recorded under Etc/GMT+12 then has an offset no listed zone uses, and its live process looks dead",
+    test: "test/process-identity.test.mjs",
+    expectRed: "a token recorded before the pin under a fixed-offset zone, Etc/GMT+12, still identifies its process",
+    edits: [{ file: "src/supervisor.mjs",
+              find: "  const offsets = new Set(Array.from({ length: 27 }, (_, i) => (i - 12) * 60));\n",
+              replace: "  const offsets = new Set();\n" }],
+  },
+  {
+    name: "process-identity-same-environment-matches",
+    why: "drop the comparison in the caller's own environment. A token the date parser can't read, such as lstart under a non-English locale, then names nothing even to a caller that kept the recorder's timezone and locale, and its live process looks dead",
+    test: "test/process-identity.test.mjs",
+    expectRed: "a token recorded before the pin identifies its process to a caller in the recorder's own environment, whatever it spells",
+    edits: [{ file: "src/supervisor.mjs",
+              find: "  if (psStart(pid, process.env) === storedStart) return true;\n",
+              replace: "" }],
+  },
 ];

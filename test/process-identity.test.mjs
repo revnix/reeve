@@ -6,6 +6,8 @@
 // daemon, called it dead, and suggested --takeover. These tests read the token
 // from child processes that run under different timezones, and compare.
 import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { readStart } from "../src/supervisor.mjs";
@@ -18,13 +20,13 @@ const check = (ok, name, detail) => {
 };
 
 // What a process running under `tz` reads for `pid`, and whether it takes
-// `stored` to be the same process.
-function readAs(tz, pid, stored = null) {
+// `stored` to be the same process. `env` adds to the environment, for a locale.
+function readAs(tz, pid, stored = null, env = {}) {
   const script = `import { readStart, isSameProcess } from ${JSON.stringify(SUPERVISOR)};
     const pid = Number(process.argv[1]), stored = process.argv[2] ?? null;
     console.log(JSON.stringify({ token: readStart(pid), same: stored === null ? null : isSameProcess(pid, stored) }));`;
   const args = ["--input-type=module", "-e", script, String(pid), ...(stored === null ? [] : [stored])];
-  return JSON.parse(execFileSync(process.execPath, args, { encoding: "utf8", env: { ...process.env, TZ: tz } }));
+  return JSON.parse(execFileSync(process.execPath, args, { encoding: "utf8", env: { ...process.env, ...env, TZ: tz } }));
 }
 
 const me = process.pid;
@@ -54,6 +56,39 @@ const beforeInNewYork = execFileSync("ps", ["-o", "lstart=", "-p", String(me)],
   { encoding: "utf8", env: { ...process.env, TZ: "America/New_York" } }).trim();
 check(readAs("Asia/Karachi", me, beforeInNewYork).same === true && readAs("UTC", me, beforeInNewYork).same === true,
   "a token recorded before the pin, in another timezone, still identifies its process", beforeInNewYork);
+// ps accepts the fixed-offset zones, and no regional zone uses -12:00.
+const beforeAtGmtMinus12 = execFileSync("ps", ["-o", "lstart=", "-p", String(me)],
+  { encoding: "utf8", env: { ...process.env, TZ: "Etc/GMT+12", LC_ALL: "C" } }).trim();
+check(readAs("Asia/Karachi", me, beforeAtGmtMinus12).same === true,
+  "a token recorded before the pin under a fixed-offset zone, Etc/GMT+12, still identifies its process", beforeAtGmtMinus12);
+
+// Read the way it was recorded, a token matches whatever it spells. A POSIX TZ
+// string with an offset no zone uses stands in for anything the date parser
+// can't account for, and needs no locale installed.
+const ODD = { TZ: "XYZ+3:17", LC_ALL: "C" };
+const beforeOdd = execFileSync("ps", ["-o", "lstart=", "-p", String(me)], { encoding: "utf8", env: { ...process.env, ...ODD } }).trim();
+check(readAs("Asia/Karachi", me, beforeOdd).same === false,
+  "control: read from another environment, a token at an offset no zone uses names nothing", beforeOdd);
+check(readAs(ODD.TZ, me, beforeOdd, ODD).same === true,
+  "a token recorded before the pin identifies its process to a caller in the recorder's own environment, whatever it spells", beforeOdd);
+
+// The realistic case: a non-English locale, whose lstart no date parser reads.
+// Built into a scratch directory, because most machines install only C; where
+// localedef or its sources are missing, the check is skipped and says so.
+{
+  const locales = mkdtempSync(join(tmpdir(), "reeve-locale-"));
+  try {
+    try { execFileSync("localedef", ["-c", "-i", "ru_RU", "-f", "UTF-8", join(locales, "ru_RU.UTF-8")], { stdio: "ignore" }); } catch { /* judged by what it left */ }
+    const name = "a token recorded before the pin in a non-English locale identifies its process to a caller with that locale";
+    if (!existsSync(join(locales, "ru_RU.UTF-8"))) console.log(`SKIP  ${name} (localedef or its ru_RU sources are missing)`);
+    else {
+      const RU = { TZ: "Europe/Moscow", LC_ALL: "ru_RU.UTF-8", LOCPATH: locales };
+      const beforeRu = execFileSync("ps", ["-o", "lstart=", "-p", String(me)], { encoding: "utf8", env: { ...process.env, ...RU } }).trim();
+      check(Number.isNaN(Date.parse(`${beforeRu} UTC`)), "control: in that locale, lstart is a string no date parser reads", beforeRu);
+      check(readAs(RU.TZ, me, beforeRu, RU).same === true, name, beforeRu);
+    }
+  } finally { rmSync(locales, { recursive: true, force: true }); }
+}
 
 // lstart's format, for building tokens a stranger could have left.
 const LSTART = (ms) => {

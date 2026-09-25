@@ -18,7 +18,7 @@
 
 import { detect } from "./profile/detect.mjs";
 import { validate, withDefaults } from "./profile/schema.mjs";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, linkSync, rmSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { resolveHome } from "./home.mjs";
 import { statePathFor, legacyStatePathFor, adoptLegacyStore } from "./paths.mjs";
@@ -320,8 +320,9 @@ export function ensureStore(home, nwo, { openStore = open, log = () => {} } = {}
   const status = storeStatus(home, nwo);
   if (status.state === "exists") return { changed: false, line: null };
   if (status.state === "legacy") {
-    let said = null;
-    const used = adoptLegacyStore(status.path, status.legacy, { log: (m) => { said = m; log(m); } });
+    let said = null, used;
+    try { used = adoptLegacyStore(status.path, status.legacy, { log: (m) => { said = m; log(m); } }); }
+    catch (e) { return { changed: false, failed: true, line: e.message }; }
     return used === status.path
       ? { changed: true, line: `moved the state database to ${status.path}` }
       : { changed: false, failed: true, line: said ?? `could not move the legacy store; using ${used}` };
@@ -329,14 +330,26 @@ export function ensureStore(home, nwo, { openStore = open, log = () => {} } = {}
   // Built beside its final path and renamed into place only once it has closed.
   // A store exists as soon as its file does, so an interrupted create would
   // otherwise leave a half-made store that the next init reports as done.
+  // Published with a link, which never replaces a store that another init
+  // published first; that one is used instead.
   const dir = dirname(status.path), stem = `${basename(status.path)}.init-`;
-  mkdirSync(dir, { recursive: true });
-  clearInterruptedCreates(dir, stem);
   const tmp = join(dir, `${stem}${process.pid}`);
-  const clear = () => { for (const s of ["", "-wal", "-shm", "-journal"]) rmSync(tmp + s, { force: true }); };
-  try { openStore(tmp).close(); renameSync(tmp, status.path); }
-  catch (e) { clear(); return { changed: false, failed: true, line: `could not create the state database at ${status.path}: ${e.message}` }; }
+  // Cleanup never throws: it runs on the failure path too, where the folder may
+  // be a file or unreadable.
+  const clear = () => { for (const s of ["", "-wal", "-shm", "-journal"]) try { rmSync(tmp + s, { force: true }); } catch { /* nothing to remove */ } };
+  let lost = false;
+  try {
+    mkdirSync(dir, { recursive: true });
+    clearInterruptedCreates(dir, stem);
+    openStore(tmp).close();
+    try { linkSync(tmp, status.path); }
+    catch (e) { if (e.code !== "EEXIST") throw e; lost = true; }
+  } catch (e) {
+    clear();
+    return { changed: false, failed: true, line: `could not create the state database at ${status.path}: ${e.message}` };
+  }
   clear();
+  if (lost) return { changed: false, line: null };
   return { changed: true, line: `created the state database at ${status.path}` };
 }
 

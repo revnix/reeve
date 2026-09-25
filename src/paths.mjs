@@ -11,7 +11,7 @@
 // system's stated primary requirement, so a key that cannot tell two of them apart
 // contradicts the whole point.
 
-import { existsSync, mkdirSync, renameSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 /**
@@ -138,10 +138,27 @@ export function runPathFor(home, taskId, { generation, phase, slice, attempt, st
  * fresh empty database beside it is how real history stops being read without
  * anything appearing to fail.
  */
-export function adoptLegacyStore(next, legacy, { log = (m) => console.error(`reeve: ${m}`), rename = renameSync } = {}) {
+export function adoptLegacyStore(next, legacy, { log = (m) => console.error(`reeve: ${m}`), rename = renameSync,
+                                                  wait = pause, alive = pidAlive, timeoutMs = 10_000 } = {}) {
+  if (existsSync(next) || !existsSync(legacy)) return next;
+  // One process moves at a time. Two commands started together, the daemon and
+  // a status check say, each saw the main file missing and moved sidecars in the
+  // other's way, and a rollback could strand the WAL. The holder of the lock
+  // beside the new path moves; another waits for it and uses what it made.
+  const lock = `${next}.moving`;
+  // A move that can't start leaves the legacy store whole, so it is used where it
+  // is. Only one another live process is part way through is unsafe to use.
+  let held;
+  try { mkdirSync(dirname(next), { recursive: true }); held = takeLock(lock, alive); }
+  catch (e) { log(`could not move the legacy store (${e.message}); using ${legacy}`); return legacy; }
+  if (!held) {
+    for (let waited = 0; waited < timeoutMs && existsSync(lock); waited += 100) wait(100);
+    if (existsSync(next)) return next;
+    if (existsSync(lock) || !takeLock(lock, alive))
+      throw new Error(`the state store at ${legacy} is being moved to ${next} by another process; try again once it finishes`);
+  }
   try {
     if (!existsSync(next) && existsSync(legacy)) {
-      mkdirSync(dirname(next), { recursive: true });
       // The main file LAST. Every reader takes it for "the store exists", so
       // moving it first and stopping before the -wal left a canonical store
       // without its newest committed writes, stranded in a WAL at the old path.
@@ -161,8 +178,31 @@ export function adoptLegacyStore(next, legacy, { log = (m) => console.error(`ree
       log(`moved ${legacy} -> ${next}`);
     }
   } catch (e) { log(`could not move the legacy store (${e.message}); using ${legacy}`); return legacy; }
+  finally { rmSync(lock, { force: true }); }
   return next;
 }
+
+/**
+ * Take the move lock, or say someone else holds it. A lock whose holder has died
+ * is left from a move that stopped partway: it is taken over, and the next move
+ * finishes what that one left, because the main file always moves last.
+ */
+function takeLock(lock, alive) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { const fd = openSync(lock, "wx"); writeSync(fd, String(process.pid)); closeSync(fd); return true; }
+    catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      let holder = NaN;
+      try { holder = Number(readFileSync(lock, "utf8").trim()); } catch { /* gone already: try again */ }
+      if (Number.isInteger(holder) && holder > 0 && alive(holder)) return false;
+      rmSync(lock, { force: true });
+    }
+  }
+  return false;
+}
+
+const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 /**
  * What a command says when a repository has no state database. The step that

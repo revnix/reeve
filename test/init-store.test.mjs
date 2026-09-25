@@ -7,7 +7,7 @@
 // an existing one, moves a legacy one into place rather than replacing it, and
 // that `run` names the step when the store is missing.
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -224,6 +224,92 @@ const reeve = (home, args) => {
     const madeRun = applyInit({ ...args, ensure: () => ({ changed: true, line: "created the state database" }) });
     check(failedRun.code === 1 && /could not move/.test(failedRun.output) && madeRun.code === 2,
       "init exits 1 when the store couldn't be made or moved, and 2 only when everything was applied", JSON.stringify({ failed: failedRun.code, made: madeRun.code }));
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}
+
+// ── one process moves a legacy store at a time ───────────────────────────────
+//
+// Two commands started together both saw the main file missing and moved each
+// other's sidecars. The holder of the lock beside the new path moves; another
+// waits and uses what it made, takes over a lock whose holder has died, and
+// fails loudly, touching nothing, when a live holder never finishes.
+{
+  const legacyStore = (home) => {
+    const legacy = legacyStatePathFor(home, NWO), next = statePathFor(home, NWO);
+    mkdirSync(dirname(legacy), { recursive: true }); mkdirSync(dirname(next), { recursive: true });
+    const live = join(home, "live.db"), w = new DatabaseSync(live);
+    w.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t(v TEXT)");
+    w.prepare("INSERT INTO t VALUES (?)").run("committed, in the wal");
+    for (const suffix of ["", "-wal", "-shm"]) if (existsSync(live + suffix)) copyFileSync(live + suffix, legacy + suffix);
+    w.close();
+    return { legacy, next, lock: `${next}.moving` };
+  };
+  const rowsAt = (path) => { try { const db = new DatabaseSync(path, { readOnly: true }); try { return db.prepare("SELECT v FROM t").all().map((r) => r.v); } finally { db.close(); } } catch { return null; } };
+  const renamesBy = () => { const calls = []; return { calls, rename: (a, b) => { calls.push(a); renameSync(a, b); } }; };
+  const alive = (pid) => pid === process.pid;
+  {
+    const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
+    try {
+      const { legacy, next, lock } = legacyStore(home);
+      writeFileSync(lock, String(process.pid));   // another process holds it
+      const ours = renamesBy();
+      // While this call waits, the holder finishes its move and lets go.
+      const wait = () => { if (existsSync(lock)) { for (const x of ["-wal", "-shm", ""]) if (existsSync(legacy + x)) renameSync(legacy + x, next + x); rmSync(lock); } };
+      const used = adoptLegacyStore(next, legacy, { log: () => {}, rename: ours.rename, wait, alive });
+      check(used === next && ours.calls.length === 0 && (rowsAt(next) ?? []).includes("committed, in the wal"),
+        "while another process holds the move, this one waits and uses what it made, moving nothing itself", JSON.stringify({ used: used === next ? "next" : used, ours: ours.calls.length }));
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }
+  {
+    const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
+    try {
+      const { legacy, next, lock } = legacyStore(home);
+      writeFileSync(lock, "999999");   // left by a move whose process died
+      const used = adoptLegacyStore(next, legacy, { log: () => {}, alive, wait: () => {} });
+      check(used === next && !existsSync(lock) && (rowsAt(next) ?? []).includes("committed, in the wal"),
+        "a lock left by a process that died is taken over, and the move finishes", JSON.stringify({ used, lock: existsSync(lock) }));
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }
+  {
+    const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
+    try {
+      const { legacy, next, lock } = legacyStore(home);
+      const used = adoptLegacyStore(next, legacy, { log: () => {} });
+      check(used === next && !existsSync(lock), "the lock is let go once the move is done", JSON.stringify({ lock: existsSync(lock) }));
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }
+  {
+    const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
+    try {
+      const { legacy, next, lock } = legacyStore(home);
+      writeFileSync(lock, String(process.pid));   // held, and never let go
+      let threw = null;
+      try { adoptLegacyStore(next, legacy, { log: () => {}, alive, wait: () => {}, timeoutMs: 300 }); } catch (e) { threw = e.message; }
+      check(/being moved/.test(threw ?? "") && existsSync(legacy) && !existsSync(next) && existsSync(lock),
+        "a move a live process never finishes fails loudly, and touches nothing", JSON.stringify({ threw, legacy: existsSync(legacy), next: existsSync(next) }));
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }
+}
+
+// ── two inits at once, and a state folder that can't be made ─────────────────
+{
+  const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
+  try {
+    const path = statePathFor(home, NWO);
+    // While this init builds its store, another publishes one first.
+    const made = ensure(home, { openStore: (p) => { const db = new DatabaseSync(p); writeFileSync(path, "the other init's store"); return db; } });
+    check(!made.failed && !made.changed && readFileSync(path, "utf8") === "the other init's store"
+      && readdirSync(dirname(path)).every((f) => !f.includes(".init-")),
+      "an init that loses to another publishes nothing over the store it made, and cleans up", JSON.stringify({ made, left: readdirSync(dirname(path)) }));
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}
+{
+  const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
+  try {
+    writeFileSync(join(home, "state"), "a file where the state folder belongs\n");
+    const made = ensure(home);
+    check(made.failed === true && /could not create the state database/.test(made.line ?? "") && !made.threw,
+      "a state folder that can't be made is a failure that says why, not a crash", JSON.stringify(made));
   } finally { rmSync(home, { recursive: true, force: true }); }
 }
 

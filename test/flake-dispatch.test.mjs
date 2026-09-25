@@ -10,9 +10,9 @@
 import { tick } from "../src/daemon.mjs";
 import { flakeAssessment, causeKey } from "../src/ci-rootcause.mjs";
 import { open, countFixAttempts } from "../src/db/ops.mjs";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
+import { tempDir } from "./fixtures/temp.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -65,7 +65,7 @@ const CAUSES = {
 };
 
 const scenario = async ({ failing, probe }) => {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-flake-"));
+  const dir = tempDir("reeve-flake-");
   const spawned = [];
   const ctx = {
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
@@ -76,7 +76,7 @@ const scenario = async ({ failing, probe }) => {
     profile: {
       // Separate directories, as a real deployment must have them: the worker
       // policy denies reads of the clone, so a checkout inside it is refused.
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-flake-clone-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-flake-clone-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },

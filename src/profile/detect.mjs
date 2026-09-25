@@ -7,6 +7,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { runnerShells, scriptOutcome, scriptShells } from "./shellscript.mjs";
 
 function sh(cmd, args, cwd) {
   try {
@@ -84,7 +85,19 @@ const INTENTS = {
   build:     ["build", "compile", "bundle"],
 };
 
-export function detectCommands(dir, language, packageManager) {
+/**
+ * `shell` is the shell the package's runner runs its scripts with, as
+ * `runnerShells` names it and `scriptShells` asks it: it decides which words
+ * are the shell's own. Given, as by a test, it is used as is. A runner whose
+ * shell isn't one the reader models, yarn 2 and later say, has no script
+ * judged, and nor has one whose shell can't be asked: npm's `script-shell=true`
+ * runs nothing of a script.
+ */
+export function detectCommands(dir, language, packageManager, options = {}) {
+  const given = Object.hasOwn(options, "shell");
+  const shells = given ? null : runnerShells(dir, packageManager);
+  const shell = given ? options.shell : shells && scriptShells(shells);
+  const judged = given || shell !== null;
   const out = {};
   const questions = [];
 
@@ -96,14 +109,13 @@ export function detectCommands(dir, language, packageManager) {
       if (!hit) { out[intent] = { cmd: null, state: "absent" }; continue; }
       const runner = packageManager ?? "npm";
       out[intent] = { cmd: `${runner} run ${hit}`, state: "present", script: hit };
-      // A declared script whose tool is not a dependency is BROKEN, not present.
-      const body = scripts[hit];
-      const tool = String(body).trim().split(/\s+/)[0];
-      const deps = fromJson(pkg.dependencies, pkg.devDependencies);
-      const localBin = existsSync(join(dir, "node_modules", ".bin", tool));
-      if (!deps[tool] && !localBin && !/^(node|tsc|pnpm|npm|yarn|turbo|nx)$/.test(tool)) {
+      // A declared script that can't pass is BROKEN, not present: it runs a
+      // program that isn't there, or it always fails. Only when that is certain;
+      // a script that can't be read with confidence stays present.
+      const verdict = judged ? scriptOutcome(scripts[hit], { dir, deps: fromJson(pkg.dependencies, pkg.devDependencies) }, shell) : { broken: false };
+      if (verdict.broken) {
         out[intent].state = "broken";
-        out[intent].reason = `script '${hit}' runs '${tool}', which is neither a dependency nor installed`;
+        out[intent].reason = `script '${hit}' ${verdict.why}`;
       }
     }
   } else if (language === "python") {

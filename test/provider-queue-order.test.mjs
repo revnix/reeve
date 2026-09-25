@@ -12,16 +12,16 @@
 // what is under test, and a fake would have whatever ordering I gave it.
 import { openHub } from "../src/build/hubdb.mjs";
 import { claimProvider, releaseProvider, queuedGuardianRequests } from "../src/provider.mjs";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
+import { tempDir } from "./fixtures/temp.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
   if (!ok) { if (detail) console.log("        " + detail); fail++; }
 };
-const dir = mkdtempSync(join(tmpdir(), "reeve-qorder-"));
+const dir = tempDir("reeve-qorder-");
 const alive = () => true;
 const NWO = "o/r", WORKER = "o/r#42:FIX_CI", CANARY = "canary:o/r";
 
@@ -96,7 +96,7 @@ const release = (db, runRef, got) => releaseProvider(db, {
   const { tick } = await import("../src/daemon.mjs");
   const { openHubAsGuest } = await import("../src/build/hubguest.mjs");
   const { open } = await import("../src/db/ops.mjs");
-  const d2 = mkdtempSync(join(tmpdir(), "reeve-qorder-tick-"));
+  const d2 = tempDir("reeve-qorder-tick-");
   const hubPath = join(d2, "hub.db");
   const db = store("tick-hub.db", 1);
   db.close();
@@ -121,7 +121,7 @@ const release = (db, runRef, got) => releaseProvider(db, {
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: NWO, defaultBranch: "main", worktreeRoot: d2, checkout: mkdtempSync(join(tmpdir(), "reeve-qorder-cl-")) },
+      identity: { key: NWO, defaultBranch: "main", worktreeRoot: d2, checkout: tempDir("reeve-qorder-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },

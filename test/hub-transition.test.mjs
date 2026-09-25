@@ -9,16 +9,16 @@
 import { openHub, hubTx } from "../src/build/hubdb.mjs";
 import { applyTransition, applyCompensation, COMPENSATIONS } from "../src/build/transition.mjs";
 import { grantLease } from "../src/build/territory.mjs";
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { tempDir } from "./fixtures/temp.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
   if (!ok) { fail++; if (detail !== undefined) console.log(`        ${detail}`); }
 };
-const dir = mkdtempSync(join(tmpdir(), "reeve-transition-"));
+const dir = tempDir("reeve-transition-");
 
 // A task, plus a RUN of phase_event rows. `outbox.fence` references
 // phase_event(seq), so a fixture with no events fails on the foreign key rather

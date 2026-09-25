@@ -146,7 +146,7 @@ export async function authenticate(nwo, name = "merge-policy") {
   if (!inst.ok) return { ok: false, why: `no installation for ${nwo}: ${inst.why}` };
   const tok = await mintInstallationToken(jwt, inst.id);
   if (!tok.ok) return { ok: false, why: tok.why };
-  return { ok: true, token: tok.token, expiresAt: tok.expiresAt, installationId: inst.id,
+  return { ok: true, token: tok.token, expiresAt: tok.expiresAt, installationId: inst.id, appId: cred.appId,
            account: inst.account, permissions: tok.permissions, repositorySelection: inst.repositorySelection,
            // The login reeve's own comments carry. Null when GitHub did not say,
            // and a caller must treat null as "cannot tell" rather than as a match.

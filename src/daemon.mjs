@@ -14,7 +14,7 @@
 //     it WOULD do. Shipping a loop that acts before its decisions have been
 //     watched is how an unattended run becomes an incident.
 
-import { evaluatePr, publishVerdict, prAnchor, isBuilderPr } from "./pr.mjs";
+import { evaluatePr, publishVerdict, prAnchor, isBuilderPr, clearRequirements } from "./pr.mjs";
 import { nextAction, describe, ACTIONS, ESCALATIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, isSameProcess, OUTCOMES } from "./supervisor.mjs";
@@ -1064,6 +1064,9 @@ export async function tick(ctx) {
   // filtered to absolute paths. (Codex #4f-[1].)
   const logPath = ctx.logPath ? resolve(ctx.logPath) : ctx.logPath;
   if (logPath !== ctx.logPath) ctx = { ...ctx, logPath };
+  // What each base requires is read afresh every tick. Kept across ticks, a rule
+  // added between them went unseen for as long as the reading was kept.
+  clearRequirements();
   const decisions = [];
   // Pull requests this tick could not read. Their queued provider requests are
   // preserved rather than cancelled: absence from `decisions` means "unknown",
@@ -1976,8 +1979,18 @@ export async function tick(ctx) {
     // Republish on every tick: a verdict is bound to a revision, so when the head
     // moves the old check stops applying to anything. Without this the shadow
     // record silently decays to nothing.
-    const pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict: e.verdict, shadow });
+    const pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict: e.verdict, shadow, base: e.baseRef });
     if (!pub.ok) log(logPath, `    could not publish: ${pub.why}`);
+    // A rule requires the enforcement check, which shadow mode never publishes,
+    // so every pull request on that branch is blocked. A person has to choose:
+    // enforce, or stop requiring the check. One escalation, not one per PR.
+    // Raised whether or not the publication succeeded: one that failed to
+    // supersede a passing result under the enforcement name says the pull
+    // request can merge unjudged, which matters most.
+    if (pub.held) {
+      log(logPath, `    shadow: ${pub.held}`);
+      raise(`shadow mode: ${pub.held}`);
+    }
 
     // A shared cause is one problem, not N. Four PRs blocked on a red base is a
     // single escalation, or the phone becomes noise and gets muted.
@@ -3503,11 +3516,16 @@ export async function run(ctx) {
 
   // The assertion dies with this process, so a crashed daemon can never leave the
   // Mac permanently unable to sleep.
-  const caffeinatePid = stayAwake(process.pid);
-  if (caffeinatePid) log(logPath, `staying awake via caffeinate pid ${caffeinatePid}`);
+  const awake = stayAwake(process.pid);
+  if (awake.pid) log(logPath, `staying awake via ${awake.via} pid ${awake.pid}`);
+  else if (awake.why) log(logPath, `not keeping the machine awake: ${awake.why}`);
 
-  let stop = false;
-  const shutdown = sig => { log(logPath, `${sig} — finishing this tick then stopping`); stop = true; };
+  // A stop ends the sleep between ticks at once. Only a tick in progress is
+  // finished: waiting out the rest of the interval as well made a stop take up to
+  // 90 seconds more, past the time systemd gives a service to exit, so it was
+  // killed and recorded as failed.
+  let stop = false, wake = null;
+  const shutdown = sig => { log(logPath, `${sig} — finishing this tick then stopping`); stop = true; wake?.(); };
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
 
@@ -3521,7 +3539,8 @@ export async function run(ctx) {
       log(logPath, `tick threw: ${e.stack?.split("\n").slice(0, 3).join(" | ") ?? e.message}`);
     }
     if (stop) break;
-    await new Promise(r => setTimeout(r, intervalMs));
+    await new Promise(r => { const t = setTimeout(r, intervalMs); wake = () => { clearTimeout(t); r(); }; });
+    wake = null;
     if (stop) break;
   }
   log(logPath, "daemon stopped");

@@ -11,7 +11,9 @@
 // system's stated primary requirement, so a key that cannot tell two of them apart
 // contradicts the whole point.
 
-import { join } from "node:path";
+import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 /**
  * A repository name made safe to put in a path.
@@ -128,4 +130,120 @@ export function runPathFor(home, taskId, { generation, phase, slice, attempt, st
       throw new Error(`a run path's ${name} must be a single path segment; ` +
                       `${JSON.stringify(String(value))} is not, and would place the file outside the task's tree`);
   return join(taskPathFor(home, taskId), "runs", `g${generation}-${phase}-s${slice}-a${attempt}.${stream}`);
+}
+
+/**
+ * Move a store from its legacy path into place, once, and return the path to use.
+ *
+ * A store at the old short-name path is moved rather than abandoned: opening a
+ * fresh empty database beside it is how real history stops being read without
+ * anything appearing to fail.
+ *
+ * Throws, with `code` STORE_BUSY or STORE_SPLIT, when neither path is safe to
+ * use: another process is still moving the store, or a move stopped with the
+ * store's files split between the two paths.
+ */
+export function adoptLegacyStore(next, legacy, { log = (m) => console.error(`reeve: ${m}`), rename = renameSync,
+                                                  timeoutMs = 10_000 } = {}) {
+  const lockPath = moveLockPath(next);
+  if (existsSync(next)) { clearMoveLock(next); return next; }
+  if (!existsSync(legacy)) return next;
+  // One process moves at a time. Two commands started together, the daemon and
+  // a status check say, each saw the main file missing and moved sidecars in the
+  // other's way, and a rollback could strand the WAL. The holder of the lock
+  // beside the new path moves; another waits for it and uses what it made.
+  //
+  // The lock is SQLite's exclusive lock on that file, which the operating system
+  // holds for the process and drops when the process ends, however it ends. A
+  // lock file naming its holder's pid came first, and every reading of it had a
+  // race: read before the pid was written, a live holder looked dead and lost
+  // its lock; a dead holder's pid, reused, held the store for ever; and two
+  // processes taking over one dead lock could each delete the other's.
+  let lock = null;
+  try {
+    mkdirSync(dirname(next), { recursive: true });
+    lock = new DatabaseSync(lockPath, { timeout: timeoutMs });
+    // Nothing is ever written to it, so its journal stays in memory. On disk,
+    // a holder killed while holding the lock left a journal beside it for good.
+    lock.exec("PRAGMA journal_mode=MEMORY");
+    lock.exec("BEGIN EXCLUSIVE");
+  } catch (e) {
+    try { lock?.close(); } catch { /* never opened */ }
+    if (existsSync(next)) return next;   // the holder finished while this one waited
+    if (e.errcode === SQLITE_BUSY)
+      throw storeError("STORE_BUSY", `the state store at ${legacy} is being moved to ${next} by another process; try again once it finishes`);
+    // A move that can't start leaves the legacy store where it was, and it is
+    // used there, unless an earlier move left some of it at the new path.
+    return whole(next, legacy, `could not move the legacy store (${e.message})`, log);
+  }
+  try {
+    if (existsSync(next) || !existsSync(legacy)) return next;   // moved while this one waited
+    // The main file LAST. Every reader takes it for "the store exists", so
+    // moving it first and stopping before the -wal left a canonical store
+    // without its newest committed writes, stranded in a WAL at the old path.
+    // With the sidecars first, a stop anywhere leaves no main file at the new
+    // path, and the next run finishes the move.
+    const moved = [];
+    try {
+      for (const suffix of ["-wal", "-shm", ""]) {
+        if (existsSync(legacy + suffix)) { rename(legacy + suffix, next + suffix); moved.push(suffix); }
+      }
+    } catch (e) {
+      // Put back what moved, so the store isn't split across two paths.
+      for (const suffix of moved.reverse()) try { rename(next + suffix, legacy + suffix); } catch { /* found by whole() */ }
+      return whole(next, legacy, `could not move the legacy store (${e.message})`, log);
+    }
+    log(`moved ${legacy} -> ${next}`);
+    // Removed only once the move is done. A process still waiting on it then
+    // finds the store moved, and every later one returns before looking for a
+    // lock. Removed after a failure, a waiter and a newcomer could each hold a
+    // lock on a different file, and move at once.
+    try { rmSync(lockPath, { force: true }); } catch { /* left for the next move */ }
+    return next;
+  } finally {
+    try { lock.exec("ROLLBACK"); } catch { /* nothing to undo */ }
+    lock.close();
+  }
+}
+
+const moveLockPath = (next) => `${next}.move-lock`;
+
+/**
+ * Remove the move lock a mover killed after its last rename left beside a store
+ * that is now in place; nothing else looks for it once the store is there. Safe
+ * only once the main file is at `next`, because the main file moves last: a
+ * process still waiting on the lock then finds the store moved and moves
+ * nothing.
+ */
+export function clearMoveLock(next) {
+  try { rmSync(moveLockPath(next), { force: true }); } catch { /* left for a later run */ }
+}
+
+const SQLITE_BUSY = 5;
+const storeError = (code, message) => Object.assign(new Error(message), { code });
+
+/**
+ * The legacy path, if the store is whole there. It isn't while any of its files
+ * sit at the new path, whether this run's rollback failed or an earlier run
+ * stopped there: opened without its WAL, the legacy main file hides every
+ * committed write still in it.
+ */
+function whole(next, legacy, why, log) {
+  const split = ["-wal", "-shm"].filter((suffix) => existsSync(next + suffix));
+  if (split.length)
+    throw storeError("STORE_SPLIT", `${why}, and the state store is split: ${split.map((s) => next + s).join(" and ")} ` +
+                                    `${split.length > 1 ? "belong" : "belongs"} with ${legacy}. Fix what stopped the move and run again to finish it`);
+  log(`${why}; using ${legacy}`);
+  return legacy;
+}
+
+/**
+ * What a command says when a repository has no state database. The step that
+ * creates one is named only for the default path: init creates the store there,
+ * not wherever --db points. init reads the repository from the directory it
+ * runs in, so the step names the checkout to run it from.
+ */
+export function missingStoreMessage(dbPath, { initCreatesIt = true, nwo = null } = {}) {
+  if (!initCreatesIt) return `no state database at ${dbPath}`;
+  return `no state database at ${dbPath}\n-> reeve init --write   creates it, run inside ${nwo ? `a checkout of ${nwo}` : "the repository's checkout"}`;
 }

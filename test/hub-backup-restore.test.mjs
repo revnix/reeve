@@ -15,9 +15,8 @@ import { DatabaseSync } from "node:sqlite";
 // `statSync` reads the inode, which is what tells `link` and `rename` apart.
 // `chmodSync` is the atomic-export drill's: a read-only destination directory
 // is how a write failure is arranged where it cannot happen by accident.
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readdirSync, statSync, chmodSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync, existsSync, readdirSync, statSync, chmodSync } from "node:fs";
 import { spawnSync } from "node:child_process";   // the CLI drill runs bin/reeve
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 // The repository root, from THIS FILE rather than from the working directory.
@@ -31,7 +30,7 @@ const check = (ok, name, detail) => {
   if (!ok) { if (detail) console.log("        " + detail); fail++; }
 };
 
-const home = mkdtempSync(join(tmpdir(), "reeve-home-"));
+const home = tempDir("reeve-home-");
 const root = join(home, "backups");
 mkdirSync(join(home, "state", "nextlyhq"), { recursive: true });
 
@@ -294,6 +293,7 @@ import { grantLease } from "../src/build/territory.mjs";
 import { copyFileSync, openSync, writeSync, closeSync } from "node:fs";
 import { acquireSingleton, withWriterLease, acquireMaintenanceLock } from "../src/build/locks.mjs";
 import { createHash } from "node:crypto";
+import { tempDir } from "./fixtures/temp.mjs";
 
 // The durable-tail format, written and read EXACTLY as `reeve export-events
 // --hub` and `reeve restore --hub --tail` do it. A fixture that invents its own
@@ -764,10 +764,9 @@ function writeAuthority(db, project) {
   back.close();
 }
 
-
 // ── a hub too corrupt to open is still restorable from a snapshot + tail ─────
 {
-  const home = mkdtempSync(join(tmpdir(), "reeve-unreadable-"));
+  const home = tempDir("reeve-unreadable-");
   mkdirSync(join(home, "state"), { recursive: true });
   const p = hubPathFor(home);
   const good = openHub(p);
@@ -1005,7 +1004,7 @@ function writeAuthority(db, project) {
 
 // test/hub-backup-restore.test.mjs, before the terminator
 {
-  const home2 = mkdtempSync(join(tmpdir(), "reeve-cli-restore-"));
+  const home2 = tempDir("reeve-cli-restore-");
   mkdirSync(join(home2, "state"), { recursive: true });
   const hub = hubPathFor(home2);
   openHub(hub).close();
@@ -1234,7 +1233,7 @@ function writeAuthority(db, project) {
 // tail was protecting. It is the file an operator reaches for after losing the
 // hub, so it is the last file in the system that may be replaced in place.
 {
-  const eHome = mkdtempSync(join(tmpdir(), "reeve-export-"));
+  const eHome = tempDir("reeve-export-");
   mkdirSync(join(eHome, "state"), { recursive: true });
   openHub(hubPathFor(eHome)).close();
   const env = { ...process.env, REEVE_HOME: eHome };
@@ -1311,7 +1310,7 @@ function writeAuthority(db, project) {
 // The guard WAS tested -- on the upsert path, via `pr_hold.created` above --
 // which is why this survived: the covered path was the one that reached it.
 {
-  const rHome = mkdtempSync(join(tmpdir(), "reeve-replay-"));
+  const rHome = tempDir("reeve-replay-");
   mkdirSync(join(rHome, "state"), { recursive: true });
   const db = openHub(hubPathFor(rHome));
 
@@ -1384,7 +1383,7 @@ function writeAuthority(db, project) {
 }
 {
   // And the outcome, for real: an absent hub plus a tail that fails at replay.
-  const sHome = mkdtempSync(join(tmpdir(), "reeve-synth-"));
+  const sHome = tempDir("reeve-synth-");
   mkdirSync(join(sHome, "state"), { recursive: true });
   const src = openHub(hubPathFor(sHome));
   src.close();
@@ -1416,7 +1415,7 @@ function writeAuthority(db, project) {
 // The prefix through snapSeq is the only evidence of provenance the file has,
 // and `export-events --hub` always writes it, because it writes the whole log.
 {
-  const fHome = mkdtempSync(join(tmpdir(), "reeve-foreign-"));
+  const fHome = tempDir("reeve-foreign-");
   mkdirSync(join(fHome, "state"), { recursive: true });
   const root = join(fHome, "backups");
 
@@ -1492,7 +1491,7 @@ function writeAuthority(db, project) {
 // `maintenance_lock` in `hub.db` -- what `acquireSingleton` reads through
 // `assertWritable`.
 {
-  const zHome = mkdtempSync(join(tmpdir(), "reeve-zero-"));
+  const zHome = tempDir("reeve-zero-");
   mkdirSync(join(zHome, "state"), { recursive: true });
   const root = join(zHome, "backups");
   const src = openHub(join(zHome, "state", "src.db"));
@@ -1564,7 +1563,7 @@ function writeAuthority(db, project) {
 // Readable now means "this branch can do its work", and its work is the four
 // lock tables it queries.
 {
-  const lHome = mkdtempSync(join(tmpdir(), "reeve-lockdmg-"));
+  const lHome = tempDir("reeve-lockdmg-");
   mkdirSync(join(lHome, "state"), { recursive: true });
   const src = openHub(join(lHome, "state", "src.db"));
   const snapL = snapshot(src, join(lHome, "backups"), "hub");
@@ -1619,7 +1618,7 @@ function writeAuthority(db, project) {
 // step -- so it is closed by LOOKING afterwards, and anything that got in is
 // recorded in `singleton_lease`.
 {
-  const wHome = mkdtempSync(join(tmpdir(), "reeve-window-"));
+  const wHome = tempDir("reeve-window-");
   mkdirSync(join(wHome, "state"), { recursive: true });
   const src = openHub(join(wHome, "state", "src.db"));
   const snapW = snapshot(src, join(wHome, "backups"), "hub");
@@ -1698,7 +1697,7 @@ function writeAuthority(db, project) {
 // and applying it to a hub that can still answer three of those four questions
 // threw away every answer it had. Four separate losses, one cause.
 {
-  const pHome = mkdtempSync(join(tmpdir(), "reeve-partial-"));
+  const pHome = tempDir("reeve-partial-");
   mkdirSync(join(pHome, "state"), { recursive: true });
   const src = openHub(join(pHome, "state", "src.db"));
   const snapP = snapshot(src, join(pHome, "backups"), "hub");
@@ -1802,7 +1801,7 @@ function writeAuthority(db, project) {
 // provider lease as a live writer; leaving it out here made the two paths
 // disagree about what "live" means.
 {
-  const gHome = mkdtempSync(join(tmpdir(), "reeve-provider-"));
+  const gHome = tempDir("reeve-provider-");
   mkdirSync(join(gHome, "state"), { recursive: true });
   const src = openHub(join(gHome, "state", "src.db"));
   const snapG = snapshot(src, join(gHome, "backups"), "hub");
@@ -1854,7 +1853,7 @@ function writeAuthority(db, project) {
 // from the opposite defect, where a READABLE log was thrown away because a lock
 // table was gone.
 {
-  const eHome = mkdtempSync(join(tmpdir(), "reeve-noevents-"));
+  const eHome = tempDir("reeve-noevents-");
   mkdirSync(join(eHome, "state"), { recursive: true });
   const src = openHub(join(eHome, "state", "src.db"));
   const snapE = snapshot(src, join(eHome, "backups"), "hub");
@@ -1903,7 +1902,7 @@ function writeAuthority(db, project) {
 // the outer catch -- `could not restore`, from the command that exists to
 // recover exactly that file.
 {
-  const cHome = mkdtempSync(join(tmpdir(), "reeve-btree-"));
+  const cHome = tempDir("reeve-btree-");
   mkdirSync(join(cHome, "state"), { recursive: true });
   const src = openHub(join(cHome, "state", "src.db"));
   const snapC = snapshot(src, join(cHome, "backups"), "hub");
@@ -1958,7 +1957,7 @@ function writeAuthority(db, project) {
 // one throws. So each lease read reports its own failure and the table joins
 // `missing` at that point.
 {
-  const lHome = mkdtempSync(join(tmpdir(), "reeve-leaf-"));
+  const lHome = tempDir("reeve-leaf-");
   mkdirSync(join(lHome, "state"), { recursive: true });
   const src = openHub(join(lHome, "state", "src.db"));
   const snapL = snapshot(src, join(lHome, "backups"), "hub");
@@ -2014,7 +2013,7 @@ function writeAuthority(db, project) {
 // silently downgraded exclusion to a file nothing else reads. With `force` a
 // writer could then start after the holder scan and be replaced.
 {
-  const bHome = mkdtempSync(join(tmpdir(), "reeve-busy-"));
+  const bHome = tempDir("reeve-busy-");
   mkdirSync(join(bHome, "state"), { recursive: true });
   const src = openHub(join(bHome, "state", "src.db"));
   const snapB = snapshot(src, join(bHome, "backups"), "hub");
@@ -2059,7 +2058,7 @@ function writeAuthority(db, project) {
 // still false. The tail query was skipped and the restore reported success after
 // discarding every post-snapshot event.
 {
-  const zHome = mkdtempSync(join(tmpdir(), "reeve-zerotail-"));
+  const zHome = tempDir("reeve-zerotail-");
   mkdirSync(join(zHome, "state"), { recursive: true });
   const src = openHub(join(zHome, "state", "src.db"));
   const snapZ = snapshot(src, join(zHome, "backups"), "hub");
@@ -2098,7 +2097,7 @@ function writeAuthority(db, project) {
 // likelier here than anywhere else, and the throw landed in the outer catch as
 // `could not restore`, where `--force` could not reach it.
 {
-  const tHome = mkdtempSync(join(tmpdir(), "reeve-bigtail-"));
+  const tHome = tempDir("reeve-bigtail-");
   mkdirSync(join(tHome, "state"), { recursive: true });
   const src = openHub(join(tHome, "state", "src.db"));
   const snapT = snapshot(src, join(tHome, "backups"), "hub");
@@ -2144,7 +2143,7 @@ function writeAuthority(db, project) {
 // file, so there is nothing to ask about it" — and a version-ZERO hub takes it
 // while being a real store full of real rows.
 {
-  const vHome = mkdtempSync(join(tmpdir(), "reeve-vzero-"));
+  const vHome = tempDir("reeve-vzero-");
   mkdirSync(join(vHome, "state"), { recursive: true });
   const src = openHub(join(vHome, "state", "src.db"));
   const snapV = snapshot(src, join(vHome, "backups"), "hub");
@@ -2231,7 +2230,7 @@ function writeAuthority(db, project) {
 
 // ── damage that arrives BEFORE the code that would have seen it ───────────
 {
-  const nHome = mkdtempSync(join(tmpdir(), "reeve-r9-"));
+  const nHome = tempDir("reeve-r9-");
   mkdirSync(join(nHome, "state"), { recursive: true });
   const src = openHub(join(nHome, "state", "src.db"));
   const snapN = snapshot(src, join(nHome, "backups"), "hub");
@@ -2371,7 +2370,7 @@ function writeAuthority(db, project) {
 // `rawOpen` returned null — sending a healthy, HELD hub down the UNREADABLE
 // path, where `--force` replaced it under its holder.
 {
-  const cHome = mkdtempSync(join(tmpdir(), "reeve-conv-"));
+  const cHome = tempDir("reeve-conv-");
   mkdirSync(join(cHome, "state"), { recursive: true });
   const src = openHub(join(cHome, "state", "src.db"));
   const snapC = snapshot(src, join(cHome, "backups"), "hub");
@@ -2454,7 +2453,7 @@ function writeAuthority(db, project) {
 // nothing consults, and under `--force` a live builder can take its lease after
 // the holder scan and be replaced.
 {
-  const wHome = mkdtempSync(join(tmpdir(), "reeve-nopk-"));
+  const wHome = tempDir("reeve-nopk-");
   mkdirSync(join(wHome, "state"), { recursive: true });
   const src = openHub(join(wHome, "state", "src.db"));
   const snapW = snapshot(src, join(wHome, "backups"), "hub");
@@ -2501,7 +2500,7 @@ function writeAuthority(db, project) {
 // perfectly well and produces a zero-byte file that IS the artifact. Deleting it
 // by length erased the very path the result had just reported.
 {
-  const zHome = mkdtempSync(join(tmpdir(), "reeve-zerobyte-"));
+  const zHome = tempDir("reeve-zerobyte-");
   mkdirSync(join(zHome, "state"), { recursive: true });
   const src = openHub(join(zHome, "state", "src.db"));
   const snapZ = snapshot(src, join(zHome, "backups"), "hub");
@@ -2530,7 +2529,7 @@ function writeAuthority(db, project) {
 // file and takes its singleton there, never looking at the sibling. The restore
 // then replaced the file underneath that live writer.
 {
-  const dHome = mkdtempSync(join(tmpdir(), "reeve-dropver-"));
+  const dHome = tempDir("reeve-dropver-");
   mkdirSync(join(dHome, "state"), { recursive: true });
   const src = openHub(join(dHome, "state", "src.db"));
   const snapD = snapshot(src, join(dHome, "backups"), "hub");
@@ -2655,7 +2654,7 @@ function writeAuthority(db, project) {
   // And the OUTCOME the gate must not break: a genuinely absent hub whose
   // restore fails at replay still leaves nothing behind. This is the reachable
   // half, and it is what goes red if `exclusive` is never granted.
-  const gHome = mkdtempSync(join(tmpdir(), "reeve-excl-"));
+  const gHome = tempDir("reeve-excl-");
   mkdirSync(join(gHome, "state"), { recursive: true });
   const src = openHub(hubPathFor(gHome));
   src.close();
@@ -2688,7 +2687,7 @@ function writeAuthority(db, project) {
 // lease either, and the sibling lock is the correct exclusion rather than a
 // downgrade.
 {
-  const kHome = mkdtempSync(join(tmpdir(), "reeve-nolock-"));
+  const kHome = tempDir("reeve-nolock-");
   mkdirSync(join(kHome, "state"), { recursive: true });
   const src = openHub(join(kHome, "state", "src.db"));
   const snapK = snapshot(src, join(kHome, "backups"), "hub");
@@ -2783,7 +2782,7 @@ function writeAuthority(db, project) {
 // expected column and no constraint breaks the lock and leaves the writer's read
 // working, so a builder can still take its lease and be replaced underneath.
 {
-  const wHome = mkdtempSync(join(tmpdir(), "reeve-enter-"));
+  const wHome = tempDir("reeve-enter-");
   mkdirSync(join(wHome, "state"), { recursive: true });
   const src = openHub(join(wHome, "state", "src.db"));
   const snapE = snapshot(src, join(wHome, "backups"), "hub");
@@ -2899,7 +2898,7 @@ function writeAuthority(db, project) {
 // it can be the only copy of the newest state: the forensic copy was omitting
 // exactly what this recovery promises to keep.
 {
-  const sHome = mkdtempSync(join(tmpdir(), "reeve-qwal-"));
+  const sHome = tempDir("reeve-qwal-");
   mkdirSync(join(sHome, "state"), { recursive: true });
   const src = openHub(join(sHome, "state", "src.db"));
   const snapS = snapshot(src, join(sHome, "backups"), "hub");
@@ -2975,7 +2974,7 @@ function writeAuthority(db, project) {
 // to recover from -- the exclusive open answered ENOENT and a perfectly valid
 // snapshot came back as `could not restore`.
 {
-  const fHome = mkdtempSync(join(tmpdir(), "reeve-fresh-"));
+  const fHome = tempDir("reeve-fresh-");
   mkdirSync(join(fHome, "state"), { recursive: true });
   const src = openHub(join(fHome, "state", "src.db"));
   const snapF = snapshot(src, join(fHome, "backups"), "hub");
@@ -3012,7 +3011,7 @@ function writeAuthority(db, project) {
 // that. What CAN be established is that a blocked probe is never read as "nobody
 // can enter", which is the whole defect.
 {
-  const bHome = mkdtempSync(join(tmpdir(), "reeve-busyw-"));
+  const bHome = tempDir("reeve-busyw-");
   mkdirSync(join(bHome, "state"), { recursive: true });
   const src = openHub(join(bHome, "state", "src.db"));
   const snapB = snapshot(src, join(bHome, "backups"), "hub");
@@ -3069,7 +3068,7 @@ rmSync(home, { recursive: true, force: true });
 // exported before the upgrade would then refuse recovery, and the PRs created
 // after that snapshot could not be carried forward at all.
 {
-  const d = mkdtempSync(join(tmpdir(), "reeve-legacy-tail-"));
+  const d = tempDir("reeve-legacy-tail-");
   const p2 = join(d, "hub.db");
   const db = openHub(p2);                       // migrations 1 and 2
   db.prepare(`INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,generation,source_kind,
@@ -3113,7 +3112,7 @@ rmSync(home, { recursive: true, force: true });
 // reads "no deadline", treats itself as the first grant, and mints a fresh one
 // over a pin the founder had time-boxed.
 {
-  const d = mkdtempSync(join(tmpdir(), "reeve-legacy-pin-"));
+  const d = tempDir("reeve-legacy-pin-");
   const hp = join(d, "hub.db");
   const bak = join(d, "backups");
   const db = openHub(hp);

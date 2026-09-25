@@ -24,6 +24,9 @@ export const ACTIONS = {
 export const ESCALATIONS = {
   BASE_RED: "the base branch is red",
   MISSING_REQUIRED: "a required check never reported",
+  SKIPPED_REQUIRED: "a required check was skipped, so it never passed",
+  IMPOSTOR: "another App publishes a check under reeve's own name",
+  SHADOW_REQUIRED: "the base requires reeve's shadow check, which never fails",
   CAP_WITH_CRITICAL: "round cap reached with a critical finding open",
   REPEATED_FAILURE: "the same failure survived a second fix",
   DIRTY: "the branch conflicts with its base",
@@ -142,6 +145,9 @@ export function nextAction(e, p, h = {}) {
   //    the base's problem and repairing it in a feature PR hides its origin.
   const ci = clause(v, "ci");
   if (ci?.state === "BLOCK") {
+    if (/under reeve's own name/i.test(ci.detail)) return act(ACTIONS.ESCALATE, ESCALATIONS.IMPOSTOR);
+    if (/requires reeve's shadow check/i.test(ci.detail)) return act(ACTIONS.ESCALATE, ESCALATIONS.SHADOW_REQUIRED);
+    if (/skipped or neutral/i.test(ci.detail)) return act(ACTIONS.ESCALATE, ESCALATIONS.SKIPPED_REQUIRED);
     if (/never reported/i.test(ci.detail)) return act(ACTIONS.ESCALATE, ESCALATIONS.MISSING_REQUIRED);
     const caused = e.checks?.caused ?? [];
     const inherited = e.checks?.inherited ?? [];

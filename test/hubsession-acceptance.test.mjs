@@ -43,9 +43,9 @@ import { hubSession } from "../src/build/hubsession.mjs";
 import { run } from "./fixtures/tick-harness.mjs";
 import { openHub } from "../src/build/hubdb.mjs";
 import { openHubAsGuest } from "../src/build/hubguest.mjs";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
+import { tempDir } from "./fixtures/temp.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -94,7 +94,7 @@ const OPS = new Set(["providerClaim", "providerRelease", "providerBind", "provid
 
 // ── THE PROPERTY, against the real tick ─────────────────────────────────────
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-acceptance-"));
+  const dir = tempDir("reeve-acceptance-");
   const generation = (n) => {
     const p = join(dir, `hub${n}.db`);
     openHub(p).close();

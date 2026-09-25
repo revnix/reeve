@@ -26,13 +26,14 @@ import { probeKeychain } from "../src/containment.mjs";
 import { netListener } from "../src/canary.mjs";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { tempDir } from "./fixtures/temp.mjs";
 
 // A worker never gets the founder's HOME (that is where the keychain lives) and
 // authenticates from a token instead of ~/.claude.
-const WORKER_HOME = mkdtempSync(join(tmpdir(), "reeve-worker-home-"));
+const WORKER_HOME = tempDir("reeve-worker-home-");
 // The founder's login keychain, by path. A scratch HOME empties the search LIST
 // and leaves this file exactly where it was, readable by the same OS user.
 const LOGIN_KEYCHAIN = join(homedir(), "Library", "Keychains", "login.keychain-db");

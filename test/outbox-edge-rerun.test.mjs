@@ -17,16 +17,15 @@
 // correct and is not where this fails, so a fixture that only ever enqueues once
 // cannot exhibit the defect no matter what it asserts.
 import { open, tx, enqueue, outboxIdFor, enqueueWithDependants } from "../src/db/ops.mjs";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { tempDir } from "./fixtures/temp.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
   if (!ok) { if (detail !== undefined) console.log("        " + detail); fail++; }
 };
-const fresh = () => open(join(mkdtempSync(join(tmpdir(), "edge-")), "s.db"));
+const fresh = () => open(join(tempDir("edge-"), "s.db"));
 
 const parent = { idemKey: "spill:1:issue", kind: "gh.issue.create",
                  args: { nwo: "o/r", title: "t", body: "b" } };

@@ -4,6 +4,7 @@
 // drift that turns a dark capability live without anyone deciding it.
 import { diffBaseline, checkBaseline, baselinePathFor } from "../src/baseline.mjs";
 import { readFileSync } from "node:fs";
+import { tempDir } from "./fixtures/temp.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -98,10 +99,9 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
 
 // ── a malformed baseline is UNKNOWN, never a crash ───────────────────────────
 {
-  const { writeFileSync: wf, mkdtempSync: md } = await import("node:fs");
-  const { tmpdir: td } = await import("node:os");
+  const { writeFileSync: wf } = await import("node:fs");
   const { join: jn } = await import("node:path");
-  const bad = jn(md(jn(td(), "reeve-badbase-")), "x.json"); wf(bad, "{ not json");
+  const bad = jn(tempDir("reeve-badbase-"), "x.json"); wf(bad, "{ not json");
   let r = null, threw = null;
   try { r = checkBaseline("o/r", {}, { fixturePath: bad, readLive: () => fixture }); } catch (e) { threw = e; }
   check(!threw && r?.level === "UNKNOWN" && /baseline/.test(r.lines.join(" ")), "a malformed baseline reports UNKNOWN with the file error", threw ? String(threw.message) : JSON.stringify(r));
@@ -301,10 +301,9 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
   const widened = { ...live, classicSnapshot: live.classicSnapshot.replace('"enabled":true', '"enabled":false') };
   check(diffBaseline(widened, live).drifted === true && /classic protection/.test(diffBaseline(widened, live).lines.join(" ")), "an unprojected classic field changing is drift", "");
 
-  const { writeFileSync: wf, mkdtempSync: md } = await import("node:fs");
-  const { tmpdir: td } = await import("node:os");
+  const { writeFileSync: wf } = await import("node:fs");
   const { join: jn } = await import("node:path");
-  const noid = jn(md(jn(td(), "reeve-noid-")), "x.json"); wf(noid, JSON.stringify({ ...fixture, nwo: undefined, branch: undefined }));
+  const noid = jn(tempDir("reeve-noid-"), "x.json"); wf(noid, JSON.stringify({ ...fixture, nwo: undefined, branch: undefined }));
   const r = checkBaseline("nextlyhq/nextly", { identity: { defaultBranch: "main" } }, { fixturePath: noid, readLive: () => fixture });
   check(r.level === "UNKNOWN" && /identity|nwo|branch/.test(r.lines.join(" ")), "a fixture without its identity fields is UNKNOWN, never compared", JSON.stringify(r));
 }
@@ -355,10 +354,9 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
   const a = readLiveBaseline("o/r", prof, { gh: mk("a") }), b2 = readLiveBaseline("o/r", prof, { gh: mk("b") });
   check(diffBaseline(a, b2).drifted === false, "the same authority returned in a different order is not drift", JSON.stringify(diffBaseline(a, b2).lines));
 
-  const { writeFileSync: wf, mkdtempSync: md } = await import("node:fs");
-  const { tmpdir: td } = await import("node:os");
+  const { writeFileSync: wf } = await import("node:fs");
   const { join: jn } = await import("node:path");
-  const badtype = jn(md(jn(td(), "reeve-badtype-")), "x.json"); wf(badtype, JSON.stringify({ ...fixture, ruleSnapshot: {} }));
+  const badtype = jn(tempDir("reeve-badtype-"), "x.json"); wf(badtype, JSON.stringify({ ...fixture, ruleSnapshot: {} }));
   let r = null, threw = null;
   try { r = checkBaseline("nextlyhq/nextly", { identity: { defaultBranch: "main" } }, { fixturePath: badtype, readLive: () => fixture }); } catch (e2) { threw = e2; }
   check(!threw && r?.level === "UNKNOWN" && /ruleSnapshot/.test(r.lines.join(" ")), "a fixture field of the wrong type is UNKNOWN, never a crash", threw ? String(threw.message) : JSON.stringify(r));

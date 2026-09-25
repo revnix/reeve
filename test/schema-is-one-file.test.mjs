@@ -2,11 +2,10 @@
 // the migrator instead, so a database opened without migrating had no fact table
 // and every evidence write failed at runtime rather than at open.
 import { open } from "../src/db/ops.mjs";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { tempDir } from "./fixtures/temp.mjs";
 
-const db = open(join(mkdtempSync(join(tmpdir(), "reeve-")), "s.db"));
+const db = open(join(tempDir("reeve-"), "s.db"));
 const names = db.prepare(
   "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
 ).all().map(r => r.name).sort();

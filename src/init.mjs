@@ -18,9 +18,11 @@
 
 import { detect } from "./profile/detect.mjs";
 import { validate, withDefaults } from "./profile/schema.mjs";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, linkSync, rmSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { resolveHome } from "./home.mjs";
+import { statePathFor, legacyStatePathFor, adoptLegacyStore, clearMoveLock } from "./paths.mjs";
+import { open } from "./db/ops.mjs";
 
 /**
  * Where a profile belongs, given what the repo is.
@@ -293,6 +295,92 @@ export function renderPlan({ nwo, proposal, questions, notes, profile, unanswere
   return L.join("\n");
 }
 
+/**
+ * The repository's state database, as init sees it, without changing anything:
+ * "exists", "legacy" (a store at the old path, to be moved into place) or
+ * "missing".
+ */
+export function storeStatus(home, nwo) {
+  const path = statePathFor(home, nwo), legacy = legacyStatePathFor(home, nwo);
+  if (existsSync(path)) return { state: "exists", path };
+  if (existsSync(legacy)) return { state: "legacy", path, legacy };
+  return { state: "missing", path };
+}
+
+/**
+ * Make sure the repository has a state database.
+ *
+ * init creates it, and `run` never does. `run` refuses a missing store, because
+ * opening a fresh empty one on its own is how real history stops being read
+ * without anything failing. So the store is created here, where a person asked
+ * for it. An existing store is left alone, and a legacy one is moved into place
+ * rather than replaced by an empty one.
+ */
+export function ensureStore(home, nwo, { openStore = open, log = () => {} } = {}) {
+  const status = storeStatus(home, nwo);
+  // An existing store is left alone, apart from a move lock a killed mover left
+  // beside it, which nothing else would look for.
+  if (status.state === "exists") { clearMoveLock(status.path); return { changed: false, line: null }; }
+  if (status.state === "legacy") {
+    let said = null, used;
+    try { used = adoptLegacyStore(status.path, status.legacy, { log: (m) => { said = m; log(m); } }); }
+    catch (e) { return { changed: false, failed: true, line: e.message }; }
+    return used === status.path
+      ? { changed: true, line: `moved the state database to ${status.path}` }
+      : { changed: false, failed: true, line: said ?? `could not move the legacy store; using ${used}` };
+  }
+  // Built beside its final path and renamed into place only once it has closed.
+  // A store exists as soon as its file does, so an interrupted create would
+  // otherwise leave a half-made store that the next init reports as done.
+  // Published with a link, which never replaces a store that another init
+  // published first; that one is used instead.
+  const dir = dirname(status.path), stem = `${basename(status.path)}.init-`;
+  const tmp = join(dir, `${stem}${process.pid}`);
+  // Cleanup never throws: it runs on the failure path too, where the folder may
+  // be a file or unreadable.
+  const clear = () => { for (const s of ["", "-wal", "-shm", "-journal"]) try { rmSync(tmp + s, { force: true }); } catch { /* nothing to remove */ } };
+  let lost = false;
+  try {
+    mkdirSync(dir, { recursive: true });
+    clearInterruptedCreates(dir, stem);
+    openStore(tmp).close();
+    try { linkSync(tmp, status.path); }
+    catch (e) { if (e.code !== "EEXIST") throw e; lost = true; }
+  } catch (e) {
+    clear();
+    return { changed: false, failed: true, line: `could not create the state database at ${status.path}: ${e.message}` };
+  }
+  clear();
+  if (lost) return { changed: false, line: null };
+  return { changed: true, line: `created the state database at ${status.path}` };
+}
+
+/** Remove what an init that stopped partway left behind, unless its process still runs. */
+function clearInterruptedCreates(dir, stem) {
+  const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+  for (const f of readdirSync(dir)) {
+    const m = f.startsWith(stem) ? /^(\d+)(?:-wal|-shm|-journal)?$/.exec(f.slice(stem.length)) : null;
+    if (m && !alive(Number(m[1]))) rmSync(join(dir, f), { force: true });
+  }
+}
+
+/**
+ * Write the profile if it changed, then make sure of the store. Exit 2 means
+ * written, and 1 means the store couldn't be made or moved: a caller that reads
+ * 2 as "applied" must not be told so while the database is missing.
+ */
+export function applyInit({ path, after, profileChanged, home, nwo, output, ensure = ensureStore }) {
+  let out = output;
+  if (profileChanged) {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, after);
+    out += `\n\nwrote ${path}`;
+  }
+  const made = ensure(home, nwo);
+  if (made.line) out += `${profileChanged ? "\n" : "\n\n"}${made.line}`;
+  return { code: made.failed ? 1 : 2, output: out };
+}
+
 /** The whole flow. `write` is false for a plan-only run. */
 export function init({ root = process.cwd(), answers = {}, write = false, home = resolveHome() }) {
   const { proposal, questions, notes } = detect(root);
@@ -319,10 +407,14 @@ export function init({ root = process.cwd(), answers = {}, write = false, home =
   if (!v.ok) return { code: 1, output: output + "\n\nREFUSED\n" + v.errors.map(e => "  " + e).join("\n") };
 
   const after = JSON.stringify(profile, null, 2) + "\n";
-  if (existing === after) return { code: 0, output: output + "\n\nnothing to do", path };
-  if (!write) return { code: 2, output: output + `\n\n-> reeve init --write   to apply`, path };
+  const profileChanged = existing !== after;
+  const store = storeStatus(home, nwo);
+  if (!profileChanged && store.state === "exists") return { code: 0, output: output + "\n\nnothing to do", path };
+  if (!write) {
+    const plan = store.state === "missing" ? `\n\nthe state database will be created at ${store.path}`
+      : store.state === "legacy" ? `\n\nthe state database will be moved from ${store.legacy} to ${store.path}` : "";
+    return { code: 2, output: output + plan + `\n\n-> reeve init --write   to apply`, path };
+  }
 
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, after);
-  return { code: 2, output: output + `\n\nwrote ${path}`, path, profile };
+  return { ...applyInit({ path, after, profileChanged, home, nwo, output }), path, profile };
 }

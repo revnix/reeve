@@ -34,7 +34,9 @@ const missing = (suitesComplete) => ({
   for (let i = 0; i < 5; i++) s = settle(s, missing(false));
   check(s.settled === false,
     "five observations while the CI provider is still running does not settle", JSON.stringify(s));
-  check(s.streak >= 3, "control: the streak really did accumulate, so the count is not what held it back", String(s.streak));
+  // The streak counts green readings only, so an absence isn't counted at all:
+  // no number of looks can settle one.
+  check(s.streak === 0, "control: an absence isn't counted, so no count of looks is what holds it back", String(s.streak));
 }
 
 // Once the provider is finished and the required check still is not there, the

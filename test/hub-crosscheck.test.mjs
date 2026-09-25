@@ -17,8 +17,8 @@ import { TABLE_OWNERS, PROSE_TABLES } from "../src/build/tables.mjs";
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { tempDir } from "./fixtures/temp.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -26,7 +26,7 @@ const check = (ok, name, detail) => {
   if (!ok) { if (detail) console.log("        " + detail); fail++; }
 };
 
-const db = openHub(join(mkdtempSync(join(tmpdir(), "reeve-xc-")), "x.db"));
+const db = openHub(join(tempDir("reeve-xc-"), "x.db"));
 const inDb = new Set(db.prepare(
   "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all().map(r => r.name));
 const declared = new Set(Object.keys(TABLE_OWNERS));

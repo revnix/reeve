@@ -141,9 +141,43 @@ export function triagePullRequest(pr, me) {
   return {
     notes,
     reasons,
+    settled,
     needsMe: mine && reasons.length > 0,
     needsPerson: mine && reasons.length === 0 && settled && !pr.isDraft,
   };
+}
+
+/**
+ * A pull request with its own lists read whole: the issues it will close, its
+ * review threads, and the checks at its head. The query that reads the pull
+ * requests stops each at its first page, and a closing reference, an unresolved
+ * thread or a failing check on a later page would otherwise go unseen.
+ * `readPage(field, after)` returns the next page of `closing`, `threads` or
+ * `contexts` as a connection. `partial` is true when a list still couldn't be
+ * read whole, so nothing is judged from part of one.
+ */
+export function completePullRequest(pr, readPage, limit = 20) {
+  const whole = (conn, field) => {
+    if (!conn?.pageInfo?.hasNextPage) return { conn, complete: true };
+    const nodes = [...conn.nodes];
+    let after = conn.pageInfo.endCursor;
+    for (let page = 0; page < limit; page++) {
+      const next = readPage(field, after);
+      nodes.push(...(next?.nodes ?? []));
+      if (!next?.pageInfo) break;
+      if (!next.pageInfo.hasNextPage) return { conn: { ...conn, nodes, pageInfo: next.pageInfo }, complete: true };
+      after = next.pageInfo.endCursor;
+    }
+    return { conn: { ...conn, nodes }, complete: false };
+  };
+  const closing = whole(pr.closingIssuesReferences, "closing");
+  const threads = whole(pr.reviewThreads, "threads");
+  const commit = pr.commits?.nodes?.[0]?.commit;
+  const contexts = whole(commit?.statusCheckRollup?.contexts, "contexts");
+  const commits = contexts.conn === commit?.statusCheckRollup?.contexts ? pr.commits
+    : { ...pr.commits, nodes: [{ ...pr.commits.nodes[0], commit: { ...commit, statusCheckRollup: { ...commit.statusCheckRollup, contexts: contexts.conn } } }] };
+  return { ...pr, closingIssuesReferences: closing.conn, reviewThreads: threads.conn, commits,
+           partial: !(closing.complete && threads.complete && contexts.complete) };
 }
 
 // The open pull requests that will close each issue. This reads the pull
@@ -285,4 +319,148 @@ export function claimOutcome(comments, { session, me, assignees }) {
 // running it again finishes a release that stopped halfway.
 export function unreleasedClaim(comments, me) {
   return comments.some((c, i) => c.body.startsWith(CLAIM) && c.who === me && !releasedAfter(comments, i, me));
+}
+
+// ── the plan board ───────────────────────────────────────────────────────────
+// A GitHub Project linked to the repository, whose Status field has these five
+// columns. Every card's column is computed from the issues and pull requests.
+// The board is never read as state, so a card moved by hand is put back.
+export const BOARD_COLUMNS = ["Blocked", "Ready", "In progress", "In review", "Done"];
+
+/**
+ * The column a task belongs in. `closers` are the open pull requests that will
+ * close it, in the shape readPlan returns. One that needs its author (a draft,
+ * review findings, changes requested, failing checks, a conflict), or whose
+ * checks are still running, means the work is still being done: In progress.
+ * Otherwise it waits on a person: In review.
+ */
+export function boardColumn({ open, blocked, closers = [], assigned }) {
+  if (!open) return "Done";
+  if (blocked) return "Blocked";
+  if (closers.length) return closers.every((pr) => { const t = triagePullRequest(pr, null); return !t.reasons.length && t.settled; })
+    ? "In review" : "In progress";
+  if (assigned) return "In progress";
+  return "Ready";
+}
+
+/**
+ * The plan board among the projects linked to a repository: the one whose Status
+ * field has exactly the five columns. None, or more than one, is no board, and
+ * says why, rather than a guess at which to write.
+ */
+export function pickBoard(projects) {
+  // A closed project is no board, whatever its columns: an old one kept with
+  // the same five would otherwise be written to, or stop the sync as a second
+  // candidate.
+  const boards = (projects ?? []).filter((p) => {
+    const names = (p.status?.options ?? []).map((o) => o.name);
+    return !p.closed && names.length === BOARD_COLUMNS.length && BOARD_COLUMNS.every((c) => names.includes(c));
+  });
+  if (boards.length === 1) return { board: boards[0], why: null };
+  return { board: null, why: boards.length
+    ? `${boards.length} linked projects have the plan board's columns: ${boards.map((b) => `#${b.number}`).join(", ")}`
+    : `no open linked project has a Status field with the columns ${BOARD_COLUMNS.join(", ")}` };
+}
+
+/**
+ * Every page of a GitHub connection. `fetch(after)` returns one page as
+ * `{ nodes, pageInfo }`. Stops after `limit` pages, and says whether it read
+ * them all, so nothing is judged from part of a list silently.
+ */
+export function allNodes(fetch, limit = 50) {
+  const nodes = [];
+  let after = null;
+  for (let page = 0; page < limit; page++) {
+    const conn = fetch(after);
+    nodes.push(...conn.nodes);
+    if (!conn.pageInfo?.hasNextPage) return { nodes, complete: true };
+    after = conn.pageInfo.endCursor;
+  }
+  return { nodes, complete: false };
+}
+
+/**
+ * Why the board must not be written from these reads, or null. A list read in
+ * part moves cards the wrong way: a task whose pull request went unread would
+ * leave In review.
+ */
+export function incompleteRead(reads) {
+  const missing = Object.entries(reads).filter(([, r]) => r?.complete === false).map(([name]) => name);
+  return missing.length ? `not every one of the ${missing.join(", ")} could be read, so no card was moved` : null;
+}
+
+/**
+ * The closed issues on the board that have sub-issues, which the plan no longer
+ * reads: a phase that has closed, or a task closed with sub-tasks of its own,
+ * even one its open phase lists. Their sub-issues are synced from them, so one
+ * left open still moves, and one closed without a card gets one.
+ */
+export function closedPhases(cards) {
+  return [...cards].filter(([, c]) => c.state === "CLOSED" && c.phase).map(([n, c]) => ({ number: n, ...c }));
+}
+
+/** Whether an issue is a phase of the plan: it has sub-issues, or its type is Feature. */
+export const isPhase = (issue) => (issue?.subIssues?.totalCount ?? 0) > 0 || issue?.issueType?.name === "Feature";
+
+/**
+ * A card's facts, from an item of the board: its issue's state, whether anyone
+ * is assigned, its parent, and whether it is a phase, as the plan counts one.
+ */
+export const cardOf = (it) => ({ item: it.id, archived: it.isArchived === true, option: it.status?.optionId ?? null, state: it.content.state,
+                                 assigned: (it.content.assignees?.totalCount ?? 0) > 0, parent: it.content.parent?.number ?? null,
+                                 phase: isPhase(it.content) });
+
+/**
+ * Closed phases found from GitHub, added to the closed parents whose sub-issues
+ * are synced, beside those found from their cards. A parent already there stays
+ * as it is.
+ */
+export function withClosedRoots(parents, roots) {
+  for (const root of roots) if (!parents.has(root.number)) parents.set(root.number, root);
+  return parents;
+}
+
+/** The closed phases with no card on the board, which get one, in Done. */
+export const uncardedRoots = (roots, cards) => roots.filter((root) => !cards.has(root.number));
+
+/** A closed issue that has sub-issues of its own, whose sub-issues the plan doesn't read. */
+export const closedParent = (issue) => issue?.state === "CLOSED" && (issue.subIssues?.totalCount ?? 0) > 0;
+
+/**
+ * Sync the sub-issues of every closed parent in `parents`, which grows as
+ * `syncTask` meets more: a closed task with sub-tasks, at any depth, card or no
+ * card, is read in its turn. A Map is iterated in insertion order, including
+ * what is added while it is being iterated.
+ */
+export function syncClosedParents(parents, readSubIssues, visited, syncTask) {
+  for (const [n] of parents) for (const task of readSubIssues(n)) if (!visited.has(task.number)) syncTask(task);
+}
+
+/**
+ * The open cards still not visited that are sub-issues of something, such as a
+ * task whose phase isn't on the board. Each is set from its own issue, as a
+ * task of an open phase would be. A card for an issue that is no sub-issue is
+ * no task of the plan, and is left as it is.
+ */
+export function openStrays(cards, visited) {
+  return [...cards].filter(([n, c]) => !visited.has(n) && c.state === "OPEN" && c.parent != null).map(([n, c]) => ({ number: n, ...c }));
+}
+
+/**
+ * Whether a card must come back from the archive before its column is set. An
+ * active task is never hidden, whatever archived it; a finished one stays where
+ * an auto-archive put it.
+ */
+export const mustUnarchive = ({ archived, column }) => Boolean(archived) && column !== "Done";
+
+/**
+ * The cards the plan didn't visit whose issue is closed. A closed task is Done
+ * whether or not its phase is still open, and a phase closed with its last tasks
+ * is no longer read at all.
+ */
+export function closedCards(cards, visited) {
+  // Only the plan's: a phase, or a sub-issue. A closed issue on the board for
+  // another reason is left as it is.
+  return [...cards].filter(([n, c]) => !visited.has(n) && c.state === "CLOSED" && (c.phase || c.parent != null))
+    .map(([n, c]) => ({ number: n, ...c }));
 }

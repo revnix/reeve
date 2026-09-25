@@ -36,10 +36,10 @@ import { openHubAsGuest } from "../../src/build/hubguest.mjs";
 import * as provider from "../../src/provider.mjs";
 import { queuedGuardianRequests } from "../../src/build/providerdb.mjs";
 
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CLAUSE_IDS } from "../../src/verdict.mjs";
+import { tempDir } from "./temp.mjs";
 
 // The fixture's evaluation payload. It lives HERE because run() closes over it;
 // leaving it in the suite would make the harness depend on its importer.
@@ -87,7 +87,7 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
                     carriedReleases, carriedCooldowns, providerBind,
                     resolveRepoIdFn, project, keepDir = false, seams = null,
                     haltMarker, openPrs, containment, ticks = 1, dbPath, evaluate } = {}) => {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-"));
+  const dir = tempDir("reeve-prov-");
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
   const guest = hub === undefined ? openHubAsGuest(hubPath) : hub;
@@ -113,7 +113,7 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: capacity ?? (() => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 })),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-clone-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-clone-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },

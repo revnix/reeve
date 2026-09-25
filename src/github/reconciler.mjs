@@ -16,6 +16,13 @@ import { execFileSync } from "node:child_process";
 /** Conclusions that do NOT block. Everything else does, including the ones a naive
  *  `conclusion === "failure"` branch would fall straight through. */
 const PASSING = new Set(["success", "skipped", "neutral"]);
+/**
+ * Passing, and yet not a pass: a skipped check didn't run, and a neutral one
+ * didn't judge. GitHub counts both as passing a required check, so a test job
+ * that a broken `if:` skips, or whose `needs:` failed, passes the gate. For a
+ * check nothing requires, a path filter's skip is what was meant, and it passes.
+ */
+const NOT_RUN = new Set(["skipped", "neutral"]);
 /** The full space, so an unrecognised value is treated as blocking rather than ignored. */
 const KNOWN_CONCLUSIONS = new Set([
   "success", "failure", "neutral", "cancelled", "skipped", "timed_out",
@@ -34,10 +41,16 @@ const KNOWN_CONCLUSIONS = new Set([
 const UNINFORMATIVE = new Set(["cancelled", "stale"]);
 
 function sh(cmd, args) {
-  try { return { ok: true, out: execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() }; }
+  // A paged read of a busy head runs past the default 1 MiB, and a read cut
+  // short there must not be taken for the whole list.
+  try { return { ok: true, out: execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 }).trim() }; }
   catch (e) { return { ok: false, out: "", err: String(e.stderr || e.message).trim() }; }
 }
-const gh = (path, jq) => { const a = ["api", path]; if (jq) a.push("--jq", jq); return sh("gh", a); };
+const gh = (path, jq, { paginate = false } = {}) => {
+  const a = ["api", ...(paginate ? ["--paginate"] : []), path];
+  if (jq) a.push("--jq", jq);
+  return sh("gh", a);
+};
 
 /**
  * The one true head for this tick. Read from the ref itself, never from the PR
@@ -72,13 +85,17 @@ export const POLICY_APP = "merge-policy";
  * Bump this whenever the set of things counted changes. A stored floor recorded
  * under an older number is discarded rather than compared against.
  */
-export const CHECK_ACCOUNTING = 3;
+export const CHECK_ACCOUNTING = 5;
 // 3: reviewer commit-status contexts (ci.reviewerStatusContexts) left the counted
 //    set. Measured the moment it shipped -- nextly #1011 read "only 34 checks
 //    reported where 35 were expected" against a floor stored under accounting 2,
 //    which is the same shape as the policy-exclusion incident this counter was
 //    added for. Changing what counts REQUIRES bumping this, and the number is the
 //    only thing standing between an exclusion and every PR stuck forever.
+// 4: check runs and statuses are read past their first page. Statuses came 30
+//    to a page and runs 100, so a head with more counts them all from here on.
+// 5: only a reviewer's commit STATUS leaves the counted set. A check run under a
+//    reviewer's context name counts, since a rule can bind it to its App.
 
 /**
  * Remove reeve's own opinion from the evidence.
@@ -126,7 +143,9 @@ export function excludeReviewerContexts(rows, contexts = []) {
   if (!contexts.length) return { rows, reviewerRows: [] };
   const set = new Set(contexts);
   const rest = [], reviewerRows = [];
-  for (const r of rows) (set.has(r.name) ? reviewerRows : rest).push(r);
+  // A reviewer's STATUS, and only that: a check run under the same name is a
+  // check run, which a rule binding it to its App requires like any other.
+  for (const r of rows) (set.has(r.name) && r.source !== "check_run" ? reviewerRows : rest).push(r);
   return { rows: rest, reviewerRows };
 }
 
@@ -145,22 +164,33 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
   // and a TSV parse then splits it into a phantom row whose "name" is a fragment
   // of the description and whose conclusion is undefined — which classifies as a
   // failure and reports "failing: undefined" to the fixer.
-  const parse = (raw, fn) => {
-    if (!raw) return;
-    let j; try { j = JSON.parse(raw); } catch { return; }
-    for (const item of j) { const r = fn(item); if (r && r.name) rows.push(r); }
+  //
+  // Every page, one JSON value per line. A page holds 100 runs, and statuses
+  // came 30 to a page, so a check past the first page went unread. A surface
+  // counts as read only when every line of every page was.
+  const parse = (r, fn) => {
+    if (!r.ok) return false;
+    for (const line of r.out.split("\n").filter(Boolean)) {
+      let item; try { item = JSON.parse(line); } catch { return false; }
+      const row = fn(item); if (row && row.name) rows.push(row);
+    }
+    return true;
   };
-  const cr = gh(`repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=latest`, ".check_runs");
-  if (cr.ok) parse(cr.out, c => ({
+  const cr = gh(`repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=latest`, ".check_runs[]", { paginate: true });
+  const crRead = parse(cr, c => ({
     name: c.name, source: "check_run",
     state: c.status === "completed" ? "completed" : "running",
     conclusion: c.conclusion || null, id: c.id != null ? String(c.id) : null,
     // Carried so reeve can recognise its OWN check and refuse to treat it as
     // evidence. Excluding by name alone would miss anything else it publishes.
     app: c.app?.slug ?? null,
+    // And the id, which is what a required check bound to an App names.
+    appId: c.app?.id != null ? String(c.app.id) : null,
+    // When it finished: GitHub accepts a required check's pass for seven days.
+    completedAt: c.completed_at ?? null,
   }));
-  const st = gh(`repos/${nwo}/commits/${sha}/status`, ".statuses");
-  if (st.ok) parse(st.out, x => ({
+  const st = gh(`repos/${nwo}/commits/${sha}/status?per_page=100`, ".statuses[]", { paginate: true });
+  const stRead = parse(st, x => ({
     // A StatusContext has .state and no .conclusion. "pending" is in flight.
     name: x.context, source: "status",
     state: x.state === "pending" ? "running" : "completed",
@@ -168,6 +198,7 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
     // A rate-limited CodeRabbit reports state=success with the truth relegated
     // here, so the description is carried rather than discarded.
     description: x.description ?? "",
+    completedAt: x.updated_at ?? x.created_at ?? null,
   }));
   // Filtered HERE rather than by each caller: the base head is read through this
   // same function, and a caller that forgot would reintroduce the latch silently.
@@ -175,13 +206,31 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
   // Reviewer rows are RETURNED, never dropped: the review pipeline reads them as
   // evidence about the reviewer, and a signal that vanishes cannot be reported.
   const rev = excludeReviewerContexts(own.rows, reviewerContexts);
-  return { ok: cr.ok || st.ok, rows: rev.rows, reviewerRows: rev.reviewerRows,
+  // `ok` only when both surfaces were read in full. Every result under a check's
+  // name must pass, and a failing one on a surface that went unread would leave
+  // the rest passing: with statuses unread, a failing status beside passing
+  // check runs read as green.
+  const ok = crRead && stRead;
+  return { ok, rows: rev.rows, reviewerRows: rev.reviewerRows,
            excluded: own.excluded, impostors: own.impostors,
-           why: cr.ok || st.ok ? null : (cr.err || st.err) };
+           why: ok ? null : !crRead ? (cr.err || "check runs couldn't be parsed") : (st.err || "statuses couldn't be parsed") };
 }
 
-/** Classify a set of check rows. Never returns "green" on absence. */
-export function classify(allRows, requiredChecks = []) {
+/**
+ * Classify a set of check rows. Never returns "green" on absence.
+ *
+ * A required check is a name, or `{ context, app }` when it is bound to an App:
+ * then only that App's check runs meet it, and a commit status under the name,
+ * which names no App reeve can read, leaves it unknown.
+ *
+ * `evidence` asks whether the rows show a pass, as a head's must. Then a
+ * required check that was skipped or neutral never passed, and a set where
+ * nothing ran shows nothing. A base is judged for health instead, which only
+ * its failures decide, so it asks without. `requiredKnown` is false when the
+ * base's own requirements couldn't be read: then nothing reads green, since a
+ * requirement unread may be one no row meets.
+ */
+export function classify(allRows, requiredChecks = [], { requiredKnown = true, evidence = true } = {}) {
   // A row with no name is a PARSE DEFECT, not a check. It cannot be reported to a
   // fixer ("failing: undefined") and it must not block on its own, but it must
   // also not vanish silently, so it is counted and surfaced.
@@ -198,11 +247,37 @@ export function classify(allRows, requiredChecks = []) {
     !UNINFORMATIVE.has(String(r.conclusion)) &&
     (!KNOWN_CONCLUSIONS.has(String(r.conclusion)) || !PASSING.has(String(r.conclusion))));
   const names = new Set(rows.map(r => r.name));
-  const missing = requiredChecks.filter(c => !names.has(c));
+  const required = requiredChecks.map(c => (typeof c === "string" ? { context: c, app: null }
+    : { context: c.context, app: c.app == null ? null : String(c.app), ...(c.origin ? { origin: c.origin } : {}) }));
+  const requiredNames = new Set(required.map(c => c.context));
+  const named = (c) => rows.filter(r => r.name === c.context);
+  const meeting = (c) => (c.app == null ? named(c) : named(c).filter(r => r.source === "check_run" && String(r.appId) === c.app));
+  const label = (c) => (c.app == null ? c.context : `${c.context} from App ${c.app}`);
+  const notRun = (results) => results.length > 0 && results.every(r => r.state === "completed" && NOT_RUN.has(String(r.conclusion)));
 
-  if (missing.length) return { verdict: "MISSING_REQUIRED", why: `required check(s) never reported: ${missing.join(", ")}`, failing, running, missing, malformed };
+  // A failure, or a check in flight, comes before what hasn't reported: a
+  // required check may be waiting on the very job that failed, or is running.
   if (failing.length) return { verdict: "RED", why: `${failing.length} check(s) not passing`, failing, running, malformed };
   if (running.length) return { verdict: "RUNNING", why: `${running.length} check(s) still in flight`, failing, running, malformed };
+  const unreadable = required.filter(c => c.app != null && !meeting(c).length && named(c).some(r => r.source !== "check_run"));
+  if (unreadable.length) return { verdict: "UNKNOWN", failing: [], running: [], malformed,
+    why: `required check(s) bound to an App and reported only by a commit status, which names no App: ${unreadable.map(label).join(", ")}` };
+  const missing = required.filter(c => !meeting(c).length);
+  if (missing.length) return { verdict: "MISSING_REQUIRED", why: `required check(s) never reported: ${missing.map(label).join(", ")}`,
+    failing, running, missing: missing.map(c => c.context), missingChecks: missing, malformed };
+  // A required job skipped because the job it needs failed was RED above, the
+  // failure's to fix. One skipped with nothing failing is terminal evidence,
+  // and settles at once.
+  const skipped = evidence ? required.filter(c => notRun(meeting(c))) : [];
+  if (skipped.length) return { verdict: "SKIPPED_REQUIRED", why: `required check(s) skipped or neutral, so they never reported a pass: ${skipped.map(label).join(", ")}`,
+    failing, running, skipped: skipped.map(c => c.context), malformed };
+  // Green needs the whole required set: a requirement unread may be one no row
+  // meets, reeve's own shadow check say, which GitHub passes on reeve's neutral.
+  const green = (result) => (evidence && !requiredKnown ? { verdict: "UNKNOWN", failing: [], running: [], malformed,
+    why: "the base's required checks couldn't be read, so whether each one passed can't be told" } : result);
+  // A head where nothing ran has no evidence at all, however many rows say so.
+  if (evidence && rows.every(r => NOT_RUN.has(String(r.conclusion)) || UNINFORMATIVE.has(String(r.conclusion))))
+    return { verdict: "UNKNOWN", failing: [], running: [], malformed, why: "no check ran at this revision: every one was skipped, neutral, cancelled or stale" };
   // A cancelled or stale run is a SUPERSEDED run, and superseding is normal: a new
   // push cancels the old workflow. What matters is whether the superseded thing was
   // one the gate requires.
@@ -216,8 +291,11 @@ export function classify(allRows, requiredChecks = []) {
   // ancillary, so every cancellation still refuses. Fail closed where the profile
   // is silent.
   if (uninformative.length) {
-    const req = new Set(requiredChecks);
-    const blocking = req.size ? uninformative.filter(r => req.has(r.name)) : uninformative;
+    // Only a row that could have met a requirement: its name, and its App where
+    // the requirement is bound to one.
+    const blocking = requiredNames.size
+      ? uninformative.filter(r => required.some(c => c.context === r.name && (c.app == null || (r.source === "check_run" && String(r.appId) === c.app))))
+      : uninformative;
     if (blocking.length) return {
       verdict: "UNKNOWN", failing: [], running: [], uninformative: blocking,
       why: `${blocking.length} required check(s) cancelled or stale — superseded, not failed`,
@@ -226,11 +304,11 @@ export function classify(allRows, requiredChecks = []) {
     // cancelled, it simply is not a reason to refuse a merge.
     if (malformed) return { verdict: "UNKNOWN", failing: [], running: [], malformed, ancillaryUninformative: uninformative,
       why: `${malformed} check row(s) could not be parsed, so this revision is not checkable` };
-    return { verdict: "GREEN", failing: [], running: [], ancillaryUninformative: uninformative,
-      why: `${rows.length - uninformative.length} required and ancillary check(s) passing; ${uninformative.length} ancillary cancelled or stale` };
+    return green({ verdict: "GREEN", failing: [], running: [], ancillaryUninformative: uninformative,
+      why: `${rows.length - uninformative.length} required and ancillary check(s) passing; ${uninformative.length} ancillary cancelled or stale` });
   }
   if (malformed) return { verdict: "UNKNOWN", failing: [], running: [], malformed, why: `${malformed} check row(s) could not be parsed, so this revision is not checkable` };
-  return { verdict: "GREEN", why: `${rows.length} check(s) all passing`, failing: [], running: [], malformed };
+  return green({ verdict: "GREEN", why: `${rows.length} check(s) all passing`, failing: [], running: [], malformed });
 }
 
 
@@ -246,11 +324,16 @@ export function classify(allRows, requiredChecks = []) {
  * Returns null when the question cannot be asked. Null is not false and it is not
  * true: it means the caller has no basis to conclude anything.
  */
-export function suitesComplete(nwo, sha, { app = "github-actions" } = {}) {
-  const r = gh(`repos/${nwo}/commits/${sha}/check-suites?per_page=100`, ".check_suites");
+export function suitesComplete(nwo, sha, { app = "github-actions", appId = null } = {}) {
+  // Every page: an App's suite past the first hundred would otherwise go unseen.
+  const r = gh(`repos/${nwo}/commits/${sha}/check-suites?per_page=100`, ".check_suites[]", { paginate: true });
   if (!r.ok || !r.out) return null;
-  let suites; try { suites = JSON.parse(r.out); } catch { return null; }
-  const mine = suites.filter(s => (s.app?.slug ?? null) === app);
+  let suites;
+  try { suites = r.out.split("\n").filter(Boolean).flatMap((line) => { const v = JSON.parse(line); return Array.isArray(v) ? v : [v]; }); }
+  catch { return null; }
+  // By the App's id where a requirement is bound to one, and otherwise by the
+  // provider's name.
+  const mine = suites.filter(s => (appId != null ? String(s.app?.id) === String(appId) : (s.app?.slug ?? null) === app));
   // No suite at all from the provider is not "finished": on a repository with CI
   // it means nothing has been created yet, which is the very state being waited on.
   if (!mine.length) return false;
@@ -277,7 +360,11 @@ export function settle(prior, reading) {
   const sameHead = Boolean(prior) && prior.sha === reading.sha;
   const floor = sameHead ? (prior.floor ?? 0) : 0;
   const same = sameHead && prior.key === key;
-  const streak = same ? (prior.streak ?? 0) + 1 : 1;
+  // The streak counts green readings in a row, and only those: a red or
+  // skipped reading, or one below the floor, starts it again. A job rerun after
+  // a skip then needs its own three green looks, not the skip's.
+  const counted = reading.verdict === "GREEN" && names.length >= floor;
+  const streak = counted ? (same ? (prior.streak ?? 0) + 1 : 1) : 0;
   const next = { sha: reading.sha, key, streak, floor: Math.max(floor, names.length), names };
 
   // THE cause of a run of "undefined" symptoms: these two returns dropped the
@@ -289,7 +376,9 @@ export function settle(prior, reading) {
   // GitHub may simply not have created it yet -- so it needs the same
   // corroboration a green set does. Calling it "never reported" on first sight
   // is the same absence-read-as-fact error pointed the other way.
-  if (reading.verdict === "RED")
+  // A required check that was skipped is present evidence too: it ran to its
+  // end, and waiting on the provider's other suites won't change it.
+  if (reading.verdict === "RED" || reading.verdict === "SKIPPED_REQUIRED")
     return { ...next, settled: true, verdict: reading.verdict, why: reading.why };
   // A required check that has not appeared is an ABSENCE, and an absence needs a
   // REASON to be believed rather than a number of looks. Counting was measured to
@@ -411,7 +500,11 @@ export function inheritedOrCaused(nwo, baseBranch, failingRows, io = {}) {
   const base = pinBase();
   if (!base.ok) return { verdict: "UNKNOWN", why: base.why, dropped };
   const read = readBase(base.sha);
-  if (!read.ok) return { verdict: "UNKNOWN", why: "could not read base checks", dropped };
+  // A read that isn't whole still shows the base failures it did read, and a
+  // failure seen there is one. What it didn't read may hold the rest, so a head
+  // failure with no twin among them stays unverified rather than caused.
+  if (!read.ok && !(read.rows ?? []).length) return { verdict: "UNKNOWN", why: "could not read base checks", dropped };
+  const partial = !read.ok;
 
   const baseFailing = new Map();
   for (const r of read.rows ?? [])
@@ -424,7 +517,7 @@ export function inheritedOrCaused(nwo, baseBranch, failingRows, io = {}) {
     const twin = baseFailing.get(row.name);
     // The cheap filter: a name that is not failing on the base at all cannot have
     // been inherited from it, and needs no probe.
-    if (!twin) { caused.push(row.name); continue; }
+    if (!twin) { (partial ? unverified : caused).push(row.name); continue; }
 
     // A shared NAME is not a shared failure. One job runs many tests, so the same
     // job can fail on the base and on the PR for entirely unrelated reasons —

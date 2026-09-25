@@ -168,6 +168,13 @@ const partsOf = (base, threads, rows = []) => readMergeParts("o/r", `base-${++ba
     "and signatures, a locked branch or push restrictions are named, and required conversation resolution is read", JSON.stringify({ guarded: guarded.unevaluated, conversations: conversations.unresolvedBlocks }));
   check(hidden.others === null && hidden.unevaluated === null && hidden.unresolvedBlocks === null && hidden.ownCheckRequired === true,
     "classic protection that couldn't be read leaves what else the base requires unknown", JSON.stringify(hidden));
+  // The branch is where classic protection's required checks are read. With it
+  // unreadable, a check it requires can't be known, even with the rest of
+  // protection read and the rules requiring reeve's check.
+  const branchless = partsOf(baseOf({ branch: { ok: false, err: "gh: HTTP 502" }, protection: settings({}) }), {});
+  check(branchless.ownCheckRequired === true && branchless.others === null && branchless.unevaluated === null
+    && mergeable({ ...branchless, readable: true }).state === UNKNOWN,
+    "a branch that couldn't be read leaves the checks its protection requires unknown, so BLOCKED can't pass", JSON.stringify(branchless));
   const unreadRules = partsOf(baseOf({ rules: { ok: false, err: "HTTP 502" } }), {});
   const unreadRows = readMergeParts("o/r", `base-${++bases}`, { mergeState: "BLOCKED", mergeable: "MERGEABLE", readable: true, unresolved: 0 }, { gh: baseOf().gh, appId: "1", rows: null });
   check(unreadRules.unevaluated === null && unreadRules.others === null && unreadRows.others === null,

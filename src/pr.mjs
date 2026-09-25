@@ -730,6 +730,9 @@ export function requirementsOn({ rules, branch, protection = null }, context, { 
   } else whole = false;
 
   const b = parsed(branch);
+  // The branch is the one place classic protection's required checks are read,
+  // so without it they are unknown, even when the rest of protection was read.
+  if (!b) whole = false;
   const checks = b?.protection?.required_status_checks;
   if (b?.protected === false) byProtection = false;
   else if (checks && typeof checks === "object") {

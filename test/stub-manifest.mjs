@@ -3704,6 +3704,15 @@ export const STUBS = [
               replace: "    }\n" }],
   },
   {
+    name: "requirements-unreadable-branch-is-unknown",
+    why: "read a base whose branch couldn't be read as whole. The checks its classic protection requires are read only there, so a required check that blocks the merge drops out, and BLOCKED passes",
+    test: "test/own-check-blocked.test.mjs",
+    expectRed: "a branch that couldn't be read leaves the checks its protection requires unknown, so BLOCKED can't pass",
+    edits: [{ file: "src/pr.mjs",
+              find: "  if (!b) whole = false;\n",
+              replace: "" }],
+  },
+  {
     name: "requirements-classic-read-only-where-enabled",
     why: "ask for classic protection on every base. Most bases only rulesets protect, and a token without an administrator's read then reads their requirements as unknown, so BLOCKED never passes",
     test: "test/own-check-blocked.test.mjs",

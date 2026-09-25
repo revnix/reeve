@@ -3365,7 +3365,7 @@ export const STUBS = [
     name: "legacy-move-main-file-last",
     why: "move the main file before its -wal. A failure between them leaves the canonical store without the committed writes still in the WAL, and every later run takes it for the whole store",
     test: "test/init-store.test.mjs",
-    expectRed: "a move that fails on -wal leaves the store whole at one path, never split",
+    expectRed: "a move killed after any file is finished by the next run, with every committed row",
     edits: [{ file: "src/paths.mjs",
               find: "        for (const suffix of [\"-wal\", \"-shm\", \"\"]) {",
               replace: "        for (const suffix of [\"\", \"-wal\", \"-shm\"]) {" }],

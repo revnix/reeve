@@ -168,6 +168,35 @@ const reeve = (home, args) => {
   }
 }
 
+// A process that dies partway runs no rollback, so what matters then is the
+// ORDER: the next run must find a state it can finish. The rename below dies
+// after k moves and refuses every later call, the rollback's included, which
+// leaves the disk exactly as a killed process would.
+{
+  const rowsAt = (path) => { try { const db = new DatabaseSync(path, { readOnly: true }); try { return db.prepare("SELECT v FROM t").all().map((r) => r.v); } finally { db.close(); } } catch { return null; } };
+  const results = [];
+  for (const k of [0, 1, 2]) {
+    const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
+    try {
+      const legacy = legacyStatePathFor(home, NWO), next = statePathFor(home, NWO);
+      mkdirSync(dirname(legacy), { recursive: true });
+      const live = join(home, "live.db"), w = new DatabaseSync(live);
+      w.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t(v TEXT)");
+      w.prepare("INSERT INTO t VALUES (?)").run("committed, in the wal");
+      for (const suffix of ["", "-wal", "-shm"]) if (existsSync(live + suffix)) copyFileSync(live + suffix, legacy + suffix);
+      w.close();
+      let n = 0;
+      const dies = (from, to) => { if (n++ >= k) throw new Error("the process died here"); return renameSync(from, to); };
+      adoptLegacyStore(next, legacy, { log: () => {}, rename: dies });
+      const used = adoptLegacyStore(next, legacy, { log: () => {} });   // the next run
+      const other = used === next ? legacy : next;
+      results.push({ k, used: used === next ? "next" : "legacy", rows: rowsAt(used), strayMain: existsSync(other) });
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }
+  check(results.every((r) => Array.isArray(r.rows) && r.rows.includes("committed, in the wal") && !r.strayMain),
+    "a move killed after any file is finished by the next run, with every committed row", JSON.stringify(results));
+}
+
 // ── an interrupted create leaves nothing that reads as a store ───────────────
 {
   const home = mkdtempSync(join(tmpdir(), "reeve-store-"));

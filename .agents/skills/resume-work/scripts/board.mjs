@@ -8,7 +8,7 @@
 // Usage: node board.mjs [--repo owner/name]
 // Exit codes: 0 synced, or no board to sync; 2 GitHub could not be asked; 64 usage.
 import { gh, repoFromGit, isRepo, parseArgs, closersByIssue, boardColumn, pickBoard, BOARD_COLUMNS,
-         allNodes, incompleteRead, closedCards, closedPhases, openStrays } from "./lib.mjs";
+         allNodes, incompleteRead, closedCards, closedPhases, openStrays, mustUnarchive } from "./lib.mjs";
 import { readPlan, openBlockers, readSubIssues } from "./plan.mjs";
 
 process.on("uncaughtException", (err) => {
@@ -49,7 +49,7 @@ const optionFor = Object.fromEntries(board.status.options.map((o) => [o.name, o.
 
 // ── its cards, by issue number ───────────────────────────────────────────────
 const items = allNodes((after) => gql(`query($id:ID!${after ? ",$after:String" : ""}){ node(id:$id){ ... on ProjectV2{
-  items(first:100${after ? ",after:$after" : ""}){ pageInfo{ hasNextPage endCursor } nodes{ id
+  items(first:100, archivedStates:[ARCHIVED, NOT_ARCHIVED]${after ? ",after:$after" : ""}){ pageInfo{ hasNextPage endCursor } nodes{ id isArchived
     content{ ... on Issue{ number state assignees(first:1){ totalCount } parent{ number } subIssues{ totalCount }
       repository{ nameWithOwner } } }
     status: fieldValueByName(name:"Status"){ ... on ProjectV2ItemFieldSingleSelectValue{ optionId } } } } } } }`,
@@ -57,7 +57,7 @@ const items = allNodes((after) => gql(`query($id:ID!${after ? ",$after:String" :
 const cards = new Map();
 for (const it of items.nodes) {
   if (it.content?.repository?.nameWithOwner?.toLowerCase() === repo.toLowerCase())
-    cards.set(it.content.number, { item: it.id, option: it.status?.optionId ?? null, state: it.content.state,
+    cards.set(it.content.number, { item: it.id, archived: it.isArchived === true, option: it.status?.optionId ?? null, state: it.content.state,
                                    assigned: (it.content.assignees?.totalCount ?? 0) > 0,
                                    parent: it.content.parent?.number ?? null, phase: (it.content.subIssues?.totalCount ?? 0) > 0 });
 }
@@ -68,8 +68,17 @@ const partial = incompleteRead({ "pull requests": prs, "pull requests' checks an
                                 "issues": issues, "board cards": items });
 if (partial) { console.error(`board: ${partial}`); process.exit(2); }
 
-const cardFor = (issue) => cards.get(issue.number)?.item ?? gql(`mutation($p:ID!,$c:ID!){
-  addProjectV2ItemById(input:{projectId:$p,contentId:$c}){ item{ id } } }`, { p: board.id, c: issue.id }).addProjectV2ItemById.item.id;
+// An issue's card, added if it has none. Adding one that exists returns it, as
+// it was, archived or not.
+const cardFor = (issue) => {
+  const known = cards.get(issue.number);
+  if (known) return { id: known.item, archived: known.archived };
+  const item = gql(`mutation($p:ID!,$c:ID!){ addProjectV2ItemById(input:{projectId:$p,contentId:$c}){ item{ id isArchived } } }`,
+    { p: board.id, c: issue.id }).addProjectV2ItemById.item;
+  return { id: item.id, archived: item.isArchived === true };
+};
+const unarchive = (item) => gql(`mutation($p:ID!,$i:ID!){ unarchiveProjectV2Item(input:{projectId:$p,itemId:$i}){ item{ id } } }`,
+  { p: board.id, i: item });
 
 // ── every phase's tasks, each set to its computed column ─────────────────────
 const prByNumber = new Map(prs.nodes.map((pr) => [pr.number, pr]));
@@ -91,9 +100,12 @@ const syncTask = (task, item = null) => {
     assigned: task.assigned ?? task.assignees.nodes.length > 0,
   });
   counts[column]++;
-  const card = item ?? cardFor(task);
+  const card = item ? { id: item, archived: cards.get(task.number)?.archived } : cardFor(task);
+  // Archived by hand or by an auto-archive, an active task would stay hidden
+  // whatever its column says.
+  if (mustUnarchive({ archived: card.archived, column })) { unarchive(card.id); moved++; }
   if (cards.get(task.number)?.option === optionFor[column]) return;
-  setColumn(card, column);
+  setColumn(card.id, column);
   moved++;
 };
 for (const phase of phases) {
@@ -105,7 +117,7 @@ for (const phase of phases) {
 // board. Its tasks are read from it and synced the same way, so one left open,
 // or reopened, still moves, and one closed without a card gets one, in Done.
 // The phase's own card is closed, and goes to Done below.
-for (const phase of closedPhases(cards, visited)) {
+for (const phase of closedPhases(cards)) {
   for (const task of readSubIssues(repo, phase.number)) if (!visited.has(task.number)) syncTask(task);
 }
 // An open sub-issue whose phase isn't on the board at all is set from its own

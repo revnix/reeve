@@ -4,7 +4,7 @@
 // pull requests, never typed, so it can't drift. These tests check each column
 // rule, and which linked project counts as the board, from plain data. The sync
 // that writes the board (scripts/board.mjs) applies exactly these functions.
-import { boardColumn, pickBoard, BOARD_COLUMNS, allNodes, incompleteRead, closedCards, closedPhases, openStrays, closersByIssue, completePullRequest, triagePullRequest } from "../.agents/skills/resume-work/scripts/lib.mjs";
+import { boardColumn, pickBoard, BOARD_COLUMNS, allNodes, incompleteRead, closedCards, closedPhases, openStrays, mustUnarchive, closersByIssue, completePullRequest, triagePullRequest } from "../.agents/skills/resume-work/scripts/lib.mjs";
 import { readPlan, openBlockers } from "../.agents/skills/resume-work/scripts/plan.mjs";
 
 let fail = 0;
@@ -164,6 +164,11 @@ check(two.board === null && /#2, #4/.test(two.why ?? ""), "two projects that bot
   const phases = closedPhases(cards, visited), strays = openStrays(cards, visited);
   check(phases.length === 1 && phases[0].number === 10,
     "a closed phase on the board is read, so its tasks are synced, and one without a card gets one", JSON.stringify(phases));
+  // A task closed with sub-tasks of its own, inside an open phase: the phase's
+  // loop has already visited it, and its sub-tasks still need reading.
+  const nested = closedPhases(new Map([[20, { item: "t", state: "CLOSED", phase: true, parent: 148 }]]), new Set([20]));
+  check(nested.length === 1 && nested[0].number === 20,
+    "a closed task with sub-tasks of its own is read even after its open phase visited it", JSON.stringify(nested));
   check(strays.length === 1 && strays[0].number === 1 && strays[0].assigned === true
     && boardColumn({ open: true, blocked: false, closers: [], assigned: strays[0].assigned }) === "In progress",
     "an open task no open phase lists is still set from its own issue", JSON.stringify(strays));
@@ -184,12 +189,20 @@ check(two.board === null && /#2, #4/.test(two.why ?? ""), "two projects that bot
   check(n === 2 && seen.every((a) => a.includes("--paginate")), "a task's open blockers are counted from every page", JSON.stringify({ n, seen }));
 }
 
+// ── an archived card ─────────────────────────────────────────────────────────
+check(mustUnarchive({ archived: true, column: "In progress" }) && mustUnarchive({ archived: true, column: "Ready" })
+  && !mustUnarchive({ archived: true, column: "Done" }) && !mustUnarchive({ archived: false, column: "In progress" }),
+  "an active task's archived card comes back before its column is set, and a finished one stays archived");
+
 // ── a closed task is Done, even when its phase is gone from the plan ─────────
 {
-  const cards = new Map([[1, { item: "a", state: "CLOSED" }], [2, { item: "b", state: "CLOSED" }], [3, { item: "c", state: "OPEN" }]]);
+  const cards = new Map([[1, { item: "a", state: "CLOSED", parent: 9 }], [2, { item: "b", state: "CLOSED", parent: 9 }], [3, { item: "c", state: "OPEN", parent: 9 }],
+    [4, { item: "d", state: "CLOSED", parent: null, phase: false }], [9, { item: "p", state: "CLOSED", parent: null, phase: true }]]);
   const done = closedCards(cards, new Set([1]));
-  check(done.length === 1 && done[0].number === 2,
+  check(done.some((c) => c.number === 2) && done.some((c) => c.number === 9) && !done.some((c) => c.number === 1 || c.number === 3),
     "a closed task no open phase lists any more still goes to Done", JSON.stringify(done));
+  check(!done.some((c) => c.number === 4),
+    "and a closed issue on the board for another reason, no sub-issue and no phase, is left as it is", JSON.stringify(done));
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

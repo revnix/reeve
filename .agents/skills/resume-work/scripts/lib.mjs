@@ -390,13 +390,13 @@ export function incompleteRead(reads) {
 }
 
 /**
- * The phases on the board that the plan no longer reads, because they have
- * closed: the cards not yet visited whose issue is closed and has sub-issues.
- * Their tasks are synced from them, so a task left open still moves, and one
- * closed without a card gets one.
+ * The closed issues on the board that have sub-issues, which the plan no longer
+ * reads: a phase that has closed, or a task closed with sub-tasks of its own,
+ * even one its open phase lists. Their sub-issues are synced from them, so one
+ * left open still moves, and one closed without a card gets one.
  */
-export function closedPhases(cards, visited) {
-  return [...cards].filter(([n, c]) => !visited.has(n) && c.state === "CLOSED" && c.phase).map(([n, c]) => ({ number: n, ...c }));
+export function closedPhases(cards) {
+  return [...cards].filter(([, c]) => c.state === "CLOSED" && c.phase).map(([n, c]) => ({ number: n, ...c }));
 }
 
 /**
@@ -410,10 +410,20 @@ export function openStrays(cards, visited) {
 }
 
 /**
+ * Whether a card must come back from the archive before its column is set. An
+ * active task is never hidden, whatever archived it; a finished one stays where
+ * an auto-archive put it.
+ */
+export const mustUnarchive = ({ archived, column }) => Boolean(archived) && column !== "Done";
+
+/**
  * The cards the plan didn't visit whose issue is closed. A closed task is Done
  * whether or not its phase is still open, and a phase closed with its last tasks
  * is no longer read at all.
  */
 export function closedCards(cards, visited) {
-  return [...cards].filter(([n, c]) => !visited.has(n) && c.state === "CLOSED").map(([n, c]) => ({ number: n, ...c }));
+  // Only the plan's: a phase, or a sub-issue. A closed issue on the board for
+  // another reason is left as it is.
+  return [...cards].filter(([n, c]) => !visited.has(n) && c.state === "CLOSED" && (c.phase || c.parent != null))
+    .map(([n, c]) => ({ number: n, ...c }));
 }

@@ -8,8 +8,9 @@
 // Usage: node board.mjs [--repo owner/name]
 // Exit codes: 0 synced, or no board to sync; 2 GitHub could not be asked; 64 usage.
 import { gh, repoFromGit, isRepo, parseArgs, closersByIssue, boardColumn, pickBoard, BOARD_COLUMNS,
-         allNodes, incompleteRead, closedCards, closedPhases, closedParent, syncClosedParents, openStrays, mustUnarchive } from "./lib.mjs";
-import { readPlan, openBlockers, readSubIssues } from "./plan.mjs";
+         allNodes, incompleteRead, closedCards, closedPhases, closedParent, syncClosedParents, openStrays, mustUnarchive,
+         withClosedRoots, uncardedRoots } from "./lib.mjs";
+import { readPlan, openBlockers, readSubIssues, readClosedRoots } from "./plan.mjs";
 
 process.on("uncaughtException", (err) => {
   console.error(`board: GitHub could not be asked (${err.message})`);
@@ -64,8 +65,11 @@ for (const it of items.nodes) {
 
 // ── the plan ─────────────────────────────────────────────────────────────────
 const { prs, issues, phases } = readPlan(repo);
+// Closed phases from GitHub itself: one that opened and closed between two
+// syncs, with all its tasks, has no card to find it by.
+const roots = readClosedRoots(repo);
 const partial = incompleteRead({ "pull requests": prs, "pull requests' checks and closing issues": { complete: !prs.nodes.some((pr) => pr.partial) },
-                                "issues": issues, "board cards": items });
+                                "issues": issues, "closed phases": roots, "board cards": items });
 if (partial) { console.error(`board: ${partial}`); process.exit(2); }
 
 // An issue's card, added if it has none. Adding one that exists returns it, as
@@ -91,7 +95,7 @@ const setColumn = (item, column) => gql(`mutation($p:ID!,$i:ID!,$f:ID!,$v:String
 { p: board.id, i: item, f: board.status.id, v: optionFor[column] });
 // Closed issues with sub-issues, whose sub-issues the plan doesn't read: those
 // on the board, and any closed task with sub-tasks met while syncing.
-const parents = new Map(closedPhases(cards).map((c) => [c.number, c]));
+const parents = withClosedRoots(new Map(closedPhases(cards).map((c) => [c.number, c])), roots.nodes);
 // One task: its column from its own facts, and its card added if it has none.
 const syncTask = (task, item = null) => {
   visited.add(task.number);
@@ -123,6 +127,12 @@ for (const phase of phases) {
 // closed task with sub-tasks met along the way, card or no card, is read in its
 // turn. The parents' own cards are closed, and go to Done below.
 syncClosedParents(parents, (n) => readSubIssues(repo, n), visited, syncTask);
+// A closed phase that never had a card gets one, in Done.
+for (const root of uncardedRoots(roots.nodes, cards)) {
+  visited.add(root.number);
+  setColumn(cardFor(root).id, "Done");
+  moved++;
+}
 // An open sub-issue whose phase isn't on the board at all is set from its own
 // issue too. A card for an issue that is no sub-issue is no task, and is left.
 for (const card of openStrays(cards, visited)) syncTask({ number: card.number, state: "OPEN", assigned: card.assigned }, card.item);

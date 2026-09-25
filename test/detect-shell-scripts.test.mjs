@@ -618,12 +618,31 @@ try {
 
   // Each command of a pipeline runs in a subshell of its own, where an expansion
   // that fails, $((1/0)) or ${x:?}, fails that command rather than ending the
-  // script. So a command with an expansion there never surely succeeds, first
-  // or last: both of these pass in dash and bash.
-  const expanding = ["set -o pipefail; ! true $((1/0)) | true", "! true | true $((1/0))"]
+  // script. So a command with an expansion there, in a word or in a
+  // here-string, never surely succeeds, first or last: all of these pass in
+  // bash, and the first two in dash.
+  const expanding = ["set -o pipefail; ! true $((1/0)) | true", "! true | true $((1/0))",
+                     "set -o pipefail; ! true <<< $((1/0)) | true", "! true | true <<< $((1/0))"]
     .map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
   check(expanding.every(({ r }) => r.state === "present"),
     "a command in a pipeline with an expansion that may fail never surely succeeds", JSON.stringify(expanding));
+
+  // Outside a pipeline, a here-string whose expansion fails ends the script, as
+  // one in a word does. Either way it fails, so its command is read as though
+  // the expansion succeeded.
+  const hereString = [["! true <<< \"$HOME\"", "always fails"], ["true <<< \"$HOME\" && no-such-runner", "'no-such-runner'"]]
+    .map(([s, want]) => ({ s, want, r: detectTest(s, {}, { shell: bashShell }) }));
+  check(hereString.every(({ want, r }) => broken(r, want)),
+    "outside a pipeline, a here-string's expansion that fails ends the script, so its command is read as succeeding", JSON.stringify(hereString));
+
+  // Where either shell may run the script, unset given -f and -v may fail, as
+  // bash refuses it, and with -f last it keeps PATH in both.
+  const eitherUnset = { ...dashShell, name: "dash or bash", unsetLastOptionWins: "maybe" };
+  const unsetEither = [["unset -vf PATH; no-such-runner", "'no-such-runner'"], ["unset -v -f PATH; no-such-runner", "'no-such-runner'"],
+                       ["! unset -vf x", "present"], ["! unset -fv x", "present"], ["unset -fv PATH; jest --ci", "present"]]
+    .map(([s, want]) => ({ s, want, r: detectTest(s, jest, { shell: eitherUnset }) }));
+  check(unsetEither.every(({ want, r }) => (want === "present" ? r.state === "present" : broken(r, want))),
+    "where either shell may run the script, unset given -f and -v may fail, and with -f last keeps PATH", JSON.stringify(unsetEither));
 
   // What the shell does is asked of it.
   const asked216 = [scriptShell(which("bash")), dashPath ? scriptShell(dashPath) : null];

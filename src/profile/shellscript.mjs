@@ -490,7 +490,7 @@ export function tokenize(body) {
       // open. The null device, a here-string and the standard descriptors can't.
       const mayFail = !(r[2] === "<<<" || (target.text === "/dev/null" && !target.expansion)
         || ((r[2] === ">&" || r[2] === "<&") && /^[012-]$/.test(target.text)));
-      const token = { t: "redir", writes, subst: target.subst, mayFail };
+      const token = { t: "redir", writes, subst: target.subst, expansion: target.expansion, mayFail };
       // dash reads bash's `&>` as `&` and then a redirection, and its `<<<`, and
       // `>&` before a file, as syntax errors.
       if (r[2] === "&>" || r[2] === "&>>") tokens.push({ ...token, syntax: r[2], otherwise: [{ t: "op", op: "&" }, token] });
@@ -805,9 +805,11 @@ function builtin(name, args, path, state, ctx) {
       if (text[k] === "--") k++;
       const lastWins = fn && vars ? ctx.shell?.unsetLastOptionWins : null;
       if (lastWins === false) return UNKNOWN;
-      if (fn && (!vars || (lastWins === true && last === "f"))) return OK;
-      // Given both, in a shell that may take either.
+      // Given both, in a shell that may take the last or refuse the command: it
+      // may fail, and with -f last it unsets no variable in either.
       const unsure = fn && vars && lastWins !== true;
+      const outcome = unsure ? UNKNOWN : OK;
+      if (fn && (!vars || last === "f")) return outcome;
       for (const w of args.slice(k)) {
         if (w.expansion || w.glob || (unsure && w.text === "PATH")) {
           if (state.pathReadonly !== false) return { o: "?", stop: "maybe" };
@@ -817,7 +819,7 @@ function builtin(name, args, path, state, ctx) {
           if (r) return r;
         }
       }
-      return OK;
+      return outcome;
     }
     case "cd": {
       let k = 0;
@@ -933,15 +935,16 @@ const JOINS = new Set(["&&", "||", "|"]);
 
 /**
  * The script split into commands, each with the operator after it, whether a
- * redirection of it writes a file or may fail, and whether it holds a command
- * substitution. The rest is opaque from the first compound. A syntax error
- * ends the list, replacing the commands of its own line, which don't run: a
- * keyword that closes nothing, `&&`, `||` or `|` without a command on both
- * sides, or an operator of bash's the shell doesn't have.
+ * redirection of it writes a file or may fail, and whether it holds an
+ * expansion, a command substitution among them, in a word or a redirection.
+ * The rest is opaque from the first compound. A syntax error ends the list,
+ * replacing the commands of its own line, which don't run: a keyword that
+ * closes nothing, `&&`, `||` or `|` without a command on both sides, or an
+ * operator of bash's the shell doesn't have.
  */
 function commands(tokens, ctx) {
   const list = [];
-  let cmd = { words: [], redirs: 0, writes: false, subst: false, mayFail: false }, lineStart = 0;
+  let cmd = { words: [], redirs: 0, writes: false, subst: false, expansion: false, mayFail: false }, lineStart = 0;
   const syntaxError = (why) => { list.splice(lineStart); list.push({ syntaxError: why, op: null }); return list; };
   // An operator of bash's is read as the shell that runs the script reads it.
   // Where the shells that may run it differ, its line may not run at all, so
@@ -973,10 +976,12 @@ function commands(tokens, ctx) {
       }
       words.push(t);
       cmd.subst ||= t.subst;
+      cmd.expansion ||= t.expansion;
     } else if (t.t === "redir") {
       cmd.redirs++;
       cmd.writes ||= t.writes;
       cmd.subst ||= t.subst;
+      cmd.expansion ||= t.expansion;
       cmd.mayFail ||= t.mayFail;
     } else if (t.t === "(" || t.t === ")") {
       list.push({ opaque: true, op: null });
@@ -990,7 +995,7 @@ function commands(tokens, ctx) {
         continue;
       }
       list.push({ ...cmd, op: t.op });
-      cmd = { words: [], redirs: 0, writes: false, subst: false, mayFail: false };
+      cmd = { words: [], redirs: 0, writes: false, subst: false, expansion: false, mayFail: false };
       if (t.newline) lineStart = list.length;
     }
   }
@@ -1051,8 +1056,9 @@ function pipeline(list, i, state, ctx) {
   const run = (k) => redirected(list[k], simple(list[k].words, { ...state, mutated: state.mutated || list[k].subst }, ctx));
   // Each runs in a subshell of its own, where an expansion that fails, $((1/0))
   // or ${x:?}, fails that command rather than ending the script. So one with an
-  // expansion never surely succeeds.
-  const sure = (k, e) => (e.o === "ok" && list[k].words.some((w) => w.expansion) ? UNKNOWN : e);
+  // expansion, in a word or in a redirection such as a here-string, never
+  // surely succeeds.
+  const sure = (k, e) => (e.o === "ok" && list[k].expansion ? UNKNOWN : e);
   const r = sure(j, run(j));
   // Under pipefail it fails when any of them fails. One before the last that
   // writes may be stopped by the next closing the pipe, so it never surely

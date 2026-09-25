@@ -61,14 +61,17 @@ export function readPlan(repo, run = gh) {
       id number title issueType{ name }
       subIssues(first:100){ totalCount nodes{ id number title state assignees(first:10){ nodes{ login } } } }
     } } } }`, (d) => d.repository.issues);
-  // Every sub-issue of a phase, from the REST listing, in the shape the query returns.
-  const readSubIssues = (n) => run(["api", "--paginate", `repos/${repo}/issues/${n}/sub_issues`, "--jq",
-    ".[] | {id: .node_id, number, title, state: (.state | ascii_upcase), assignees: {nodes: [.assignees[] | {login}]}} | @json"])
-    .split("\n").filter(Boolean).map((l) => JSON.parse(l));
   const phases = issues.nodes.filter((i) => i.subIssues.nodes.length > 0 || i.issueType?.name === "Feature")
-    .map((phase) => completePhase(phase, readSubIssues));
+    .map((phase) => completePhase(phase, (n) => readSubIssues(repo, n, run)));
 
   return { prs, issues, phases };
+}
+
+/** Every sub-issue of an issue, from the REST listing, in the shape the plan's query returns. */
+export function readSubIssues(repo, n, run = gh) {
+  return run(["api", "--paginate", `repos/${repo}/issues/${n}/sub_issues`, "--jq",
+    ".[] | {id: .node_id, number, title, state: (.state | ascii_upcase), assignees: {nodes: [.assignees[] | {login}]}} | @json"])
+    .split("\n").filter(Boolean).map((l) => JSON.parse(l));
 }
 
 /**

@@ -349,14 +349,17 @@ export function boardColumn({ open, blocked, closers = [], assigned }) {
  * says why, rather than a guess at which to write.
  */
 export function pickBoard(projects) {
+  // A closed project is no board, whatever its columns: an old one kept with
+  // the same five would otherwise be written to, or stop the sync as a second
+  // candidate.
   const boards = (projects ?? []).filter((p) => {
     const names = (p.status?.options ?? []).map((o) => o.name);
-    return names.length === BOARD_COLUMNS.length && BOARD_COLUMNS.every((c) => names.includes(c));
+    return !p.closed && names.length === BOARD_COLUMNS.length && BOARD_COLUMNS.every((c) => names.includes(c));
   });
   if (boards.length === 1) return { board: boards[0], why: null };
   return { board: null, why: boards.length
     ? `${boards.length} linked projects have the plan board's columns: ${boards.map((b) => `#${b.number}`).join(", ")}`
-    : `no linked project has a Status field with the columns ${BOARD_COLUMNS.join(", ")}` };
+    : `no open linked project has a Status field with the columns ${BOARD_COLUMNS.join(", ")}` };
 }
 
 /**
@@ -387,12 +390,23 @@ export function incompleteRead(reads) {
 }
 
 /**
- * The cards the plan didn't visit whose issue is still open: a task left open,
- * or reopened, after its phase closed, which the plan no longer reads. Each is
- * set from its own issue, as a task of an open phase would be.
+ * The phases on the board that the plan no longer reads, because they have
+ * closed: the cards not yet visited whose issue is closed and has sub-issues.
+ * Their tasks are synced from them, so a task left open still moves, and one
+ * closed without a card gets one.
+ */
+export function closedPhases(cards, visited) {
+  return [...cards].filter(([n, c]) => !visited.has(n) && c.state === "CLOSED" && c.phase).map(([n, c]) => ({ number: n, ...c }));
+}
+
+/**
+ * The open cards still not visited that are sub-issues of something, such as a
+ * task whose phase isn't on the board. Each is set from its own issue, as a
+ * task of an open phase would be. A card for an issue that is no sub-issue is
+ * no task of the plan, and is left as it is.
  */
 export function openStrays(cards, visited) {
-  return [...cards].filter(([n, c]) => !visited.has(n) && c.state === "OPEN").map(([n, c]) => ({ number: n, ...c }));
+  return [...cards].filter(([n, c]) => !visited.has(n) && c.state === "OPEN" && c.parent != null).map(([n, c]) => ({ number: n, ...c }));
 }
 
 /**

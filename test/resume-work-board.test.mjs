@@ -4,7 +4,7 @@
 // pull requests, never typed, so it can't drift. These tests check each column
 // rule, and which linked project counts as the board, from plain data. The sync
 // that writes the board (scripts/board.mjs) applies exactly these functions.
-import { boardColumn, pickBoard, BOARD_COLUMNS, allNodes, incompleteRead, closedCards, openStrays, closersByIssue, completePullRequest, triagePullRequest } from "../.agents/skills/resume-work/scripts/lib.mjs";
+import { boardColumn, pickBoard, BOARD_COLUMNS, allNodes, incompleteRead, closedCards, closedPhases, openStrays, closersByIssue, completePullRequest, triagePullRequest } from "../.agents/skills/resume-work/scripts/lib.mjs";
 import { readPlan, openBlockers } from "../.agents/skills/resume-work/scripts/plan.mjs";
 
 let fail = 0;
@@ -56,10 +56,18 @@ const project = (number, names) => ({ id: `P${number}`, number, status: { id: "F
 const one = pickBoard([project(1, ["Todo", "In Progress", "Done"]), project(2, BOARD_COLUMNS)]);
 check(one.board?.number === 2 && one.why === null, "the linked project with the five columns is the board", JSON.stringify(one));
 const none = pickBoard([project(1, ["Todo", "In Progress", "Done"]), project(3, [...BOARD_COLUMNS, "Icebox"])]);
-check(none.board === null && /no linked project/.test(none.why ?? ""),
+check(none.board === null && /no open linked project/.test(none.why ?? ""),
   "a project with other columns, or extra ones, is not taken for the board", JSON.stringify(none));
 const two = pickBoard([project(2, BOARD_COLUMNS), project(4, [...BOARD_COLUMNS].reverse())]);
 check(two.board === null && /#2, #4/.test(two.why ?? ""), "two projects that both look like the board are named, not guessed between", JSON.stringify(two));
+{
+  // An old project kept, closed, with the same five columns.
+  const closed = (number) => ({ ...project(number, BOARD_COLUMNS), closed: true });
+  const beside = pickBoard([closed(1), project(2, BOARD_COLUMNS)]);
+  const alone = pickBoard([closed(1)]);
+  check(beside.board?.number === 2 && alone.board === null && /no open linked project/.test(alone.why ?? ""),
+    "a closed project is never the board, beside the open one or alone", JSON.stringify({ beside, alone }));
+}
 
 // ── reading whole lists, and refusing to write from part of one ──────────────
 {
@@ -143,12 +151,23 @@ check(two.board === null && /#2, #4/.test(two.why ?? ""), "two projects that bot
     JSON.stringify({ read: resolved.reviewThreads.nodes.length, partial: resolved.partial }));
 }
 {
-  // A task left open, or reopened, after its phase closed: no open phase lists it.
-  const cards = new Map([[1, { item: "a", state: "OPEN", assigned: true }], [2, { item: "b", state: "CLOSED" }], [3, { item: "c", state: "OPEN" }]]);
-  const strays = openStrays(cards, new Set([3]));
+  // Cards the plan didn't visit: a closed phase, a task under it left open, and
+  // an open issue that is no one's sub-issue.
+  const cards = new Map([
+    [10, { item: "p", state: "CLOSED", phase: true, parent: null }],
+    [1, { item: "a", state: "OPEN", assigned: true, parent: 10 }],
+    [2, { item: "b", state: "CLOSED", parent: 10 }],
+    [3, { item: "c", state: "OPEN", parent: 10 }],
+    [4, { item: "d", state: "OPEN", assigned: true, parent: null }],
+  ]);
+  const visited = new Set([3]);
+  const phases = closedPhases(cards, visited), strays = openStrays(cards, visited);
+  check(phases.length === 1 && phases[0].number === 10,
+    "a closed phase on the board is read, so its tasks are synced, and one without a card gets one", JSON.stringify(phases));
   check(strays.length === 1 && strays[0].number === 1 && strays[0].assigned === true
     && boardColumn({ open: true, blocked: false, closers: [], assigned: strays[0].assigned }) === "In progress",
     "an open task no open phase lists is still set from its own issue", JSON.stringify(strays));
+  check(!strays.some((c) => c.number === 4), "and an open card that is no one's sub-issue is no task, and is left as it is", JSON.stringify(strays));
 }
 {
   // A task's blockers, two pages of them, an open one on each.

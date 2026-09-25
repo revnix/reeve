@@ -8,8 +8,8 @@
 // Usage: node board.mjs [--repo owner/name]
 // Exit codes: 0 synced, or no board to sync; 2 GitHub could not be asked; 64 usage.
 import { gh, repoFromGit, isRepo, parseArgs, closersByIssue, boardColumn, pickBoard, BOARD_COLUMNS,
-         allNodes, incompleteRead, closedCards, openStrays } from "./lib.mjs";
-import { readPlan, openBlockers } from "./plan.mjs";
+         allNodes, incompleteRead, closedCards, closedPhases, openStrays } from "./lib.mjs";
+import { readPlan, openBlockers, readSubIssues } from "./plan.mjs";
 
 process.on("uncaughtException", (err) => {
   console.error(`board: GitHub could not be asked (${err.message})`);
@@ -39,7 +39,7 @@ const gql = (query, vars = {}) => {
 // whole: a list read in part would move cards the wrong way.
 // ── the board: the one linked project with the five columns ──────────────────
 const projects = allNodes((after) => gql(`query($owner:String!,$name:String!${after ? ",$after:String" : ""}){ repository(owner:$owner,name:$name){
-  projectsV2(first:20${after ? ",after:$after" : ""}){ pageInfo{ hasNextPage endCursor } nodes{ id number title
+  projectsV2(first:20${after ? ",after:$after" : ""}){ pageInfo{ hasNextPage endCursor } nodes{ id number title closed
     status: field(name:"Status"){ ... on ProjectV2SingleSelectField{ id options{ id name } } } } } } }`,
   { owner, name, ...(after ? { after } : {}) }).repository.projectsV2, 20);
 if (!projects.complete) { console.error(`board: ${incompleteRead({ "linked projects": projects })}`); process.exit(2); }
@@ -50,14 +50,16 @@ const optionFor = Object.fromEntries(board.status.options.map((o) => [o.name, o.
 // ── its cards, by issue number ───────────────────────────────────────────────
 const items = allNodes((after) => gql(`query($id:ID!${after ? ",$after:String" : ""}){ node(id:$id){ ... on ProjectV2{
   items(first:100${after ? ",after:$after" : ""}){ pageInfo{ hasNextPage endCursor } nodes{ id
-    content{ ... on Issue{ number state assignees(first:1){ totalCount } repository{ nameWithOwner } } }
+    content{ ... on Issue{ number state assignees(first:1){ totalCount } parent{ number } subIssues{ totalCount }
+      repository{ nameWithOwner } } }
     status: fieldValueByName(name:"Status"){ ... on ProjectV2ItemFieldSingleSelectValue{ optionId } } } } } } }`,
   { id: board.id, ...(after ? { after } : {}) }).node.items);
 const cards = new Map();
 for (const it of items.nodes) {
   if (it.content?.repository?.nameWithOwner?.toLowerCase() === repo.toLowerCase())
     cards.set(it.content.number, { item: it.id, option: it.status?.optionId ?? null, state: it.content.state,
-                                   assigned: (it.content.assignees?.totalCount ?? 0) > 0 });
+                                   assigned: (it.content.assignees?.totalCount ?? 0) > 0,
+                                   parent: it.content.parent?.number ?? null, phase: (it.content.subIssues?.totalCount ?? 0) > 0 });
 }
 
 // ── the plan ─────────────────────────────────────────────────────────────────
@@ -78,42 +80,38 @@ const visited = new Set();
 const setColumn = (item, column) => gql(`mutation($p:ID!,$i:ID!,$f:ID!,$v:String!){ updateProjectV2ItemFieldValue(input:{
   projectId:$p,itemId:$i,fieldId:$f,value:{singleSelectOptionId:$v}}){ projectV2Item{ id } } }`,
 { p: board.id, i: item, f: board.status.id, v: optionFor[column] });
+// One task: its column from its own facts, and its card added if it has none.
+const syncTask = (task, item = null) => {
+  visited.add(task.number);
+  const open = task.state === "OPEN";
+  const column = boardColumn({
+    open,
+    blocked: open && openBlockers(repo, task.number) > 0,
+    closers: (closers.get(task.number) ?? []).map((n) => prByNumber.get(n)).filter(Boolean),
+    assigned: task.assigned ?? task.assignees.nodes.length > 0,
+  });
+  counts[column]++;
+  const card = item ?? cardFor(task);
+  if (cards.get(task.number)?.option === optionFor[column]) return;
+  setColumn(card, column);
+  moved++;
+};
 for (const phase of phases) {
   cardFor(phase);   // phases are on the project too, and the Board view filters them out
   visited.add(phase.number);
-  for (const task of phase.subIssues.nodes) {
-    visited.add(task.number);
-    const open = task.state === "OPEN";
-    const column = boardColumn({
-      open,
-      blocked: open && openBlockers(repo, task.number) > 0,
-      closers: (closers.get(task.number) ?? []).map((n) => prByNumber.get(n)).filter(Boolean),
-      assigned: task.assignees.nodes.length > 0,
-    });
-    counts[column]++;
-    const item = cardFor(task);
-    if (cards.get(task.number)?.option === optionFor[column]) continue;
-    setColumn(item, column);
-    moved++;
-  }
+  for (const task of phase.subIssues.nodes) syncTask(task);
 }
-// A task left open, or reopened, after its phase closed is no longer in the
-// plan, but its card is on the board. It is set from its own issue, as a task
-// of an open phase is.
-for (const card of openStrays(cards, visited)) {
-  const column = boardColumn({
-    open: true,
-    blocked: openBlockers(repo, card.number) > 0,
-    closers: (closers.get(card.number) ?? []).map((n) => prByNumber.get(n)).filter(Boolean),
-    assigned: card.assigned,
-  });
-  counts[column]++;
-  if (card.option === optionFor[column]) continue;
-  setColumn(card.item, column);
-  moved++;
+// A phase that has closed is no longer in the plan, but its card is on the
+// board. Its tasks are read from it and synced the same way, so one left open,
+// or reopened, still moves, and one closed without a card gets one, in Done.
+// The phase's own card is closed, and goes to Done below.
+for (const phase of closedPhases(cards, visited)) {
+  for (const task of readSubIssues(repo, phase.number)) if (!visited.has(task.number)) syncTask(task);
 }
-// A card whose issue closed but that no open phase lists any more, its phase
-// having closed with it, is Done too.
+// An open sub-issue whose phase isn't on the board at all is set from its own
+// issue too. A card for an issue that is no sub-issue is no task, and is left.
+for (const card of openStrays(cards, visited)) syncTask({ number: card.number, state: "OPEN", assigned: card.assigned }, card.item);
+// A closed card none of that reached is Done too.
 for (const card of closedCards(cards, visited)) {
   if (card.option === optionFor.Done) continue;
   setColumn(card.item, "Done");

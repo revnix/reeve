@@ -25,12 +25,12 @@ const NWO = "o/r", CONTEXT = "ops/merge-policy";
 const verdict = { state: "BLOCK", summary: "ci: failing", head: "a".repeat(40), clauses: [] };
 
 // A fake GitHub: the rules and protection it reports, and what was published.
-const github = ({ rules, protection }) => {
+const github = ({ rules, branch }) => {
   const published = [];
   const api = (_token, args) => {
     const path = args.find((a) => typeof a === "string" && a.startsWith("repos/"));
     if (path.includes("/rules/branches/")) return rules;
-    if (path.includes("/protection/required_status_checks")) return protection;
+    if (/\/branches\/[^/]+$/.test(path) && !path.includes("/rules/")) return branch;
     if (path.includes("/check-runs?")) return { ok: true, out: "" };   // no run at this head yet
     if (args.includes("POST")) {
       const field = (k) => (args[args.indexOf(args.find((a) => a.startsWith(`${k}=`)))] ?? "").slice(k.length + 1);
@@ -44,7 +44,12 @@ const github = ({ rules, protection }) => {
 const rulesRequiring = (context) => ({ ok: true, out: JSON.stringify([{ type: "required_status_checks",
   parameters: { required_status_checks: [{ context, integration_id: 1 }] } }, { type: "deletion" }]) });
 const RULES_NONE = { ok: true, out: JSON.stringify([{ type: "deletion" }]) };
-const NOT_PROTECTED = { ok: false, err: "gh: Branch not protected (HTTP 404)" };
+// A branch as GitHub reports it: classic protection off, as on a branch that
+// only rulesets protect, or never protected at all.
+const NOT_PROTECTED = { ok: true, out: JSON.stringify({ protected: true, protection: { enabled: false,
+  required_status_checks: { enforcement_level: "off", contexts: [], checks: [] } } }) };
+const PROTECTED_REQUIRING = (context) => ({ ok: true, out: JSON.stringify({ protected: true, protection: { enabled: true,
+  required_status_checks: { enforcement_level: "non_admins", contexts: [context], checks: [{ context, app_id: 1 }] } } }) });
 const FORBIDDEN = { ok: false, err: "gh: Resource not accessible by integration (HTTP 403)" };
 const publish = async (gh, over = {}) => {
   const r = await publishVerdict({ nwo: NWO, verdict, shadow: true, context: CONTEXT, base: "main", auth: gh.auth, api: gh.api, ...over });
@@ -53,46 +58,46 @@ const publish = async (gh, over = {}) => {
 
 // ── what shadow mode publishes ────────────────────────────────────────────────
 {
-  const { r, sent } = await publish(github({ rules: rulesRequiring(CONTEXT), protection: NOT_PROTECTED }));
+  const { r, sent } = await publish(github({ rules: rulesRequiring(CONTEXT), branch: NOT_PROTECTED }));
   check(sent && !PASSING.has(sent.conclusion) && /required on main/.test(r.held ?? "") && /^\[shadow\] not passing/.test(sent.title),
     "with the check required by a ruleset, shadow mode publishes a conclusion that doesn't pass, and says why", JSON.stringify({ r, sent }));
   check(/stop requiring/.test(sent?.summary ?? "") && /would be: \*\*failure\*\*/.test(sent?.summary ?? ""),
     "and the check tells the person how to fix it, and what the verdict would have been", sent?.summary?.slice(0, 200));
 }
 {
-  const { r, sent } = await publish(github({ rules: RULES_NONE, protection: { ok: true, out: JSON.stringify({ contexts: [CONTEXT], checks: [] }) } }));
+  const { r, sent } = await publish(github({ rules: RULES_NONE, branch: PROTECTED_REQUIRING(CONTEXT) }));
   check(sent && !PASSING.has(sent.conclusion) && r.held,
     "with the check required by classic branch protection, it doesn't pass either", JSON.stringify({ r, sent }));
 }
 {
-  const { r, sent } = await publish(github({ rules: RULES_NONE, protection: NOT_PROTECTED }));
+  const { r, sent } = await publish(github({ rules: RULES_NONE, branch: NOT_PROTECTED }));
   check(sent?.conclusion === "neutral" && !r.held && /^\[shadow\] BLOCK/.test(sent.title),
     "control: with the check not required anywhere, shadow mode publishes neutral, which blocks nothing", JSON.stringify({ r, sent }));
 }
 {
-  const { r, sent } = await publish(github({ rules: rulesRequiring("some/other-check"), protection: NOT_PROTECTED }));
+  const { r, sent } = await publish(github({ rules: rulesRequiring("some/other-check"), branch: NOT_PROTECTED }));
   check(sent?.conclusion === "neutral" && !r.held, "control: another check being required doesn't make this one required", JSON.stringify({ r, sent }));
 }
 {
-  const { r, sent } = await publish(github({ rules: FORBIDDEN, protection: NOT_PROTECTED }));
+  const { r, sent } = await publish(github({ rules: FORBIDDEN, branch: NOT_PROTECTED }));
   check(sent && !PASSING.has(sent.conclusion) && /couldn't be read/.test(r.held ?? ""),
     "when the rules can't be read, shadow mode doesn't pass: unknown is never taken for not required", JSON.stringify({ r, sent }));
 }
 {
-  const { r, sent } = await publish(github({ rules: RULES_NONE, protection: FORBIDDEN }));
+  const { r, sent } = await publish(github({ rules: RULES_NONE, branch: FORBIDDEN }));
   check(sent && !PASSING.has(sent.conclusion) && r.held,
-    "nor when branch protection can't be read (a 403, unlike the 404 of an unprotected branch)", JSON.stringify({ r, sent }));
+    "nor when the branch's own protection can't be read", JSON.stringify({ r, sent }));
 }
 {
-  const { r, sent } = await publish(github({ rules: RULES_NONE, protection: NOT_PROTECTED }), { base: null });
+  const { r, sent } = await publish(github({ rules: RULES_NONE, branch: NOT_PROTECTED }), { base: null });
   check(sent && !PASSING.has(sent.conclusion) && r.held, "nor when the base branch isn't known", JSON.stringify({ r, sent }));
 }
 {
-  const gh = github({ rules: FORBIDDEN, protection: FORBIDDEN });
+  const gh = github({ rules: FORBIDDEN, branch: FORBIDDEN });
   const { sent } = await publish(gh, { shadow: false });
   check(sent?.conclusion === "failure" && !/shadow/.test(sent.title), "control: enforcing, the real conclusion is published as before", JSON.stringify(sent));
 }
-check(requiredOn({ rules: { ok: true, out: "not json" }, protection: NOT_PROTECTED }, CONTEXT) === null && shadowConclusion(null) === "action_required",
+check(requiredOn({ rules: { ok: true, out: "not json" }, branch: NOT_PROTECTED }, CONTEXT) === null && shadowConclusion(null) === "action_required",
   "an unreadable rules answer is unknown, and unknown doesn't pass");
 
 // ── what the daemon does with it ──────────────────────────────────────────────

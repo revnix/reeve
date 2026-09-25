@@ -599,11 +599,12 @@ function existingPolicyRun(token, nwo, sha, context, api = apiAsInstallation) {
 /**
  * Is `context` a required status check on a branch? GitHub requires a check in
  * two places, and both are read: the rules that apply to the branch (every
- * ruleset, the organisation's included) and classic branch protection, whose
- * 404 means the branch isn't protected. Returns true, false, or null when either
- * couldn't be read, and null is never taken for "not required".
+ * ruleset, the organisation's included), and classic branch protection, as the
+ * branch itself reports it, which needs only read access. Returns true, false,
+ * or null when either couldn't be read, and null is never taken for "not
+ * required".
  */
-export function requiredOn({ rules, protection }, context) {
+export function requiredOn({ rules, branch }, context) {
   const parse = (r, fallback) => { try { return JSON.parse(r.out || fallback); } catch { return undefined; } };
   let byRules = null, byProtection = null;
   if (rules?.ok) {
@@ -611,10 +612,13 @@ export function requiredOn({ rules, protection }, context) {
     if (Array.isArray(list)) byRules = list.some((r) => r?.type === "required_status_checks"
       && (r.parameters?.required_status_checks ?? []).some((c) => c?.context === context));
   }
-  if (protection?.ok) {
-    const p = parse(protection, "{}");
-    if (p && typeof p === "object") byProtection = (p.contexts ?? []).includes(context) || (p.checks ?? []).some((c) => c?.context === context);
-  } else if (/\(HTTP 404\)/.test(protection?.err ?? "")) byProtection = false;
+  if (branch?.ok) {
+    const b = parse(branch, "{}");
+    const checks = b?.protection?.required_status_checks;
+    if (b?.protected === false) byProtection = false;
+    else if (checks && typeof checks === "object")
+      byProtection = (checks.contexts ?? []).includes(context) || (checks.checks ?? []).some((c) => c?.context === context);
+  }
   if (byRules === true || byProtection === true) return true;
   if (byRules === null || byProtection === null) return null;
   return false;
@@ -645,7 +649,7 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = "o
   const real = verdict.state === PASS ? "success" : verdict.state === BLOCK ? "failure" : "action_required";
   const required = shadow && base ? requiredOn({
     rules: api(auth.token, [`repos/${nwo}/rules/branches/${encodeURIComponent(base)}`]),
-    protection: api(auth.token, [`repos/${nwo}/branches/${encodeURIComponent(base)}/protection/required_status_checks`]),
+    branch: api(auth.token, [`repos/${nwo}/branches/${encodeURIComponent(base)}`]),
   }, context) : null;
   const conclusion = shadow ? shadowConclusion(required) : real;
   const held = shadow && required !== false

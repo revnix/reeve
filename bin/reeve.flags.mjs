@@ -180,4 +180,5 @@ export const ERROR_KINDS = Object.freeze([
   "hub_unreadable",
   "hub_incompatible",
   "store_absent",
+  "store_unusable",
 ]);

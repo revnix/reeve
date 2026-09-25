@@ -6,11 +6,11 @@
 // daemon at all. These tests check that init creates the store, never touches
 // an existing one, moves a legacy one into place rather than replacing it, and
 // that `run` names the step when the store is missing.
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { applyInit, ensureStore, storeStatus } from "../src/init.mjs";
 import { statePathFor, legacyStatePathFor, missingStoreMessage, adoptLegacyStore } from "../src/paths.mjs";
@@ -34,13 +34,15 @@ const NWO = "acme/widget";
 // ensureStore, with a throw recorded rather than raised: a stubbed rule can make
 // it throw, and a file that dies there leaves every later assertion unrun.
 const ensure = (home, opts) => { try { return ensureStore(home, NWO, opts); } catch (e) { return { threw: e.message }; } };
-// The CLI, run from a scratch home. Returns the exit code and stderr.
+// adoptLegacyStore likewise: the path it returns, or what it threw.
+const adopt = (next, legacy, opts = {}) => { try { return adoptLegacyStore(next, legacy, { log: () => {}, ...opts }); } catch (e) { return { threw: e.message, code: e.code }; } };
+// The CLI, run from a scratch home. Returns the exit code, stdout and stderr.
 const reeve = (home, args) => {
   try {
-    execFileSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
+    const out = execFileSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
       { cwd: home, env: { ...process.env, REEVE_HOME: home }, stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" });
-    return { code: 0, err: "" };
-  } catch (e) { return { code: e.status, err: String(e.stderr) }; }
+    return { code: 0, out, err: "" };
+  } catch (e) { return { code: e.status, out: String(e.stdout ?? ""), err: String(e.stderr) }; }
 };
 
 // ── a fresh machine ───────────────────────────────────────────────────────────
@@ -158,12 +160,12 @@ const reeve = (home, args) => {
       if (failOn === "-wal") check(existsSync(legacy + "-wal"), "control: the legacy store's rows are in its -wal file", readdirSync(dirname(legacy)).join(","));
       let failed = false;
       const rename = (from, to) => { if (from === legacy + failOn && !failed) { failed = true; throw new Error("simulated failure"); } return renameSync(from, to); };
-      const used = adoptLegacyStore(next, legacy, { log: () => {}, rename });
+      const used = adopt(next, legacy, { rename });
       const atLegacy = rowsAt(legacy), atNext = existsSync(next) ? rowsAt(next) : null;
       const whole = (rows) => Array.isArray(rows) && rows.includes("committed, in the wal");
       check(failed && used === legacy && whole(atLegacy) && !existsSync(next) && !existsSync(next + "-wal"),
         `a move that fails on ${failOn || "the main file"} leaves the store whole at one path, never split`,
-        JSON.stringify({ used: used === legacy ? "legacy" : "next", atLegacy, atNext, next: readdirSync(dirname(next)) }));
+        JSON.stringify({ used: used === legacy ? "legacy" : used === next ? "next" : used, atLegacy, atNext, next: readdirSync(dirname(next)) }));
     } finally { rmSync(home, { recursive: true, force: true }); }
   }
 }
@@ -187,10 +189,10 @@ const reeve = (home, args) => {
       w.close();
       let n = 0;
       const dies = (from, to) => { if (n++ >= k) throw new Error("the process died here"); return renameSync(from, to); };
-      adoptLegacyStore(next, legacy, { log: () => {}, rename: dies });
-      const used = adoptLegacyStore(next, legacy, { log: () => {} });   // the next run
+      const first = adopt(next, legacy, { rename: dies });   // refuses both paths once the store is split
+      const used = adopt(next, legacy, { timeoutMs: 1000 });   // the next run
       const other = used === next ? legacy : next;
-      results.push({ k, used: used === next ? "next" : "legacy", rows: rowsAt(used), strayMain: existsSync(other) });
+      results.push({ k, first: first.code ?? "returned", used: used === next ? "next" : used === legacy ? "legacy" : used, rows: rowsAt(used), strayMain: existsSync(other) });
     } finally { rmSync(home, { recursive: true, force: true }); }
   }
   check(results.every((r) => Array.isArray(r.rows) && r.rows.includes("committed, in the wal") && !r.strayMain),
@@ -231,8 +233,10 @@ const reeve = (home, args) => {
 //
 // Two commands started together both saw the main file missing and moved each
 // other's sidecars. The holder of the lock beside the new path moves; another
-// waits and uses what it made, takes over a lock whose holder has died, and
-// fails loudly, touching nothing, when a live holder never finishes.
+// waits and uses what it made, and a live holder that never finishes is refused
+// loudly, touching nothing. The movers here are real processes, because what is
+// being tested is what one process sees of another: a holder part way through a
+// move, and one killed there.
 {
   const legacyStore = (home) => {
     const legacy = legacyStatePathFor(home, NWO), next = statePathFor(home, NWO);
@@ -242,51 +246,146 @@ const reeve = (home, args) => {
     w.prepare("INSERT INTO t VALUES (?)").run("committed, in the wal");
     for (const suffix of ["", "-wal", "-shm"]) if (existsSync(live + suffix)) copyFileSync(live + suffix, legacy + suffix);
     w.close();
-    return { legacy, next, lock: `${next}.moving` };
+    return { legacy, next };
   };
   const rowsAt = (path) => { try { const db = new DatabaseSync(path, { readOnly: true }); try { return db.prepare("SELECT v FROM t").all().map((r) => r.v); } finally { db.close(); } } catch { return null; } };
+  const whole = (path) => (rowsAt(path) ?? []).includes("committed, in the wal");
   const renamesBy = () => { const calls = []; return { calls, rename: (a, b) => { calls.push(a); renameSync(a, b); } }; };
-  const alive = (pid) => pid === process.pid;
+  // Another process moving the store. It stops once its -wal has moved, the
+  // point where the two paths each hold part of the store, and there either
+  // waits `pause` milliseconds and finishes, or is killed.
+  const MOVER = `
+    import { renameSync } from "node:fs";
+    import { adoptLegacyStore } from ${JSON.stringify(new URL("../src/paths.mjs", import.meta.url).href)};
+    const { MOVE_NEXT: next, MOVE_LEGACY: legacy, MOVE_PAUSE: pause } = process.env;
+    const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    adoptLegacyStore(next, legacy, { log: () => {}, rename: (from, to) => {
+      renameSync(from, to);
+      if (!from.endsWith("-wal")) return;
+      console.log("part way");
+      if (pause === "killed") process.kill(process.pid, "SIGKILL");
+      sleep(Number(pause));
+    } });
+    console.log("done");`;
+  const mover = async (next, legacy, pause) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", MOVER],
+      { env: { ...process.env, MOVE_NEXT: next, MOVE_LEGACY: legacy, MOVE_PAUSE: String(pause) }, stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    const ended = new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal, out })));
+    const partWay = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 15_000);
+      child.stdout.on("data", (d) => { out += d; if (out.includes("part way")) { clearTimeout(timer); resolve(true); } });
+      child.on("exit", () => { clearTimeout(timer); resolve(out.includes("part way")); });
+    });
+    return { partWay, ended, stop: () => child.kill("SIGKILL") };
+  };
   {
     const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
     try {
-      const { legacy, next, lock } = legacyStore(home);
-      writeFileSync(lock, String(process.pid));   // another process holds it
+      const { legacy, next } = legacyStore(home);
+      const other = await mover(next, legacy, 800);
       const ours = renamesBy();
-      // While this call waits, the holder finishes its move and lets go.
-      const wait = () => { if (existsSync(lock)) { for (const x of ["-wal", "-shm", ""]) if (existsSync(legacy + x)) renameSync(legacy + x, next + x); rmSync(lock); } };
-      const used = adoptLegacyStore(next, legacy, { log: () => {}, rename: ours.rename, wait, alive });
-      check(used === next && ours.calls.length === 0 && (rowsAt(next) ?? []).includes("committed, in the wal"),
-        "while another process holds the move, this one waits and uses what it made, moving nothing itself", JSON.stringify({ used: used === next ? "next" : used, ours: ours.calls.length }));
+      // Called while the other process is part way through; it finishes and lets go.
+      const used = adopt(next, legacy, { rename: ours.rename });
+      const theirs = await other.ended;
+      check(other.partWay && used === next && ours.calls.length === 0 && whole(next) && !existsSync(legacy),
+        "while another process moves the store, this one waits and uses what it made, moving nothing itself",
+        JSON.stringify({ partWay: other.partWay, used, ours: ours.calls, theirs }));
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }
+  {
+    const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
+    let other = null;
+    try {
+      const { legacy, next } = legacyStore(home);
+      other = await mover(next, legacy, 3000);
+      // Empty whatever lock file sits beside the store. A holder that has made
+      // its lock but not yet written into it leaves exactly this, and a lock
+      // judged by what its file says was taken from its live holder then.
+      for (const f of readdirSync(dirname(next))) if (f.startsWith(`${basename(next)}.`)) writeFileSync(join(dirname(next), f), "");
+      const ours = renamesBy();
+      const used = adopt(next, legacy, { rename: ours.rename, timeoutMs: 300 });
+      check(other.partWay && used.code === "STORE_BUSY" && /being moved/.test(used.threw ?? "") && ours.calls.length === 0 && existsSync(legacy),
+        "a holder part way through a move is never taken for dead, whatever its lock file says, and one that doesn't finish in time is refused, touching nothing",
+        JSON.stringify({ partWay: other.partWay, used, ours: ours.calls, legacy: existsSync(legacy) }));
+      const theirs = await other.ended;
+      check(theirs.code === 0 && whole(next) && !existsSync(legacy), "control: the holder then finishes its move, with every committed row", JSON.stringify(theirs));
+    } finally { other?.stop(); rmSync(home, { recursive: true, force: true }); }
+  }
+  {
+    const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
+    try {
+      const { legacy, next } = legacyStore(home);
+      const other = await mover(next, legacy, "killed");
+      const theirs = await other.ended;
+      // An earlier build's lock file named its holder's pid. Reused by a live
+      // process, that pid held a dead holder's lock for ever.
+      writeFileSync(`${next}.moving`, String(process.pid));
+      const used = adopt(next, legacy, { timeoutMs: 1000 });
+      check(other.partWay && theirs.signal === "SIGKILL" && used === next && whole(next) && !existsSync(legacy),
+        "a move stopped by a killed process is finished by the next run, whatever pid a lock file names",
+        JSON.stringify({ partWay: other.partWay, theirs, used }));
     } finally { rmSync(home, { recursive: true, force: true }); }
   }
   {
     const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
     try {
-      const { legacy, next, lock } = legacyStore(home);
-      writeFileSync(lock, "999999");   // left by a move whose process died
-      const used = adoptLegacyStore(next, legacy, { log: () => {}, alive, wait: () => {} });
-      check(used === next && !existsSync(lock) && (rowsAt(next) ?? []).includes("committed, in the wal"),
-        "a lock left by a process that died is taken over, and the move finishes", JSON.stringify({ used, lock: existsSync(lock) }));
+      const { legacy, next } = legacyStore(home);
+      rmSync(`${next}.moving`, { force: true });
+      const used = adopt(next, legacy);
+      const left = readdirSync(dirname(next)).filter((f) => ![basename(next), `${basename(next)}-wal`, `${basename(next)}-shm`].includes(f));
+      check(used === next && whole(next) && left.length === 0, "nothing but the store is left beside it once the move is done", JSON.stringify({ used, left }));
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }
+
+  // ── a move that leaves the store split refuses both paths ──────────────────
+  //
+  // The legacy main file, opened without the WAL that sits at the new path,
+  // hides every committed write still in that WAL. So while any of the store's
+  // files are at the new path, neither path is used; the next run finishes the
+  // move, because the main file always moves last.
+  {
+    const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
+    try {
+      const { legacy, next } = legacyStore(home);
+      // The main file won't move, and the WAL won't move back.
+      const rename = (from, to) => {
+        if (from === legacy) throw new Error("EIO: the main file failed to move");
+        if (from === `${next}-wal`) throw new Error("EIO: the WAL failed to move back");
+        return renameSync(from, to);
+      };
+      const used = adopt(next, legacy, { rename });
+      check(used.code === "STORE_SPLIT" && (used.threw ?? "").includes(`${next}-wal`) && /main file failed/.test(used.threw ?? ""),
+        "a move whose rollback also fails refuses both paths, and says which files are where", JSON.stringify(used));
+      const again = adopt(next, legacy, { timeoutMs: 1000 });
+      check(again === next && whole(next) && !existsSync(legacy), "and the next run finishes the move, with every committed row", JSON.stringify({ again }));
     } finally { rmSync(home, { recursive: true, force: true }); }
   }
   {
     const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
     try {
-      const { legacy, next, lock } = legacyStore(home);
-      const used = adoptLegacyStore(next, legacy, { log: () => {} });
-      check(used === next && !existsSync(lock), "the lock is let go once the move is done", JSON.stringify({ lock: existsSync(lock) }));
+      const { legacy, next } = legacyStore(home);
+      renameSync(`${legacy}-wal`, `${next}-wal`);   // where a killed run left it
+      const refused = () => { throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }); };
+      const used = adopt(next, legacy, { rename: refused });
+      check(used.code === "STORE_SPLIT" && (used.threw ?? "").includes(`${next}-wal`),
+        "a move that can't run is refused while an earlier run left part of the store at the new path, not answered with the legacy path",
+        JSON.stringify(used));
     } finally { rmSync(home, { recursive: true, force: true }); }
   }
   {
     const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
     try {
-      const { legacy, next, lock } = legacyStore(home);
-      writeFileSync(lock, String(process.pid));   // held, and never let go
-      let threw = null;
-      try { adoptLegacyStore(next, legacy, { log: () => {}, alive, wait: () => {}, timeoutMs: 300 }); } catch (e) { threw = e.message; }
-      check(/being moved/.test(threw ?? "") && existsSync(legacy) && !existsSync(next) && existsSync(lock),
-        "a move a live process never finishes fails loudly, and touches nothing", JSON.stringify({ threw, legacy: existsSync(legacy), next: existsSync(next) }));
+      const { legacy, next } = legacyStore(home);
+      renameSync(`${legacy}-wal`, `${next}-wal`);
+      mkdirSync(`${next}.move-lock`);   // so the move can't start
+      const json = reeve(home, ["status", NWO, "--json"]);
+      let doc = null; try { doc = JSON.parse(json.out); } catch { /* stays null */ }
+      const prose = reeve(home, ["status", NWO]);
+      check(json.code === 1 && doc?.ok === false && doc?.kind === "store_unusable" && doc?.retryable === false && /split/.test(doc?.message ?? "")
+        && prose.code === 1 && /reeve status: .*split/.test(prose.err) && !/^\s+at /m.test(prose.err),
+        "a command given a store it can't use refuses it with a reason, not a stack trace",
+        JSON.stringify({ json: json.code, doc, prose: prose.err.slice(0, 400) }));
     } finally { rmSync(home, { recursive: true, force: true }); }
   }
 }

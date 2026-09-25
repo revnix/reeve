@@ -476,7 +476,13 @@ process.env.REEVE_HOME = HOME;
  * right there. A repeated resolution is a resolution that will drift again, so
  * there is now only one.
  */
-const stateFor = nwo => adoptLegacyStore(statePathFor(HOME, nwo), legacyStatePathFor(HOME, nwo));
+const stateFor = nwo => {
+  // A store another process is still moving, or one a failed move left split
+  // between two paths, can't be used at either. Every command refuses it the
+  // same way, and says why, rather than dying on a stack trace.
+  try { return adoptLegacyStore(statePathFor(HOME, nwo), legacyStatePathFor(HOME, nwo)); }
+  catch (e) { fail("store_unusable", `reeve ${cmd}: ${e.message}`, { retryable: e.code === "STORE_BUSY" }); }
+};
 
 function detectNwo() {
   try {

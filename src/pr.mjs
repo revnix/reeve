@@ -12,10 +12,10 @@ import { rootCause } from "./ci-rootcause.mjs";
 import { computeVerdict, renderVerdict, PASS, BLOCK, UNKNOWN } from "./verdict.mjs";
 // The builder App's name has one home already; the classifier reads it rather
 // than restating it.
-import { POLICY_APP } from "./github/reconciler.mjs";
+import { POLICY_APP, POLICY_CONTEXT } from "./github/reconciler.mjs";
 import { reviewState } from "./review/derive.mjs";
 import { compare } from "./review/shadow.mjs";
-import { authenticate, apiAsInstallation } from "./github/app.mjs";
+import { authenticate, apiAsInstallation, loadAppCredentials } from "./github/app.mjs";
 import { execFileSync } from "node:child_process";
 
 function ghJson(args) {
@@ -36,7 +36,7 @@ function ghJson(args) {
 // `reviewsAgree` for what that does and does not catch.
 const THREADS_QUERY = `query($o:String!,$r:String!,$n:Int!,$c:String){
   repository(owner:$o,name:$r){ pullRequest(number:$n){
-    mergeStateStatus
+    mergeStateStatus mergeable reviewDecision
     reviews(first:1){ totalCount }
     reviewThreads(first:100, after:$c){
       totalCount
@@ -57,15 +57,22 @@ export function readThreads(nwo, pr, io = null) {
   const call = io?.gh ?? ghJson;
   const [o, r] = nwo.split("/");
   let cursor = null, total = null, seen = 0, unresolved = 0, mergeState = null, pages = 0;
-  let reviewTotal = null;
+  let reviewTotal = null, mergeable = null, reviewDecision = null, partsReadable = true;
   for (;;) {
     const args = ["graphql", "-f", `query=${THREADS_QUERY}`, "-F", `o=${o}`, "-F", `r=${r}`, "-F", `n=${pr}`];
     if (cursor) args.push("-F", `c=${cursor}`);
     const res = call(args);
     if (!res.ok) return { readable: false, why: res.err.split("\n")[0], mergeState };
-    const pr_ = JSON.parse(res.out).data?.repository?.pullRequest;
+    const parsed = JSON.parse(res.out);
+    // An HTTP 200 can still carry errors for single fields, which then read as
+    // null. A null review decision reads as "no review outstanding", so any error
+    // makes the mergeability parts unknown rather than clear.
+    if (parsed.errors?.length) partsReadable = false;
+    const pr_ = parsed.data?.repository?.pullRequest;
     if (!pr_) return { readable: false, why: "no pullRequest in response", mergeState };
     mergeState = pr_.mergeStateStatus;
+    mergeable = pr_.mergeable ?? null;
+    reviewDecision = pr_.reviewDecision ?? null;
     // Read from the FIRST page only: it is a totalCount, identical on every page,
     // and re-reading it per page would just be the same number again.
     if (reviewTotal === null) reviewTotal = pr_.reviews?.totalCount ?? null;
@@ -78,7 +85,93 @@ export function readThreads(nwo, pr, io = null) {
     cursor = t.pageInfo.endCursor;
   }
   // Only claim readability when the count seen matches the count declared.
-  return { readable: seen >= total, total, unresolved, seen, mergeState, reviewTotal };
+  return { readable: seen >= total, total, unresolved, seen, mergeState, reviewTotal, mergeable, reviewDecision, partsReadable };
+}
+
+/**
+ * The parts of GitHub's mergeability that reeve can read, for when
+ * mergeStateStatus is BLOCKED and the verdict has to take it apart: whether the
+ * branch conflicts, the review decision, whether reeve's own check is required on
+ * the base, and everything else the base requires. The base is read only when
+ * BLOCKED, the one state it explains, since it costs calls:
+ *   others            each other required check, with its state at this head in
+ *                     `rows`: passing, failing, running, superseded, expired,
+ *                     missing, or unknown
+ *   unresolvedBlocks  whether the base requires resolved conversations and one
+ *                     isn't
+ *   strict, behind    whether the base requires branches up to date, and how
+ *                     many commits this head is behind it
+ *   unevaluated       what the base requires that reeve doesn't evaluate
+ * Each is null when it couldn't be told.
+ */
+export function readMergeParts(nwo, baseRef, threads, { gh = ghJson, context = POLICY_CONTEXT, appId = ownAppId(), rows = null, head = null } = {}) {
+  const parts = { readable: threads?.partsReadable !== false, mergeable: threads?.mergeable ?? null,
+                  reviewDecision: threads?.reviewDecision ?? null, ownCheckRequired: null,
+                  others: null, unresolvedBlocks: null, strict: null, behind: null, unevaluated: null };
+  if (String(threads?.mergeState ?? "").toUpperCase() !== "BLOCKED" || !baseRef) return parts;
+  const req = requirementsOnBase({ nwo, base: baseRef, context, gh, appId });
+  parts.ownCheckRequired = req.own;
+  parts.others = req.others && Array.isArray(rows) ? req.others.map((r) => ({ ...r, state: requiredCheckState(rows, r) })) : null;
+  parts.unresolvedBlocks = req.threadResolution === null ? null
+    : !req.threadResolution ? false
+    : threads?.readable === false || !Number.isInteger(threads?.unresolved) ? null : threads.unresolved > 0;
+  parts.unevaluated = req.unevaluated;
+  // A base that wants branches up to date blocks one that is behind, and
+  // BLOCKED says nothing of which. How far behind is read only then.
+  parts.strict = req.strict;
+  if (req.strict && head) {
+    const c = gh([`repos/${nwo}/compare/${encodeURIComponent(baseRef)}...${head}`, "--jq", ".behind_by"]);
+    const n = c.ok ? Number(c.out.trim()) : NaN;
+    parts.behind = Number.isInteger(n) && n >= 0 ? n : null;
+  }
+  return parts;
+}
+
+/**
+ * The head's check rows for judging the base's other required checks: CI, the
+ * reviewers' statuses, and other Apps' runs under reeve's name, since a
+ * required check is met by whichever carries its name. Null unless both check
+ * runs and statuses were read in full: every result under a name must pass, and
+ * a failing one on a surface that went unread would leave the rest passing.
+ */
+export const mergeRows = (read) => (read?.whole ? [...read.rows, ...read.reviewerRows, ...read.impostors] : null);
+
+// What passes a required check, as GitHub counts it.
+const PASSING_RUN = new Set(["success", "neutral", "skipped"]);
+// A run a newer one replaces: no answer yet, rather than a failure, as the CI
+// clause reads it too.
+const SUPERSEDED_RUN = new Set(["cancelled", "stale"]);
+// GitHub accepts a required check's passing result for seven days after it
+// completed, and holds the merge for a rerun after that.
+const REQUIRED_RESULT_MS = 7 * 24 * 3600 * 1000;
+
+/**
+ * A required check's state among a head's check runs and statuses. One bound to
+ * an App is met only by that App's run; a commit status names no App reeve can
+ * read, so one standing in for a bound check is unknown. Every result under the
+ * name must pass, since GitHub holds the merge for any of them: a passing status
+ * beside a failing check run of the same name is failing.
+ */
+function requiredCheckState(rows, { context, app, besideOwn = false }, now = Date.now()) {
+  const named = rows.filter((r) => r?.name === context);
+  const candidates = app == null ? named : named.filter((r) => r.source === "check_run" && String(r.appId) === app);
+  const passes = (r) => r.source === "status" ? r.conclusion === "success" : PASSING_RUN.has(r.conclusion);
+  // Beside reeve's own check, no other result under its name is nothing more
+  // outstanding; reeve's own results are never among the rows.
+  if (!candidates.length) return besideOwn ? "passing" : app != null && named.some((r) => r.source !== "check_run") ? "unknown" : "missing";
+  const superseded = (r) => r.source === "check_run" && SUPERSEDED_RUN.has(r.conclusion);
+  if (candidates.some((r) => r.state === "completed" && !passes(r) && !superseded(r))) return "failing";
+  if (candidates.some((r) => r.state !== "completed")) return "running";
+  if (candidates.some(superseded)) return "superseded";
+  // Passing, but too long ago to count, or at a time that can't be read.
+  if (candidates.some((r) => !(now - Date.parse(r.completedAt) <= REQUIRED_RESULT_MS))) return "expired";
+  return "passing";
+}
+
+/** reeve's own App id, from its credentials, or null when there are none. */
+function ownAppId() {
+  const c = loadAppCredentials();
+  return c.ok ? c.appId : null;
 }
 
 /**
@@ -440,7 +533,8 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // A reviewer's commit status is never CI evidence: a rate-limited CodeRabbit
   // reports success. Excluded at the read, for the head AND the base alike.
   const reviewerContexts = profile.ci?.reviewerStatusContexts ?? [];
-  const { rows } = readChecks(nwo, pin.sha, { reviewerContexts });
+  const read = readChecks(nwo, pin.sha, { reviewerContexts });
+  const { rows } = read;
   const c = classify(rows, profile.ci?.requiredChecks ?? []);
   // ONE reading, folded into what the previous tick recorded. Settlement is about
   // the check SET being stable ACROSS TIME, so it can only be established by
@@ -556,6 +650,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     bodyFindings: facts.bodyFindings, unreadableBodies: facts.unreadableBodies,
     ledgerBlockers,
     mergeState: threads.mergeState, profile,
+    mergeParts: readMergeParts(nwo, baseRef, threads, { rows: mergeRows(read), head: pin.sha }),
     // Passed through, never read here. `pr_hold` is a HUB row and this function
     // holds the per-repository state database, so the reading is taken by the
     // caller that has the hub connection and handed in. Null when the caller has
@@ -581,34 +676,215 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
 }
 
 /**
- * The id of the policy check already at this head, or null. Read as the App
- * rather than as the user, because the check the App created is the one it is
- * allowed to update; `filter=latest` is exactly right here, since the newest run
- * under that name is the one to supersede.
- *
- * A failure to look is not "there is none": returning null would then create a
- * duplicate rather than lose anything, which is the harmless direction.
+ * The name shadow results publish under. Never the enforcement check's, so a
+ * shadow result can't satisfy a rule that requires the real check, whatever the
+ * rules become after it was published: a pull request retargeted to a protected
+ * branch, or a check made required between two ticks.
  */
-function existingPolicyRun(token, nwo, sha, context) {
-  const r = apiAsInstallation(token,
-    [`repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=latest`,
-     "--jq", `[.check_runs[] | select(.name == "${context}") | .id] | last // empty`]);
-  return r.ok && r.out ? r.out.trim() : null;
+export const shadowContextOf = (context) => `${context} (shadow)`;
+
+/**
+ * The check runs at this head under these names, read in one pass: reeve's own
+ * latest under each, as `mine: { [name]: { id, conclusion, app } | null }`, and
+ * every other App's under any of them, as `others`. Null when the runs couldn't
+ * be read. Read as the App, because a run the App created is one it may update.
+ * Only the App's own runs are its to update: taking another App's for reeve's
+ * own left reeve's passing run under the enforcement name standing. A failure to
+ * look is not "there are none": returning null then creates a duplicate rather
+ * than losing anything, which is the harmless direction.
+ */
+function existingRuns(token, nwo, sha, names, api = apiAsInstallation) {
+  const r = api(token, ["--paginate", `repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=latest`,
+    "--jq", ".check_runs[] | {name, id, conclusion, app: .app.slug}"]);
+  if (!r.ok) return null;
+  const rows = [];
+  for (const line of (r.out ?? "").split("\n").filter(Boolean)) { try { rows.push(JSON.parse(line)); } catch { return null; } }
+  return { mine: Object.fromEntries(names.map((n) => [n, rows.filter((c) => c.name === n && c.app === POLICY_APP).at(-1) ?? null])),
+           others: rows.filter((c) => names.includes(c.name) && c.app !== POLICY_APP) };
 }
 
 /**
- * Publish. Shadow publishes `neutral`, which GitHub shows and never blocks on.
- * Enforcing publishes the real conclusion.
+ * Whether the results other than reeve's own under `context` at this head,
+ * other Apps' check runs and commit statuses, would pass it: there is one, and
+ * every one passes, as GitHub requires of every result under a name. True,
+ * false, or null when the runs or the statuses couldn't be read.
  */
-export async function publishVerdict({ nwo, verdict, shadow = true, context = "ops/merge-policy" }) {
-  const auth = await authenticate(nwo);
+function othersPassUnder(token, nwo, sha, context, runs, api) {
+  if (!runs) return null;
+  const st = api(token, ["--paginate", `repos/${nwo}/commits/${sha}/status?per_page=100`,
+    "--jq", `.statuses[] | select(.context == ${JSON.stringify(context)}) | {state}`]);
+  if (!st.ok) return null;
+  let states;
+  try { states = (st.out ?? "").split("\n").filter(Boolean).map((l) => JSON.parse(l).state); } catch { return null; }
+  const results = [...runs.others.filter((c) => c.name === context).map((c) => PASSING_RUN.has(c.conclusion)),
+                   ...states.map((state) => state === "success")];
+  return results.length > 0 && results.every(Boolean);
+}
+
+// Rule types that can't stop a pull request merging into a branch that already
+// exists: they govern creating, deleting and force-pushing the branch. Linear
+// history rules out merge commits, and squash and rebase merges still merge.
+const HARMLESS_RULES = new Set(["creation", "deletion", "non_fast_forward", "required_linear_history"]);
+
+/**
+ * What a branch requires before a pull request merges into it, as far as reeve
+ * can tell:
+ *   own               whether `context` is required from reeve's own App
+ *   others            every other required status check, as { context, app }
+ *   threadResolution  whether every conversation must be resolved
+ *   strict            whether a branch must be up to date with the base first
+ *   unevaluated       what can stop a merge that reeve doesn't evaluate: deployments,
+ *                     signatures, a merge queue, a locked branch, and any rule it
+ *                     doesn't know, named
+ *
+ * GitHub requires things in two places, and both are read: the rules that apply to
+ * the branch (every ruleset, the organisation's included, every page), and classic
+ * branch protection. The branch reports protection's required checks to anyone
+ * who can read it; the rest of protection is `protection`, which needs an
+ * administrator's read. A requirement bound to another App isn't reeve's: GitHub
+ * waits for that App.
+ *
+ * `own` is true, false, or null when it can't be told; the other three are null
+ * when they can't be told. Null is never taken for "nothing required".
+ */
+export function requirementsOn({ rules, branch, protection = null }, context, { appId = null } = {}) {
+  // Every page of the rules arrives as one object per line; a single array is
+  // read too.
+  const entries = (r) => {
+    const text = (r.out ?? "").trim();
+    if (!text) return [];
+    try { const v = JSON.parse(text); return Array.isArray(v) ? v : [v]; }
+    catch { try { return text.split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { return undefined; } }
+  };
+  // Ours when unbound, or bound to reeve's App; unknown when bound and reeve's
+  // App id isn't known.
+  const ours = (bound) => (bound == null || Number(bound) === -1 ? true : appId == null ? null : String(bound) === String(appId));
+  const verdictOf = (answers) => (answers.includes(true) ? true : answers.includes(null) ? null : false);
+  const others = [], unevaluated = [];
+  let byRules = null, byProtection = null, threadResolution = false, strict = false, whole = true;
+  // A required check is reeve's, another App's, or, bound to an App reeve can't
+  // name, both: GitHub waits for whichever App it is.
+  const required = (answers, c, bound) => {
+    if (c !== context) { others.push({ context: c, app: bound == null || Number(bound) === -1 ? null : String(bound) }); return; }
+    const mine = ours(bound);
+    answers.push(mine);
+    if (mine !== true) others.push({ context: c, app: String(bound) });
+    // Unbound, the requirement takes every result under the name, so another's
+    // result under reeve's name must pass beside reeve's own.
+    else if (bound == null || Number(bound) === -1) others.push({ context: c, app: null, besideOwn: true });
+  };
+
+  const list = rules?.ok ? entries(rules) : undefined;
+  if (Array.isArray(list)) {
+    const answers = [];
+    for (const r of list) {
+      if (r?.type === "required_status_checks") {
+        for (const c of r.parameters?.required_status_checks ?? []) required(answers, c?.context, c?.integration_id);
+        strict ||= r.parameters?.strict_required_status_checks_policy === true;
+      }
+      // Reviews are GitHub's review decision, which the verdict reads.
+      else if (r?.type === "pull_request") threadResolution ||= r.parameters?.required_review_thread_resolution === true;
+      else if (!HARMLESS_RULES.has(r?.type)) unevaluated.push(`rule ${r?.type ?? "of no type"}`);
+    }
+    byRules = verdictOf(answers);
+  } else whole = false;
+
+  const b = parsed(branch);
+  // The branch is the one place classic protection's required checks are read,
+  // so without it they are unknown, even when the rest of protection was read.
+  if (!b) whole = false;
+  const checks = b?.protection?.required_status_checks;
+  if (b?.protected === false) byProtection = false;
+  else if (checks && typeof checks === "object") {
+    const answers = [];
+    for (const c of checks.checks ?? []) required(answers, c?.context, c?.app_id);
+    if (!(checks.checks ?? []).length) for (const c of checks.contexts ?? []) required(answers, c, null);
+    byProtection = verdictOf(answers);
+  }
+  if (classicProtection(b) !== false) {
+    // The rest of classic protection. Its endpoint answers "Branch not protected"
+    // when there is none, which is an answer; any other failure isn't.
+    const p = parsed(protection);
+    if (p) {
+      // Reviews are the review decision again, and linear history, force pushes,
+      // deletions and creations can't stop a merge.
+      if (p.required_conversation_resolution?.enabled) threadResolution = true;
+      if (p.required_status_checks?.strict) strict = true;
+      if (p.required_signatures?.enabled) unevaluated.push("protection required_signatures");
+      if (p.lock_branch?.enabled) unevaluated.push("protection lock_branch");
+      if (p.restrictions) unevaluated.push("protection restrictions");
+    } else if (!/Branch not protected/.test(protection?.err ?? "")) whole = false;
+  }
+
+  const own = byRules === true || byProtection === true ? true : byRules === null || byProtection === null ? null : false;
+  return whole ? { own, others, threadResolution, strict, unevaluated }
+    : { own, others: null, threadResolution: null, strict: null, unevaluated: null };
+}
+
+const parsed = (r) => { try { return r?.ok ? JSON.parse(r.out || "{}") : undefined; } catch { return undefined; } };
+// Whether a branch has classic protection, as the branch reports it: false for
+// none, null when the branch couldn't be read. A branch that only rulesets
+// protect reports itself protected, with its classic protection disabled.
+const classicProtection = (b) => (!b ? null : b.protected === false || b.protection?.enabled === false ? false : true);
+
+/** Is `context` a required status check on a branch, from reeve's own App? requirementsOn's `own`. */
+export const requiredOn = (read, context, options) => requirementsOn(read, context, options).own;
+
+// One reading per base and check, kept for the daemon's tick, and for a minute
+// at most: every pull request that targets the same branch asks the same
+// question, and the daemon asks it for each one on every tick.
+const REQUIRED = new Map();
+const REQUIRED_TTL_MS = 60_000;
+
+/** Drop every kept reading, so the next question reads the base afresh. The daemon calls this as each tick starts. */
+export function clearRequirements() { REQUIRED.clear(); }
+
+/** requirementsOn for a base branch, read with `gh` and cached for a minute. */
+export function requirementsOnBase({ nwo, base, context, gh, appId = null, now = Date.now() }) {
+  const key = `${nwo}\u0000${base}\u0000${context}\u0000${appId ?? ""}`;
+  const hit = REQUIRED.get(key);
+  if (hit && now - hit.at < REQUIRED_TTL_MS) return hit.value;
+  const path = `repos/${nwo}/branches/${encodeURIComponent(base)}`;
+  const branch = gh([path]);
+  const value = requirementsOn({
+    rules: gh(["--paginate", `repos/${nwo}/rules/branches/${encodeURIComponent(base)}`, "--jq", ".[]"]),
+    branch,
+    // The rest of classic protection only where the branch has some.
+    protection: classicProtection(parsed(branch)) === false ? null : gh([`${path}/protection`]),
+  }, context, { appId });
+  // Kept only when whole. A reading that came back partial, a token without
+  // the reads it needed, say, is read again by the next caller, which may be
+  // one that can: reeve's App reads what the ambient token couldn't.
+  if (REQUIRED.size > 256) REQUIRED.clear();
+  if (value.own !== null && value.others !== null) REQUIRED.set(key, { at: now, value });
+  return value;
+}
+
+/** Whether reeve's check is required on a base: requirementsOnBase's `own`. */
+export const requiredOnBase = (args) => requirementsOnBase(args).own;
+
+/**
+ * Publish. Enforcing publishes the real conclusion under the policy's name.
+ * Shadow publishes `neutral` under its own name, which shows the verdict and can
+ * never pass a rule that requires the real check.
+ *
+ * Two things more in shadow mode. A passing result an earlier version published
+ * under the enforcement name at this head would still pass that check if a rule
+ * came to require it, so it is marked superseded. And when a rule already
+ * requires the enforcement check, every pull request is blocked until reeve
+ * enforces: that comes back as `held`, for the daemon to raise.
+ */
+export async function publishVerdict({ nwo, verdict, shadow = true, context = "ops/merge-policy", base = null,
+                                      auth: authenticateAs = authenticate, api = apiAsInstallation }) {
+  const auth = await authenticateAs(nwo);
   if (!auth.ok) return { ok: false, why: auth.why };
 
   const real = verdict.state === PASS ? "success" : verdict.state === BLOCK ? "failure" : "action_required";
+  const name = shadow ? shadowContextOf(context) : context;
   const conclusion = shadow ? "neutral" : real;
   const title = `${shadow ? "[shadow] " : ""}${verdict.state}: ${verdict.summary}`;
   const body = shadow
-    ? `**Shadow mode.** This check reports what the merge policy *would* have decided. It does not block.\n\nIf enforcing, this revision would be: **${real}**\n\n${renderVerdict(verdict)}`
+    ? `**Shadow mode.** This check reports what the merge policy *would* have decided. It does not block, and it is published as \`${name}\`, so it can never stand in for \`${context}\`.\n\nIf enforcing, this revision would be: **${real}**\n\n${renderVerdict(verdict)}`
     : renderVerdict(verdict);
 
   // Update the run already at this head rather than adding another. One head on
@@ -620,12 +896,65 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = "o
     "-f", `output[title]=${title.slice(0, 250)}`,
     "-f", `output[summary]=${body.slice(0, 60000)}`,
   ];
-  const existing = existingPolicyRun(auth.token, nwo, verdict.head, context);
+  const runs = existingRuns(auth.token, nwo, verdict.head, [name, context], api);
+  const existing = runs?.mine[name]?.id ?? null;
+
+  // Shadow mode supersedes first. A passing result an earlier version left under
+  // the enforcement name passes that check for as long as it stands, so it is
+  // cancelled before anything else is written, and a run stopped in between
+  // leaves the gate safe. One that can't be superseded, or can't be looked for,
+  // fails the publication: the daemon says so, and the next tick tries again.
+  let superseded = false, left = null, stale = null;
+  if (shadow) {
+    stale = runs?.mine[context];
+    if (!runs) left = `the check runs at ${verdict.head.slice(0, 8)} couldn't be read, so a passing result an earlier version may have left there under ${context} couldn't be superseded`;
+    else if (stale && stale.app === POLICY_APP && PASSING_RUN.has(stale.conclusion)) {
+      const s = api(auth.token, ["-X", "PATCH", `repos/${nwo}/check-runs/${stale.id}`, "-f", "status=completed", "-f", "conclusion=cancelled",
+        "-f", `output[title]=Superseded: shadow results now publish as ${name}`,
+        "-f", `output[summary]=This result was published in shadow mode under the enforcement check's name, where it could pass that check if a rule came to require it. Shadow results now publish as \`${name}\`.`]);
+      superseded = s.ok;
+      if (!s.ok) left = `the passing result an earlier version left under ${context} at ${verdict.head.slice(0, 8)} couldn't be superseded (${(s.err ?? "").split("\n")[0]})`;
+    }
+  }
+
   const res = existing
-    ? apiAsInstallation(auth.token, ["-X", "PATCH", `repos/${nwo}/check-runs/${existing}`, ...fields])
-    : apiAsInstallation(auth.token, ["-X", "POST", `repos/${nwo}/check-runs`,
-        "-f", `name=${context}`, "-f", `head_sha=${verdict.head}`, ...fields]);
-  if (!res.ok) return { ok: false, why: res.err.split("\n")[0] };
-  return { ok: true, id: JSON.parse(res.out).id, conclusion, wouldBe: real, shadow,
-           updated: Boolean(existing) };
+    ? api(auth.token, ["-X", "PATCH", `repos/${nwo}/check-runs/${existing}`, ...fields])
+    : api(auth.token, ["-X", "POST", `repos/${nwo}/check-runs`,
+        "-f", `name=${name}`, "-f", `head_sha=${verdict.head}`, ...fields]);
+  // Enforcing, a failed write is the whole story. In shadow mode it isn't: a
+  // rule requiring the enforcement name still needs saying, or one failed write
+  // would leave it unseen.
+  if (!res.ok && !shadow) return { ok: false, why: res.err.split("\n")[0] };
+  const unwritten = res.ok ? null : `couldn't publish as ${name} (${res.err.split("\n")[0]})`;
+
+  let held = null;
+  if (shadow) {
+    const req = base ? requirementsOnBase({ nwo, base, context, gh: (args) => api(auth.token, args), appId: auth.appId ?? null }) : null;
+    const required = req?.own ?? null;
+    // Bound to reeve's App, only reeve's run can pass the requirement. With no
+    // App bound, or the binding unread, anyone's result under the name can.
+    const unbound = required === true && !(Array.isArray(req.others) && !req.others.some((o) => o.context === context && o.besideOwn));
+    // Required, the check isn't blocked while such a result stands: it passes,
+    // and the pull request can merge unjudged. So too, maybe, when the rules
+    // couldn't be read to say. That is for a person to know now, and so is a
+    // head whose runs couldn't be read to rule such a result out: "every pull
+    // request is blocked" would say the opposite of what may be true.
+    const blocked = `a rule requires ${context} on ${base}, and reeve publishes it only when enforcing, so every pull request there is blocked until it enforces or the rule stops requiring it`;
+    if (left && required !== false)
+      held = `a rule ${required ? "requires" : "may require"} ${context} on ${base ?? "the base"}, and ${left}, so pull request head ${verdict.head.slice(0, 8)} ${stale && required ? "can" : "may"} pass that check unjudged`;
+    else if (unbound) {
+      // Not blocked, then, if another App or a commit status has put a passing
+      // result under the name, and that is for a person to know now.
+      const passing = othersPassUnder(auth.token, nwo, verdict.head, context, runs, api);
+      held = passing === false
+        ? `${blocked}; with no App bound to the rule, any passing result under ${context} would pass it, so bind the rule to reeve's App`
+        : `a rule requires ${context} on ${base} with no App bound, and ${passing ? "a passing result of another's stands under that name" : "whether a passing result of another's stands under that name couldn't be read"} at ${verdict.head.slice(0, 8)}, so pull request head ${verdict.head.slice(0, 8)} ${passing ? "can" : "may"} pass that check unjudged`;
+    }
+    else if (required === true) held = blocked;
+  }
+  const id = res.ok ? JSON.parse(res.out).id : null;
+  if (unwritten || left)
+    return { ok: false, why: [unwritten, left && (res.ok ? `published as ${name}, but ${left}` : left)].filter(Boolean).join("; "),
+             id, conclusion, name, wouldBe: real, shadow, updated: Boolean(existing), superseded, held };
+  return { ok: true, id, conclusion, name, wouldBe: real, shadow, updated: Boolean(existing), superseded, held };
 }

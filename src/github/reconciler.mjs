@@ -34,10 +34,16 @@ const KNOWN_CONCLUSIONS = new Set([
 const UNINFORMATIVE = new Set(["cancelled", "stale"]);
 
 function sh(cmd, args) {
-  try { return { ok: true, out: execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() }; }
+  // A paged read of a busy head runs past the default 1 MiB, and a read cut
+  // short there must not be taken for the whole list.
+  try { return { ok: true, out: execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 }).trim() }; }
   catch (e) { return { ok: false, out: "", err: String(e.stderr || e.message).trim() }; }
 }
-const gh = (path, jq) => { const a = ["api", path]; if (jq) a.push("--jq", jq); return sh("gh", a); };
+const gh = (path, jq, { paginate = false } = {}) => {
+  const a = ["api", ...(paginate ? ["--paginate"] : []), path];
+  if (jq) a.push("--jq", jq);
+  return sh("gh", a);
+};
 
 /**
  * The one true head for this tick. Read from the ref itself, never from the PR
@@ -72,13 +78,15 @@ export const POLICY_APP = "merge-policy";
  * Bump this whenever the set of things counted changes. A stored floor recorded
  * under an older number is discarded rather than compared against.
  */
-export const CHECK_ACCOUNTING = 3;
+export const CHECK_ACCOUNTING = 4;
 // 3: reviewer commit-status contexts (ci.reviewerStatusContexts) left the counted
 //    set. Measured the moment it shipped -- nextly #1011 read "only 34 checks
 //    reported where 35 were expected" against a floor stored under accounting 2,
 //    which is the same shape as the policy-exclusion incident this counter was
 //    added for. Changing what counts REQUIRES bumping this, and the number is the
 //    only thing standing between an exclusion and every PR stuck forever.
+// 4: check runs and statuses are read past their first page. Statuses came 30
+//    to a page and runs 100, so a head with more counts them all from here on.
 
 /**
  * Remove reeve's own opinion from the evidence.
@@ -145,22 +153,33 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
   // and a TSV parse then splits it into a phantom row whose "name" is a fragment
   // of the description and whose conclusion is undefined — which classifies as a
   // failure and reports "failing: undefined" to the fixer.
-  const parse = (raw, fn) => {
-    if (!raw) return;
-    let j; try { j = JSON.parse(raw); } catch { return; }
-    for (const item of j) { const r = fn(item); if (r && r.name) rows.push(r); }
+  //
+  // Every page, one JSON value per line. A page holds 100 runs, and statuses
+  // came 30 to a page, so a check past the first page went unread. A surface
+  // counts as read only when every line of every page was.
+  const parse = (r, fn) => {
+    if (!r.ok) return false;
+    for (const line of r.out.split("\n").filter(Boolean)) {
+      let item; try { item = JSON.parse(line); } catch { return false; }
+      const row = fn(item); if (row && row.name) rows.push(row);
+    }
+    return true;
   };
-  const cr = gh(`repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=latest`, ".check_runs");
-  if (cr.ok) parse(cr.out, c => ({
+  const cr = gh(`repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=latest`, ".check_runs[]", { paginate: true });
+  const crRead = parse(cr, c => ({
     name: c.name, source: "check_run",
     state: c.status === "completed" ? "completed" : "running",
     conclusion: c.conclusion || null, id: c.id != null ? String(c.id) : null,
     // Carried so reeve can recognise its OWN check and refuse to treat it as
     // evidence. Excluding by name alone would miss anything else it publishes.
     app: c.app?.slug ?? null,
+    // And the id, which is what a required check bound to an App names.
+    appId: c.app?.id != null ? String(c.app.id) : null,
+    // When it finished: GitHub accepts a required check's pass for seven days.
+    completedAt: c.completed_at ?? null,
   }));
-  const st = gh(`repos/${nwo}/commits/${sha}/status`, ".statuses");
-  if (st.ok) parse(st.out, x => ({
+  const st = gh(`repos/${nwo}/commits/${sha}/status?per_page=100`, ".statuses[]", { paginate: true });
+  const stRead = parse(st, x => ({
     // A StatusContext has .state and no .conclusion. "pending" is in flight.
     name: x.context, source: "status",
     state: x.state === "pending" ? "running" : "completed",
@@ -168,6 +187,7 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
     // A rate-limited CodeRabbit reports state=success with the truth relegated
     // here, so the description is carried rather than discarded.
     description: x.description ?? "",
+    completedAt: x.updated_at ?? x.created_at ?? null,
   }));
   // Filtered HERE rather than by each caller: the base head is read through this
   // same function, and a caller that forgot would reintroduce the latch silently.
@@ -175,9 +195,12 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
   // Reviewer rows are RETURNED, never dropped: the review pipeline reads them as
   // evidence about the reviewer, and a signal that vanishes cannot be reported.
   const rev = excludeReviewerContexts(own.rows, reviewerContexts);
-  return { ok: cr.ok || st.ok, rows: rev.rows, reviewerRows: rev.reviewerRows,
+  // `whole` only when both surfaces were read in full. `ok` stays true with one
+  // of them, as its callers have always read it, so a caller that must see every
+  // result under a check's name asks for `whole`.
+  return { ok: crRead || stRead, whole: crRead && stRead, rows: rev.rows, reviewerRows: rev.reviewerRows,
            excluded: own.excluded, impostors: own.impostors,
-           why: cr.ok || st.ok ? null : (cr.err || st.err) };
+           why: crRead || stRead ? null : (cr.err || st.err || "check rows couldn't be parsed") };
 }
 
 /** Classify a set of check rows. Never returns "green" on absence. */

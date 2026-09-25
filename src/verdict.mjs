@@ -249,10 +249,43 @@ export function computeVerdict(i) {
   }
 
   // 7. GitHub's own mergeability. UNKNOWN is GitHub still computing; retry.
+  //
+  // BLOCKED counts reeve's own check once that check is required, and the check
+  // can only pass once this verdict does: taking BLOCKED at its word blocked
+  // every verdict after the first, for ever. So BLOCKED is taken apart, and it
+  // passes only when reeve's check is the one thing left that can be blocking:
+  // no conflict, no review outstanding, every other required check passing, no
+  // unresolved conversation the base requires resolved, not behind a base that
+  // wants branches up to date, and nothing required that reeve doesn't
+  // evaluate. Anything else GitHub can be waiting for keeps it
+  // from passing, because finding reeve's check among the requirements doesn't
+  // make it the only one. This never looks at whether reeve's check is passing,
+  // because a verdict that did would flip on each publish.
   const MS = String(i.mergeState ?? "").toUpperCase();
+  const parts = i.mergeParts ?? null;
   if (!MS) add("mergeable", UNKNOWN, "mergeStateStatus not read");
   else if (MS === "CLEAN" || MS === "UNSTABLE") add("mergeable", PASS, MS);
   else if (MS === "UNKNOWN") add("mergeable", UNKNOWN, "GitHub is still computing mergeability");
+  else if (MS === "BLOCKED" && parts?.readable === false) add("mergeable", UNKNOWN, "mergeStateStatus BLOCKED, and GitHub reported an error reading its parts");
+  else if (MS === "BLOCKED" && parts) {
+    const review = parts.reviewDecision === "CHANGES_REQUESTED" || parts.reviewDecision === "REVIEW_REQUIRED";
+    const others = (state) => (parts.others ?? []).filter((c) => c.state === state).map((c) => c.context);
+    const failing = others("failing"), waiting = [...others("running"), ...others("superseded"), ...others("expired"), ...others("missing"), ...others("unknown")];
+    if (parts.mergeable === "CONFLICTING") add("mergeable", BLOCK, "mergeStateStatus BLOCKED: the branch conflicts with its base");
+    else if (review) add("mergeable", BLOCK, `mergeStateStatus BLOCKED: review ${parts.reviewDecision}`);
+    else if (parts.ownCheckRequired === false) add("mergeable", BLOCK, "mergeStateStatus BLOCKED, and not by reeve's own check");
+    else if (parts.ownCheckRequired === null) add("mergeable", UNKNOWN, "mergeStateStatus BLOCKED, and whether reeve's own required check is among the reasons couldn't be read");
+    else if (failing.length) add("mergeable", BLOCK, `mergeStateStatus BLOCKED: required check(s) not passing: ${failing.join(", ")}`);
+    else if (parts.unresolvedBlocks === true) add("mergeable", BLOCK, "mergeStateStatus BLOCKED: the base requires every conversation resolved");
+    else if (parts.strict === true && parts.behind > 0) add("mergeable", BLOCK, `mergeStateStatus BLOCKED: the base requires branches up to date, and this one is ${parts.behind} commit(s) behind`);
+    else if (!Array.isArray(parts.others) || parts.unresolvedBlocks == null || !Array.isArray(parts.unevaluated)
+             || parts.strict == null || (parts.strict && !Number.isInteger(parts.behind)))
+      add("mergeable", UNKNOWN, "mergeStateStatus BLOCKED, and what else the base requires couldn't be read");
+    else if (waiting.length) add("mergeable", UNKNOWN, `mergeStateStatus BLOCKED, waiting for required check(s): ${waiting.join(", ")}`);
+    else if (parts.unevaluated.length) add("mergeable", UNKNOWN, `mergeStateStatus BLOCKED, and the base requires what reeve doesn't evaluate: ${parts.unevaluated.join(", ")}`);
+    else if (parts.mergeable !== "MERGEABLE") add("mergeable", UNKNOWN, `mergeStateStatus BLOCKED, and GitHub hasn't settled whether the branch merges (${parts.mergeable ?? "unread"})`);
+    else add("mergeable", PASS, "mergeStateStatus BLOCKED by reeve's own required check, which this verdict decides; nothing else the base requires is outstanding");
+  }
   else add("mergeable", BLOCK, `mergeStateStatus ${MS}`);
 
   const state = clauses.reduce((acc, c) => worst(acc, c.state), PASS);

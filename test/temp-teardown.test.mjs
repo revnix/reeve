@@ -5,7 +5,7 @@
 // TMPDIR set to an empty folder of its own, has it make folders through the
 // helper and end in one of the ways a test file ends, and then looks at what's
 // left in that folder.
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -42,14 +42,30 @@ check(finished.status === 0 && finished.left.length === 0, "a test file's tempor
 check(failed.status === 1 && failed.left.length === 0 && threw.status !== 0 && threw.left.length === 0,
   "and once it exits with a failure, or on an uncaught error", JSON.stringify({ failed, threw }));
 
-// A signal ends a process without its exit listeners: Ctrl-C, or a runner
-// stopping a test file that hangs. The folders go all the same, and the child
-// still ends by that signal, so whatever sent it sees why it stopped. Windows
-// has no signals to send: there, process.kill ends a process outright.
+// A signal keeps its default action, which ends a test at once, even one busy
+// in synchronous code, where a JavaScript listener would never run: a listener
+// switches the default off, and Node runs it only between tasks, so a stopped
+// test ran on and then exited 0 (#220). Its folders are left; the suite's
+// runner, scripts/test.mjs, removes them. Windows has no signals to send:
+// there, process.kill ends a process outright.
+const stoppedWhileBusy = (sig) => new Promise((resolve) => {
+  const tmp = mkdtempSync(join(tmpdir(), "reeve-teardown-"));
+  const script = `const { tempDir } = await import(${JSON.stringify(pathToFileURL(helper).href)});
+    tempDir("reeve-a-"); process.stdout.write("ready\\n");
+    const end = Date.now() + 20_000; while (Date.now() < end) {}`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script],
+    { env: { ...process.env, TMPDIR: tmp, TEMP: tmp, TMP: tmp }, stdio: ["ignore", "pipe", "ignore"] });
+  let sentAt = null;
+  child.stdout.on("data", (d) => { if (sentAt === null && String(d).includes("ready")) { sentAt = Date.now(); child.kill(sig); } });
+  child.on("exit", (status, signal) => {
+    rmSync(tmp, { recursive: true, force: true });
+    resolve({ sig, status, signal, ms: sentAt === null ? null : Date.now() - sentAt });
+  });
+});
 if (process.platform !== "win32") {
-  const stopped = ["SIGINT", "SIGTERM"].map((sig) => ({ sig, ...leftBy(`process.kill(process.pid, ${JSON.stringify(sig)}); setTimeout(() => {}, 20_000);`) }));
-  check(stopped.every(({ sig, signal, left }) => signal === sig && left.length === 0),
-    "and once SIGINT or SIGTERM stops it, which it still ends by", JSON.stringify(stopped));
+  const stopped = [await stoppedWhileBusy("SIGTERM"), await stoppedWhileBusy("SIGINT")];
+  check(stopped.every(({ sig, signal, ms }) => signal === sig && ms !== null && ms < 5_000),
+    "a test busy in synchronous code is ended at once by SIGTERM or SIGINT, and by that signal", JSON.stringify(stopped));
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

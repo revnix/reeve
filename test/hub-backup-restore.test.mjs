@@ -12,6 +12,7 @@ import { readFileSync } from "node:fs";                      // reads the durabl
 import { openHub, HUB_SCHEMA_VERSION, HUB_TABLES } from "../src/build/hubdb.mjs";
 import { hubPathFor } from "../src/paths.mjs";
 import { DatabaseSync } from "node:sqlite";
+import { tempDir } from "./fixtures/temp.mjs";
 // `statSync` reads the inode, which is what tells `link` and `rename` apart.
 // `chmodSync` is the atomic-export drill's: a read-only destination directory
 // is how a write failure is arranged where it cannot happen by accident.
@@ -293,7 +294,6 @@ import { grantLease } from "../src/build/territory.mjs";
 import { copyFileSync, openSync, writeSync, closeSync } from "node:fs";
 import { acquireSingleton, withWriterLease, acquireMaintenanceLock } from "../src/build/locks.mjs";
 import { createHash } from "node:crypto";
-import { tempDir } from "./fixtures/temp.mjs";
 
 // The durable-tail format, written and read EXACTLY as `reeve export-events
 // --hub` and `reeve restore --hub --tail` do it. A fixture that invents its own

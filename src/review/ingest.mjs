@@ -1,3 +1,4 @@
+// @ts-check
 // review/ingest — raw review observations, landed append-only.
 //
 // This is the WRITE half of review ingest. It fetches what reviewers actually

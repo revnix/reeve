@@ -116,6 +116,7 @@ next:
 | Run every test file and list all failures (exits non-zero if any fail) | `( fail=0; for f in test/*.test.mjs; do case "$f" in */escape.test.mjs) continue;; esac; node "$f" >/dev/null \|\| { echo "FAILED $f"; fail=1; }; done; exit $fail )` |
 | The containment escape probe (run deliberately, on a quiet machine) | `npm run test:escape` |
 | Lint | `npm run lint` |
+| Type-check every file marked `// @ts-check` | `npm run typecheck` |
 | Check one stub-sweep entry (the full sweep runs nightly in CI) | `STUB_SWEEP_NO_DIFF=1 node scripts/stub-sweep.mjs <entry-name>` |
 
 **Why the escape probe is left out of the routine commands:** it writes decoy
@@ -124,3 +125,14 @@ macOS it probes the login keychain. CI still runs it, because CI runs on a
 clean runner.
 
 CI runs the tests twice: under `TZ=UTC` and under `TZ=Asia/Karachi`.
+
+## Types
+
+- A file is type-checked once it starts with `// @ts-check`. The core verdict
+  and evidence modules are, and `test/typecheck.test.mjs` names them. When you
+  change a file that checks clean with the line added, add it.
+- The check isn't strict yet: an untyped parameter is allowed. Where an
+  inferred type is wrong, give the right one in a JSDoc comment rather than
+  turning the check off.
+- A new module may be `.ts`, using only syntax Node can strip, so no `enum` or
+  `namespace`. Lint doesn't read `.ts` files yet.

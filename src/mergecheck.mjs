@@ -1,3 +1,4 @@
+// @ts-check
 // Is a merged pull request's content still on main?
 //
 // WHAT THIS COMPARES, AND WHY IT CHANGED. The first version compared main

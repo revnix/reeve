@@ -12,9 +12,10 @@
 //               the line. A hole that is written down as a hole cannot be
 //               forgotten; a hole that a green suite cannot see can.
 //
-// The sandboxed section is mandatory on macOS, the only measured platform
-// (docs/measured/2026-08-22-claude-print-mode.md); elsewhere it is SKIPPED
-// with a count, never silently green. The daemon's own canary (canary.mjs)
+// The sandboxed section is mandatory on macOS and Linux, the measured platforms
+// (docs/measured/2026-08-22-claude-print-mode.md,
+// docs/measured/2026-09-25-linux-wsl-sandbox.md); elsewhere it is SKIPPED with
+// a count, never silently green. The daemon's own canary (canary.mjs)
 // is the runtime proof under the real CLI; this file is the development-time
 // proof under the runtime, and both read files, never a worker's word.
 //
@@ -26,7 +27,7 @@ import { probeKeychain } from "../src/containment.mjs";
 import { netListener } from "../src/canary.mjs";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { tempDir } from "./fixtures/temp.mjs";
@@ -130,10 +131,14 @@ console.log("── under the OS sandbox (the runtime's own profile, via srt)");
 let srt = null;
 try { srt = join(dirname(createRequire(import.meta.url).resolve("@anthropic-ai/sandbox-runtime")), "cli.js"); } catch { srt = null; }
 
-if (process.platform !== "darwin") {
-  skip("every sandboxed shape", `the OS sandbox is measured on macOS only; this is ${process.platform}`);
+// On Linux the runtime is bubblewrap, with socat relaying to its network proxy.
+const linuxDeps = process.platform === "linux" ? ["bwrap", "socat"].filter(b => sh(root, "sh", ["-c", `command -v ${b}`]).status !== 0) : [];
+if (!["darwin", "linux"].includes(process.platform)) {
+  skip("every sandboxed shape", `the OS sandbox is measured on macOS and Linux only; this is ${process.platform}`);
 } else if (!srt || !existsSync(srt)) {
-  check(false, "the sandbox runtime is installed (npm install; it is a devDependency, and on macOS the sandboxed shapes are mandatory)", "srt not resolvable");
+  check(false, "the sandbox runtime is installed (npm install; it is a devDependency, and on macOS and Linux the sandboxed shapes are mandatory)", "srt not resolvable");
+} else if (linuxDeps.length) {
+  check(false, "the sandbox's Linux dependencies are installed: bubblewrap and socat (apt install bubblewrap socat)", `missing: ${linuxDeps.join(", ")}`);
 } else {
   // The block every worker gets, turned into the runtime's own settings
   // shape. The CLI adds cwd to the write scope implicitly; srt adds nothing,
@@ -147,10 +152,13 @@ if (process.platform !== "darwin") {
   const policyFor = (profile, worktree) => sandboxFor({ profile, action: "FIX_CI", worktree, tmpDir }).settings.sandbox;
   const policy = policyFor({ units: [] }, wt.path);
   const policyStandalone = policyFor({ units: [], identity: { checkout: clone } }, standalone);
-  const settingsFor = (cwd, extraWrite = [], pol = policy) => {
-    const p = join(root, `srt-${extraWrite.length ? "wide" : "cwd"}-${cwd.split("/").pop()}.json`);
+  // `sockets` turns the runtime's seccomp filter off, as on a Linux host where it
+  // can't be applied: then only the deny list keeps the host's sockets closed.
+  const settingsFor = (cwd, extraWrite = [], pol = policy, { sockets = false } = {}) => {
+    const p = join(root, `srt-${extraWrite.length ? "wide" : "cwd"}-${sockets ? "sockets-" : ""}${cwd.split("/").pop()}.json`);
     writeFileSync(p, JSON.stringify({
-      network: { allowedDomains: pol.network.allowedDomains, deniedDomains: [], allowUnixSockets: [], allowLocalBinding: false },
+      network: { allowedDomains: pol.network.allowedDomains, deniedDomains: [], allowUnixSockets: [], allowLocalBinding: false,
+                 ...(sockets ? { allowAllUnixSockets: true } : {}) },
       filesystem: { allowWrite: [cwd, tmpDir, ...extraWrite], denyWrite: [], allowRead: [tmpDir], denyRead: [...pol.filesystem.denyRead, fileDecoy] },
     }));
     return p;
@@ -186,6 +194,19 @@ if (process.platform !== "darwin") {
   // account is metadata, not the secret (no -w/-g); read it so the probe
   // reproduces the hole on any host without a username baked into this file.
   const acct = (() => { const r = sh(root, "security", ["find-internet-password", "-s", "github.com"]); const m = /"acct"<blob>="([^"]+)"/.exec(r.stdout ?? ""); return m ? m[1] : null; })();
+  // Linux's ways out of the sandbox (#156). A file under /mnt, where WSL keeps
+  // the Windows drives and a hosted runner its scratch disk; a decoy in gh's
+  // config directory, where gh keeps its token without a keyring; and, on WSL, a
+  // Windows binary committed to the worktree, which interop would run OUTSIDE.
+  const mntFile = process.platform !== "linux" ? null
+    : ["/mnt/c/Windows/System32/drivers/etc/hosts", "/mnt/DATALOSS_WARNING_README.txt"].find(f => sh(root, "test", ["-r", f]).status === 0)
+      ?? (sh(root, "sh", ["-c", "find /mnt -maxdepth 3 -type f -readable -print -quit 2>/dev/null"]).stdout.trim() || null);
+  const ghDecoy = join(homedir(), ".config", "gh", `reeve-escape-decoy-${process.pid}`);
+  mkdirSync(dirname(ghDecoy), { recursive: true }); writeFileSync(ghDecoy, "decoy\n");
+  const windowsExe = "/mnt/c/Windows/System32/cmd.exe";
+  // Once per folder: the copy keeps the Windows file's read-only mode.
+  const plant = (cwd) => { if (process.platform === "linux" && existsSync(windowsExe) && !existsSync(join(cwd, "committed.exe"))) copyFileSync(windowsExe, join(cwd, "committed.exe")); };
+  const uid = process.getuid?.();
   const script = (cwd) => `#!/bin/sh
 out="./probe-results.txt"; : > "$out"
 rec() { echo "$1=$2" >> "$out"; }
@@ -213,11 +234,18 @@ cat ${JSON.stringify(fileDecoy)} >/dev/null 2>&1; rec file_decoy $?
 cat ${JSON.stringify(fileControl)} >/dev/null 2>&1; rec file_control $?
 cat ${JSON.stringify(founderWip)} >/dev/null 2>&1; rec founder_wip $?
 cat ${JSON.stringify(founderEnv)} >/dev/null 2>&1; rec founder_env $?
+cat ${JSON.stringify(mntFile ?? "/nonexistent")} >/dev/null 2>&1; rec mnt_file $?
+./committed.exe /c exit 0 >/dev/null 2>&1 </dev/null; rec interop $?
+[ -n "$(ls -A /run/WSL 2>/dev/null)" ]; rec run_wsl $?
+socat -u OPEN:/dev/null UNIX-CONNECT:/run/user/${uid}/bus >/dev/null 2>&1; rec session_bus $?
+socat -u OPEN:/dev/null UNIX-CONNECT:/run/dbus/system_bus_socket >/dev/null 2>&1; rec system_bus $?
+cat ${JSON.stringify(ghDecoy)} >/dev/null 2>&1; rec gh_decoy $?
+${JSON.stringify(process.execPath)} -e 'require("net").createServer().listen("./probe.sock", function () { this.close(); })' >/dev/null 2>&1; rec new_socket $?
 `;
   const runProbe = (cwd, settings) => {
-    for (const f of ["probe-results.txt", "INSIDE", "curl-body", "decoy-copy", "decoy-copy2", "decoy-link"]) rmSync(join(cwd, f), { force: true });
+    for (const f of ["probe-results.txt", "INSIDE", "curl-body", "decoy-copy", "decoy-copy2", "decoy-link", "probe.sock"]) rmSync(join(cwd, f), { force: true });
     rmSync(join(tmpDir, "TMP"), { force: true }); rmSync(join(outside, "OUTSIDE"), { force: true });
-    writeFileSync(join(cwd, "probe.sh"), script(cwd));
+    writeFileSync(join(cwd, "probe.sh"), script(cwd)); plant(cwd);
     const r = spawnSync(process.execPath, [srt, "-s", settings, "--", "sh", "./probe.sh"], { cwd, env, encoding: "utf8" });
     const results = {};
     if (existsSync(join(cwd, "probe-results.txt")))
@@ -225,13 +253,17 @@ cat ${JSON.stringify(founderEnv)} >/dev/null 2>&1; rec founder_env $?
     return { results, stderr: r.stderr ?? "", status: r.status };
   };
   const keychain = probeKeychain();
+  // What the unsandboxed probe reached: a Linux shape is judged only where the
+  // host has it, and skipped with a count where it doesn't.
+  const control = {};
 
   // ── control: the probe, unsandboxed, exhibits the open shapes ───────────
   {
     const ctl = join(root, "control"); git(root, "clone", "-q", origin, ctl); git(ctl, "checkout", "-q", "feature");
-    writeFileSync(join(ctl, "probe.sh"), script(ctl));
+    writeFileSync(join(ctl, "probe.sh"), script(ctl)); plant(ctl);
     sh(ctl, "sh", ["./probe.sh"], env);
     const res = {}; for (const line of readFileSync(join(ctl, "probe-results.txt"), "utf8").split("\n")) { const m = /^(\w+)=(-?\d+)$/.exec(line); if (m) res[m[1]] = Number(m[2]); }
+    Object.assign(control, res);
     check(res.outside === 0 && res.noverify === 0 && res.decoy === 0 && existsSync(join(outside, "OUTSIDE")) && refsAt(dest).includes("escape-noverify"),
       "control: unsandboxed, the probe writes outside, pushes with --no-verify and reads the decoy", JSON.stringify(res));
     check(res.curl === 0 || res.curl === 6 || res.curl === 7 || res.curl === 28, "control: unsandboxed, curl reaches the network or fails only for want of it", `curl=${res.curl}`);
@@ -307,6 +339,33 @@ cat ${JSON.stringify(founderEnv)} >/dev/null 2>&1; rec founder_env $?
     }
   }
 
+  // ── Linux: the host's own ways out (#156) ────────────────────────────────
+  //
+  // Measured on WSL2 (docs/measured/2026-09-25-linux-wsl-sandbox.md). The
+  // runtime's seccomp filter, which blocks new Unix sockets, closes interop and
+  // D-Bus by itself; the deny list must close them where it can't be applied,
+  // so each socket shape is judged with the filter off too. Nothing closes a
+  // file read under /mnt but the deny list.
+  if (process.platform === "linux") {
+    const { results: r } = runProbe(standalone, settingsFor(standalone, [], policyStandalone));
+    const { results: o } = runProbe(standalone, settingsFor(standalone, [], policyStandalone, { sockets: true }));
+    const on = (k, name, why, test) => (control[k] === 0 ? check(test(), name, JSON.stringify({ [k]: control[k], filterOn: r[k], filterOff: o[k] })) : skip(name, why));
+    check("inside" in o && o.inside === 0 && r.new_socket !== 0 && o.new_socket === 0,
+      "control: the socket filter is on in the worker's policy, and off in the second run, whose script still ran",
+      JSON.stringify({ filterOn: r.new_socket, filterOff: o.new_socket, ran: o.inside }));
+    on("mnt_file", "HELD: a file under /mnt is unreadable, with or without the socket filter", "nothing readable under /mnt on this host",
+       () => r.mnt_file !== 0 && o.mnt_file !== 0);
+    on("gh_decoy", "HELD: gh's config directory is unreadable, where gh keeps its token without a keyring", "the decoy wasn't readable unsandboxed",
+       () => r.gh_decoy !== 0);
+    on("system_bus", "HELD: the system bus is out of reach, with or without the socket filter", "no system bus on this host",
+       () => r.system_bus !== 0 && o.system_bus !== 0);
+    on("session_bus", "HELD: the session bus, and the Secret Service behind it, is out of reach, with or without the socket filter", "no session bus on this host",
+       () => r.session_bus !== 0 && o.session_bus !== 0);
+    on("run_wsl", "HELD: WSL's interop sockets are hidden", "not WSL", () => r.run_wsl !== 0 && o.run_wsl !== 0);
+    on("interop", "HELD: a Windows binary committed to the worktree cannot run, with or without the socket filter", "not WSL",
+       () => r.interop !== 0 && o.interop !== 0);
+  }
+
   // ── a standalone clone: the topology PR-2b moves workers to ──────────────
   {
     const { results: r } = runProbe(standalone, settingsFor(standalone, [], policyStandalone));
@@ -326,7 +385,7 @@ cat ${JSON.stringify(founderEnv)} >/dev/null 2>&1; rec founder_env $?
       `wip=${r.founder_wip} env=${r.founder_env}`);
   }
 
-  rmSync(decoy, { force: true }); rmSync(deniedCfg, { force: true }); rmSync(xdgDecoy, { force: true }); listener.close();
+  rmSync(decoy, { force: true }); rmSync(deniedCfg, { force: true }); rmSync(xdgDecoy, { force: true }); rmSync(ghDecoy, { force: true }); listener.close();
 }
 
 // ── the declaration the env alone makes must still say what it measured ──────

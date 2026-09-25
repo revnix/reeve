@@ -77,6 +77,19 @@ jobs:
       - name: Install
         run: npm ci
 
+      # The worker sandbox on Linux is bubblewrap, with socat relaying to its
+      # network proxy, and the escape probe runs its sandboxed shapes under it
+      # (#156). Ubuntu 24.04 strips the capabilities of an unprivileged user
+      # namespace, which bubblewrap needs, unless this restriction is off.
+      - name: Install the sandbox's Linux dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap socat
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       # BEFORE the suite, because it is seconds against minutes and its failures are
       # about code that should not have been written rather than behaviour that broke.
       # A reader who sees the suite fail first will look for a behavioural cause.

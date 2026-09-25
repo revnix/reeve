@@ -3268,8 +3268,8 @@ export const STUBS = [
     test: "test/process-identity.test.mjs",
     expectRed: "a process's identity is the same in every timezone",
     edits: [{ file: "src/supervisor.mjs",
-              find: "  const utc = psStart(pid, { ...process.env, ...PINNED });",
-              replace: "  const utc = psStart(pid, process.env);" }],
+              find: "  return psStart(pid, { ...process.env, ...PINNED });",
+              replace: "  return psStart(pid, process.env);" }],
   },
   {
     name: "process-identity-old-tokens-still-match",
@@ -3290,15 +3290,6 @@ export const STUBS = [
               replace: "  return Math.abs(diff) <= 14 * 3600000;" }],
   },
   {
-    name: "process-identity-current-tokens-match-exactly",
-    why: "read current tokens with the old-token tolerance too. A current token that differs by a real offset then names a stranger as the recorded process, for as long as the record lives, not only while old records drain",
-    test: "test/process-identity.test.mjs",
-    expectRed: "a current token that differs names a different process, whatever the difference",
-    edits: [{ file: "src/supervisor.mjs",
-              find: '  if (typeof storedStart !== "string" || storedStart.endsWith(CURRENT)) return false;',
-              replace: '  if (typeof storedStart !== "string") return false;' }],
-  },
-  {
     name: "process-identity-fixed-offset-zones",
     why: "take offsets only from supportedValuesOf, which leaves out the fixed-offset zones. A token recorded under Etc/GMT+12 then has an offset no listed zone uses, and its live process looks dead",
     test: "test/process-identity.test.mjs",
@@ -3315,5 +3306,14 @@ export const STUBS = [
     edits: [{ file: "src/supervisor.mjs",
               find: "  if (psStart(pid, process.env) === storedStart) return true;\n",
               replace: "" }],
+  },
+  {
+    name: "process-identity-format-unchanged",
+    why: "change the token's format, here by marking it with a suffix. A process still running an earlier version compares tokens as strings, reads every new token as a dead process, and may reap a live lock",
+    test: "test/process-identity.test.mjs",
+    expectRed: "a token is exactly ps's lstart in UTC and the C locale, the format earlier versions write and compare",
+    edits: [{ file: "src/supervisor.mjs",
+              find: "  return psStart(pid, { ...process.env, ...PINNED });",
+              replace: "  const utc = psStart(pid, { ...process.env, ...PINNED });\n  return utc === null ? null : `${utc} UTC`;" }],
   },
 ];

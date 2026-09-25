@@ -35,13 +35,20 @@ check(typeof utc.token === "string" && utc.token.length > 0, "control: a live pr
 check(utc.token === karachi.token && utc.token === newYork.token,
   "a process's identity is the same in every timezone", JSON.stringify({ utc, karachi, newYork }));
 
-// Read from another timezone, the token is still the start time in UTC, and
-// says so.
+// Read from another timezone, the token is still the start time in UTC.
 const startedAt = Date.now() - process.uptime() * 1000;
-const parsed = Date.parse(karachi.token);
-check(Number.isFinite(parsed) && Math.abs(parsed - startedAt) < 3000 && karachi.token.endsWith(" UTC"),
+const parsed = Date.parse(`${karachi.token} UTC`);
+check(Number.isFinite(parsed) && Math.abs(parsed - startedAt) < 3000,
   "the token is the start time in UTC, even when read from another timezone",
   `read ${karachi.token}; started ${new Date(startedAt).toISOString()}`);
+
+// And it is exactly ps's lstart in UTC and the C locale, which is what earlier
+// versions write and compare as strings. A process still running one of them
+// would read any other format as a dead process, and might reap its lock.
+const plain = execFileSync("ps", ["-o", "lstart=", "-p", String(me)],
+  { encoding: "utf8", env: { ...process.env, TZ: "UTC", LC_ALL: "C" } }).trim();
+check(utc.token === plain, "a token is exactly ps's lstart in UTC and the C locale, the format earlier versions write and compare",
+  `${utc.token} / ${plain}`);
 
 // A token recorded before the pin is what ps printed in the recorder's own
 // timezone. After an upgrade it must still identify its process, or every live
@@ -84,8 +91,11 @@ check(readAs(ODD.TZ, me, beforeOdd, ODD).same === true,
     else {
       const RU = { TZ: "Europe/Moscow", LC_ALL: "ru_RU.UTF-8", LOCPATH: locales };
       const beforeRu = execFileSync("ps", ["-o", "lstart=", "-p", String(me)], { encoding: "utf8", env: { ...process.env, ...RU } }).trim();
-      check(Number.isNaN(Date.parse(`${beforeRu} UTC`)), "control: in that locale, lstart is a string no date parser reads", beforeRu);
-      check(readAs(RU.TZ, me, beforeRu, RU).same === true, name, beforeRu);
+      // Some builds of ps print English whatever the locale, and then the case
+      // can't be exercised here: a string the parser reads proves nothing about
+      // one it can't.
+      if (!Number.isNaN(Date.parse(`${beforeRu} UTC`))) console.log(`SKIP  ${name} (ps printed ${JSON.stringify(beforeRu)} under ru_RU here, which a date parser reads)`);
+      else check(readAs(RU.TZ, me, beforeRu, RU).same === true, name, beforeRu);
     }
   } finally { rmSync(locales, { recursive: true, force: true }); }
 }
@@ -96,16 +106,11 @@ const LSTART = (ms) => {
   return `${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getUTCDay()]} ${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][d.getUTCMonth()]} ` +
     `${String(d.getUTCDate()).padStart(2, " ")} ${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}:${p2(d.getUTCSeconds())} ${d.getUTCFullYear()}`;
 };
-const trueStart = Date.parse(utc.token);
+const trueStart = Date.parse(`${utc.token} UTC`);
 // An old token must be off by a real timezone's offset, to the second.
 const offByOddAmount = LSTART(trueStart + (2 * 3600 + 17 * 60 + 13) * 1000);
 check(readAs("Asia/Karachi", me, offByOddAmount).same === false,
   "an old token off by anything but a real timezone's offset names a different process", offByOddAmount);
-// A current token carries " UTC" and must match exactly. Five hours off is a
-// real offset, and still a different process.
-const currentButShifted = `${LSTART(trueStart + 5 * 3600 * 1000)} UTC`;
-check(readAs("Asia/Karachi", me, currentButShifted).same === false,
-  "a current token that differs names a different process, whatever the difference", currentButShifted);
 check(readAs("Asia/Karachi", me, "Thu Jan  1 00:00:00 1970").same === false,
   "control: a stale token is not the same process");
 check(readStart(999999) === null, "control: a pid that isn't running has no token");

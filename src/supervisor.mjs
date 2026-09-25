@@ -40,9 +40,10 @@ export const OUTCOMES = {
 // under TZ=UTC and under TZ=Asia/Karachi gave two different tokens, and a CLI run
 // in another timezone called a live daemon dead and suggested --takeover. The
 // token is read pinned to UTC and the C locale, so every caller gets the same
-// one, and it ends in " UTC": that says what it is, and it marks it as current.
+// one. Its format is exactly what the pin first wrote, and must stay so: a
+// process still running an earlier version compares tokens as strings, and a
+// changed format reads to it as a dead process, whose lock it may then reap.
 const PINNED = { TZ: "UTC", LC_ALL: "C" };
-const CURRENT = " UTC";
 
 function psStart(pid, env) {
   // stderr is piped, not inherited: ps writes "process id too large" for an
@@ -53,8 +54,7 @@ function psStart(pid, env) {
 
 /** Identity token for a pid. Non-zero exit means dead; a differing string means reused. */
 export function readStart(pid) {
-  const utc = psStart(pid, { ...process.env, ...PINNED });
-  return utc === null ? null : `${utc}${CURRENT}`;
+  return psStart(pid, { ...process.env, ...PINNED });
 }
 
 // The UTC offsets, in minutes, that real timezones use at an instant. Cached by
@@ -90,7 +90,7 @@ function offsetsInUseAt(ms) {
  * and those stop existing as the leases and runs recorded before the upgrade end.
  */
 export function oldTokenNames(stored, current) {
-  const start = Date.parse(current);
+  const start = Date.parse(`${current} UTC`);
   const wall = Date.parse(`${stored} UTC`);
   if (!Number.isFinite(start) || !Number.isFinite(wall)) return false;
   const diff = wall - start;
@@ -121,12 +121,12 @@ export function isSameProcess(pid, storedStart) {
   const now = readStart(pid);
   if (now === null) return false;
   if (now === storedStart) return true;
-  // A current token that differs names a different process. The looser readings
-  // below are for tokens recorded before the pin, and only for them.
-  if (typeof storedStart !== "string" || storedStart.endsWith(CURRENT)) return false;
-  // Otherwise the upgrade would make every live daemon and worker look dead at
-  // once, which invites a takeover or a second worker on the same task. Remove
-  // once no stored record predates the pin.
+  if (typeof storedStart !== "string") return false;
+  // A token recorded before the pin was written in its recorder's timezone and
+  // locale. Without the readings below, the upgrade would make every live daemon
+  // and worker look dead at once, which invites a takeover or a second worker on
+  // the same task. Each can only turn "dead" into "alive", the safe direction: at
+  // worst a dead holder is reaped later. Remove once no record predates the pin.
   //
   // First read it the way it was recorded. A caller that kept the recorder's
   // timezone and locale gets the same string, whatever that locale spells: under

@@ -133,6 +133,14 @@ const partsOf = (base, threads, rows = []) => readMergeParts("o/r", `base-${++ba
     && state["ci/lint"] === "missing" && state["ci/bound-status"] === "unknown" && !("ops/merge-policy" in state),
     "each other required check is read at the head: passing, failing, running, never reported, or run by an App other than the one it's bound to",
     JSON.stringify(parts.others));
+  // One name reported twice, as a status and as a check run: GitHub holds the
+  // merge for either, so both must pass.
+  const both = (status, run, runState = "completed") => partsOf(baseOf({ rules: [OWN, { type: "required_status_checks", parameters: { required_status_checks: [{ context: "ci/e2e" }] } }] }), {}, [
+    { name: "ci/e2e", source: "status", state: "completed", conclusion: status },
+    { name: "ci/e2e", source: "check_run", state: runState, conclusion: run, appId: "15368" }]).others?.[0]?.state;
+  check(both("success", "failure") === "failing" && both("failure", "success") === "failing" && both("success", null, "running") === "running"
+    && both("success", "success") === "passing",
+    "a check reported both as a status and as a check run passes only when both do", JSON.stringify([both("success", "failure"), both("failure", "success"), both("success", null, "running"), both("success", "success")]));
 }
 {
   const rules = [OWN, { type: "deletion" }, { type: "non_fast_forward" }, { type: "creation" }, { type: "required_linear_history" },

@@ -122,16 +122,18 @@ const PASSING_RUN = new Set(["success", "neutral", "skipped"]);
 /**
  * A required check's state among a head's check runs and statuses. One bound to
  * an App is met only by that App's run; a commit status names no App reeve can
- * read, so one standing in for a bound check is unknown.
+ * read, so one standing in for a bound check is unknown. Every result under the
+ * name must pass, since GitHub holds the merge for any of them: a passing status
+ * beside a failing check run of the same name is failing.
  */
 function requiredCheckState(rows, { context, app }) {
   const named = rows.filter((r) => r?.name === context);
   const candidates = app == null ? named : named.filter((r) => r.source === "check_run" && String(r.appId) === app);
-  const passes = (r) => r.state === "completed" && (r.source === "status" ? r.conclusion === "success" : PASSING_RUN.has(r.conclusion));
-  if (candidates.some(passes)) return "passing";
+  const passes = (r) => r.source === "status" ? r.conclusion === "success" : PASSING_RUN.has(r.conclusion);
+  if (!candidates.length) return app != null && named.some((r) => r.source !== "check_run") ? "unknown" : "missing";
+  if (candidates.some((r) => r.state === "completed" && !passes(r))) return "failing";
   if (candidates.some((r) => r.state !== "completed")) return "running";
-  if (candidates.length) return "failing";
-  return app != null && named.some((r) => r.source !== "check_run") ? "unknown" : "missing";
+  return "passing";
 }
 
 /** reeve's own App id, from its credentials, or null when there are none. */
@@ -652,11 +654,14 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
 export const shadowContextOf = (context) => `${context} (shadow)`;
 
 /**
- * The latest check run at this head under each name, read in one pass, as
- * `{ [name]: { id, conclusion, app } | null }`, or null when the runs couldn't be
- * read. Read as the App, because a run the App created is one it may update.
- * A failure to look is not "there are none": returning null then creates a
- * duplicate rather than losing anything, which is the harmless direction.
+ * reeve's own latest check run at this head under each name, read in one pass,
+ * as `{ [name]: { id, conclusion, app } | null }`, or null when the runs couldn't
+ * be read. Read as the App, because a run the App created is one it may update.
+ * Only the App's own runs count: another App's run under the same name is one
+ * reeve may not update, and taking it for reeve's own left reeve's passing run
+ * under the enforcement name standing. A failure to look is not "there are
+ * none": returning null then creates a duplicate rather than losing anything,
+ * which is the harmless direction.
  */
 function existingRuns(token, nwo, sha, names, api = apiAsInstallation) {
   const r = api(token, ["--paginate", `repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=latest`,
@@ -664,7 +669,7 @@ function existingRuns(token, nwo, sha, names, api = apiAsInstallation) {
   if (!r.ok) return null;
   const rows = [];
   for (const line of (r.out ?? "").split("\n").filter(Boolean)) { try { rows.push(JSON.parse(line)); } catch { return null; } }
-  return Object.fromEntries(names.map((n) => [n, rows.filter((c) => c.name === n).at(-1) ?? null]));
+  return Object.fromEntries(names.map((n) => [n, rows.filter((c) => c.name === n && c.app === POLICY_APP).at(-1) ?? null]));
 }
 
 // Rule types that can't stop a pull request merging into a branch that already
@@ -853,9 +858,11 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = "o
     }
     const required = base ? requiredOnBase({ nwo, base, context, gh: (args) => api(auth.token, args), appId: auth.appId ?? null }) : null;
     // Required, the check isn't blocked while that result stands: it passes, and
-    // the pull request can merge unjudged. That is for a person to know now.
+    // the pull request can merge unjudged. That is for a person to know now, and
+    // so is a head whose runs couldn't be read to rule it out: "every pull
+    // request is blocked" would say the opposite of what may be true.
     if (required === true)
-      held = left && stale ? `a rule requires ${context} on ${base}, and ${left}, so pull request head ${verdict.head.slice(0, 8)} can pass that check unjudged`
+      held = left ? `a rule requires ${context} on ${base}, and ${left}, so pull request head ${verdict.head.slice(0, 8)} ${stale ? "can" : "may"} pass that check unjudged`
         : `a rule requires ${context} on ${base}, and reeve publishes it only when enforcing, so every pull request there is blocked until it enforces or the rule stops requiring it`;
   }
   const id = JSON.parse(res.out).id;

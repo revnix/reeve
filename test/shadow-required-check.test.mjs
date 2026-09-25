@@ -85,8 +85,28 @@ const publish = (gh, over = {}) => publishVerdict({ nwo: NWO, verdict, shadow: t
   const x = await publish(exposed);
   check(/can pass that check unjudged/.test(x.held ?? ""),
     "with a rule requiring the check, a passing result that can't be superseded is held as a pull request that can merge unjudged", JSON.stringify(x));
+  // Runs that couldn't be read can't rule such a result out, and "every pull
+  // request is blocked" would say the opposite of what may be true.
+  const unseen = await publish(github({ runs: { ok: false, err: "gh: HTTP 502" }, rules: rulesRequiring(CONTEXT, APP) }));
+  check(/may pass that check unjudged/.test(unseen.held ?? "") && !/every pull request there is blocked/.test(unseen.held ?? ""),
+    "and so is one whose runs couldn't be read to rule it out", JSON.stringify(unseen));
   const control = await publish(github({ runs: [{ name: CONTEXT, id: 5, conclusion: "neutral", app: "merge-policy" }] }));
   check(control.ok === true && control.superseded === true, "control: one that is superseded publishes cleanly", JSON.stringify(control));
+}
+{
+  // Another App's runs under the same names, listed after reeve's own. Only
+  // reeve's own are its to update or supersede.
+  const gh = github({ runs: [
+    { name: CONTEXT, id: 5, conclusion: "neutral", app: "merge-policy" },
+    { name: CONTEXT, id: 8, conclusion: "success", app: "someone-else" },
+    { name: shadowContextOf(CONTEXT), id: 9, conclusion: "neutral", app: "someone-else" },
+  ] });
+  const r = await publish(gh);
+  const touched = gh.writes.filter((w) => /\/check-runs\/(8|9)$/.test(w.path));
+  check(r.ok && touched.length === 0 && gh.writes.some((w) => w.verb === "POST" && w.name === shadowContextOf(CONTEXT))
+    && gh.writes.some((w) => w.verb === "PATCH" && w.path.endsWith("/check-runs/5") && w.conclusion === "cancelled"),
+    "another App's runs under the same names are never updated, and reeve's own passing result under the enforcement name is still superseded",
+    JSON.stringify(gh.writes));
 }
 {
   const other = github({ runs: [{ name: CONTEXT, id: 6, conclusion: "neutral", app: "someone-else" }] });

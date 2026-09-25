@@ -146,6 +146,36 @@ export function triagePullRequest(pr, me) {
   };
 }
 
+/**
+ * A pull request with its own lists read whole: the issues it will close, and
+ * the checks at its head. The query that reads the pull requests stops each at
+ * its first page, and a closing reference or a failing check on a later page
+ * would otherwise go unseen. `readPage(field, after)` returns the next page of
+ * `closing` or `contexts` as a connection. `partial` is true when a list still
+ * couldn't be read whole, so nothing is judged from part of one.
+ */
+export function completePullRequest(pr, readPage, limit = 20) {
+  const whole = (conn, field) => {
+    if (!conn?.pageInfo?.hasNextPage) return { conn, complete: true };
+    const nodes = [...conn.nodes];
+    let after = conn.pageInfo.endCursor;
+    for (let page = 0; page < limit; page++) {
+      const next = readPage(field, after);
+      nodes.push(...(next?.nodes ?? []));
+      if (!next?.pageInfo) break;
+      if (!next.pageInfo.hasNextPage) return { conn: { ...conn, nodes, pageInfo: next.pageInfo }, complete: true };
+      after = next.pageInfo.endCursor;
+    }
+    return { conn: { ...conn, nodes }, complete: false };
+  };
+  const closing = whole(pr.closingIssuesReferences, "closing");
+  const commit = pr.commits?.nodes?.[0]?.commit;
+  const contexts = whole(commit?.statusCheckRollup?.contexts, "contexts");
+  const commits = contexts.conn === commit?.statusCheckRollup?.contexts ? pr.commits
+    : { ...pr.commits, nodes: [{ ...pr.commits.nodes[0], commit: { ...commit, statusCheckRollup: { ...commit.statusCheckRollup, contexts: contexts.conn } } }] };
+  return { ...pr, closingIssuesReferences: closing.conn, commits, partial: !(closing.complete && contexts.complete) };
+}
+
 // The open pull requests that will close each issue. This reads the pull
 // requests' own closingIssuesReferences, which arrive in the same query as the
 // pull requests. So a task can't look ready just because a second query failed.

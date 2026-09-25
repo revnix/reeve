@@ -61,7 +61,8 @@ for (const it of items.nodes) {
 
 // ── the plan ─────────────────────────────────────────────────────────────────
 const { prs, issues, phases } = readPlan(repo);
-const partial = incompleteRead({ "pull requests": prs, "issues": issues, "board cards": items });
+const partial = incompleteRead({ "pull requests": prs, "pull requests' checks and closing issues": { complete: !prs.nodes.some((pr) => pr.partial) },
+                                "issues": issues, "board cards": items });
 if (partial) { console.error(`board: ${partial}`); process.exit(2); }
 
 const cardFor = (issue) => cards.get(issue.number)?.item ?? gql(`mutation($p:ID!,$c:ID!){

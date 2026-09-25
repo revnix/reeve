@@ -18,8 +18,8 @@
 
 import { detect } from "./profile/detect.mjs";
 import { validate, withDefaults } from "./profile/schema.mjs";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { resolveHome } from "./home.mjs";
 import { statePathFor, legacyStatePathFor, adoptLegacyStore } from "./paths.mjs";
 import { open } from "./db/ops.mjs";
@@ -324,11 +324,46 @@ export function ensureStore(home, nwo, { openStore = open, log = () => {} } = {}
     const used = adoptLegacyStore(status.path, status.legacy, { log: (m) => { said = m; log(m); } });
     return used === status.path
       ? { changed: true, line: `moved the state database to ${status.path}` }
-      : { changed: false, line: said ?? `could not move the legacy store; using ${used}` };
+      : { changed: false, failed: true, line: said ?? `could not move the legacy store; using ${used}` };
   }
-  mkdirSync(dirname(status.path), { recursive: true });
-  openStore(status.path).close();
+  // Built beside its final path and renamed into place only once it has closed.
+  // A store exists as soon as its file does, so an interrupted create would
+  // otherwise leave a half-made store that the next init reports as done.
+  const dir = dirname(status.path), stem = `${basename(status.path)}.init-`;
+  mkdirSync(dir, { recursive: true });
+  clearInterruptedCreates(dir, stem);
+  const tmp = join(dir, `${stem}${process.pid}`);
+  const clear = () => { for (const s of ["", "-wal", "-shm", "-journal"]) rmSync(tmp + s, { force: true }); };
+  try { openStore(tmp).close(); renameSync(tmp, status.path); }
+  catch (e) { clear(); return { changed: false, failed: true, line: `could not create the state database at ${status.path}: ${e.message}` }; }
+  clear();
   return { changed: true, line: `created the state database at ${status.path}` };
+}
+
+/** Remove what an init that stopped partway left behind, unless its process still runs. */
+function clearInterruptedCreates(dir, stem) {
+  const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+  for (const f of readdirSync(dir)) {
+    const m = f.startsWith(stem) ? /^(\d+)(?:-wal|-shm|-journal)?$/.exec(f.slice(stem.length)) : null;
+    if (m && !alive(Number(m[1]))) rmSync(join(dir, f), { force: true });
+  }
+}
+
+/**
+ * Write the profile if it changed, then make sure of the store. Exit 2 means
+ * written, and 1 means the store couldn't be made or moved: a caller that reads
+ * 2 as "applied" must not be told so while the database is missing.
+ */
+export function applyInit({ path, after, profileChanged, home, nwo, output, ensure = ensureStore }) {
+  let out = output;
+  if (profileChanged) {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, after);
+    out += `\n\nwrote ${path}`;
+  }
+  const made = ensure(home, nwo);
+  if (made.line) out += `${profileChanged ? "\n" : "\n\n"}${made.line}`;
+  return { code: made.failed ? 1 : 2, output: out };
 }
 
 /** The whole flow. `write` is false for a plan-only run. */
@@ -366,13 +401,5 @@ export function init({ root = process.cwd(), answers = {}, write = false, home =
     return { code: 2, output: output + plan + `\n\n-> reeve init --write   to apply`, path };
   }
 
-  let out = output;
-  if (profileChanged) {
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, after);
-    out += `\n\nwrote ${path}`;
-  }
-  const made = ensureStore(home, nwo);
-  if (made.line) out += `${profileChanged ? "\n" : "\n\n"}${made.line}`;
-  return { code: 2, output: out, path, profile };
+  return { ...applyInit({ path, after, profileChanged, home, nwo, output }), path, profile };
 }

@@ -138,12 +138,25 @@ export function runPathFor(home, taskId, { generation, phase, slice, attempt, st
  * fresh empty database beside it is how real history stops being read without
  * anything appearing to fail.
  */
-export function adoptLegacyStore(next, legacy, { log = (m) => console.error(`reeve: ${m}`) } = {}) {
+export function adoptLegacyStore(next, legacy, { log = (m) => console.error(`reeve: ${m}`), rename = renameSync } = {}) {
   try {
     if (!existsSync(next) && existsSync(legacy)) {
       mkdirSync(dirname(next), { recursive: true });
-      for (const suffix of ["", "-wal", "-shm"]) {
-        if (existsSync(legacy + suffix)) renameSync(legacy + suffix, next + suffix);
+      // The main file LAST. Every reader takes it for "the store exists", so
+      // moving it first and stopping before the -wal left a canonical store
+      // without its newest committed writes, stranded in a WAL at the old path.
+      // With the sidecars first, a stop anywhere leaves no main file at the new
+      // path, and the next run finishes the move.
+      const moved = [];
+      try {
+        for (const suffix of ["-wal", "-shm", ""]) {
+          if (existsSync(legacy + suffix)) { rename(legacy + suffix, next + suffix); moved.push(suffix); }
+        }
+      } catch (e) {
+        // Put back what moved, so the store isn't split across two paths.
+        const stranded = moved.reverse().filter((suffix) => { try { rename(next + suffix, legacy + suffix); return false; } catch { return true; } });
+        if (stranded.length) throw new Error(`${e.message}; and ${stranded.map((s) => next + s).join(", ")} could not be moved back`);
+        throw e;
       }
       log(`moved ${legacy} -> ${next}`);
     }
@@ -154,8 +167,10 @@ export function adoptLegacyStore(next, legacy, { log = (m) => console.error(`ree
 /**
  * What a command says when a repository has no state database. The step that
  * creates one is named only for the default path: init creates the store there,
- * not wherever --db points.
+ * not wherever --db points. init reads the repository from the directory it
+ * runs in, so the step names the checkout to run it from.
  */
-export function missingStoreMessage(dbPath, { initCreatesIt = true } = {}) {
-  return `no state database at ${dbPath}` + (initCreatesIt ? "\n-> reeve init --write   creates it" : "");
+export function missingStoreMessage(dbPath, { initCreatesIt = true, nwo = null } = {}) {
+  if (!initCreatesIt) return `no state database at ${dbPath}`;
+  return `no state database at ${dbPath}\n-> reeve init --write   creates it, run inside ${nwo ? `a checkout of ${nwo}` : "the repository's checkout"}`;
 }

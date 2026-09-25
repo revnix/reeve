@@ -263,6 +263,7 @@ export function computeVerdict(i) {
   if (!MS) add("mergeable", UNKNOWN, "mergeStateStatus not read");
   else if (MS === "CLEAN" || MS === "UNSTABLE") add("mergeable", PASS, MS);
   else if (MS === "UNKNOWN") add("mergeable", UNKNOWN, "GitHub is still computing mergeability");
+  else if (MS === "BLOCKED" && parts?.readable === false) add("mergeable", UNKNOWN, "mergeStateStatus BLOCKED, and GitHub reported an error reading its parts");
   else if (MS === "BLOCKED" && parts) {
     const review = parts.reviewDecision === "CHANGES_REQUESTED" || parts.reviewDecision === "REVIEW_REQUIRED";
     if (parts.mergeable === "CONFLICTING") add("mergeable", BLOCK, "mergeStateStatus BLOCKED: the branch conflicts with its base");

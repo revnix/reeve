@@ -59,25 +59,34 @@ check(mergeable({ mergeable: "UNKNOWN" }).state === UNKNOWN,
 {
   const calls = [];
   const gh = (args) => {
-    calls.push(args[0]);
-    if (args[0].includes("/rules/branches/")) return { ok: true, out: JSON.stringify([{ type: "required_status_checks",
-      parameters: { required_status_checks: [{ context: "ops/merge-policy", integration_id: 1 }] } }]) };
+    const path = args.find((a) => a.startsWith("repos/"));
+    calls.push(path);
+    if (path.includes("/rules/branches/")) return { ok: true, out: JSON.stringify({ type: "required_status_checks",
+      parameters: { required_status_checks: [{ context: "ops/merge-policy", integration_id: 1 }] } }) };
     return { ok: true, out: JSON.stringify({ protected: true, protection: { enabled: false, required_status_checks: { contexts: [], checks: [] } } }) };
   };
-  const parts = readMergeParts("o/r", "main", { mergeState: "BLOCKED", mergeable: "MERGEABLE", reviewDecision: "APPROVED" }, { gh });
+  const parts = readMergeParts("o/r", "parts-main", { mergeState: "BLOCKED", mergeable: "MERGEABLE", reviewDecision: "APPROVED" }, { gh, appId: "1" });
   check(parts.ownCheckRequired === true && parts.mergeable === "MERGEABLE" && parts.reviewDecision === "APPROVED"
-    && calls.some((c) => c.includes("/rules/branches/main")) && calls.some((c) => /\/branches\/main$/.test(c)),
+    && calls.some((c) => c.includes("/rules/branches/parts-main")) && calls.some((c) => /\/branches\/parts-main$/.test(c)),
     "when BLOCKED, the parts read whether reeve's check is required on the base, from its rules and its protection", JSON.stringify({ parts, calls }));
   calls.length = 0;
-  const clean = readMergeParts("o/r", "main", { mergeState: "CLEAN", mergeable: "MERGEABLE" }, { gh });
+  const clean = readMergeParts("o/r", "parts-clean", { mergeState: "CLEAN", mergeable: "MERGEABLE" }, { gh, appId: "1" });
   check(calls.length === 0 && clean.ownCheckRequired === null, "control: in any other state nothing more is read", JSON.stringify({ clean, calls }));
 }
 {
   const page = { data: { repository: { pullRequest: { mergeStateStatus: "BLOCKED", mergeable: "MERGEABLE", reviewDecision: "APPROVED",
     reviews: { totalCount: 1 }, reviewThreads: { totalCount: 0, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } } };
   const t = readThreads("o/r", 7, { gh: () => ({ ok: true, out: JSON.stringify(page) }) });
-  check(t.mergeState === "BLOCKED" && t.mergeable === "MERGEABLE" && t.reviewDecision === "APPROVED",
+  check(t.mergeState === "BLOCKED" && t.mergeable === "MERGEABLE" && t.reviewDecision === "APPROVED" && t.partsReadable === true,
     "the pull request's own read carries mergeable and the review decision", JSON.stringify(t));
+  // An HTTP 200 can carry an error for one field, which then reads as null, and a
+  // null review decision would read as "no review outstanding".
+  const partial = { ...page, errors: [{ message: "Something went wrong while executing your query.", path: ["repository", "pullRequest", "reviewDecision"] }] };
+  partial.data = { repository: { pullRequest: { ...page.data.repository.pullRequest, reviewDecision: null } } };
+  const e = readThreads("o/r", 7, { gh: () => ({ ok: true, out: JSON.stringify(partial) }) });
+  const parts = readMergeParts("o/r", "parts-partial", e, { gh: () => ({ ok: true, out: "[]" }), appId: "1" });
+  check(e.partsReadable === false && parts.readable === false && computeVerdict({ ...blocked({}), mergeParts: parts }).clauses.find((c) => c.id === "mergeable").state === UNKNOWN,
+    "a GraphQL error in the pull request's read makes its mergeability parts unknown, never a clear review", JSON.stringify({ partsReadable: e.partsReadable, parts }));
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

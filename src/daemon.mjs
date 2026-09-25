@@ -1978,12 +1978,12 @@ export async function tick(ctx) {
     // record silently decays to nothing.
     const pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict: e.verdict, shadow, base: e.baseRef });
     if (!pub.ok) log(logPath, `    could not publish: ${pub.why}`);
-    // Shadow mode found its own check required, or couldn't tell. It published a
-    // conclusion that doesn't pass rather than open the gate, and a person has to
-    // choose: enforce, or stop requiring the check. One escalation, not one per PR.
+    // A rule requires the enforcement check, which shadow mode never publishes,
+    // so every pull request on that branch is blocked. A person has to choose:
+    // enforce, or stop requiring the check. One escalation, not one per PR.
     else if (pub.held) {
-      log(logPath, `    shadow: published a conclusion that doesn't pass, because ${pub.held}`);
-      raise(`shadow mode can't publish a passing-neutral check: ${pub.held}`);
+      log(logPath, `    shadow: ${pub.held}`);
+      raise(`shadow mode: ${pub.held}`);
     }
 
     // A shared cause is one problem, not N. Four PRs blocked on a red base is a

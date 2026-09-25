@@ -201,6 +201,25 @@ const status = (name, state) => ({ name, conclusion: state, state: "completed", 
     JSON.stringify({ shadowed, ci, d }));
 }
 
+// A rule can bind the shadow check to one App, and then GitHub takes only that
+// App's run. Bound to another App, reeve's shadow result can't meet it, so
+// there's nothing to refuse: it's required like any other check, and that App's
+// run is what meets it. Unbound, bound to reeve's own App, or where reeve's App
+// can't be told, reeve's result could meet it, and it's refused (#214).
+{
+  const shadow = shadowContextOf(POLICY_CONTEXT);
+  const of = (app, appId) => requiredChecksOf({ nwo: "o/r", baseRef: "main", profile: {}, appId,
+    requirements: () => [{ context: shadow, app }, { context: "CI Gate", app: null }] });
+  const other = of("9999", "4242"), mine = of("4242", "4242"), untold = of("9999", null), unbound = of(null, "4242");
+  const missing = classify([run("CI Gate", "success")], other.required);
+  const met = classify([run("CI Gate", "success"), run(shadow, "success", { appId: "9999" })], other.required);
+  check(other.shadowRequired === false && other.required.some((c) => c.context === shadow && c.app === "9999" && c.origin === "base")
+    && missing.verdict === "MISSING_REQUIRED" && met.verdict === "GREEN"
+    && [mine, untold, unbound].every((r) => r.shadowRequired === true && !r.required.some((c) => c.context === shadow)),
+    "a shadow check bound to another App is required like any other, and one reeve's result could meet is refused",
+    JSON.stringify({ other, mine, untold, unbound, missing: missing.verdict, met: met.verdict }));
+}
+
 // The base's required checks are read from its rules and branch alone, and kept
 // for a minute, so a token without the admin-only protection read still has
 // them, without reading them again on every tick.

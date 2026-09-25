@@ -116,6 +116,15 @@ export function readMergeParts(nwo, baseRef, threads, { gh = ghJson, context = P
   return parts;
 }
 
+/**
+ * The head's check rows for judging the base's other required checks: CI, the
+ * reviewers' statuses, and other Apps' runs under reeve's name, since a
+ * required check is met by whichever carries its name. Null unless both check
+ * runs and statuses were read in full: every result under a name must pass, and
+ * a failing one on a surface that went unread would leave the rest passing.
+ */
+export const mergeRows = (read) => (read?.whole ? [...read.rows, ...read.reviewerRows, ...read.impostors] : null);
+
 // What passes a required check, as GitHub counts it.
 const PASSING_RUN = new Set(["success", "neutral", "skipped"]);
 
@@ -618,9 +627,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     bodyFindings: facts.bodyFindings, unreadableBodies: facts.unreadableBodies,
     ledgerBlockers,
     mergeState: threads.mergeState, profile,
-    // A required check is met by whichever row carries its name: a reviewer's
-    // status, or another App's run under reeve's name, as well as CI.
-    mergeParts: readMergeParts(nwo, baseRef, threads, { rows: read.ok ? [...rows, ...read.reviewerRows, ...read.impostors] : null }),
+    mergeParts: readMergeParts(nwo, baseRef, threads, { rows: mergeRows(read) }),
     // Passed through, never read here. `pr_hold` is a HUB row and this function
     // holds the per-repository state database, so the reading is taken by the
     // caller that has the hub connection and handed in. Null when the caller has

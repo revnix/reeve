@@ -5,11 +5,11 @@
 // GitHub BLOCKED: every verdict after the first was BLOCK, for ever. These tests
 // build verdicts that are satisfied in every other way, with BLOCKED standing
 // for each reason GitHub can have, and check which of them still block.
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { computeVerdict, PASS, BLOCK, UNKNOWN } from "../src/verdict.mjs";
-import { readMergeParts, readThreads } from "../src/pr.mjs";
+import { readMergeParts, readThreads, mergeRows } from "../src/pr.mjs";
 import { readChecks } from "../src/github/reconciler.mjs";
 
 let fail = 0;
@@ -188,24 +188,54 @@ const partsOf = (base, threads, rows = []) => readMergeParts("o/r", `base-${++ba
   check(unreadRules.unevaluated === null && unreadRules.others === null && unreadRows.others === null,
     "and so do rules that couldn't be read, or a head whose checks couldn't be", JSON.stringify({ unreadRules, unreadRows }));
 }
-{
-  // A required check bound to an App names the App's id, so the head's check runs
-  // must carry it. Read through a stand-in for gh, answering as GitHub does.
+// readChecks, with a throw recorded rather than raised, so a stubbed rule that
+// makes it throw fails its check and leaves the rest of the file running.
+const read = (sha) => { try { return readChecks("o/r", sha); } catch (e) { return { threw: e.message, ok: false, whole: false, rows: [], reviewerRows: [], impostors: [] }; } };
+// A stand-in for gh on the PATH, answering as \`gh api --paginate --jq\` does:
+// one JSON value per line, every page's in turn. \`script\` is the body of a
+// shell \`case\` on the request path. Every call's arguments are logged.
+const withGh = (script, fn) => {
   const bin = mkdtempSync(join(tmpdir(), "reeve-gh-"));
   const path = process.env.PATH;
   try {
-    writeFileSync(join(bin, "gh"), `#!/bin/sh
-case "$2" in
-  *check-runs*) echo '[{"name":"ci/lint","status":"completed","conclusion":"success","id":1,"app":{"slug":"linter","id":42}}]';;
-  *) echo '[]';;
-esac
-`, { mode: 0o755 });
+    writeFileSync(join(bin, "gh"), `#!/bin/sh\necho "$*" >> "${join(bin, "calls")}"\nfor a in "$@"; do case "$a" in repos/*) p="$a";; esac; done\ncase "$p" in\n${script}\nesac\n`, { mode: 0o755 });
     process.env.PATH = `${bin}:${path}`;
-    const read = readChecks("o/r", "c".repeat(40));
-    const bound = (app) => partsOf(baseOf({ rules: [OWN, { type: "required_status_checks", parameters: { required_status_checks: [{ context: "ci/lint", integration_id: app }] } }] }), {}, read.rows);
-    check(read.ok && read.rows[0]?.appId === "42" && bound(42).others?.[0]?.state === "passing" && bound(99).others?.[0]?.state === "missing",
-      "the head's check runs carry their App's id, so a check bound to that App is met by its run and by no other App's", JSON.stringify({ rows: read.rows, ours: bound(42).others, theirs: bound(99).others }));
+    return fn(() => { try { return readFileSync(join(bin, "calls"), "utf8").trim().split("\n"); } catch { return []; } });
   } finally { process.env.PATH = path; rmSync(bin, { recursive: true, force: true }); }
+};
+{
+  // A required check bound to an App names the App's id, so the head's check runs
+  // must carry it.
+  withGh(`  *check-runs*) echo '{"name":"ci/lint","status":"completed","conclusion":"success","id":1,"app":{"slug":"linter","id":42}}';;
+  *) ;;`, () => {
+    const got = read("c".repeat(40));
+    const bound = (app) => partsOf(baseOf({ rules: [OWN, { type: "required_status_checks", parameters: { required_status_checks: [{ context: "ci/lint", integration_id: app }] } }] }), {}, got.rows);
+    check(got.ok && got.rows[0]?.appId === "42" && bound(42).others?.[0]?.state === "passing" && bound(99).others?.[0]?.state === "missing",
+      "the head's check runs carry their App's id, so a check bound to that App is met by its run and by no other App's", JSON.stringify({ rows: got.rows, ours: bound(42).others, theirs: bound(99).others }));
+  });
+}
+{
+  // Two pages of each: gh prints every page's results in turn.
+  withGh(`  *check-runs*) echo '{"name":"ci/a","status":"completed","conclusion":"success","id":1,"app":{"slug":"github-actions","id":15368}}'
+    echo '{"name":"ci/b","status":"completed","conclusion":"failure","id":2,"app":{"slug":"github-actions","id":15368}}';;
+  */status*) echo '{"context":"lint/a","state":"success"}'
+    echo '{"context":"lint/b","state":"pending"}';;`, (calls) => {
+    const got = read("d".repeat(40));
+    const paged = calls().filter((c) => /check-runs|\/status/.test(c));
+    check(got.whole === true && got.rows.length === 4 && paged.length === 2 && paged.every((c) => c.includes("--paginate") && c.includes("per_page=100")),
+      "a head's check runs and statuses are read past their first page, 100 at a time", JSON.stringify({ whole: got.whole, rows: got.rows.map((r) => r.name), paged }));
+  });
+}
+{
+  // The check runs fail to read, and the statuses show the same name passing.
+  withGh(`  *check-runs*) echo "gh: HTTP 502" >&2; exit 1;;
+  */status*) echo '{"context":"ci/e2e","state":"success"}';;`, () => {
+    const got = read("e".repeat(40));
+    const parts = partsOf(baseOf({ rules: [OWN, { type: "required_status_checks", parameters: { required_status_checks: [{ context: "ci/e2e" }] } }] }), {}, mergeRows(got));
+    check(got.ok === true && got.whole === false && mergeRows(got) === null && parts.others === null && mergeable({ ...parts, readable: true }).state === UNKNOWN,
+      "a head whose check runs or statuses couldn't be read gives the base's other checks nothing to pass on, so BLOCKED is UNKNOWN",
+      JSON.stringify({ ok: got.ok, whole: got.whole, others: parts.others }));
+  });
 }
 {
   const page = { data: { repository: { pullRequest: { mergeStateStatus: "BLOCKED", mergeable: "MERGEABLE", reviewDecision: "APPROVED",

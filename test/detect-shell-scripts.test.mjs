@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { detectCommands } from "../src/profile/detect.mjs";
-import { scriptShell } from "../src/profile/shellscript.mjs";
+import { npmScriptShell, scriptShell } from "../src/profile/shellscript.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let fail = 0;
@@ -23,6 +23,11 @@ const check = (ok, name, detail) => {
 };
 
 const root = mkdtempSync(join(tmpdir(), "reeve-detect-"));
+// npm's own settings can name another shell: here only a fixture's .npmrc does,
+// whatever this machine's user and global config say.
+for (const key of Object.keys(process.env)) if (/^npm_config_(script_shell|userconfig|globalconfig)$/i.test(key)) delete process.env[key];
+process.env.npm_config_userconfig = join(root, "no-user-npmrc");
+process.env.npm_config_globalconfig = join(root, "no-global-npmrc");
 // What detection says about one script, run as the `test` intent. `shell` stands
 // in for the shell npm runs, when a case needs one whatever this machine's is.
 const detectTest = (script, devDependencies = {}, { shell, files = {} } = {}) => {
@@ -98,18 +103,20 @@ try {
     "an assignment after command, exec or nohup is a program's name, which fails", JSON.stringify(afterWrapper));
 
   // A wrapper's options that still run the command don't stop it being judged.
-  const withOptions = ["command -p no-such-runner", "env -i no-such-runner", "env -u HOME no-such-runner", "exec -a label no-such-runner"]
+  // Under dash, whose exec takes no options, `exec -a` runs a program called -a.
+  const withOptions = ["command -p no-such-runner", "env -i no-such-runner", "env -u HOME no-such-runner"]
     .map((s) => ({ s, r: detectTest(s) }));
-  check(withOptions.every(({ r }) => broken(r, "'no-such-runner'")),
-    "options that still run the command, command -p, env -i and -u, exec -a, don't stop it being judged", JSON.stringify(withOptions));
+  const execOptions = detectTest("exec -a label no-such-runner");
+  check(withOptions.every(({ r }) => broken(r, "'no-such-runner'")) && broken(execOptions),
+    "options that still run the command, command -p, env -i and -u, exec -a, don't stop it being judged", JSON.stringify({ withOptions, execOptions }));
   const emptied = detectTest("env -i jest --ci", jest);
   check(broken(emptied, "'jest'"),
     "env -i empties the environment, PATH with it, so a dependency's runner isn't found", JSON.stringify(emptied));
 
   // Words the shell npm runs has, or doesn't, asked of that shell.
-  const shell = scriptShell();
+  const shell = scriptShell(npmScriptShell(root));
   const asked = (word) => {
-    const r = spawnSync("sh", ["-c", `command -V '${word}'`], { encoding: "utf8", env: { ...process.env, LC_ALL: "C" } });
+    const r = spawnSync(npmScriptShell(root), ["-c", `command -V '${word}'`], { encoding: "utf8", env: { ...process.env, LC_ALL: "C" } });
     return / is a (special )?shell builtin| is a (shell keyword|reserved word)/.test(r.stdout + r.stderr);
   };
   const words = [["source", "source ./env.sh && jest --ci"], ["[[", "[[ -f jest.config.js ]] && jest --ci"],
@@ -117,9 +124,11 @@ try {
     .map(([word, script]) => ({ word, hasIt: asked(word), r: detectTest(script, jest) }));
   check(shell !== null && words.every(({ hasIt, r }) => (r.state === "broken") === !hasIt),
     "a word is the shell's own exactly when the shell npm runs scripts with says so", JSON.stringify({ shell: shell?.name, words }));
-  const dashLike = { name: "dash", builtins: new Set(["echo", "exit", "true", "false", "set", "export", "command", "exec", ":", "."]),
+  const dashLike = { name: "dash", execOptions: false,
+                     builtins: new Set(["echo", "printf", "exit", "true", "false", "set", "export", "unset", "cd", "read", "trap", "alias",
+                                        "command", "exec", ":", "."]),
                      keywords: new Set(["if", "for", "while", "until", "case", "!", "{", "}"]) };
-  const bashLike = { ...dashLike, name: "bash", builtins: new Set([...dashLike.builtins, "source"]),
+  const bashLike = { ...dashLike, name: "bash", execOptions: true, builtins: new Set([...dashLike.builtins, "source", "declare"]),
                      keywords: new Set([...dashLike.keywords, "[[", "function", "select", "time"]) };
   const onDash = detectTest("[[ -f x ]] && jest --ci", jest, { shell: dashLike });
   const onBash = detectTest("[[ -f x ]] && jest --ci", jest, { shell: bashLike });
@@ -151,7 +160,7 @@ try {
   // A reserved word only counts unquoted; a quoted builtin still runs.
   const quotedKeyword = ['"for" x', "'if' y", "\\while z"].map((s) => ({ s, r: detectTest(s) }));
   const quotedBuiltin = detectTest("'echo' hi");
-  check(quotedKeyword.every(({ r }) => r.state === "broken") && quotedBuiltin.state === "present",
+  check(quotedKeyword.every(({ r }) => broken(r, "as a program")) && quotedBuiltin.state === "present",
     "a quoted reserved word is a program's name, and a quoted builtin still runs", JSON.stringify({ quotedKeyword, quotedBuiltin }));
 
   // A PATH given with the command is where it's looked up.
@@ -162,6 +171,164 @@ try {
   check(pathed.every(({ r }) => r.state === "broken") && ownBin.state === "present" && expanded.state === "present",
     "a literal PATH before the program is where it's looked up, and a PATH built from expansions isn't judged",
     JSON.stringify({ pathed, ownBin, expanded }));
+
+  // ── read more closely (#205) ──────────────────────────────────────────────
+  //
+  // Each shape here made a script that passes read as broken, or one that
+  // always fails read as present.
+
+  // The shell is the one npm's script-shell setting names, read as npm reads
+  // it: the environment first, then the project's .npmrc (its workspace root's,
+  // for a workspace), the user's and the global one.
+  const tree = (name, files) => {
+    const dir = join(root, name);
+    for (const [file, body] of Object.entries(files)) {
+      mkdirSync(dirname(join(dir, file)), { recursive: true });
+      writeFileSync(join(dir, file), body);
+    }
+    return dir;
+  };
+  const npmEnv = { PATH: process.env.PATH, HOME: join(root, "home"), npm_config_userconfig: join(root, "none"), npm_config_globalconfig: join(root, "none") };
+  const plain = tree("rc-plain", { "package.json": "{}" });
+  const project = tree("rc-project", { "package.json": "{}", ".npmrc": "script-shell = /bin/bash ; ours\n" });
+  const userRc = join(tree("rc-user", { ".npmrc": "script-shell=bash\n" }), ".npmrc");
+  const globalRc = join(tree("rc-global", { npmrc: "script-shell=ksh\n" }), "npmrc");
+  const mono = tree("rc-mono", {
+    "package.json": JSON.stringify({ workspaces: ["packages/*"] }), ".npmrc": "script-shell=bash\n",
+    "packages/web/package.json": "{}", "packages/web/.npmrc": "script-shell=zsh\n",
+    "tools/package.json": "{}", "tools/.npmrc": "script-shell=zsh\n",
+  });
+  const sectioned = tree("rc-section", { "package.json": "{}", ".npmrc": "[section]\nscript-shell=zsh\n" });
+  const replaced = tree("rc-replaced", { "package.json": "{}", ".npmrc": 'script-shell="${SHELL_DIR}/bash"\n' });
+  const relativeRc = tree("rc-relative", { "package.json": "{}", ".npmrc": "script-shell=./tools/sh\n" });
+  const settings = {
+    plain: npmScriptShell(plain, npmEnv),
+    project: npmScriptShell(project, npmEnv),
+    fromEnv: npmScriptShell(project, { ...npmEnv, npm_config_script_shell: "zsh" }),
+    fromEnvUpper: npmScriptShell(project, { ...npmEnv, NPM_CONFIG_SCRIPT_SHELL: "zsh" }),
+    user: npmScriptShell(plain, { ...npmEnv, npm_config_userconfig: userRc }),
+    projectOverUser: npmScriptShell(project, { ...npmEnv, npm_config_userconfig: userRc }),
+    global: npmScriptShell(plain, { ...npmEnv, npm_config_globalconfig: globalRc }),
+    workspace: npmScriptShell(join(mono, "packages", "web"), npmEnv),
+    notWorkspace: npmScriptShell(join(mono, "tools"), npmEnv),
+    section: npmScriptShell(sectioned, npmEnv),
+    replaced: npmScriptShell(replaced, { ...npmEnv, SHELL_DIR: "/usr/bin" }),
+    relative: npmScriptShell(relativeRc, npmEnv),
+  };
+  const wanted = { plain: "sh", project: "/bin/bash", fromEnv: "zsh", fromEnvUpper: "zsh", user: "bash", projectOverUser: "/bin/bash",
+                   global: "ksh", workspace: "bash", notWorkspace: "zsh", section: "sh", replaced: "/usr/bin/bash",
+                   relative: join(relativeRc, "tools", "sh") };
+  check(Object.entries(wanted).every(([k, v]) => settings[k] === v),
+    "npm's script-shell is read as npm reads it: the environment, then the project's .npmrc, a workspace root's for its workspaces, the user's, the global one",
+    JSON.stringify({ settings, wanted }));
+  const underBash = detectTest("[[ -f x ]] && jest --ci", jest, { files: { ".npmrc": "script-shell=bash\n" } });
+  check(underBash.state === "present",
+    "the shell asked is the one npm's script-shell names, so a word of bash's is no missing program under bash", JSON.stringify(underBash));
+
+  // `!` inverts a whole pipeline, and set -e never stops at one it inverts. An
+  // exit inside it ends the script before anything is inverted.
+  const bangPasses = ["! true | false", "set -e; ! true; echo reached"].map((s) => ({ s, r: detectTest(s) }));
+  const bangFails = ["! false | true", "! exit 1"].map((s) => ({ s, r: detectTest(s) }));
+  check(bangPasses.every(({ r }) => r.state === "present") && bangFails.every(({ r }) => broken(r, "always fails")),
+    "! inverts a whole pipeline, set -e never stops at one, and an exit inside it ends the script first", JSON.stringify({ bangPasses, bangFails }));
+
+  // A line continuation, or a newline after &&, || or |, joins two lines into
+  // one list; an operator with nothing after it is a syntax error.
+  const joined = [["NODE_ENV=test \\\n  jest --ci", "present"], ["jest --ci ||\n  no-such-runner", "present"],
+                  ["echo setup && \\\n  no-such-runner", "'no-such-runner'"], ["no-such-runner &&\n  jest --ci", "'no-such-runner'"],
+                  ["jest --ci &&", "syntax error"], ["jest --ci |", "syntax error"],
+                  ["jest --ci\n\n", "present"], ["no-such-runner --ci\n", "'no-such-runner'"]]
+    .map(([s, want]) => ({ s, want, r: detectTest(s, jest) }));
+  check(joined.every(({ want, r }) => (want === "present" ? r.state === "present" : broken(r, want))),
+    "a line continuation, or a newline after an operator, joins the lines and makes no empty command; an operator with nothing after it is a syntax error",
+    JSON.stringify(joined));
+
+  // A command that ran may have made the program a later one is missing: an
+  // install, a build, a command substitution, a file written. One running
+  // beside it in a pipeline can't have.
+  const madeBefore = ["npm ci && no-such-runner", "node build.js; no-such-runner", "echo x > out.txt && no-such-runner",
+                      "echo $(npm ci) && no-such-runner", "no-such-runner $(npm ci)"].map((s) => ({ s, r: detectTest(s) }));
+  const beside = detectTest("npm ci | no-such-runner");
+  check(madeBefore.every(({ r }) => r.state === "present") && broken(beside, "'no-such-runner'"),
+    "a missing program after one that may change files, an install say, may be there by then; one beside it in a pipeline can't be",
+    JSON.stringify({ madeBefore, beside }));
+
+  // cd, and env -C, move where relative names are found from. CDPATH can send a
+  // bare folder name elsewhere, to a runner that is there.
+  const runner = { "tools/runner": "#!/bin/sh\n" };
+  const moved = ["cd tools && ./runner --ci", "cd tools && PATH=. runner", "env -C tools ./runner", "cd $DIR && ./runner"]
+    .map((s) => ({ s, r: detectTest(s, {}, { files: runner }) }));
+  const movedMissing = detectTest("cd tools && ./missing", {}, { files: runner });
+  const cdpath = tree("cdpath", { "tools/runner": "#!/bin/sh\n" });
+  chmodSync(join(cdpath, "tools", "runner"), 0o755);
+  process.env.CDPATH = cdpath;
+  const viaCdpath = detectTest("cd tools && ./runner", {}, { files: { "tools/other": "" } });
+  delete process.env.CDPATH;
+  check(moved.every(({ r }) => r.state === "present") && broken(movedMissing, "'./missing'") && viaCdpath.state === "present",
+    "a relative program or PATH entry is found from the folder cd or env -C moved to", JSON.stringify({ moved, movedMissing, viaCdpath }));
+
+  // command -p, and env with PATH unset, look only in the standard path.
+  const fixtureRunner = { "fixture-runner": "^1.0.0" };
+  const standard = ["command -p fixture-runner --ci", "env -u PATH fixture-runner --ci", "env --unset=PATH fixture-runner --ci"]
+    .map((s) => ({ s, r: detectTest(s, fixtureRunner) }));
+  const standardOk = ["command -p ls", "env -u HOME fixture-runner --ci"].map((s) => ({ s, r: detectTest(s, fixtureRunner) }));
+  check(standard.every(({ r }) => broken(r, "'fixture-runner'")) && standardOk.every(({ r }) => r.state === "present"),
+    "command -p and env -u PATH look only in the standard path", JSON.stringify({ standard, standardOk }));
+
+  // An alias defined in the script changes what later words run.
+  const aliased = detectTest("alias no-such-runner=true\nno-such-runner");
+  check(aliased.state === "present", "an alias definition leaves what follows it unread", JSON.stringify(aliased));
+
+  // A pathname pattern names whatever files match it.
+  const pattern = detectTest("./scripts/run-*.sh", {}, { files: { "scripts/run-all.sh": "#!/bin/sh\n" } });
+  check(pattern.state === "present",
+    "a command word holding a pathname pattern isn't judged: it names whatever files match", JSON.stringify(pattern));
+
+  // set's options end at --, - or its first operand, and a set that may or may
+  // not have run leaves set -e unsure.
+  const setShapes = ["set -- -e; false; true", "set x -e; false; true", "set - -e; false; true", "set -e; set $FLAGS; false; true",
+                     "set -e; jest --ci && set +e; false; true"].map((s) => ({ s, r: detectTest(s, jest) }));
+  const setOn = detectTest("set -eo pipefail; false; true");
+  check(setShapes.every(({ r }) => r.state === "present") && broken(setOn, "always fails"),
+    "set reads options only until --, - or its first operand, and one that may not have run leaves set -e unsure",
+    JSON.stringify({ setShapes, setOn }));
+
+  // exec's options are the shell's own: dash's exec takes none.
+  const execDash = ["exec -a label jest --ci", "exec -- jest --ci"].map((s) => ({ s, r: detectTest(s, jest, { shell: dashLike }) }));
+  const execBash = ["exec -a label jest --ci", "exec -- jest --ci"].map((s) => ({ s, r: detectTest(s, jest, { shell: bashLike }) }));
+  const execEnds = detectTest("exec -- jest --ci", jest, { shell: { ...dashLike, execEndsOptions: true } });
+  check(broken(execDash[0].r, "'-a'") && broken(execDash[1].r, "'--'") && execBash.every(({ r }) => r.state === "present") && execEnds.state === "present",
+    "exec takes options only in a shell whose exec has them: under dash, exec -a runs a program called -a", JSON.stringify({ execDash, execBash, execEnds }));
+
+  // A trap can end the script its own way.
+  const trapped = detectTest("trap 'exit 0' EXIT; no-such-runner");
+  check(trapped.state === "present", "a trap can decide how the script ends, so a script that sets one isn't judged", JSON.stringify(trapped));
+
+  // A bare exit exits with the status just before it.
+  const exitOk = detectTest("false; true && exit");
+  const exitFails = detectTest("true; false || exit");
+  check(exitOk.state === "present" && broken(exitFails, "always fails"),
+    "a bare exit exits with the status just before it, inside an and-or list too", JSON.stringify({ exitOk, exitFails }));
+
+  // A builtin that may set PATH leaves a later missing program unsure.
+  const setsPath = [["printf -v PATH %s ./tools; runner", bashLike], ["read PATH < pathfile; runner", undefined]]
+    .map(([s, sh]) => ({ s, r: detectTest(s, {}, { shell: sh, files: { ...runner, pathfile: "tools\n" } }) }));
+  check(setsPath.every(({ r }) => r.state === "present"),
+    "a builtin that may set PATH, printf -v or read, leaves a later missing program unjudged", JSON.stringify(setsPath));
+
+  // Programs are found as npm finds them: in any node_modules/.bin from the
+  // package up, and as a dependency of a folder above, such as a workspace root.
+  const monorepo = tree("monorepo", {
+    "package.json": JSON.stringify({ workspaces: ["web"], devDependencies: { "root-runner": "^1.0.0" } }),
+    "node_modules/.bin/hoisted-runner": "#!/bin/sh\n",
+  });
+  const inWorkspace = ["root-runner --ci", "hoisted-runner --ci", "no-such-runner --ci"].map((script) => {
+    tree("monorepo", { "web/package.json": JSON.stringify({ name: "web", scripts: { test: script } }) });
+    return { script, r: detectCommands(join(monorepo, "web"), "typescript", "npm").commands.test };
+  });
+  check(inWorkspace[0].r.state === "present" && inWorkspace[1].r.state === "present" && broken(inWorkspace[2].r, "'no-such-runner'"),
+    "a program is found as npm finds it: in any node_modules/.bin from the package up, or as a dependency of a folder above it, such as a workspace root",
+    JSON.stringify(inWorkspace));
 } finally {
   rmSync(root, { recursive: true, force: true });
 }

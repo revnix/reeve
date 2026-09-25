@@ -7,7 +7,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { scriptOutcome, scriptShell } from "./shellscript.mjs";
+import { npmScriptShell, scriptOutcome, scriptShell } from "./shellscript.mjs";
 
 function sh(cmd, args, cwd) {
   try {
@@ -86,10 +86,11 @@ const INTENTS = {
 };
 
 /**
- * `shell` is the shell npm runs scripts with, as `scriptShell()` finds it, which
- * decides which words are the shell's own; given, as by a test, it is used as is.
+ * `shell` is the shell npm runs the package's scripts with, the one its
+ * `script-shell` setting names, as `scriptShell()` asks it: it decides which
+ * words are the shell's own. Given, as by a test, it is used as is.
  */
-export function detectCommands(dir, language, packageManager, { shell = scriptShell() } = {}) {
+export function detectCommands(dir, language, packageManager, { shell = scriptShell(npmScriptShell(dir)) } = {}) {
   const out = {};
   const questions = [];
 

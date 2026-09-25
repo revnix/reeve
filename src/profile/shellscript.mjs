@@ -7,14 +7,16 @@
 // named by a variable, is never called broken: a wrong "broken" sends a fixer
 // after a script that works.
 //
-// npm runs scripts with `sh`, which is dash on Debian and Ubuntu and bash on
-// macOS, and the two disagree about which words are the shell's own: dash has no
-// `source`, `[[`, `function` or `select`, and its `time` is a program. So those
-// words are asked of that shell, once, rather than listed here.
+// npm runs scripts with its `script-shell` setting, `sh` unless it is set, which
+// is dash on Debian and Ubuntu and bash on macOS. The two disagree about which
+// words are the shell's own: dash has no `source`, `[[`, `function` or `select`,
+// its `time` is a program, and its `exec` takes no options. So those are asked
+// of that shell, once, rather than listed here.
 
 import { spawnSync } from "node:child_process";
-import { statSync } from "node:fs";
-import { basename, delimiter, isAbsolute, join, resolve } from "node:path";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 // Words some shell treats as its own, keywords and builtins. Which of them the
 // shell npm runs actually has is asked of it.
@@ -27,30 +29,164 @@ const CANDIDATES = [
   "umask", "unalias", "unset", "wait",
 ];
 
-let asked;
-/**
- * The shell npm runs scripts with, as `{ name, builtins, keywords }`: `sh`, as
- * npm finds it on the PATH, asked once which of the candidate words it treats
- * as its own. Null when it can't be asked; then no candidate word is judged.
- */
-export function scriptShell() {
-  if (asked !== undefined) return asked;
-  const r = spawnSync("sh", ["-c",
-    'printf "shell\\t%s\\n" "$(readlink -f "$(command -v sh)" 2>/dev/null || command -v sh)"; ' +
-    'for w in "$@"; do printf "%s\\t" "$w"; command -V "$w" 2>&1 | head -n 1; done', "sh", ...CANDIDATES],
-    { encoding: "utf8", env: { ...process.env, LC_ALL: "C" }, timeout: 10_000 });
-  if (r.status !== 0 || !r.stdout) return (asked = null);
-  const builtins = new Set(), keywords = new Set();
-  let name = "sh";
-  for (const line of r.stdout.split("\n")) {
-    const tab = line.indexOf("\t");
-    if (tab < 0) continue;
-    const word = line.slice(0, tab), said = line.slice(tab + 1);
-    if (word === "shell") { name = basename(said) || "sh"; continue; }
-    if (/ is a (special )?shell builtin$/.test(said)) builtins.add(word);
-    else if (/ is a (shell keyword|reserved word)$/.test(said)) keywords.add(word);
+// Where a program is looked up without PATH: `command -p`'s standard path, and
+// env's own after `env -i` or `env -u PATH`. Shells and C libraries differ, and
+// dash's is the widest, so this is all of theirs: a program in any of them is
+// never called missing.
+const STANDARD_PATH = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"];
+
+const runnable = (file) => { try { return statSync(file).isFile(); } catch { return false; } };
+const isDir = (dir) => { try { return statSync(dir).isDirectory(); } catch { return false; } };
+const readJson = (file) => { try { return JSON.parse(readFileSync(file, "utf8")); } catch { return null; } };
+
+// ── the shell npm runs scripts with ─────────────────────────────────────────
+
+// A value in an npmrc file, as npm's ini parser reads it: quoted, or up to an
+// unescaped `;` or `#`.
+function iniValue(raw) {
+  let v = raw.trim();
+  if (v.length > 1 && (v[0] === '"' || v[0] === "'") && v.at(-1) === v[0]) {
+    if (v[0] === "'") v = v.slice(1, -1);
+    try { v = JSON.parse(v); } catch { /* kept as written */ }
+    return v;
   }
-  return (asked = { name, builtins, keywords });
+  let out = "", esc = false;
+  for (const c of v) {
+    if (esc) { out += "\\;#".includes(c) ? c : "\\" + c; esc = false; }
+    else if (c === ";" || c === "#") break;
+    else if (c === "\\") esc = true;
+    else out += c;
+  }
+  return (esc ? out + "\\" : out).trim();
+}
+
+// An npmrc file's settings outside any [section], the last of a key winning;
+// {} when there is no such file.
+function npmrc(file) {
+  const out = {};
+  let text;
+  try { text = readFileSync(file, "utf8"); } catch { return out; }
+  let section = false;
+  for (const line of text.split(/[\r\n]+/)) {
+    if (/^\s*([;#]|$)/.test(line)) continue;
+    if (/^\[[^\]]*\]\s*$/.test(line)) { section = true; continue; }
+    const m = /^([^=]+)(=(.*))?$/.exec(line);
+    if (!m || section) continue;
+    const value = m[2] === undefined ? true : iniValue(m[3]);
+    out[iniValue(m[1])] = ["true", "false", "null"].includes(value) ? JSON.parse(value) : value;
+  }
+  return out;
+}
+
+// ${NAME} in an npm setting is the environment's NAME, and ${NAME?} empty when
+// it is unset, as npm replaces them.
+const envReplace = (value, env) => value.replace(/(?<!\\)(\\*)\$\{([^${}?]+)(\?)?\}/g, (orig, esc, name, opt) =>
+  (esc.length % 2 ? orig.slice((esc.length + 1) / 2) : esc.slice(esc.length / 2) + (env[name] ?? (opt ? "" : `\${${name}}`))));
+
+// Whether workspace patterns list the folder `rel`, as npm's globs do; a later
+// pattern overrides an earlier one, and `!` excludes.
+function listed(patterns, rel) {
+  const path = rel.split(sep).join("/");
+  let hit = false;
+  for (const pattern of patterns) {
+    if (typeof pattern !== "string") continue;
+    const bangs = /^!*/.exec(pattern)[0].length;
+    const glob = pattern.slice(bangs).replace(/^\.?\/+/, "").replace(/\/+$/, "");
+    const re = glob.split("/").map((seg) => (seg === "**" ? ".*"
+      : seg.replace(/[.+^${}()|\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]"))).join("/");
+    if (new RegExp(`^${re}$`).test(path)) hit = bangs % 2 === 0;
+  }
+  return hit;
+}
+
+// The folder whose .npmrc is the project's: the package's own, or that of the
+// workspace root that lists it, which npm uses instead.
+function npmProject(dir) {
+  for (let p = dirname(dir); ; p = dirname(p)) {
+    const pkg = readJson(join(p, "package.json"));
+    const patterns = Array.isArray(pkg?.workspaces) ? pkg.workspaces : pkg?.workspaces?.packages;
+    if (Array.isArray(patterns) && listed(patterns, relative(p, dir))) return p;
+    if (p === dirname(p)) return dir;
+  }
+}
+
+// The first file on the PATH called `name`, followed to where it really is.
+const onPath = (name, env) => {
+  for (const d of (env.PATH ?? "").split(delimiter)) {
+    if (d && runnable(join(d, name))) try { return realpathSync(join(d, name)); } catch { /* next */ }
+  }
+  return null;
+};
+
+/**
+ * The shell npm runs the scripts of the package in `dir` with: its
+ * `script-shell` setting, read as npm reads it, or `sh`. The first of these that
+ * sets it wins: the environment's `npm_config_script_shell`, the project's
+ * `.npmrc` (its workspace root's, for a workspace), the user's, the global one,
+ * then npm's own. A relative path is the package's.
+ */
+export function npmScriptShell(dir, env = process.env) {
+  dir = resolve(dir);
+  const home = env.HOME || homedir();
+  const setting = (key, ...layers) => {
+    for (const layer of layers) {
+      if (layer[key] !== undefined) return typeof layer[key] === "string" ? envReplace(layer[key].trim(), env) : layer[key];
+    }
+  };
+  const file = (value, fallback) => (typeof value !== "string" || !value ? fallback
+    : value.startsWith("~/") ? join(home, value.slice(2)) : resolve(value));
+
+  const fromEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (/^npm_config_/i.test(key) && value !== "") fromEnv[key.slice(11).replace(/(?!^)_/g, "-").toLowerCase()] = value;
+  }
+  const cli = onPath("npm", env);
+  const builtin = cli ? npmrc(join(dirname(dirname(cli)), "npmrc")) : {};
+  const userFile = (...layers) => file(setting("userconfig", fromEnv, ...layers, builtin), join(home, ".npmrc"));
+  const projectFile = join(npmProject(dir), ".npmrc");
+  const project = projectFile === userFile() ? {} : npmrc(projectFile);
+  const user = npmrc(userFile(project));
+  const node = onPath("node", env) ?? process.execPath;
+  const prefix = env.PREFIX || (env.DESTDIR ? join(env.DESTDIR, dirname(dirname(node))) : dirname(dirname(node)));
+  const global = npmrc(file(setting("globalconfig", fromEnv, project, user, builtin),
+    join(file(setting("prefix", fromEnv, project, user, builtin), prefix), "etc", "npmrc")));
+
+  const shell = setting("script-shell", fromEnv, project, user, global, builtin);
+  if (typeof shell !== "string" || !shell) return "sh";
+  return shell.includes("/") && !isAbsolute(shell) ? resolve(dir, shell) : shell;
+}
+
+const asked = new Map();
+/**
+ * A shell, as `{ name, builtins, keywords, execOptions, execEndsOptions }`:
+ * asked once which of the candidate words it treats as its own, whether its
+ * `exec` takes options, and whether it takes `--`. Null when it can't be asked;
+ * then no candidate word is judged.
+ */
+export function scriptShell(path = "sh") {
+  if (asked.has(path)) return asked.get(path);
+  const r = spawnSync(path, ["-c",
+    'printf "shell\\t%s\\n" "$(readlink -f "$(command -v "$1")" 2>/dev/null || printf %s "$1")"; shift; ' +
+    'if (exec -a probe true) >/dev/null 2>&1; then printf "exec-options\\tyes\\n"; fi; ' +
+    'if (exec -- true) >/dev/null 2>&1; then printf "exec-ends-options\\tyes\\n"; fi; ' +
+    'for w in "$@"; do printf "%s\\t" "$w"; command -V "$w" 2>&1 | head -n 1; done', "sh", path, ...CANDIDATES],
+    { encoding: "utf8", env: { ...process.env, LC_ALL: "C" }, timeout: 10_000 });
+  let shell = null;
+  if (r.status === 0 && r.stdout) {
+    shell = { name: basename(path), builtins: new Set(), keywords: new Set(), execOptions: false, execEndsOptions: false };
+    for (const line of r.stdout.split("\n")) {
+      const tab = line.indexOf("\t");
+      if (tab < 0) continue;
+      const word = line.slice(0, tab), said = line.slice(tab + 1);
+      if (word === "shell") shell.name = basename(said) || shell.name;
+      else if (word === "exec-options") shell.execOptions = true;
+      else if (word === "exec-ends-options") shell.execEndsOptions = true;
+      else if (/ is a (special )?shell builtin$/.test(said)) shell.builtins.add(word);
+      else if (/ is a (shell keyword|reserved word)$/.test(said)) shell.keywords.add(word);
+    }
+  }
+  asked.set(path, shell);
+  return shell;
 }
 
 // ── reading ─────────────────────────────────────────────────────────────────
@@ -88,15 +224,22 @@ function expansionEnd(s, i) {
 /**
  * The script's tokens: words, operators and redirections, split as the shell
  * splits them. A word carries whether any of it was quoted, the part before its
- * first quote, and whether it holds an expansion. Null for what isn't read: an
- * unbalanced quote, a here-document, or case syntax.
+ * first quote, whether it holds an expansion, a command substitution among
+ * them, and whether it holds an unquoted pathname pattern. A redirection says
+ * whether it writes a file. Null for what isn't read: an unbalanced quote, a
+ * here-document, or case syntax.
  */
 export function tokenize(body) {
   const s = String(body), tokens = [];
   let i = 0;
   const word = () => {
-    let text = "", bare = null, expansion = false;
+    let text = "", bare = null, expansion = false, subst = false, glob = false;
     const quote = () => { if (bare === null) bare = text; };
+    const expand = (from, end) => {
+      if (end > from + 1) expansion = true;
+      if (/\$\(|`/.test(s.slice(from, end))) subst = true;
+      text += s.slice(from, end);
+    };
     while (i < s.length) {
       const c = s[i];
       if (c === " " || c === "\t" || c === "\n" || ";&|()<>".includes(c)) break;
@@ -118,8 +261,7 @@ export function tokenize(body) {
           if (s[j] === "$" || s[j] === "`") {
             const end = expansionEnd(s, j);
             if (end < 0) return undefined;
-            if (end > j + 1) expansion = true;
-            text += s.slice(j, end); j = end; continue;
+            expand(j, end); j = end; continue;
           }
           text += s[j++];
         }
@@ -129,18 +271,25 @@ export function tokenize(body) {
       if (c === "$" || c === "`") {
         const end = expansionEnd(s, i);
         if (end < 0) return undefined;
-        if (end > i + 1) expansion = true;
-        text += s.slice(i, end); i = end; continue;
+        expand(i, end); i = end; continue;
       }
+      // An unquoted pattern, replaced by the files it matches before it runs.
+      if (c === "*" || c === "?" || (c === "[" && /^\[[^\s\]]*\]/.test(s.slice(i)))) glob = true;
       text += c; i++;
     }
-    return { t: "word", text, quoted: bare !== null, bare: bare ?? text, expansion };
+    return { t: "word", text, quoted: bare !== null, bare: bare ?? text, expansion, subst, glob };
   };
   while (i < s.length) {
     const c = s[i];
     if (c === " " || c === "\t") { i++; continue; }
+    // A line continuation between words joins the lines, and is no word.
+    if (c === "\\" && s[i + 1] === "\n") { i += 2; continue; }
     if (c === "#") { while (i < s.length && s[i] !== "\n") i++; continue; }
-    if (c === "\n") { tokens.push({ t: "op", op: ";", newline: true }); i++; continue; }
+    if (c === "\n") {
+      // After `&&`, `||` or `|` a newline only continues the line.
+      if (!["&&", "||", "|"].includes(tokens.at(-1)?.op)) tokens.push({ t: "op", op: ";", newline: true });
+      i++; continue;
+    }
     if (s.startsWith(";;", i) || s.startsWith(";&", i)) return null;
     const op = ["&&", "||", "|&", ";", "&", "|"].find((o) => s.startsWith(o, i));
     if (op) { tokens.push({ t: "op", op: op === "|&" ? "|" : op }); i += op.length; continue; }
@@ -152,7 +301,9 @@ export function tokenize(body) {
       while (s[i] === " " || s[i] === "\t") i++;
       const target = word();
       if (!target || (target.text === "" && !target.quoted)) return null;
-      tokens.push({ t: "redir" });
+      // `>&2` and `>&-` only point at a descriptor; the rest write a file.
+      const writes = [">", ">>", ">|", "<>"].includes(r[2]) || (r[2] === ">&" && !/^(\d+|-)$/.test(target.text));
+      tokens.push({ t: "redir", writes, subst: target.subst });
       continue;
     }
     const w = word();
@@ -166,9 +317,13 @@ export function tokenize(body) {
 //
 // An outcome is `ok` (certainly succeeds), `fail` (certainly fails, with `why`)
 // or `?`. `stop` says whether the script ends there: true, false or "maybe".
+// `mutates` says it may have changed files, or what a later lookup reads, after
+// which a program found missing may be there after all: `npm ci && jest`
+// installs jest before it runs.
 
 const OK = { o: "ok" }, UNKNOWN = { o: "?" };
 const failing = (why) => ({ o: "fail", why });
+const statusOf = (r) => ({ o: r.o, why: r.why });
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 // An assignment is a word whose name and `=` weren't quoted; its value is what
@@ -179,46 +334,62 @@ const assignment = (w) => {
   return { name: w.text.slice(0, eq), value: { text: w.text.slice(eq + 1), expansion: w.expansion } };
 };
 
-/**
- * The directories a literal PATH value names, resolved against the package, or
- * null when it holds an expansion and can't be known.
- */
-function literalPath(value, dir) {
-  if (value.expansion) return null;
-  return value.text.split(":").map((d) => (d === "" ? dir : isAbsolute(d) ? d : resolve(dir, d)));
-}
+// The folders a literal PATH value names, as written, or null when it holds an
+// expansion and can't be known. A relative one, the empty one included, is
+// found from wherever the script is when it looks a program up.
+const literalPath = (value) => (value.expansion ? null : value.text.split(":"));
 
-// A file there is taken to run, as setup detection always has: a missing
-// execute bit would fail too, but that is a broken install, not a missing tool,
-// and erring this way never calls a working script broken.
-const runnable = (file) => { try { return statSync(file).isFile(); } catch { return false; } };
+// Whether a package.json in `dir` depends on `name`.
+const declares = (dir, name) => {
+  const pkg = readJson(join(dir, "package.json"));
+  return [pkg?.dependencies, pkg?.devDependencies].some((deps) => deps !== null && typeof deps === "object" && Object.hasOwn(deps, name));
+};
 
 /**
  * Whether `name` runs as a program: true, false, or null when that can't be
- * told. With `path` undefined it is found as npm finds it: a dependency, the
- * package's own `node_modules/.bin`, a runner every setup has, or the PATH. With
- * a literal PATH given, only there.
+ * told. A name with a slash is a file, from the script's folder. Otherwise, with
+ * `path` undefined it is found as npm finds it: a runner every setup has, a
+ * dependency of the package or of a folder above it such as a workspace root,
+ * any `node_modules/.bin` from the package up, or the PATH. With a literal PATH
+ * given, only there. A file found is taken to run, as setup detection always
+ * has: a missing execute bit is a broken install, not a missing tool.
  */
-function found(name, path, pkg) {
-  if (name.includes("/")) return runnable(resolve(pkg.dir, name));
+function found(name, path, pkg, cwd) {
+  if (name.includes("/")) return isAbsolute(name) ? runnable(name) : cwd === null ? null : runnable(resolve(cwd, name));
   if (path === null) return null;
   if (path === undefined) {
     if (pkg.deps[name] || /^(node|tsc|pnpm|npm|yarn|turbo|nx)$/.test(name)) return true;
-    return [join(pkg.dir, "node_modules", ".bin"), ...(process.env.PATH ?? "").split(delimiter)].some((d) => d && runnable(join(d, name)));
+    for (let d = pkg.dir; ; d = dirname(d)) {
+      if (runnable(join(d, "node_modules", ".bin", name)) || (d !== pkg.dir && declares(d, name))) return true;
+      if (d === dirname(d)) break;
+    }
+    path = (process.env.PATH ?? "").split(delimiter);
   }
-  return path.some((d) => runnable(join(d, name)));
+  let unsure = false;
+  for (const d of path) {
+    if (!isAbsolute(d) && cwd === null) { unsure = true; continue; }
+    if (runnable(join(isAbsolute(d) ? d : resolve(cwd, d), name))) return true;
+  }
+  return unsure ? null : false;
 }
 
-function program(words, path, ctx) {
+function program(words, path, state, ctx) {
   const [name, ...rest] = words;
-  if (!name || name.expansion) return name ? UNKNOWN : OK;
-  const wrapped = wrapper(name.text, rest, path, ctx);
+  if (!name) return OK;
+  if (name.expansion || name.glob) return { o: "?", mutates: true };
+  const wrapped = wrapper(name.text, rest, path, state, ctx);
   if (wrapped) return wrapped;
-  const is = found(name.text, path, ctx.pkg);
-  if (is !== false) return UNKNOWN;
+  const is = found(name.text, path, ctx.pkg, state.cwd);
+  if (is !== false) return { o: "?", mutates: true };
+  // Something that ran before may have made it: an install, a build, a file
+  // written. Missing now isn't proof then.
+  if (state.mutated) return UNKNOWN;
   const shell = ctx.shell;
-  if (CANDIDATES.includes(name.text) && shell)
-    return failing(`uses '${name.text}', which ${shell.name}, the shell npm runs scripts with, doesn't have`);
+  if (CANDIDATES.includes(name.text) && shell) {
+    return failing(shell.keywords.has(name.text) || shell.builtins.has(name.text)
+      ? `runs '${name.text}' as a program, and none is installed: the shell's own '${name.text}' isn't what runs there`
+      : `uses '${name.text}', which ${shell.name}, the shell npm runs scripts with, doesn't have`);
+  }
   if (ASSIGNMENT.test(name.text))
     return failing(`runs '${name.text}' as a program: only env takes an assignment after its own name`);
   if (Array.isArray(path)) return failing(`runs '${name.text}' with a PATH it isn't found in`);
@@ -227,20 +398,30 @@ function program(words, path, ctx) {
 
 // Programs that run the command after them: env, nohup, and time where it is a
 // program rather than the shell's own word. Each one's options are its own.
-function wrapper(name, rest, path, ctx) {
-  let i = 0, p = path;
+function wrapper(name, rest, path, state, ctx) {
+  let i = 0, p = path, cwd = state.cwd;
   if (name === "env") {
-    for (; i < rest.length && rest[i].text.startsWith("-") && rest[i].text !== "-"; i++) {
-      const o = rest[i].text;
+    for (; i < rest.length; i++) {
+      const w = rest[i], o = w.text;
+      if (!o.startsWith("-") || o === "-") break;
       if (o === "--") { i++; break; }
-      if (/^-(S|-split-string)/.test(o)) return UNKNOWN;
-      if (/^-[iv0]+$/.test(o) || o === "--ignore-environment") { if (o.includes("i")) p = ["/bin", "/usr/bin"]; continue; }
-      if (o === "-u" || o === "-C" || o === "--unset" || o === "--chdir") { i++; continue; }
-      if (/^--(unset|chdir)=/.test(o) || /^-[uC]./.test(o)) continue;
-      return UNKNOWN;
+      if (w.expansion || w.glob || /^-(S|-split-string)/.test(o)) return { o: "?", mutates: true };
+      let m;
+      if (/^-[iv0]+$/.test(o) || o === "--ignore-environment") {
+        // With the environment emptied, env's own exec looks in the standard path.
+        if (o.includes("i")) p = STANDARD_PATH;
+      } else if ((m = /^(?:-u|--unset)(?:=?(.+))?$/.exec(o))) {
+        if ((m[1] ?? rest[++i]?.text) === "PATH") p = STANDARD_PATH;
+      } else if ((m = /^(?:-C|--chdir)(?:=?(.+))?$/.exec(o))) {
+        // The folder the command runs in, which a relative name is found from.
+        const to = m[1] !== undefined ? { text: m[1], expansion: false } : rest[++i];
+        cwd = !to || to.expansion || to.glob || cwd === null ? null : resolve(cwd, to.text);
+      } else {
+        return { o: "?", mutates: true };
+      }
     }
-    if (rest[i]?.text === "-") { p = ["/bin", "/usr/bin"]; i++; }
-    for (let a; i < rest.length && (a = assignment(rest[i])); i++) if (a.name === "PATH") p = literalPath(a.value, ctx.pkg.dir);
+    if (rest[i]?.text === "-") { p = STANDARD_PATH; i++; }
+    for (let a; i < rest.length && (a = assignment(rest[i])); i++) if (a.name === "PATH") p = literalPath(a.value);
   } else if (name === "nohup") {
     if (rest[0]?.text === "--") i = 1;
   } else if (name === "time") {
@@ -248,14 +429,21 @@ function wrapper(name, rest, path, ctx) {
       const o = rest[i].text;
       if (o === "--") { i++; break; }
       if (o === "-f" || o === "-o") { i++; continue; }
-      if (!/^(-[pvqa]+|--(portability|verbose|quiet|append|format=.*|output=.*))$/.test(o)) return UNKNOWN;
+      if (!/^(-[pvqa]+|--(portability|verbose|quiet|append|format=.*|output=.*))$/.test(o)) return { o: "?", mutates: true };
     }
   } else return null;
   if (i >= rest.length) return name === "env" ? OK : UNKNOWN;
-  const inner = program(rest.slice(i), p, ctx);
+  const inner = program(rest.slice(i), p, cwd === state.cwd ? state : { ...state, cwd }, ctx);
   if (inner.o === "fail") return inner;
-  return found(name, path, ctx.pkg) === false ? failing(`runs '${name}', which is neither a dependency nor installed`) : inner;
+  return found(name, path, ctx.pkg, state.cwd) === false && !state.mutated
+    ? failing(`runs '${name}', which is neither a dependency nor installed`) : { ...inner, mutates: true };
 }
+
+// Builtins that change nothing a later command finds, except what `builtin`
+// follows itself: PATH, the folder, set -e, traps. `command` and `exec` change
+// what the command they run changes. Any other builtin may change anything.
+const PURE = new Set(["true", ":", "false", "exit", "set", "export", "readonly", "unset", "cd", "trap", "alias",
+  "unalias", "echo", "printf", "pwd", "umask", "test", "[", "shift", "type", "wait", "jobs", "times", "command", "exec"]);
 
 // A builtin of the shell, run in `state`.
 function builtin(name, args, path, state, ctx) {
@@ -264,43 +452,78 @@ function builtin(name, args, path, state, ctx) {
     case "true": case ":": return OK;
     case "false": return failing("always fails: 'false' never succeeds");
     case "exit": {
-      if (!args.length) return { ...state.status, stop: true };   // with the last status
+      if (!args.length) return { ...state.status, stop: true };   // with the status just before
       if (args[0].expansion) return { o: "?", stop: true };
       const n = Number(text[0]);
       if (!Number.isInteger(n)) return { o: "?", stop: true };
       return n % 256 === 0 ? { o: "ok", stop: true } : { ...failing(`always fails: it exits ${n}`), stop: true };
     }
     case "set":
-      for (let k = 0; k < text.length; k++) {
-        const o = text[k];
-        if (/^-[a-zA-Z]*e/.test(o) || (o === "-o" && text[k + 1] === "errexit")) state.errexit = true;
-        if (/^\+[a-zA-Z]*e/.test(o) || (o === "+o" && text[k + 1] === "errexit")) state.errexit = false;
+      // Options, until `--`, `-` or the first word that isn't one: the rest are
+      // positional parameters, which change nothing here.
+      for (let k = 0; k < args.length; k++) {
+        if (args[k].expansion || args[k].glob) { state.errexit = "maybe"; break; }
+        const m = /^([-+])([a-zA-Z]+)$/.exec(text[k]);
+        if (!m) break;
+        if (m[2].includes("e")) state.errexit = m[1] === "-";
+        // `o` takes the next word as an option's name.
+        if (m[2].includes("o") && ++k < args.length) {
+          if (args[k].expansion) state.errexit = "maybe";
+          else if (text[k] === "errexit") state.errexit = m[1] === "-";
+        }
       }
       return OK;
     case "export": case "readonly":
-      for (const w of args) { const a = assignment(w); if (a?.name === "PATH") state.path = literalPath(a.value, ctx.pkg.dir); }
+      for (const w of args) { const a = assignment(w); if (a?.name === "PATH") state.path = literalPath(a.value); }
       return OK;
-    case "echo": case "printf": case "unset": case "alias": case "unalias": case "umask": case "trap": case "pwd":
-      return OK;
-    case "command": {
+    case "cd": {
       let k = 0;
+      while (/^-[LPe@]+$/.test(text[k] ?? "")) k++;
+      if (text[k] === "--") k++;
+      const to = args[k];
+      // Only a folder that is there, named as written, is known to be where the
+      // script goes: CDPATH can send a bare name elsewhere.
+      const target = !to || to.expansion || to.glob || to.text === "-" || (process.env.CDPATH && !/^\.{0,2}\//.test(to.text)) ? null
+        : isAbsolute(to.text) ? to.text : state.cwd === null ? null : resolve(state.cwd, to.text);
+      state.cwd = target !== null && isDir(target) ? target : null;
+      return UNKNOWN;
+    }
+    case "trap":
+      // A trap can end the script with a status of its own.
+      if (args.length) state.trapped = true;
+      return OK;
+    case "alias":
+      // An alias defined here can change what any later word runs.
+      return args.some((a) => a.text.includes("=")) ? { o: "?", opaque: true } : args.length ? UNKNOWN : OK;
+    case "echo": case "pwd":
+      return OK;
+    case "printf":
+      // bash's `printf -v` sets a variable, which may be PATH.
+      return /^-v/.test(text[0] ?? "") ? { o: "?", mutates: true } : UNKNOWN;
+    case "command": {
+      let k = 0, p = path;
       for (; k < args.length && args[k].text.startsWith("-"); k++) {
         if (args[k].text === "--") { k++; break; }
         if (/[vV]/.test(args[k].text)) return UNKNOWN;   // only looks a program up
         if (!/^-p+$/.test(args[k].text)) return UNKNOWN;
+        p = STANDARD_PATH;   // the standard path, whatever PATH says
       }
-      return args.length > k ? command(args.slice(k), path, state, ctx) : OK;
+      return args.length > k ? command(args.slice(k), p, state, ctx) : OK;
     }
     case "exec": {
       let k = 0;
-      for (; k < args.length && args[k].text.startsWith("-"); k++) {
-        if (args[k].text === "--") { k++; break; }
-        if (args[k].text === "-a") k++;
-        else if (!/^-[cl]+$/.test(args[k].text)) return UNKNOWN;
-      }
+      // Only a shell whose exec takes options reads them: dash's takes none,
+      // and runs a program called -a, or one called --.
+      if (ctx.shell?.execOptions) {
+        for (; k < args.length && args[k].text.startsWith("-"); k++) {
+          if (args[k].text === "--") { k++; break; }
+          if (args[k].text === "-a") k++;
+          else if (!/^-[cl]+$/.test(args[k].text)) return { o: "?", mutates: true };
+        }
+      } else if (ctx.shell?.execEndsOptions && text[0] === "--") k = 1;
       if (args.length <= k) return OK;
       // The program replaces the shell, which ends with it.
-      return { ...program(args.slice(k), path, ctx), stop: true };
+      return { ...program(args.slice(k), path, state, ctx), stop: true };
     }
     default: return UNKNOWN;
   }
@@ -313,9 +536,9 @@ function builtin(name, args, path, state, ctx) {
  */
 function command(words, path, state, ctx) {
   const [name, ...args] = words;
-  if (name.expansion) return UNKNOWN;
+  if (name.expansion || name.glob) return { o: "?", mutates: true };
   const shell = ctx.shell;
-  if (!shell && CANDIDATES.includes(name.text)) return UNKNOWN;
+  if (!shell && CANDIDATES.includes(name.text)) return { o: "?", mutates: true };
   if (!name.quoted && shell?.keywords.has(name.text)) {
     if (name.text !== "time") return { o: "?", opaque: true };
     // The shell's own `time` times the command after it, assignments and all.
@@ -323,21 +546,21 @@ function command(words, path, state, ctx) {
     while (args[k]?.text === "-p") k++;
     return args.length > k ? simple(args.slice(k), state, ctx) : OK;
   }
-  if (shell?.builtins.has(name.text)) return builtin(name.text, args, path, state, ctx);
-  return program(words, path, ctx);
+  if (shell?.builtins.has(name.text)) {
+    const r = builtin(name.text, args, path, state, ctx);
+    return PURE.has(name.text) ? r : { ...r, mutates: true };
+  }
+  return program(words, path, state, ctx);
 }
 
 /** One simple command in `state`: its leading assignments, then its command. */
 function simple(words, state, ctx) {
   if (!words.length) return OK;
-  if (!words[0].quoted && words[0].text === "!" && ctx.shell?.keywords.has("!")) {
-    const r = simple(words.slice(1), state, ctx);
-    return { ...r, o: r.o === "ok" ? "fail" : r.o === "fail" ? "ok" : "?", why: r.o === "ok" ? "always fails: '!' inverts a command that succeeds" : null };
-  }
   let k = 0, path = state.path;
-  for (let a; k < words.length && (a = assignment(words[k])); k++) if (a.name === "PATH") path = literalPath(a.value, ctx.pkg.dir);
+  for (let a; k < words.length && (a = assignment(words[k])); k++) if (a.name === "PATH") path = literalPath(a.value);
   if (k === words.length) {
-    // Assignments alone last for the rest of the script.
+    // Assignments alone last for the rest of the script, and end with the
+    // status of a command substitution among them.
     if (path !== state.path) state.path = path;
     return words.some((w) => w.expansion) ? UNKNOWN : OK;
   }
@@ -347,96 +570,145 @@ function simple(words, state, ctx) {
 // Keywords that continue or close a compound. Before any compound is open, one
 // is a syntax error, and the shell exits 2 without running its line.
 const CLOSERS = new Set(["then", "else", "elif", "fi", "do", "done", "esac", "}", "in"]);
+const JOINS = new Set(["&&", "||", "|"]);
 
 /**
- * The script split into commands, each with the operator after it. The rest is
- * opaque from the first compound; a keyword that closes nothing ends the list
- * as a syntax error, replacing the commands of its own line, which don't run.
+ * The script split into commands, each with the operator after it, whether a
+ * redirection of it writes a file, and whether it holds a command substitution.
+ * The rest is opaque from the first compound. A syntax error ends the list,
+ * replacing the commands of its own line, which don't run: a keyword that
+ * closes nothing, or `&&`, `||` or `|` without a command on both sides.
  */
 function commands(tokens, ctx) {
   const list = [];
-  let words = [], lineStart = 0;
-  for (let i = 0; i < tokens.length; i++) {
-    const t = tokens[i];
+  let cmd = { words: [], redirs: 0, writes: false, subst: false }, lineStart = 0;
+  const syntaxError = (why) => { list.splice(lineStart); list.push({ syntaxError: why, op: null }); return list; };
+  for (const t of tokens) {
     if (t.t === "word") {
-      if (!words.length && !t.quoted && ctx.shell?.keywords.has(t.text) && CLOSERS.has(t.text)) {
-        list.splice(lineStart);
-        list.push({ syntaxError: t.text, op: null });
-        return list;
-      }
+      const { words } = cmd;
+      // A reserved word counts first in a command, or after the `!` that
+      // inverts its pipeline.
+      const leading = words.length === 0 || (words.length === 1 && !words[0].quoted && words[0].text === "!");
+      if (leading && !t.quoted && ctx.shell?.keywords.has(t.text) && CLOSERS.has(t.text))
+        return syntaxError(`'${t.text}' closes nothing`);
       // A keyword opening a compound, or a subshell, spans what follows: from
       // there, nothing more is read.
-      if (!words.length && !t.quoted && (t.text === "{" || ctx.shell?.keywords.has(t.text)) && t.text !== "!" && t.text !== "time") {
+      if (leading && !t.quoted && (t.text === "{" || ctx.shell?.keywords.has(t.text)) && t.text !== "!" && t.text !== "time") {
         list.push({ opaque: true, op: null });
         return list;
       }
       words.push(t);
+      cmd.subst ||= t.subst;
+    } else if (t.t === "redir") {
+      cmd.redirs++;
+      cmd.writes ||= t.writes;
+      cmd.subst ||= t.subst;
     } else if (t.t === "(" || t.t === ")") {
       list.push({ opaque: true, op: null });
       return list;
     } else if (t.t === "op") {
-      list.push({ words, op: t.op });
-      words = [];
+      // An empty command: before `;` or `&` the shell passes over it, and
+      // before or after an operator that joins two it is a syntax error.
+      if (!cmd.words.length && !cmd.redirs) {
+        if (JOINS.has(t.op) || JOINS.has(list.at(-1)?.op)) return syntaxError(`'${t.op}' has no command on one side`);
+        if (t.newline) lineStart = list.length;
+        continue;
+      }
+      list.push({ ...cmd, op: t.op });
+      cmd = { words: [], redirs: 0, writes: false, subst: false };
       if (t.newline) lineStart = list.length;
     }
   }
-  if (words.length || !list.length || list.at(-1).op) list.push({ words, op: null });
+  if (cmd.words.length || cmd.redirs) list.push({ ...cmd, op: null });
+  else if (JOINS.has(list.at(-1)?.op)) return syntaxError(`'${list.at(-1).op}' has no command after it`);
   return list;
 }
 
 const either = (a, b) => (a.o === b.o ? (a.o === "fail" ? a : b) : UNKNOWN);
+const inverted = (r) => {
+  const o = r.o === "ok" ? "fail" : r.o === "fail" ? "ok" : "?";
+  return { ...r, o, why: o === "fail" ? "always fails: '!' inverts a pipeline that succeeds" : null, negated: true };
+};
 
-/** Run one command, or a pipeline of them, from `i`. Returns the outcome and where the next begins. */
+/**
+ * Run one pipeline from `i`: one command, or several joined by `|`, each run
+ * apart with the last deciding, the whole inverted by a leading `!`. Returns the
+ * outcome and where the next begins.
+ */
 function pipeline(list, i, state, ctx) {
+  const first = list[i];
+  const bang = first.words?.[0];
+  if (bang && !bang.quoted && bang.text === "!" && ctx.shell?.keywords.has("!")) {
+    const rest = [...list];
+    rest[i] = { ...first, words: first.words.slice(1) };
+    const p = pipeline(rest, i, state, ctx);
+    // An exit, or an exec, ends the shell before `!` inverts anything.
+    return p.r.stop === true ? p : { ...p, r: inverted(p.r) };
+  }
   let j = i;
   while (list[j].op === "|") j++;
   if (list[j].syntaxError)
-    return { r: { ...failing(`has a syntax error: '${list[j].syntaxError}' closes nothing, so the shell exits 2`), stop: true }, next: j + 1 };
+    return { r: { ...failing(`has a syntax error: ${list[j].syntaxError}, so the shell exits 2`), stop: true }, next: j + 1 };
   if (list[j].opaque) return { r: UNKNOWN, next: j + 1, opaque: true };
   if (j === i) {
-    const r = simple(list[i].words, state, ctx);
-    return { r, next: i + 1, opaque: Boolean(r.opaque) };
+    // A command substitution runs first, and may change what its command finds.
+    if (first.subst) state.mutated = true;
+    const r = simple(first.words, state, ctx);
+    const mutates = r.mutates || first.writes || first.subst;
+    return { r: mutates ? { ...r, mutates: true } : r, next: i + 1, opaque: Boolean(r.opaque) };
   }
-  // Each command of a pipeline runs apart; the last one decides.
   for (let k = i; k < j; k++) if (list[k].opaque) return { r: UNKNOWN, next: list.length, opaque: true };
-  const r = simple(list[j].words, { ...state }, ctx);
-  return { r: { o: r.o, why: r.why }, next: j + 1, opaque: Boolean(r.opaque) };
+  // The commands of a pipeline run apart and at once: none changes the shell's
+  // own state or makes another's program in time to count, and the last one's
+  // status is the pipeline's.
+  const r = simple(list[j].words, { ...state, mutated: state.mutated || list[j].subst }, ctx);
+  return { r: { o: r.o, why: r.why, mutates: true }, next: j + 1, opaque: Boolean(r.opaque) };
 }
 
 /**
  * Whether the script certainly fails, as `{ broken, why }`. It runs the script's
  * commands in order as the shell would: `&&` and `||` skip what they skip, `;`
- * and newlines go on, `set -e` stops at a failure, `exit` stops, and a pipeline
- * ends with its last command. Anything unsure stays unsure.
+ * and newlines go on, `set -e` stops at a failure, `exit` stops, a pipeline ends
+ * with its last command, and `!` inverts one. Anything unsure stays unsure.
  */
-export function scriptOutcome(body, pkg, shell = scriptShell()) {
+export function scriptOutcome(body, pkg, shell = scriptShell(npmScriptShell(pkg.dir))) {
   const tokens = tokenize(body);
   if (!tokens) return { broken: false, why: null };
   const ctx = { pkg, shell };
   const list = commands(tokens, ctx);
-  const state = { errexit: false, path: undefined, status: OK };
+  // errexit is true, false or "maybe".
+  const state = { errexit: false, path: undefined, cwd: pkg.dir, status: OK, mutated: false, trapped: false };
   const maybe = [];   // outcomes the script may already have stopped with
+  const ran = (r) => { if (r.mutates) state.mutated = true; };
   let last = OK, i = 0;
   while (i < list.length) {
     // One and-or list.
     let { r: acc, next, opaque } = pipeline(list, i, state, ctx);
     let fromLast = true, stop = acc.stop ?? false;
+    ran(acc);
     i = next;
     while (!opaque && stop !== true && (list[i - 1]?.op === "&&" || list[i - 1]?.op === "||") && i < list.length) {
       const op = list[i - 1].op;
       const runs = op === "&&" ? acc.o === "ok" : acc.o === "fail";
       const skips = op === "&&" ? acc.o === "fail" : acc.o === "ok";
       if (skips) { const p = pipeline(list, i, { ...state }, ctx); i = p.next; opaque = p.opaque; fromLast = false; continue; }
+      // `$?` is the left side's status by now, for a bare `exit`.
+      state.status = statusOf(acc);
       if (runs) {
         const p = pipeline(list, i, state, ctx);
         i = p.next; opaque = p.opaque; acc = p.r; stop = p.r.stop ?? false; fromLast = true;
+        ran(p.r);
         continue;
       }
-      // Unsure whether it runs. A PATH it may have changed is unknown after it.
+      // Unsure whether it runs. What it may have changed is unknown after it.
       const maybeState = { ...state };
       const p = pipeline(list, i, maybeState, ctx);
       i = p.next; opaque = p.opaque;
       if (maybeState.path !== state.path) state.path = null;
+      if (maybeState.cwd !== state.cwd) state.cwd = null;
+      if (maybeState.errexit !== state.errexit) state.errexit = "maybe";
+      if (maybeState.trapped) state.trapped = true;
+      ran(p.r);
       acc = op === "&&" ? (p.r.o === "fail" ? p.r : UNKNOWN) : (p.r.o === "ok" ? OK : UNKNOWN);
       if (p.r.stop) stop = "maybe";
       fromLast = "?";
@@ -447,11 +719,16 @@ export function scriptOutcome(body, pkg, shell = scriptShell()) {
     if (stop === true) { last = acc; break; }
     if (stop === "maybe") maybe.push(acc);
     if (sep === "&") { state.status = OK; last = OK; continue; }
-    if (state.errexit && acc.o === "fail" && fromLast === true) { maybe.push(acc); last = acc; break; }
-    if (state.errexit && acc.o !== "ok" && fromLast !== false) maybe.push(failing(acc.why ?? "may stop at a failure under set -e"));
-    state.status = acc;
+    // set -e stops at a failure of an and-or list's last command, and never at
+    // a pipeline `!` inverts.
+    const errexit = fromLast === false || acc.negated ? false : state.errexit;
+    if (errexit === true && acc.o === "fail" && fromLast === true) { maybe.push(acc); last = acc; break; }
+    if (errexit && acc.o !== "ok") maybe.push(failing(acc.why ?? "may stop at a failure under set -e"));
+    state.status = statusOf(acc);
     last = acc;
   }
+  // A trap can end the script with a status of its own.
+  if (state.trapped) return { broken: false, why: null };
   const final = maybe.reduce(either, last);
   return final.o === "fail" ? { broken: true, why: final.why } : { broken: false, why: null };
 }

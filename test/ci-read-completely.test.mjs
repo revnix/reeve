@@ -14,7 +14,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classify, POLICY_CONTEXT, readChecks, settle } from "../src/github/reconciler.mjs";
-import { classifyRead, clearRequirements, evaluatePr, requiredChecksOf, requiredChecksOnBase, requirementsOn, shadowContextOf } from "../src/pr.mjs";
+import { classifyRead, clearRequirements, evaluatePr, missingSettled, requiredChecksOf, requiredChecksOnBase, requirementsOn, shadowContextOf } from "../src/pr.mjs";
 import { computeVerdict, CLAUSE_IDS } from "../src/verdict.mjs";
 import { ACTIONS, ESCALATIONS, nextAction } from "../src/watcher.mjs";
 import { open } from "../src/db/ops.mjs";
@@ -54,8 +54,8 @@ const status = (name, state) => ({ name, conclusion: state, state: "completed", 
     JSON.stringify(health));
   const unplaced = classify([run("maybe-required", "skipped"), run("lint", "success")], [], { requiredKnown: false });
   const noneSkipped = classify([run("lint", "success")], [], { requiredKnown: false });
-  check(unplaced.verdict === "UNKNOWN" && /couldn't be read/.test(unplaced.why) && noneSkipped.verdict === "GREEN",
-    "where the base's requirements couldn't be read, a skipped or neutral check may be a required one, so it isn't green",
+  check(unplaced.verdict === "UNKNOWN" && /couldn't be read/.test(unplaced.why) && noneSkipped.verdict === "UNKNOWN",
+    "where the base's requirements couldn't be read, nothing reads green: a requirement unread may be one no row meets",
     JSON.stringify({ unplaced, noneSkipped }));
 }
 
@@ -90,14 +90,15 @@ const status = (name, state) => ({ name, conclusion: state, state: "completed", 
     passed: classify([run("test", "success", { appId: "15368" })], bound),
     onlyAnother: classify([theirs, run("lint", "success")], bound),
     onlyAStatus: classify([status("test", "success"), run("lint", "success")], bound),
+    anotherCancelled: classify([run("test", "success", { appId: "15368" }), run("test", "cancelled", { appId: "99" })], bound),
   };
   const rules = { ok: true, out: JSON.stringify([{ type: "required_status_checks",
     parameters: { required_status_checks: [{ context: "test", integration_id: 15368 }, { context: "any", integration_id: -1 }] } }]) };
   const read = requirementsOn({ rules, branch: { ok: true, out: JSON.stringify({ protected: false }) } }, POLICY_CONTEXT);
   check(cases.skippedBesideAnother.verdict === "SKIPPED_REQUIRED" && cases.passed.verdict === "GREEN"
-    && cases.onlyAnother.verdict === "MISSING_REQUIRED" && cases.onlyAStatus.verdict === "UNKNOWN"
+    && cases.onlyAnother.verdict === "MISSING_REQUIRED" && cases.onlyAStatus.verdict === "UNKNOWN" && cases.anotherCancelled.verdict === "GREEN"
     && JSON.stringify(read.checks) === JSON.stringify([{ context: "test", app: "15368" }, { context: "any", app: null }]),
-    "a required check bound to an App is met only by that App's runs: another App's pass isn't it, and a status can't be told",
+    "a required check bound to an App is met only by that App's runs: another App's pass isn't it, its cancelled run holds nothing, and a status can't be told",
     JSON.stringify({ cases, checks: read.checks }));
 }
 
@@ -110,6 +111,19 @@ const status = (name, state) => ({ name, conclusion: state, state: "completed", 
   check(red.verdict === "RED" && inFlight.verdict === "RUNNING" && settled.settled === true && settled.verdict === "SKIPPED_REQUIRED",
     "a failure or a running check comes before a required check yet to report, and a skipped required check settles at once",
     JSON.stringify({ red, inFlight, settled }));
+}
+
+// A required check that hasn't reported waits on the App it's bound to, not on
+// the CI provider's suites.
+{
+  const done = { "github-actions": true, 4242: false };
+  const suites = (nwo, sha, { app, appId }) => done[appId ?? app];
+  const bound = missingSettled("o/r", "a".repeat(40), [{ context: "third-party", app: "4242" }], {}, suites);
+  const unbound = missingSettled("o/r", "a".repeat(40), [{ context: "CI Gate", app: null }], {}, suites);
+  const both = missingSettled("o/r", "a".repeat(40), [{ context: "CI Gate", app: null }, { context: "third-party", app: "4242" }], {}, suites);
+  const unasked = missingSettled("o/r", "a".repeat(40), [{ context: "third-party", app: "4242" }], {}, () => null);
+  check(bound === false && unbound === true && both === false && unasked === null,
+    "a required check yet to report is settled by its own App's suites, not by the CI provider's", JSON.stringify({ bound, unbound, both, unasked }));
 }
 
 // A base that requires reeve's shadow check is gated by a result that never
@@ -266,6 +280,20 @@ ${requiresGate}
 ${requiresGate}
   */commits/${HEAD}/check-runs*) echo '${runJson("CI Gate", "failure")}';;
   */commits/${HEAD}/status*) echo "gh: HTTP 502" >&2; exit 1;;`);
+  const rulesUnread = ciAfterTicks(`${base}
+  */rules/branches/*) echo "gh: HTTP 502" >&2; exit 1;;
+  */branches/main) echo '{"protected":true,"protection":{"enabled":false}}';;
+  */commits/${HEAD}/check-runs*) echo '${runJson("CI Gate", "success")}';;
+  */commits/${HEAD}/status*) ;;`);
+  const thirdParty = (third) => `  */commits/${BASE}/check-runs*) echo '${runJson("CI Gate", "success")}';;
+  */commits/${BASE}/status*) ;;
+  */check-suites*) echo '[{"app":{"slug":"github-actions","id":15368},"status":"completed"},{"app":{"slug":"third","id":4242},"status":"${third}"}]';;
+  */rules/branches/*) echo '{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"CI Gate"},{"context":"third-party","integration_id":4242}]}}';;
+  */branches/main) echo '{"protected":true,"protection":{"enabled":false}}';;
+  */commits/${HEAD}/check-runs*) echo '${runJson("CI Gate", "success")}';;
+  */commits/${HEAD}/status*) ;;`;
+  const boundWaiting = ciAfterTicks(thirdParty("queued"));
+  const boundDone = ciAfterTicks(thirdParty("completed"));
   const shadowGated = ciAfterTicks(`${base}
   */rules/branches/*) echo '{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"CI Gate"},{"context":"${shadowContextOf(POLICY_CONTEXT)}"}]}}';;
   */branches/main) echo '{"protected":true,"protection":{"enabled":false}}';;
@@ -289,6 +317,10 @@ ${requiresGate}
     "through evaluatePr, a skipped required check from another CI blocks at once, though no GitHub Actions suite exists to finish", JSON.stringify(gateSkippedNoSuites));
   check(failingPartly.state === "BLOCK" && /CI Gate/.test(failingPartly.detail),
     "through evaluatePr, a failure read where the statuses couldn't be blocks as a failure", JSON.stringify(failingPartly));
+  check(rulesUnread.state === "UNKNOWN" && /couldn't be read/.test(rulesUnread.detail),
+    "through evaluatePr, a head whose base's rules couldn't be read has no CI pass, though every check it has passes", JSON.stringify(rulesUnread));
+  check(boundWaiting.state === "UNKNOWN" && boundDone.state === "BLOCK" && /third-party/.test(boundDone.detail),
+    "through evaluatePr, a required check from a third-party App waits for that App's suite, not GitHub Actions'", JSON.stringify({ boundWaiting, boundDone }));
   check(shadowGated.state === "BLOCK" && /shadow check/.test(shadowGated.detail),
     "through evaluatePr, a base that requires reeve's shadow check blocks", JSON.stringify(shadowGated));
   check(baseSkipped.base?.state === "PASS",

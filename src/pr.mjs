@@ -199,6 +199,23 @@ export function classifyRead(read, { required = [], known = true } = {}, { evide
   return { verdict: "UNKNOWN", failing: [], running: [], why: `the checks couldn't be read in full: ${read?.why ?? "nothing was read"}` };
 }
 
+/**
+ * Whether the Apps that a head's missing required checks wait on have finished
+ * there: the App a requirement is bound to, or the profile's CI provider for one
+ * that isn't. True only when every one has, and null when one couldn't be
+ * asked. A third-party App that hasn't scheduled its run yet isn't finished
+ * because GitHub Actions is.
+ */
+export function missingSettled(nwo, sha, missing = [], profile = {}, suites = suitesComplete) {
+  let all = true;
+  for (const app of new Set(missing.length ? missing.map((c) => c?.app ?? null) : [null])) {
+    const done = app == null ? suites(nwo, sha, { app: profile.ci?.appSlug ?? "github-actions" }) : suites(nwo, sha, { appId: app });
+    if (done === null) return null;
+    if (!done) all = false;
+  }
+  return all;
+}
+
 /** reeve's own App id, from its credentials, or null when there are none. */
 function ownAppId() {
   const c = loadAppCredentials();
@@ -577,9 +594,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // Only asked when a required check is missing, because that is the only branch
   // whose answer depends on it and each call is an extra API round trip.
   const reading = { ...c, sha: pin.sha, rows,
-    suitesComplete: c.verdict === "MISSING_REQUIRED"
-      ? suitesComplete(nwo, pin.sha, { app: profile.ci?.appSlug ?? "github-actions" })
-      : null };
+    suitesComplete: c.verdict === "MISSING_REQUIRED" ? missingSettled(nwo, pin.sha, c.missingChecks, profile) : null };
   let s;
   if (db) {
     s = saveSettlement(db, nwo, pr, settle(loadSettlement(db, nwo, pr), reading));

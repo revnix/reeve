@@ -223,8 +223,8 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
  * required check that was skipped or neutral never passed, and a set where
  * nothing ran shows nothing. A base is judged for health instead, which only
  * its failures decide, so it asks without. `requiredKnown` is false when the
- * base's own requirements couldn't be read: then a skipped or neutral check may
- * be a required one, and doesn't read green.
+ * base's own requirements couldn't be read: then nothing reads green, since a
+ * requirement unread may be one no row meets.
  */
 export function classify(allRows, requiredChecks = [], { requiredKnown = true, evidence = true } = {}) {
   // A row with no name is a PARSE DEFECT, not a check. It cannot be reported to a
@@ -260,17 +260,17 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
     why: `required check(s) bound to an App and reported only by a commit status, which names no App: ${unreadable.map(label).join(", ")}` };
   const missing = required.filter(c => !meeting(c).length);
   if (missing.length) return { verdict: "MISSING_REQUIRED", why: `required check(s) never reported: ${missing.map(label).join(", ")}`,
-    failing, running, missing: missing.map(c => c.context), malformed };
+    failing, running, missing: missing.map(c => c.context), missingChecks: missing, malformed };
   // A required job skipped because the job it needs failed was RED above, the
   // failure's to fix. One skipped with nothing failing is terminal evidence,
   // and settles at once.
   const skipped = evidence ? required.filter(c => notRun(meeting(c))) : [];
   if (skipped.length) return { verdict: "SKIPPED_REQUIRED", why: `required check(s) skipped or neutral, so they never reported a pass: ${skipped.map(label).join(", ")}`,
     failing, running, skipped: skipped.map(c => c.context), malformed };
-  // A skipped or neutral check whose name the required set may be missing.
-  const unplaced = requiredKnown || !evidence ? [] : [...names].filter(n => !requiredNames.has(n) && notRun(rows.filter(r => r.name === n)));
-  if (unplaced.length) return { verdict: "UNKNOWN", failing: [], running: [], malformed,
-    why: `${unplaced.join(", ")} skipped or neutral, and whether the base requires it couldn't be read` };
+  // Green needs the whole required set: a requirement unread may be one no row
+  // meets, reeve's own shadow check say, which GitHub passes on reeve's neutral.
+  const green = (result) => (evidence && !requiredKnown ? { verdict: "UNKNOWN", failing: [], running: [], malformed,
+    why: "the base's required checks couldn't be read, so whether each one passed can't be told" } : result);
   // A head where nothing ran has no evidence at all, however many rows say so.
   if (evidence && rows.every(r => NOT_RUN.has(String(r.conclusion)) || UNINFORMATIVE.has(String(r.conclusion))))
     return { verdict: "UNKNOWN", failing: [], running: [], malformed, why: "no check ran at this revision: every one was skipped, neutral, cancelled or stale" };
@@ -287,7 +287,11 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
   // ancillary, so every cancellation still refuses. Fail closed where the profile
   // is silent.
   if (uninformative.length) {
-    const blocking = requiredNames.size ? uninformative.filter(r => requiredNames.has(r.name)) : uninformative;
+    // Only a row that could have met a requirement: its name, and its App where
+    // the requirement is bound to one.
+    const blocking = requiredNames.size
+      ? uninformative.filter(r => required.some(c => c.context === r.name && (c.app == null || (r.source === "check_run" && String(r.appId) === c.app))))
+      : uninformative;
     if (blocking.length) return {
       verdict: "UNKNOWN", failing: [], running: [], uninformative: blocking,
       why: `${blocking.length} required check(s) cancelled or stale — superseded, not failed`,
@@ -296,11 +300,11 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
     // cancelled, it simply is not a reason to refuse a merge.
     if (malformed) return { verdict: "UNKNOWN", failing: [], running: [], malformed, ancillaryUninformative: uninformative,
       why: `${malformed} check row(s) could not be parsed, so this revision is not checkable` };
-    return { verdict: "GREEN", failing: [], running: [], ancillaryUninformative: uninformative,
-      why: `${rows.length - uninformative.length} required and ancillary check(s) passing; ${uninformative.length} ancillary cancelled or stale` };
+    return green({ verdict: "GREEN", failing: [], running: [], ancillaryUninformative: uninformative,
+      why: `${rows.length - uninformative.length} required and ancillary check(s) passing; ${uninformative.length} ancillary cancelled or stale` });
   }
   if (malformed) return { verdict: "UNKNOWN", failing: [], running: [], malformed, why: `${malformed} check row(s) could not be parsed, so this revision is not checkable` };
-  return { verdict: "GREEN", why: `${rows.length} check(s) all passing`, failing: [], running: [], malformed };
+  return green({ verdict: "GREEN", why: `${rows.length} check(s) all passing`, failing: [], running: [], malformed });
 }
 
 
@@ -316,11 +320,13 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
  * Returns null when the question cannot be asked. Null is not false and it is not
  * true: it means the caller has no basis to conclude anything.
  */
-export function suitesComplete(nwo, sha, { app = "github-actions" } = {}) {
+export function suitesComplete(nwo, sha, { app = "github-actions", appId = null } = {}) {
   const r = gh(`repos/${nwo}/commits/${sha}/check-suites?per_page=100`, ".check_suites");
   if (!r.ok || !r.out) return null;
   let suites; try { suites = JSON.parse(r.out); } catch { return null; }
-  const mine = suites.filter(s => (s.app?.slug ?? null) === app);
+  // By the App's id where a requirement is bound to one, and otherwise by the
+  // provider's name.
+  const mine = suites.filter(s => (appId != null ? String(s.app?.id) === String(appId) : (s.app?.slug ?? null) === app));
   // No suite at all from the provider is not "finished": on a repository with CI
   // it means nothing has been created yet, which is the very state being waited on.
   if (!mine.length) return false;

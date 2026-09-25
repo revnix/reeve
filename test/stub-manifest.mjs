@@ -3412,7 +3412,7 @@ export const STUBS = [
     test: "test/init-store.test.mjs",
     expectRed: "an existing state database is left alone",
     edits: [{ file: "src/init.mjs",
-              find: '  if (status.state === "exists") return { changed: false, line: null };\n',
+              find: '  if (status.state === "exists") { clearMoveLock(status.path); return { changed: false, line: null }; }\n',
               replace: "" }],
   },
   {
@@ -3592,8 +3592,8 @@ export const STUBS = [
     test: "test/init-store.test.mjs",
     expectRed: "a mover killed after its last rename leaves nothing behind once the next run finds the store",
     edits: [{ file: "src/paths.mjs",
-              find: "    try { rmSync(lockPath, { force: true }); } catch { /* left for a later run */ }\n",
-              replace: "" }],
+              find: "  if (existsSync(next)) { clearMoveLock(next); return next; }",
+              replace: "  if (existsSync(next)) return next;" }],
   },
   {
     name: "legacy-move-lock-journal-in-memory",
@@ -3603,6 +3603,15 @@ export const STUBS = [
     edits: [{ file: "src/paths.mjs",
               find: "    lock.exec(\"PRAGMA journal_mode=MEMORY\");\n",
               replace: "" }],
+  },
+  {
+    name: "init-clears-a-killed-movers-lock",
+    why: "return from init as soon as the store is in place. A lock a mover killed after its last rename left beside it then stays for good when init is what runs next",
+    test: "test/init-store.test.mjs",
+    expectRed: "and so does reeve init --write, which finds the store in place",
+    edits: [{ file: "src/init.mjs",
+              find: "{ clearMoveLock(status.path); return { changed: false, line: null }; }",
+              replace: "return { changed: false, line: null };" }],
   },
   {
     name: "init-publish-never-overwrites",

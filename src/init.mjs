@@ -21,7 +21,7 @@ import { validate, withDefaults } from "./profile/schema.mjs";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, linkSync, rmSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { resolveHome } from "./home.mjs";
-import { statePathFor, legacyStatePathFor, adoptLegacyStore } from "./paths.mjs";
+import { statePathFor, legacyStatePathFor, adoptLegacyStore, clearMoveLock } from "./paths.mjs";
 import { open } from "./db/ops.mjs";
 
 /**
@@ -318,7 +318,9 @@ export function storeStatus(home, nwo) {
  */
 export function ensureStore(home, nwo, { openStore = open, log = () => {} } = {}) {
   const status = storeStatus(home, nwo);
-  if (status.state === "exists") return { changed: false, line: null };
+  // An existing store is left alone, apart from a move lock a killed mover left
+  // beside it, which nothing else would look for.
+  if (status.state === "exists") { clearMoveLock(status.path); return { changed: false, line: null }; }
   if (status.state === "legacy") {
     let said = null, used;
     try { used = adoptLegacyStore(status.path, status.legacy, { log: (m) => { said = m; log(m); } }); }

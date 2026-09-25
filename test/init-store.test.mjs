@@ -351,6 +351,19 @@ const reeve = (home, args) => {
         "a mover killed after its last rename leaves nothing behind once the next run finds the store", JSON.stringify({ theirs, used, left }));
     } finally { rmSync(home, { recursive: true, force: true }); }
   }
+  {
+    const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
+    try {
+      const { legacy, next } = legacyStore(home);
+      const other = await mover(next, legacy, "killed", "");
+      const theirs = await other.ended;
+      // The next thing run is init, which finds the store in place and moves nothing.
+      const made = ensure(home);
+      const left = leftBeside(next);
+      check(other.partWay && theirs.signal === "SIGKILL" && !made.changed && !made.failed && !made.threw && whole(next) && left.length === 0,
+        "and so does reeve init --write, which finds the store in place", JSON.stringify({ made, left }));
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }
 
   // ── a move that leaves the store split refuses both paths ──────────────────
   //

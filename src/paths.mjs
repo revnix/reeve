@@ -145,15 +145,8 @@ export function runPathFor(home, taskId, { generation, phase, slice, attempt, st
  */
 export function adoptLegacyStore(next, legacy, { log = (m) => console.error(`reeve: ${m}`), rename = renameSync,
                                                   timeoutMs = 10_000 } = {}) {
-  const lockPath = `${next}.move-lock`;
-  if (existsSync(next)) {
-    // A mover killed after its last rename leaves its lock file behind, and
-    // nothing looks for it again once the store is in place. Removing it is safe
-    // once the main file is here, because the main file moves last: a process
-    // still waiting on the lock finds the store moved and moves nothing.
-    try { rmSync(lockPath, { force: true }); } catch { /* left for a later run */ }
-    return next;
-  }
+  const lockPath = moveLockPath(next);
+  if (existsSync(next)) { clearMoveLock(next); return next; }
   if (!existsSync(legacy)) return next;
   // One process moves at a time. Two commands started together, the daemon and
   // a status check say, each saw the main file missing and moved sidecars in the
@@ -211,6 +204,19 @@ export function adoptLegacyStore(next, legacy, { log = (m) => console.error(`ree
     try { lock.exec("ROLLBACK"); } catch { /* nothing to undo */ }
     lock.close();
   }
+}
+
+const moveLockPath = (next) => `${next}.move-lock`;
+
+/**
+ * Remove the move lock a mover killed after its last rename left beside a store
+ * that is now in place; nothing else looks for it once the store is there. Safe
+ * only once the main file is at `next`, because the main file moves last: a
+ * process still waiting on the lock then finds the store moved and moves
+ * nothing.
+ */
+export function clearMoveLock(next) {
+  try { rmSync(moveLockPath(next), { force: true }); } catch { /* left for a later run */ }
 }
 
 const SQLITE_BUSY = 5;

@@ -149,11 +149,13 @@ const SUPERSEDED_RUN = new Set(["cancelled", "stale"]);
  * name must pass, since GitHub holds the merge for any of them: a passing status
  * beside a failing check run of the same name is failing.
  */
-function requiredCheckState(rows, { context, app }) {
+function requiredCheckState(rows, { context, app, besideOwn = false }) {
   const named = rows.filter((r) => r?.name === context);
   const candidates = app == null ? named : named.filter((r) => r.source === "check_run" && String(r.appId) === app);
   const passes = (r) => r.source === "status" ? r.conclusion === "success" : PASSING_RUN.has(r.conclusion);
-  if (!candidates.length) return app != null && named.some((r) => r.source !== "check_run") ? "unknown" : "missing";
+  // Beside reeve's own check, no other result under its name is nothing more
+  // outstanding; reeve's own results are never among the rows.
+  if (!candidates.length) return besideOwn ? "passing" : app != null && named.some((r) => r.source !== "check_run") ? "unknown" : "missing";
   const superseded = (r) => r.source === "check_run" && SUPERSEDED_RUN.has(r.conclusion);
   if (candidates.some((r) => r.state === "completed" && !passes(r) && !superseded(r))) return "failing";
   if (candidates.some((r) => r.state !== "completed")) return "running";
@@ -743,6 +745,9 @@ export function requirementsOn({ rules, branch, protection = null }, context, { 
     const mine = ours(bound);
     answers.push(mine);
     if (mine !== true) others.push({ context: c, app: String(bound) });
+    // Unbound, the requirement takes every result under the name, so another's
+    // result under reeve's name must pass beside reeve's own.
+    else if (bound == null || Number(bound) === -1) others.push({ context: c, app: null, besideOwn: true });
   };
 
   const list = rules?.ok ? entries(rules) : undefined;
@@ -866,24 +871,15 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = "o
   ];
   const runs = existingRuns(auth.token, nwo, verdict.head, [name, context], api);
   const existing = runs?.[name]?.id ?? null;
-  const res = existing
-    ? api(auth.token, ["-X", "PATCH", `repos/${nwo}/check-runs/${existing}`, ...fields])
-    : api(auth.token, ["-X", "POST", `repos/${nwo}/check-runs`,
-        "-f", `name=${name}`, "-f", `head_sha=${verdict.head}`, ...fields]);
-  // Enforcing, a failed write is the whole story. In shadow mode it isn't: a
-  // passing result an earlier version left under the enforcement name still
-  // needs superseding, and a rule requiring that name still needs saying, or
-  // one failed write would leave both unseen.
-  if (!res.ok && !shadow) return { ok: false, why: res.err.split("\n")[0] };
-  const unwritten = res.ok ? null : `couldn't publish as ${name} (${res.err.split("\n")[0]})`;
 
-  let superseded = false, held = null, left = null;
+  // Shadow mode supersedes first. A passing result an earlier version left under
+  // the enforcement name passes that check for as long as it stands, so it is
+  // cancelled before anything else is written, and a run stopped in between
+  // leaves the gate safe. One that can't be superseded, or can't be looked for,
+  // fails the publication: the daemon says so, and the next tick tries again.
+  let superseded = false, left = null, stale = null;
   if (shadow) {
-    // A passing result left under the enforcement name passes that check for as
-    // long as it stands, so one that can't be superseded, or can't be looked
-    // for, fails the publication: the daemon says so, and the next tick tries
-    // again.
-    const stale = runs?.[context];
+    stale = runs?.[context];
     if (!runs) left = `the check runs at ${verdict.head.slice(0, 8)} couldn't be read, so a passing result an earlier version may have left there under ${context} couldn't be superseded`;
     else if (stale && stale.app === POLICY_APP && PASSING_RUN.has(stale.conclusion)) {
       const s = api(auth.token, ["-X", "PATCH", `repos/${nwo}/check-runs/${stale.id}`, "-f", "status=completed", "-f", "conclusion=cancelled",
@@ -892,14 +888,30 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = "o
       superseded = s.ok;
       if (!s.ok) left = `the passing result an earlier version left under ${context} at ${verdict.head.slice(0, 8)} couldn't be superseded (${(s.err ?? "").split("\n")[0]})`;
     }
+  }
+
+  const res = existing
+    ? api(auth.token, ["-X", "PATCH", `repos/${nwo}/check-runs/${existing}`, ...fields])
+    : api(auth.token, ["-X", "POST", `repos/${nwo}/check-runs`,
+        "-f", `name=${name}`, "-f", `head_sha=${verdict.head}`, ...fields]);
+  // Enforcing, a failed write is the whole story. In shadow mode it isn't: a
+  // rule requiring the enforcement name still needs saying, or one failed write
+  // would leave it unseen.
+  if (!res.ok && !shadow) return { ok: false, why: res.err.split("\n")[0] };
+  const unwritten = res.ok ? null : `couldn't publish as ${name} (${res.err.split("\n")[0]})`;
+
+  let held = null;
+  if (shadow) {
     const required = base ? requiredOnBase({ nwo, base, context, gh: (args) => api(auth.token, args), appId: auth.appId ?? null }) : null;
-    // Required, the check isn't blocked while that result stands: it passes, and
-    // the pull request can merge unjudged. That is for a person to know now, and
-    // so is a head whose runs couldn't be read to rule it out: "every pull
+    // Required, the check isn't blocked while such a result stands: it passes,
+    // and the pull request can merge unjudged. So too, maybe, when the rules
+    // couldn't be read to say. That is for a person to know now, and so is a
+    // head whose runs couldn't be read to rule such a result out: "every pull
     // request is blocked" would say the opposite of what may be true.
-    if (required === true)
-      held = left ? `a rule requires ${context} on ${base}, and ${left}, so pull request head ${verdict.head.slice(0, 8)} ${stale ? "can" : "may"} pass that check unjudged`
-        : `a rule requires ${context} on ${base}, and reeve publishes it only when enforcing, so every pull request there is blocked until it enforces or the rule stops requiring it`;
+    if (left && required !== false)
+      held = `a rule ${required ? "requires" : "may require"} ${context} on ${base ?? "the base"}, and ${left}, so pull request head ${verdict.head.slice(0, 8)} ${stale && required ? "can" : "may"} pass that check unjudged`;
+    else if (required === true)
+      held = `a rule requires ${context} on ${base}, and reeve publishes it only when enforcing, so every pull request there is blocked until it enforces or the rule stops requiring it`;
   }
   const id = res.ok ? JSON.parse(res.out).id : null;
   if (unwritten || left)

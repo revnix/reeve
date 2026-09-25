@@ -152,6 +152,17 @@ const partsOf = (base, threads, rows = []) => readMergeParts("o/r", `base-${++ba
     "a check reported both as a status and as a check run passes only when both do", JSON.stringify([both("success", "failure"), both("failure", "success"), both("success", null, "running"), both("success", "success")]));
 }
 {
+  // Reeve's own check required with no App bound: GitHub takes every result
+  // under the name, so another's failing result there blocks beside reeve's.
+  const unbound = { type: "required_status_checks", parameters: { required_status_checks: [{ context: "ops/merge-policy" }] } };
+  const foreign = partsOf(baseOf({ rules: [unbound] }), {}, [{ name: "ops/merge-policy", source: "status", state: "completed", conclusion: "failure" }]);
+  const alone = partsOf(baseOf({ rules: [unbound] }), {}, []);
+  const blocked = mergeable({ ...foreign, readable: true }), clear = mergeable({ ...alone, readable: true });
+  check(foreign.ownCheckRequired === true && blocked.state === BLOCK && /ops\/merge-policy/.test(blocked.detail) && clear.state === PASS,
+    "with reeve's check required and no App bound, another's failing result under its name blocks, and none at all is nothing outstanding",
+    JSON.stringify({ others: foreign.others, blocked, clear }));
+}
+{
   // Branches required up to date, by a rule or by classic protection: how far
   // the head is behind is read, and only then.
   const strictRule = { type: "required_status_checks", parameters: { strict_required_status_checks_policy: true,

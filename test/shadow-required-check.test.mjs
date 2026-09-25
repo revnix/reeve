@@ -94,6 +94,24 @@ const publish = (gh, over = {}) => publishVerdict({ nwo: NWO, verdict, shadow: t
   check(control.ok === true && control.superseded === true, "control: one that is superseded publishes cleanly", JSON.stringify(control));
 }
 {
+  // A passing result an earlier version left under the enforcement name is
+  // cancelled before the shadow result is written, so a run stopped between the
+  // two leaves the gate safe.
+  const gh = github({ runs: [{ name: CONTEXT, id: 5, conclusion: "neutral", app: "merge-policy" }] });
+  await publish(gh);
+  const cancel = gh.writes.findIndex((w) => w.verb === "PATCH" && w.path.endsWith("/check-runs/5"));
+  const write = gh.writes.findIndex((w) => w.verb === "POST" && w.name === shadowContextOf(CONTEXT));
+  check(cancel >= 0 && write >= 0 && cancel < write,
+    "the passing result under the enforcement name is superseded before the shadow result is written", JSON.stringify(gh.writes));
+  // It can't be superseded, and the rules couldn't be read to say whether the
+  // check is required: it may be, and then the pull request may merge unjudged.
+  const blind = github({ runs: [{ name: CONTEXT, id: 5, conclusion: "neutral", app: "merge-policy" }], rules: FORBIDDEN, branch: FORBIDDEN,
+    refuse: (verb, path) => verb === "PATCH" && path.endsWith("/check-runs/5") });
+  const r = await publish(blind);
+  check(/may require/.test(r.held ?? "") && /may pass that check unjudged/.test(r.held ?? ""),
+    "a passing result that can't be superseded, on a base whose rules couldn't be read, is held as one that may merge unjudged", JSON.stringify(r));
+}
+{
   // The shadow write itself fails. A passing result an earlier version left
   // under the required name is still superseded, and the rule is still said.
   const gh = github({ runs: [{ name: CONTEXT, id: 5, conclusion: "neutral", app: "merge-policy" }], rules: rulesRequiring(CONTEXT, APP),

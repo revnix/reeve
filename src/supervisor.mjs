@@ -40,7 +40,10 @@ export const OUTCOMES = {
 // ps prints lstart in the CALLER's timezone and locale. So the same process read
 // under TZ=UTC and under TZ=Asia/Karachi gave two different tokens, and a CLI run
 // in another timezone called a live daemon dead and suggested --takeover. The
-// token is read pinned to UTC and the C locale, so every caller gets the same one.
+// token is read pinned to UTC and the C locale, so every caller gets the same
+// one. Its format is exactly what the pin first wrote, and must stay so: a
+// process still running an earlier version compares tokens as strings, and a
+// changed format reads to it as a dead process, whose lock it may then reap.
 const PINNED = { TZ: "UTC", LC_ALL: "C" };
 
 function psStart(pid, env) {
@@ -78,12 +81,13 @@ function tailOf(path, n) {
 export function isSameProcess(pid, storedStart) {
   const now = readStart(pid);
   if (now === null) return false;
-  if (now === storedStart) return true;
-  // A token recorded before the pin was written in the recorder's own timezone.
-  // Read the same way it still matches, so the upgrade doesn't make every live
-  // daemon and worker look dead, which would invite a takeover or a second
-  // worker on the same task. Remove once no stored record predates the pin.
-  return psStart(pid, process.env) === storedStart;
+  // Exactly, and nothing looser. A token recorded before the pin was written in
+  // its recorder's timezone and names no process now. Readings that tried to
+  // recognise those tokens could also recognise a stranger that reused the pid
+  // at just the wrong moment, and keep a dead holder's lock alive for it; and no
+  // deployment holds such a token. Upgrading across the pin means stopping the
+  // daemon and its workers first.
+  return now === storedStart;
 }
 
 /**

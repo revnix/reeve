@@ -399,6 +399,17 @@ export function closedPhases(cards) {
   return [...cards].filter(([, c]) => c.state === "CLOSED" && c.phase).map(([n, c]) => ({ number: n, ...c }));
 }
 
+/** Whether an issue is a phase of the plan: it has sub-issues, or its type is Feature. */
+export const isPhase = (issue) => (issue?.subIssues?.totalCount ?? 0) > 0 || issue?.issueType?.name === "Feature";
+
+/**
+ * A card's facts, from an item of the board: its issue's state, whether anyone
+ * is assigned, its parent, and whether it is a phase, as the plan counts one.
+ */
+export const cardOf = (it) => ({ item: it.id, archived: it.isArchived === true, option: it.status?.optionId ?? null, state: it.content.state,
+                                 assigned: (it.content.assignees?.totalCount ?? 0) > 0, parent: it.content.parent?.number ?? null,
+                                 phase: isPhase(it.content) });
+
 /**
  * Closed phases found from GitHub, added to the closed parents whose sub-issues
  * are synced, beside those found from their cards. A parent already there stays

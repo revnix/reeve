@@ -4,7 +4,7 @@
 // pull requests, never typed, so it can't drift. These tests check each column
 // rule, and which linked project counts as the board, from plain data. The sync
 // that writes the board (scripts/board.mjs) applies exactly these functions.
-import { boardColumn, pickBoard, BOARD_COLUMNS, allNodes, incompleteRead, closedCards, openStrays, closersByIssue, completePullRequest } from "../.agents/skills/resume-work/scripts/lib.mjs";
+import { boardColumn, pickBoard, BOARD_COLUMNS, allNodes, incompleteRead, closedCards, openStrays, closersByIssue, completePullRequest, triagePullRequest } from "../.agents/skills/resume-work/scripts/lib.mjs";
 import { readPlan, openBlockers } from "../.agents/skills/resume-work/scripts/plan.mjs";
 
 let fail = 0;
@@ -105,8 +105,13 @@ check(two.board === null && /#2, #4/.test(two.why ?? ""), "two projects that bot
   const closers = closersByIssue(plan.prs.nodes, "o/r");
   check(closers.get(10)?.includes(7) && closers.get(11)?.includes(7),
     "every issue a pull request will close is read, past the first page, so neither task looks ready", JSON.stringify([...closers]));
-  check(boardColumn({ open: true, blocked: false, closers: [only], assigned: true }) === "In progress" && only.partial === false,
-    "every check at its head is read, so a failing one past the first page keeps its task In progress", JSON.stringify({ partial: only.partial, read: only.commits.nodes[0].commit.statusCheckRollup.contexts.nodes.length }));
+  // Seen, not only unread: a check left unread keeps a task out of In review on
+  // its own, so the failing check itself must be among the reasons.
+  const reasons = triagePullRequest(only, null).reasons;
+  check(boardColumn({ open: true, blocked: false, closers: [only], assigned: true }) === "In progress" && only.partial === false
+    && reasons.some((r) => /failing: .*\bLint\b/.test(r)),
+    "every check at its head is read, so a failing one past the first page keeps its task In progress",
+    JSON.stringify({ partial: only.partial, read: only.commits.nodes[0].commit.statusCheckRollup.contexts.nodes.length, reasons }));
   const more = { nodes: [], pageInfo: { hasNextPage: true, endCursor: "x" } };   // a list whose pages never end
   const endless = completePullRequest({ ...only, closingIssuesReferences: more }, () => more, 3);
   check(endless.partial === true && /no card was moved/.test(incompleteRead({ "pull requests' checks and closing issues": { complete: !endless.partial } }) ?? ""),

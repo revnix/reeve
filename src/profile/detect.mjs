@@ -77,6 +77,35 @@ export function detectLanguage(dir) {
 // nothing would tell them if they got it wrong.
 const fromJson = (...objects) => Object.assign(Object.create(null), ...objects);
 
+// The words a shell reads before, or instead of, a program. `npm test` here is a
+// `for` loop over the test files, and was reported as running a missing program
+// called `for`.
+const SHELL_WORDS = new Set([
+  "!", "[[", "case", "for", "function", "if", "select", "time", "until", "while",
+  ".", ":", "[", "alias", "builtin", "cd", "command", "echo", "eval", "exec", "exit", "export", "false",
+  "local", "printf", "pwd", "read", "readonly", "return", "set", "shift", "source", "test", "trap",
+  "true", "type", "ulimit", "umask", "unset", "wait",
+]);
+
+/**
+ * The program a script runs, or null when its first word isn't one.
+ *
+ * Leading variable assignments are skipped: `NODE_ENV=test jest` runs jest. A
+ * shell keyword, builtin, group or subshell names no program, and neither does
+ * an assignment whose quoted value spans words, so there is nothing to judge: a
+ * script that can't be read confidently is never called broken.
+ */
+export function programOf(body) {
+  const words = String(body).trim().split(/\s+/).filter(Boolean);
+  while (words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) {
+    if ((words[0].match(/["']/g) ?? []).length % 2) return null;
+    words.shift();
+  }
+  const first = words[0];
+  if (!first || /^[({]/.test(first) || SHELL_WORDS.has(first)) return null;
+  return first;
+}
+
 const INTENTS = {
   lint:      ["lint", "lint:check", "eslint", "ruff", "check:lint", "biome:check"],
   typecheck: ["typecheck", "check-types", "type-check", "tsc", "types", "mypy"],
@@ -97,8 +126,8 @@ export function detectCommands(dir, language, packageManager) {
       const runner = packageManager ?? "npm";
       out[intent] = { cmd: `${runner} run ${hit}`, state: "present", script: hit };
       // A declared script whose tool is not a dependency is BROKEN, not present.
-      const body = scripts[hit];
-      const tool = String(body).trim().split(/\s+/)[0];
+      const tool = programOf(scripts[hit]);
+      if (tool === null) continue;
       const deps = fromJson(pkg.dependencies, pkg.devDependencies);
       const localBin = existsSync(join(dir, "node_modules", ".bin", tool));
       if (!deps[tool] && !localBin && !/^(node|tsc|pnpm|npm|yarn|turbo|nx)$/.test(tool)) {

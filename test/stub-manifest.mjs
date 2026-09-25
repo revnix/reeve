@@ -3371,6 +3371,15 @@ export const STUBS = [
               replace: "    await new Promise(r => setTimeout(r, intervalMs));\n" }],
   },
   {
+    name: "service-lets-a-tick-finish",
+    why: "leave the service on systemd's default 90-second stop limit. A tick outlasts it, measured at 109 seconds over 3 pull requests, so a stop kills the daemon mid-tick and records the unit as failed",
+    test: "test/platform.test.mjs",
+    expectRed: "the service gives a tick in progress time to finish before systemd kills it",
+    edits: [{ file: "deploy/reeve.service",
+              find: "TimeoutStopSec=10min\n",
+              replace: "" }],
+  },
+  {
     name: "process-identity-pinned-to-utc",
     why: "read a process's start time in the caller's own timezone again. The same live daemon then has a different identity for a CLI in another timezone, which calls it dead and suggests --takeover",
     test: "test/process-identity.test.mjs",

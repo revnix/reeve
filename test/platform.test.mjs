@@ -125,6 +125,12 @@ const fakeOs = (load1, cores) => ({ loadavg: () => [load1, 0, 0], availableParal
   check(!/--(enforce|execute)\b/.test(exec), "control: the service starts in shadow mode and dispatches nothing", exec);
   check(/^Restart=always$/m.test(unit) && /^WantedBy=default\.target$/m.test(unit),
     "control: the service restarts after any exit and starts with the user's session");
+  // A stop lets the tick in progress finish. systemd's default 90 seconds is
+  // shorter than a measured tick, so without a longer limit a stop kills the
+  // daemon mid-tick and leaves the unit failed.
+  const stopLimit = (unit.match(/^TimeoutStopSec=(\d+)min$/m) ?? [])[1];
+  check(Number(stopLimit) >= 10, "the service gives a tick in progress time to finish before systemd kills it",
+    String((unit.match(/^TimeoutStopSec=.*$/m) ?? ["no TimeoutStopSec"])[0]));
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

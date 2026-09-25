@@ -29,7 +29,9 @@ for (const rel of tracked) {
   let printed = "";
   try {
     printed = execFileSync("npx", ["eslint", "--print-config", rel],
-                           { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+                           // eslint turns on node's compile cache, which it keeps in the temp
+                           // directory; with it off, nothing is left there (#204).
+                           { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, NODE_DISABLE_COMPILE_CACHE: "1" } });
   } catch { printed = ""; }
   let rules = null;
   try { rules = JSON.parse(printed).rules; } catch { /* left null */ }

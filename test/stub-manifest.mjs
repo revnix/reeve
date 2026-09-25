@@ -5215,4 +5215,22 @@ export const STUBS = [
               find: "    for (; i < rest.length && rest[i].text.indexOf(\"=\") > 0; i++) {",
               replace: "    for (; i < rest.length && ASSIGNMENT.test(rest[i].bare); i++) {" }],
   },
+  {
+    name: "temp-dirs-removed-however-the-test-ends",
+    why: "remove a test's temporary folders only when it finishes on its own. A test that exits with a failure or throws, which is when a folder is likeliest to matter, then leaves every one behind",
+    test: "test/temp-teardown.test.mjs",
+    expectRed: "and once it exits with a failure, or on an uncaught error",
+    edits: [{ file: "test/fixtures/temp.mjs",
+              find: "process.on(\"exit\", () => {",
+              replace: "process.on(\"beforeExit\", () => {" }],
+  },
+  {
+    name: "temp-dirs-remembered",
+    why: "hand out folders without remembering them. Nothing is then removed at exit, and every run of the suite leaves them in the temp directory",
+    test: "test/temp-teardown.test.mjs",
+    expectRed: "a test file's temporary folders are gone once it finishes",
+    edits: [{ file: "test/fixtures/temp.mjs",
+              find: "  made.push(dir);\n",
+              replace: "" }],
+  },
 ];

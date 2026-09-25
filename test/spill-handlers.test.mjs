@@ -14,16 +14,15 @@ import { ghIssueCreate, ghThreadResolve, HANDLERS, markerFor,
 import { open, tx, enqueue } from "../src/db/ops.mjs";
 import { drainOutbox } from "../src/outbox/drain.mjs";
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { tempDir } from "./fixtures/temp.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
   if (!ok) { if (detail !== undefined) console.log("        " + detail); fail++; }
 };
-const fresh = tag => open(join(mkdtempSync(join(tmpdir(), `reeve-spill-${tag}-`)), "state.db"));
+const fresh = tag => open(join(tempDir(`reeve-spill-${tag}-`), "state.db"));
 const threwFn = fn => { try { fn(); return null; } catch (e) { return e; } };
 
 // A recorder that also answers. `replies` is consulted in order; anything
@@ -149,7 +148,7 @@ const recorder = (replies = []) => {
   // to a table that exists — so without the rebuild an old store keeps the old
   // list and the failure appears at the first INSERT of the new kind, inside the
   // daemon, on the first spill.
-  const dir = mkdtempSync(join(tmpdir(), "reeve-spill-old-"));
+  const dir = tempDir("reeve-spill-old-");
   const path = join(dir, "old.db");
   const raw = new DatabaseSync(path);
   raw.exec(`CREATE TABLE outbox (
@@ -176,7 +175,7 @@ const recorder = (replies = []) => {
   // it, so any store that has ever delivered anything holds rows for ever —
   // refusing on a row count made the error's own advice ("drain the queue")
   // impossible to satisfy, and the daemon would never open again.
-  const dir2 = mkdtempSync(join(tmpdir(), "reeve-spill-full-"));
+  const dir2 = tempDir("reeve-spill-full-");
   const path2 = join(dir2, "full.db");
   const raw2 = new DatabaseSync(path2);
   raw2.exec(`CREATE TABLE outbox (
@@ -228,7 +227,7 @@ const recorder = (replies = []) => {
   // a process dying before the copy leaves the rows in staging and no real table.
   // Recreating an empty one and dropping staging on top would destroy every queued
   // and delivered effect — the worst outcome this table can have.
-  const dir3 = mkdtempSync(join(tmpdir(), "reeve-spill-crash-"));
+  const dir3 = tempDir("reeve-spill-crash-");
   const path3 = join(dir3, "crash.db");
   const raw3 = new DatabaseSync(path3);
   raw3.exec(`CREATE TABLE _reshape_outbox (
@@ -257,7 +256,7 @@ const recorder = (replies = []) => {
   // a process can also die AFTER the copy committed and before the drop — leaving a
   // populated table beside a populated staging one. Deciding by row count gets this
   // wrong: it looks exactly like a healthy table.
-  const dir4 = mkdtempSync(join(tmpdir(), "reeve-spill-crash2-"));
+  const dir4 = tempDir("reeve-spill-crash2-");
   const path4 = join(dir4, "crash2.db");
   const db4a = open(path4);   // a healthy, current-shape store
   tx(db4a, () => enqueue(db4a, { idemKey: "already", kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: "b" } }));
@@ -280,7 +279,7 @@ const recorder = (replies = []) => {
   // AND the index names must be freed on the RECOVERY path too, not only after a
   // fresh rename. A process dying between the rename and the index-drop loop left
   // the names held, so the recovered table came back with no indexes.
-  const dir5 = mkdtempSync(join(tmpdir(), "reeve-spill-crash3-"));
+  const dir5 = tempDir("reeve-spill-crash3-");
   const path5 = join(dir5, "crash3.db");
   const raw5 = new DatabaseSync(path5);
   raw5.exec(`CREATE TABLE _reshape_outbox (

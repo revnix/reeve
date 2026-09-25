@@ -17,9 +17,8 @@ import { open, tx, enqueue, leaseOutbox, settleOutbox, supersedeEffects,
 import { drainOutbox } from "../src/outbox/drain.mjs";
 import { resolveDependencyArgs, needsDependency, DependencyResolutionError } from "../src/outbox/depends.mjs";
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { tempDir } from "./fixtures/temp.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -28,7 +27,7 @@ const check = (ok, name, detail) => {
 };
 const threw = fn => { try { fn(); return null; } catch (e) { return e; } };
 
-const fresh = tag => open(join(mkdtempSync(join(tmpdir(), `reeve-dep-${tag}-`)), "state.db"));
+const fresh = tag => open(join(tempDir(`reeve-dep-${tag}-`), "state.db"));
 
 // --- the substitution itself, with no database and no network ------------------
 {
@@ -490,7 +489,7 @@ const fresh = tag => open(join(mkdtempSync(join(tmpdir(), `reeve-dep-${tag}-`)),
   // not-yet-added column throws -- on exactly the stores that hold real history.
   // It was found by opening a copy of the live store AFTER this suite was green,
   // which is the only reason it is not still in the branch.
-  const dir = mkdtempSync(join(tmpdir(), "reeve-dep-old-"));
+  const dir = tempDir("reeve-dep-old-");
   const path = join(dir, "old.db");
   const raw = new DatabaseSync(path);
   raw.exec(`CREATE TABLE outbox (

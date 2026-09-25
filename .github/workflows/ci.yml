@@ -89,16 +89,25 @@ jobs:
       - name: The skill copies are identical
         run: diff -r .agents/skills .claude/skills
 
+      # Every test file removes what it makes under the temp directory (#204).
+      # Each one runs with TMPDIR set to an empty folder of its own, and a file
+      # that leaves anything there fails the step, named with what it left.
       - name: Run the suite
         env:
           TZ: UTC
         run: |
           set -euo pipefail
           fail=0
+          base="$(mktemp -d)"
           for f in test/*.test.mjs; do
             echo "── $f"
+            export TMPDIR="$base/$(basename "$f" .test.mjs)"
+            mkdir "$TMPDIR"
             node "$f" || fail=1
+            left="$(ls -A "$TMPDIR")"
+            if [ -n "$left" ]; then echo "LEFT BEHIND by $f:"; echo "$left" | head -20; fail=1; fi
           done
+          rm -rf "$base"
           exit $fail
 
       # The runner is UTC, where a timestamp parsed without its trailing Z is
@@ -111,7 +120,15 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
-          for f in test/*.test.mjs; do node "$f" >/dev/null || { echo "FAILED under TZ=$TZ: $f"; fail=1; }; done
+          base="$(mktemp -d)"
+          for f in test/*.test.mjs; do
+            export TMPDIR="$base/$(basename "$f" .test.mjs)"
+            mkdir "$TMPDIR"
+            node "$f" >/dev/null || { echo "FAILED under TZ=$TZ: $f"; fail=1; }
+            left="$(ls -A "$TMPDIR")"
+            if [ -n "$left" ]; then echo "LEFT BEHIND under TZ=$TZ by $f:"; echo "$left" | head -20; fail=1; fi
+          done
+          rm -rf "$base"
           exit $fail
 
   gate:

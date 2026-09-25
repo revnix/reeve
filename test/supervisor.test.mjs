@@ -4,6 +4,7 @@
 import { runWorker, classifyResult, workerArgs, readEvent, readStart, isSameProcess, capacity, OUTCOMES }
   from "../src/supervisor.mjs";
 import { spawn, execFileSync } from "node:child_process";
+import { tempDir } from "./fixtures/temp.mjs";
 
 let fail = 0;
 const check = (n, got, want) => { const ok = got === want;
@@ -25,10 +26,8 @@ const alive = pid => { try { process.kill(pid, 0); return true; } catch { return
 // ── result classification ─────────────────────────────────────────────────
 // Every worker now takes an exact environment and durable output files.
 const WENV = { PATH: "/usr/bin:/bin" };
-const { mkdtempSync: _mk } = await import("node:fs");
-const { tmpdir: _tmp } = await import("node:os");
 const { join: _join } = await import("node:path");
-const _wdir = _mk(_join(_tmp(), "reeve-sup-files-"));
+const _wdir = tempDir("reeve-sup-files-");
 const wfiles = name => ({ outPath: _join(_wdir, `${name}.out`), errPath: _join(_wdir, `${name}.err`) });
 
 const R = o => classifyResult(o, { code: 0, signal: null, killedByUs: false }).outcome;
@@ -146,10 +145,9 @@ check("an unknown system subtype does not break parsing",
 // cuts both ways: without a reaper, killing the supervisor leaves the worker, its
 // shell and whatever build it was running with no parent to stop them.
 {
-  const { writeFileSync, mkdtempSync } = await import("node:fs");
-  const { tmpdir } = await import("node:os");
+  const { writeFileSync } = await import("node:fs");
   const { join } = await import("node:path");
-  const supScript = join(mkdtempSync(join(tmpdir(), "reeve-sup-")), "sup.mjs");
+  const supScript = join(tempDir("reeve-sup-"), "sup.mjs");
   // `.href` for the same reason as provider-scheduler: this is an import specifier
   // in generated source, not a path. JSON.stringify would escape the backslashes
   // faithfully and still leave a `C:` specifier node ESM refuses.

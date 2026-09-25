@@ -9,9 +9,9 @@
 import { checkDetectors } from "../src/doctor.mjs";
 import { ingest, noteHead } from "../src/review/ingest.mjs";
 import { open } from "../src/db/ops.mjs";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
+import { tempDir } from "./fixtures/temp.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -43,7 +43,7 @@ const idleFor = r => JSON.stringify(r).includes("codex.bodyFindings");
 
 // The defect: the badge appears in a THREAD and nowhere else.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-r08-a-"));
+  const dir = tempDir("reeve-r08-a-");
   const db = open(join(dir, "s.db"));
   noteHead(db, NWO, 1, HEAD, T);
   ingest(db, NWO, 1, [thread("PRRT_1", "**![P1 Badge](x)** in a thread"),
@@ -59,7 +59,7 @@ const idleFor = r => JSON.stringify(r).includes("codex.bodyFindings");
 // Without this the assertion above would pass just as well if the check had been
 // broken outright and never reported anything.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-r08-b-"));
+  const dir = tempDir("reeve-r08-b-");
   const db = open(join(dir, "s.db"));
   noteHead(db, NWO, 1, HEAD, T);
   ingest(db, NWO, 1, [thread("PRRT_1", "**![P1 Badge](x)** in a thread"),
@@ -76,7 +76,7 @@ const idleFor = r => JSON.stringify(r).includes("codex.bodyFindings");
 // one, so one match from months ago would otherwise vouch for it for ever. The
 // taxonomy here has already been replaced wholesale once.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-r08-c-"));
+  const dir = tempDir("reeve-r08-c-");
   const db = open(join(dir, "s.db"));
   noteHead(db, NWO, 1, HEAD, T);
   // One old body the delimiter parses, then a dozen recent ones in a taxonomy it
@@ -95,7 +95,7 @@ const idleFor = r => JSON.stringify(r).includes("codex.bodyFindings");
 // Control: the same window with the grammar still working is NOT idle, so the
 // assertion above is about drift and not about the window being too small.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-r08-d-"));
+  const dir = tempDir("reeve-r08-d-");
   const db = open(join(dir, "s.db"));
   noteHead(db, NWO, 1, HEAD, T);
   ingest(db, NWO, 1, [review(1, "**![P1 Badge](x) an old-style finding**")], { at: T });

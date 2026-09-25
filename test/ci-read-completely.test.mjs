@@ -13,7 +13,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classify, POLICY_CONTEXT, readChecks, settle } from "../src/github/reconciler.mjs";
+import { classify, inheritedOrCaused, POLICY_CONTEXT, readChecks, settle } from "../src/github/reconciler.mjs";
 import { classifyRead, clearRequirements, evaluatePr, missingSettled, requiredChecksOf, requiredChecksOnBase, requirementsOn, shadowContextOf } from "../src/pr.mjs";
 import { computeVerdict, CLAUSE_IDS } from "../src/verdict.mjs";
 import { ACTIONS, ESCALATIONS, nextAction } from "../src/watcher.mjs";
@@ -124,6 +124,47 @@ const status = (name, state) => ({ name, conclusion: state, state: "completed", 
   const unasked = missingSettled("o/r", "a".repeat(40), [{ context: "third-party", app: "4242" }], {}, () => null);
   check(bound === false && unbound === true && both === false && unasked === null,
     "a required check yet to report is settled by its own App's suites, not by the CI provider's", JSON.stringify({ bound, unbound, both, unasked }));
+}
+
+// The three green readings a pass needs are three green readings in a row: a
+// skipped or red reading before them counts for none.
+{
+  const sha = "a".repeat(40);
+  const reading = (verdict, conclusion) => ({ verdict, sha, rows: [run("test", conclusion), run("lint", "success")], why: verdict });
+  const after = (verdicts) => verdicts.reduce((prior, [verdict, conclusion]) => settle(prior, reading(verdict, conclusion)), null);
+  const afterSkips = after([["SKIPPED_REQUIRED", "skipped"], ["SKIPPED_REQUIRED", "skipped"], ["GREEN", "success"]]);
+  const afterReds = after([["RED", "failure"], ["RED", "failure"], ["GREEN", "success"]]);
+  const threeGreen = after([["GREEN", "success"], ["GREEN", "success"], ["GREEN", "success"]]);
+  check(afterSkips.settled === false && afterSkips.streak === 1 && afterReds.settled === false && afterReds.streak === 1
+    && threeGreen.settled === true && threeGreen.verdict === "GREEN",
+    "a pass needs three green readings in a row: skipped or red readings before a rerun's green count for none",
+    JSON.stringify({ afterSkips, afterReds, threeGreen }));
+}
+
+// An unbound check the base requires may be any App's, or a status from none,
+// so no suite can say it has finished: its absence stays unsettled.
+{
+  const suites = () => true;
+  const imported = missingSettled("o/r", "a".repeat(40), [{ context: "Vercel", app: null, origin: "base" }], {}, suites);
+  const own = missingSettled("o/r", "a".repeat(40), [{ context: "CI Gate", app: null, origin: "profile" }], {}, suites);
+  const origins = requiredChecksOf({ nwo: "o/r", baseRef: "main", profile: { ci: { requiredChecks: ["e2e"] } },
+    requirements: () => [{ context: "Vercel", app: null }] }).required.map((c) => `${c.context}:${c.origin}`);
+  check(imported === false && own === true && JSON.stringify(origins) === JSON.stringify(["e2e:profile", "Vercel:base"]),
+    "an unbound check the base requires stays unsettled while it hasn't reported: no suite can say its provider has finished",
+    JSON.stringify({ imported, own, origins }));
+}
+
+// A partial read of the base still shows the failures it did read.
+{
+  const probe = inheritedOrCaused("o/r", "main", [run("CI Gate", "failure"), run("lint", "failure")], {
+    pinBase: () => ({ ok: true, sha: "b".repeat(40) }),
+    readBase: () => ({ ok: false, why: "gh: HTTP 502", rows: [run("CI Gate", "failure")] }),
+    resolveCause: (nwo, row) => ({ ok: true, job: row.name, step: "test", cause: [] }),
+  });
+  check(JSON.stringify(probe.inherited) === JSON.stringify(["CI Gate"]) && JSON.stringify(probe.unverified) === JSON.stringify(["lint"])
+    && probe.caused.length === 0,
+    "a partial read of the base still shows its failures: one matched there is inherited, and one with no match stays unverified",
+    JSON.stringify(probe));
 }
 
 // A base that requires reeve's shadow check is gated by a result that never
@@ -292,6 +333,11 @@ ${requiresGate}
   */branches/main) echo '{"protected":true,"protection":{"enabled":false}}';;
   */commits/${HEAD}/check-runs*) echo '${runJson("CI Gate", "success")}';;
   */commits/${HEAD}/status*) ;;`;
+  const unboundImported = ciAfterTicks(`${base}
+  */rules/branches/*) echo '{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"CI Gate"},{"context":"Vercel"}]}}';;
+  */branches/main) echo '{"protected":true,"protection":{"enabled":false}}';;
+  */commits/${HEAD}/check-runs*) echo '${runJson("CI Gate", "success")}';;
+  */commits/${HEAD}/status*) ;;`);
   const boundWaiting = ciAfterTicks(thirdParty("queued"));
   const boundDone = ciAfterTicks(thirdParty("completed"));
   const shadowGated = ciAfterTicks(`${base}
@@ -319,6 +365,8 @@ ${requiresGate}
     "through evaluatePr, a failure read where the statuses couldn't be blocks as a failure", JSON.stringify(failingPartly));
   check(rulesUnread.state === "UNKNOWN" && /couldn't be read/.test(rulesUnread.detail),
     "through evaluatePr, a head whose base's rules couldn't be read has no CI pass, though every check it has passes", JSON.stringify(rulesUnread));
+  check(unboundImported.state === "UNKNOWN" && /Vercel/.test(unboundImported.detail),
+    "through evaluatePr, an unbound check the base requires waits while it hasn't reported, though GitHub Actions has finished", JSON.stringify(unboundImported));
   check(boundWaiting.state === "UNKNOWN" && boundDone.state === "BLOCK" && /third-party/.test(boundDone.detail),
     "through evaluatePr, a required check from a third-party App waits for that App's suite, not GitHub Actions'", JSON.stringify({ boundWaiting, boundDone }));
   check(shadowGated.state === "BLOCK" && /shadow check/.test(shadowGated.detail),

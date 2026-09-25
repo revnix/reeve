@@ -169,9 +169,10 @@ function requiredCheckState(rows, { context, app, besideOwn = false }, now = Dat
 }
 
 /**
- * The checks a pull request's CI must include, as `{ context, app }`: those the
- * profile names, and those its base's rules and protection require, each with
- * the App it's bound to. Of the base's, reeve's own check is aside, since its
+ * The checks a pull request's CI must include, as `{ context, app, origin }`:
+ * those the profile names, and those its base's rules and protection require,
+ * each with the App it's bound to and where it came from. Of the base's, reeve's
+ * own check is aside, since its
  * rows are never evidence, and so are reviewers' statuses, which the review
  * clauses read. `known` is false when the base's couldn't be read.
  *
@@ -183,7 +184,8 @@ export function requiredChecksOf({ nwo, baseRef, profile = {}, requirements = re
   const base = baseRef ? requirements({ nwo, base: baseRef, gh }) : null;
   const shadow = shadowContextOf(POLICY_CONTEXT);
   const aside = new Set([POLICY_CONTEXT, shadow, ...(profile.ci?.reviewerStatusContexts ?? [])]);
-  const all = [...(profile.ci?.requiredChecks ?? []).map((context) => ({ context, app: null })), ...(base ?? []).filter((c) => !aside.has(c.context))];
+  const all = [...(profile.ci?.requiredChecks ?? []).map((context) => ({ context, app: null, origin: "profile" })),
+               ...(base ?? []).filter((c) => !aside.has(c.context)).map((c) => ({ ...c, origin: "base" }))];
   const required = all.filter((c, i) => all.findIndex((d) => d.context === c.context && d.app === c.app) === i);
   return { required, known: Array.isArray(base), shadowRequired: (base ?? []).some((c) => c.context === shadow) };
 }
@@ -207,6 +209,10 @@ export function classifyRead(read, { required = [], known = true } = {}, { evide
  * because GitHub Actions is.
  */
 export function missingSettled(nwo, sha, missing = [], profile = {}, suites = suitesComplete) {
+  // An unbound check the base requires may come from any App, or be a commit
+  // status from none, so no suite can say it has finished: its absence stays
+  // unsettled until it reports.
+  if (missing.some((c) => c?.app == null && c?.origin === "base")) return false;
   let all = true;
   for (const app of new Set(missing.length ? missing.map((c) => c?.app ?? null) : [null])) {
     const done = app == null ? suites(nwo, sha, { app: profile.ci?.appSlug ?? "github-actions" }) : suites(nwo, sha, { appId: app });

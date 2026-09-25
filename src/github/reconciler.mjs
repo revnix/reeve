@@ -244,7 +244,7 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
     (!KNOWN_CONCLUSIONS.has(String(r.conclusion)) || !PASSING.has(String(r.conclusion))));
   const names = new Set(rows.map(r => r.name));
   const required = requiredChecks.map(c => (typeof c === "string" ? { context: c, app: null }
-    : { context: c.context, app: c.app == null ? null : String(c.app) }));
+    : { context: c.context, app: c.app == null ? null : String(c.app), ...(c.origin ? { origin: c.origin } : {}) }));
   const requiredNames = new Set(required.map(c => c.context));
   const named = (c) => rows.filter(r => r.name === c.context);
   const meeting = (c) => (c.app == null ? named(c) : named(c).filter(r => r.source === "check_run" && String(r.appId) === c.app));
@@ -353,7 +353,11 @@ export function settle(prior, reading) {
   const sameHead = Boolean(prior) && prior.sha === reading.sha;
   const floor = sameHead ? (prior.floor ?? 0) : 0;
   const same = sameHead && prior.key === key;
-  const streak = same ? (prior.streak ?? 0) + 1 : 1;
+  // The streak counts green readings in a row, and only those: a red or
+  // skipped reading, or one below the floor, starts it again. A job rerun after
+  // a skip then needs its own three green looks, not the skip's.
+  const counted = reading.verdict === "GREEN" && names.length >= floor;
+  const streak = counted ? (same ? (prior.streak ?? 0) + 1 : 1) : 0;
   const next = { sha: reading.sha, key, streak, floor: Math.max(floor, names.length), names };
 
   // THE cause of a run of "undefined" symptoms: these two returns dropped the
@@ -489,7 +493,11 @@ export function inheritedOrCaused(nwo, baseBranch, failingRows, io = {}) {
   const base = pinBase();
   if (!base.ok) return { verdict: "UNKNOWN", why: base.why, dropped };
   const read = readBase(base.sha);
-  if (!read.ok) return { verdict: "UNKNOWN", why: "could not read base checks", dropped };
+  // A read that isn't whole still shows the base failures it did read, and a
+  // failure seen there is one. What it didn't read may hold the rest, so a head
+  // failure with no twin among them stays unverified rather than caused.
+  if (!read.ok && !(read.rows ?? []).length) return { verdict: "UNKNOWN", why: "could not read base checks", dropped };
+  const partial = !read.ok;
 
   const baseFailing = new Map();
   for (const r of read.rows ?? [])
@@ -502,7 +510,7 @@ export function inheritedOrCaused(nwo, baseBranch, failingRows, io = {}) {
     const twin = baseFailing.get(row.name);
     // The cheap filter: a name that is not failing on the base at all cannot have
     // been inherited from it, and needs no probe.
-    if (!twin) { caused.push(row.name); continue; }
+    if (!twin) { (partial ? unverified : caused).push(row.name); continue; }
 
     // A shared NAME is not a shared failure. One job runs many tests, so the same
     // job can fail on the base and on the PR for entirely unrelated reasons —

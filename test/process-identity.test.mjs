@@ -18,13 +18,13 @@ const check = (ok, name, detail) => {
 };
 
 // What a process running under `tz` reads for `pid`, and whether it takes
-// `stored` to be the same process.
-function readAs(tz, pid, stored = null) {
+// `stored` to be the same process. `env` adds to the environment, for a locale.
+function readAs(tz, pid, stored = null, env = {}) {
   const script = `import { readStart, isSameProcess } from ${JSON.stringify(SUPERVISOR)};
     const pid = Number(process.argv[1]), stored = process.argv[2] ?? null;
     console.log(JSON.stringify({ token: readStart(pid), same: stored === null ? null : isSameProcess(pid, stored) }));`;
   const args = ["--input-type=module", "-e", script, String(pid), ...(stored === null ? [] : [stored])];
-  return JSON.parse(execFileSync(process.execPath, args, { encoding: "utf8", env: { ...process.env, TZ: tz } }));
+  return JSON.parse(execFileSync(process.execPath, args, { encoding: "utf8", env: { ...process.env, ...env, TZ: tz } }));
 }
 
 const me = process.pid;
@@ -40,14 +40,38 @@ check(Number.isFinite(parsed) && Math.abs(parsed - startedAt) < 3000,
   "the token is the start time in UTC, even when read from another timezone",
   `read ${karachi.token}; started ${new Date(startedAt).toISOString()}`);
 
+// And it is exactly ps's lstart in UTC and the C locale, which is what earlier
+// versions write and compare as strings. A process still running one of them
+// would read any other format as a dead process, and might reap its lock.
+const plain = execFileSync("ps", ["-o", "lstart=", "-p", String(me)],
+  { encoding: "utf8", env: { ...process.env, TZ: "UTC", LC_ALL: "C" } }).trim();
+check(utc.token === plain, "a token is exactly ps's lstart in UTC and the C locale, the format earlier versions write and compare",
+  `${utc.token} / ${plain}`);
+
 // A token recorded before the pin is what ps printed in the recorder's own
-// timezone. After an upgrade it must still identify its process, or every live
-// daemon and worker would look dead at once.
+// timezone. It names no process now, not even the one it was recorded for:
+// readings that tried to recognise such tokens could also recognise a stranger
+// that reused the pid, and keep a dead holder's lock alive for it. No deployment
+// holds one, and upgrading across the pin means stopping the daemon first.
 const before = execFileSync("ps", ["-o", "lstart=", "-p", String(me)],
   { encoding: "utf8", env: { ...process.env, TZ: "Asia/Karachi" } }).trim();
 check(before !== utc.token, "control: a token from before the pin differs from the pinned one", `${before} / ${utc.token}`);
-check(readAs("Asia/Karachi", me, before).same === true,
-  "a token recorded before the pin still identifies its process", before);
+check(readAs("Asia/Karachi", me, before).same === false,
+  "a token recorded before the pin names no process, even read in the timezone it was recorded in", before);
+
+// lstart's format, for building tokens a stranger could have left.
+const LSTART = (ms) => {
+  const d = new Date(ms), p2 = (n) => String(n).padStart(2, "0");
+  return `${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getUTCDay()]} ${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][d.getUTCMonth()]} ` +
+    `${String(d.getUTCDate()).padStart(2, " ")} ${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}:${p2(d.getUTCSeconds())} ${d.getUTCFullYear()}`;
+};
+const trueStart = Date.parse(`${utc.token} UTC`);
+check(readAs("Asia/Karachi", me, LSTART(trueStart)).same === true, "control: a token built the way the pin writes it names the process");
+// A stranger that reused the pid and started a timezone's offset later, to the
+// second, is still a stranger.
+const shifted = [5 * 3600, -3600, 30 * 60, 1].map((s) => LSTART(trueStart + s * 1000));
+check(shifted.every((t) => readAs("Asia/Karachi", me, t).same === false),
+  "a token that differs by any amount names a different process, a timezone's offset included", JSON.stringify(shifted));
 check(readAs("Asia/Karachi", me, "Thu Jan  1 00:00:00 1970").same === false,
   "control: a stale token is not the same process");
 check(readStart(999999) === null, "control: a pid that isn't running has no token");

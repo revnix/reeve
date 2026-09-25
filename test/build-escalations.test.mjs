@@ -1085,13 +1085,19 @@ const freshHub = () => {
   const sent = [];
   const send = (a) => { sent.push(a); return { ok: true, channels: [{ name: "t", ok: true }] }; };
   const key = escalationKey({ task: "bt:0C", kind: "phase:blocked", phase: "RESEARCH" });
-  const huge = body({ type: "FAILED", detail: "E".repeat(2000) });
+  const detail = "E".repeat(2000);
+  const huge = body({ type: "FAILED", detail });
 
   announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
                   bodies: new Map([[key, huge]]) });
   const msg = sent[0]?.message ?? "";
   check(/truncated/.test(msg),
     "control: the body really is long enough to be truncated", String(msg.length));
+  // THE CAP IS THE BOUNDARY'S OWN. The body's credentials are scrubbed before it
+  // is stored, so the final `redact` is a second layer there, and the only place
+  // the whole message is cut to what a phone shows.
+  check(msg.length < detail.length,
+    "a message is capped before it leaves, however long its body", String(msg.length));
   check(/reeve task why bt:0C/.test(msg),
     "and the action still arrives, because it is above the detail rather than after it",
     JSON.stringify(msg.slice(0, 200)));
@@ -1565,8 +1571,9 @@ const freshHub = () => {
   announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
                   send: () => ({ ok: true, channels: [{ name: "t", ok: true }] }),
                   bodies: new Map([[key, { type: "FAILED", [`k${A}`]: "first", [`k${B}`]: "second" }]]) });
-  const stored = JSON.parse(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body);
-  const values = Object.values(stored).filter(v => v === "first" || v === "second");
+  const stored = JSON.parse(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? "null");
+  // A report that wasn't stored fails here rather than ending the file.
+  const values = Object.values(stored ?? {}).filter(v => v === "first" || v === "second");
   check(values.length === 2,
     "both values survive a key collision, under distinct names", JSON.stringify(stored));
 }

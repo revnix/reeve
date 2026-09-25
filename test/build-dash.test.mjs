@@ -1304,6 +1304,25 @@ const T = {};
   check(/HUB DAMAGED/.test(damagedText) && /reeve restore --hub --force/.test(damagedText),
     "and the text says so, with the recovery command the error itself carries",
     damagedText.split("\n").filter(l => /DAMAGED|recover/.test(l)).join(" | ") || "(no model)");
+
+  // A CURSOR THAT NAMES AN EVENT is proved by its timestamp on a hub with no
+  // identity, which is a legacy cursor's proof too. A sequence-zero cursor is
+  // proved by its sequence, so only this one reaches the note that blames the
+  // cursor, and it must still blame the hub.
+  const { task } = await fileTask({ db: ddb, registry, project: "alpha", title: "a scout task", territory: ["packages/x"],
+                                    io, isAlive: isSameProcess, pid: process.pid, lstart: readStart(process.pid) });
+  const at = NOW - 10;
+  const seq = ddb.prepare(`INSERT INTO phase_event(task,at,op,from_phase,to_phase,from_generation,to_generation,detail)
+                           VALUES(?,?,'dispatch.sizing','FILED','SIZING',1,1,'{}') RETURNING seq`).get(task, at).seq;
+  // Only where the digest answered at all: a damaged hub that throws is its own
+  // check, above.
+  const atEvent = model && dashModel(ddb, { now: NOW, switchesFor: resolver(), projects: [], since: cur(seq, at, SOME_ID), isAlive: ALIVE });
+  const eventNote = (atEvent ? renderDash(atEvent) : "").split("\n").find(l => /note:/.test(l)) ?? "(no note)";
+  check(atEvent?.cursor_proof === "timestamp" && atEvent?.incarnation === null,
+    "control: a cursor that names an event, on a hub with no identity, is proved by its timestamp",
+    JSON.stringify({ proof: atEvent?.cursor_proof, hub: atEvent?.incarnation }));
+  check(/this HUB cannot supply an incarnation id/.test(eventNote) && !/this cursor predates/.test(eventNote),
+    "and when its timestamp proves the cursor, the note still blames the HUB, not the cursor", eventNote);
   ddb.close();
   rmSync(dhome, { recursive: true, force: true });
 }

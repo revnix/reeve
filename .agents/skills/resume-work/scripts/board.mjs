@@ -8,7 +8,7 @@
 // Usage: node board.mjs [--repo owner/name]
 // Exit codes: 0 synced, or no board to sync; 2 GitHub could not be asked; 64 usage.
 import { gh, repoFromGit, isRepo, parseArgs, closersByIssue, boardColumn, pickBoard, BOARD_COLUMNS,
-         allNodes, incompleteRead, closedCards } from "./lib.mjs";
+         allNodes, incompleteRead, closedCards, openStrays } from "./lib.mjs";
 import { readPlan, openBlockers } from "./plan.mjs";
 
 process.on("uncaughtException", (err) => {
@@ -50,13 +50,14 @@ const optionFor = Object.fromEntries(board.status.options.map((o) => [o.name, o.
 // ── its cards, by issue number ───────────────────────────────────────────────
 const items = allNodes((after) => gql(`query($id:ID!${after ? ",$after:String" : ""}){ node(id:$id){ ... on ProjectV2{
   items(first:100${after ? ",after:$after" : ""}){ pageInfo{ hasNextPage endCursor } nodes{ id
-    content{ ... on Issue{ number state repository{ nameWithOwner } } }
+    content{ ... on Issue{ number state assignees(first:1){ totalCount } repository{ nameWithOwner } } }
     status: fieldValueByName(name:"Status"){ ... on ProjectV2ItemFieldSingleSelectValue{ optionId } } } } } } }`,
   { id: board.id, ...(after ? { after } : {}) }).node.items);
 const cards = new Map();
 for (const it of items.nodes) {
   if (it.content?.repository?.nameWithOwner?.toLowerCase() === repo.toLowerCase())
-    cards.set(it.content.number, { item: it.id, option: it.status?.optionId ?? null, state: it.content.state });
+    cards.set(it.content.number, { item: it.id, option: it.status?.optionId ?? null, state: it.content.state,
+                                   assigned: (it.content.assignees?.totalCount ?? 0) > 0 });
 }
 
 // ── the plan ─────────────────────────────────────────────────────────────────
@@ -95,6 +96,21 @@ for (const phase of phases) {
     setColumn(item, column);
     moved++;
   }
+}
+// A task left open, or reopened, after its phase closed is no longer in the
+// plan, but its card is on the board. It is set from its own issue, as a task
+// of an open phase is.
+for (const card of openStrays(cards, visited)) {
+  const column = boardColumn({
+    open: true,
+    blocked: openBlockers(repo, card.number) > 0,
+    closers: (closers.get(card.number) ?? []).map((n) => prByNumber.get(n)).filter(Boolean),
+    assigned: card.assigned,
+  });
+  counts[column]++;
+  if (card.option === optionFor[column]) continue;
+  setColumn(card.item, column);
+  moved++;
 }
 // A card whose issue closed but that no open phase lists any more, its phase
 // having closed with it, is Done too.

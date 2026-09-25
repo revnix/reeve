@@ -141,18 +141,20 @@ export function triagePullRequest(pr, me) {
   return {
     notes,
     reasons,
+    settled,
     needsMe: mine && reasons.length > 0,
     needsPerson: mine && reasons.length === 0 && settled && !pr.isDraft,
   };
 }
 
 /**
- * A pull request with its own lists read whole: the issues it will close, and
- * the checks at its head. The query that reads the pull requests stops each at
- * its first page, and a closing reference or a failing check on a later page
- * would otherwise go unseen. `readPage(field, after)` returns the next page of
- * `closing` or `contexts` as a connection. `partial` is true when a list still
- * couldn't be read whole, so nothing is judged from part of one.
+ * A pull request with its own lists read whole: the issues it will close, its
+ * review threads, and the checks at its head. The query that reads the pull
+ * requests stops each at its first page, and a closing reference, an unresolved
+ * thread or a failing check on a later page would otherwise go unseen.
+ * `readPage(field, after)` returns the next page of `closing`, `threads` or
+ * `contexts` as a connection. `partial` is true when a list still couldn't be
+ * read whole, so nothing is judged from part of one.
  */
 export function completePullRequest(pr, readPage, limit = 20) {
   const whole = (conn, field) => {
@@ -169,11 +171,13 @@ export function completePullRequest(pr, readPage, limit = 20) {
     return { conn: { ...conn, nodes }, complete: false };
   };
   const closing = whole(pr.closingIssuesReferences, "closing");
+  const threads = whole(pr.reviewThreads, "threads");
   const commit = pr.commits?.nodes?.[0]?.commit;
   const contexts = whole(commit?.statusCheckRollup?.contexts, "contexts");
   const commits = contexts.conn === commit?.statusCheckRollup?.contexts ? pr.commits
     : { ...pr.commits, nodes: [{ ...pr.commits.nodes[0], commit: { ...commit, statusCheckRollup: { ...commit.statusCheckRollup, contexts: contexts.conn } } }] };
-  return { ...pr, closingIssuesReferences: closing.conn, commits, partial: !(closing.complete && contexts.complete) };
+  return { ...pr, closingIssuesReferences: closing.conn, reviewThreads: threads.conn, commits,
+           partial: !(closing.complete && threads.complete && contexts.complete) };
 }
 
 // The open pull requests that will close each issue. This reads the pull
@@ -326,13 +330,15 @@ export const BOARD_COLUMNS = ["Blocked", "Ready", "In progress", "In review", "D
 /**
  * The column a task belongs in. `closers` are the open pull requests that will
  * close it, in the shape readPlan returns. One that needs its author (a draft,
- * review findings, changes requested, failing checks, a conflict) means the work
- * is still being done: In progress. Otherwise it waits on a person: In review.
+ * review findings, changes requested, failing checks, a conflict), or whose
+ * checks are still running, means the work is still being done: In progress.
+ * Otherwise it waits on a person: In review.
  */
 export function boardColumn({ open, blocked, closers = [], assigned }) {
   if (!open) return "Done";
   if (blocked) return "Blocked";
-  if (closers.length) return closers.some((pr) => triagePullRequest(pr, null).reasons.length) ? "In progress" : "In review";
+  if (closers.length) return closers.every((pr) => { const t = triagePullRequest(pr, null); return !t.reasons.length && t.settled; })
+    ? "In review" : "In progress";
   if (assigned) return "In progress";
   return "Ready";
 }
@@ -378,6 +384,15 @@ export function allNodes(fetch, limit = 50) {
 export function incompleteRead(reads) {
   const missing = Object.entries(reads).filter(([, r]) => r?.complete === false).map(([name]) => name);
   return missing.length ? `not every one of the ${missing.join(", ")} could be read, so no card was moved` : null;
+}
+
+/**
+ * The cards the plan didn't visit whose issue is still open: a task left open,
+ * or reopened, after its phase closed, which the plan no longer reads. Each is
+ * set from its own issue, as a task of an open phase would be.
+ */
+export function openStrays(cards, visited) {
+  return [...cards].filter(([n, c]) => !visited.has(n) && c.state === "OPEN").map(([n, c]) => ({ number: n, ...c }));
 }
 
 /**

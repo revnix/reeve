@@ -4,7 +4,7 @@
 // pull requests, never typed, so it can't drift. These tests check each column
 // rule, and which linked project counts as the board, from plain data. The sync
 // that writes the board (scripts/board.mjs) applies exactly these functions.
-import { boardColumn, pickBoard, BOARD_COLUMNS, allNodes, incompleteRead, closedCards, closersByIssue, completePullRequest } from "../.agents/skills/resume-work/scripts/lib.mjs";
+import { boardColumn, pickBoard, BOARD_COLUMNS, allNodes, incompleteRead, closedCards, openStrays, closersByIssue, completePullRequest } from "../.agents/skills/resume-work/scripts/lib.mjs";
 import { readPlan, openBlockers } from "../.agents/skills/resume-work/scripts/plan.mjs";
 
 let fail = 0;
@@ -39,6 +39,13 @@ check(boardColumn({ open: true, blocked: false, closers: [pr({ reviewThreads: { 
   "a task whose pull request has review findings, failing checks or a conflict is In progress");
 check(boardColumn({ open: true, blocked: false, closers: [pr(), pr({ number: 2, isDraft: true })], assigned: true }) === "In progress",
   "one pull request still needing its author keeps the task In progress");
+{
+  // Just after a push, the checks are queued or running: nobody can act yet.
+  const running = { commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { totalCount: 1,
+    nodes: [{ __typename: "CheckRun", name: "Test", status: "IN_PROGRESS", conclusion: null }] } } } }] } };
+  check(boardColumn({ open: true, blocked: false, closers: [pr(running)], assigned: true }) === "In progress",
+    "a task whose pull request's checks are still running is In progress, not yet In review");
+}
 check(boardColumn({ open: true, blocked: false, closers: [], assigned: true }) === "In progress",
   "an assigned task with no pull request is In progress");
 check(boardColumn({ open: true, blocked: false, closers: [], assigned: false }) === "Ready",
@@ -104,6 +111,39 @@ check(two.board === null && /#2, #4/.test(two.why ?? ""), "two projects that bot
   const endless = completePullRequest({ ...only, closingIssuesReferences: more }, () => more, 3);
   check(endless.partial === true && /no card was moved/.test(incompleteRead({ "pull requests' checks and closing issues": { complete: !endless.partial } }) ?? ""),
     "a pull request whose lists still couldn't be read whole is partial, and the board moves no card from it", JSON.stringify({ partial: endless.partial }));
+}
+{
+  // Review threads run past their first page too: 100 resolved on the first,
+  // and on the second one more, resolved or not.
+  const planWith = (lastResolved) => readPlan("o/r", (args) => {
+    const query = args.find((a) => a.startsWith("query=")) ?? "";
+    const after = (args.find((a) => a.startsWith("after=")) ?? "").slice(6);
+    if (query.includes("pullRequest(number:$n)"))
+      return JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: after === "t1"
+        ? { totalCount: 101, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ isResolved: lastResolved }] }
+        : { totalCount: 101, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } } });
+    if (query.includes("pullRequests(")) return JSON.stringify({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{
+      number: 8, title: "t", isDraft: false, author: { login: "a" }, reviewDecision: null, mergeable: "MERGEABLE",
+      closingIssuesReferences: { totalCount: 1, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ number: 12, repository: { nameWithOwner: "o/r" } }] },
+      reviewThreads: { totalCount: 101, pageInfo: { hasNextPage: true, endCursor: "t1" }, nodes: Array.from({ length: 100 }, () => ({ isResolved: true })) },
+      commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { totalCount: 1, pageInfo: { hasNextPage: false, endCursor: null },
+        nodes: [{ __typename: "CheckRun", name: "Test", status: "COMPLETED", conclusion: "SUCCESS" }] } } } }] } }] } } } });
+    if (query.includes("issues(")) return JSON.stringify({ data: { repository: { issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } });
+    return "";
+  });
+  const resolved = planWith(true).prs.nodes[0], open = planWith(false).prs.nodes[0];
+  check(boardColumn({ open: true, blocked: false, closers: [resolved], assigned: true }) === "In review"
+    && boardColumn({ open: true, blocked: false, closers: [open], assigned: true }) === "In progress" && !resolved.partial,
+    "every review thread is read past the first page: all resolved reaches In review, and one open on a later page keeps it In progress",
+    JSON.stringify({ read: resolved.reviewThreads.nodes.length, partial: resolved.partial }));
+}
+{
+  // A task left open, or reopened, after its phase closed: no open phase lists it.
+  const cards = new Map([[1, { item: "a", state: "OPEN", assigned: true }], [2, { item: "b", state: "CLOSED" }], [3, { item: "c", state: "OPEN" }]]);
+  const strays = openStrays(cards, new Set([3]));
+  check(strays.length === 1 && strays[0].number === 1 && strays[0].assigned === true
+    && boardColumn({ open: true, blocked: false, closers: [], assigned: strays[0].assigned }) === "In progress",
+    "an open task no open phase lists is still set from its own issue", JSON.stringify(strays));
 }
 {
   // A task's blockers, two pages of them, an open one on each.

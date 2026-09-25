@@ -5,6 +5,7 @@ import { gh, completePhase, completePullRequest } from "./lib.mjs";
 
 // A pull request's own lists, as the queries below read them.
 const CLOSING = "totalCount pageInfo{ hasNextPage endCursor } nodes{ number repository{ nameWithOwner } }";
+const THREADS = "totalCount pageInfo{ hasNextPage endCursor } nodes{ isResolved }";
 const CONTEXTS = `totalCount pageInfo{ hasNextPage endCursor } nodes{
   __typename ... on CheckRun{ name status conclusion } ... on StatusContext{ context state } }`;
 
@@ -36,18 +37,20 @@ export function readPlan(repo, run = gh) {
       pageInfo{ hasNextPage endCursor } nodes{
       number title isDraft author{ login } reviewDecision mergeable
       closingIssuesReferences(first:100){ ${CLOSING} }
-      reviewThreads(first:100){ totalCount nodes{ isResolved } }
+      reviewThreads(first:100){ ${THREADS} }
       commits(last:1){ nodes{ commit{ statusCheckRollup{ contexts(first:100){ ${CONTEXTS} } } } } }
     } } } }`, (d) => d.repository.pullRequests);
   // Each one's own lists stop at their first page there, so one that ran past it
   // is read whole, page by page.
   const nextPage = (number, field, after) => {
     const list = field === "closing" ? `closingIssuesReferences(first:100, after:$after){ ${CLOSING} }`
+      : field === "threads" ? `reviewThreads(first:100, after:$after){ ${THREADS} }`
       : `commits(last:1){ nodes{ commit{ statusCheckRollup{ contexts(first:100, after:$after){ ${CONTEXTS} } } } } }`;
     const pr = JSON.parse(run(["api", "graphql", "-f", `query=query($owner:String!,$name:String!,$n:Int!,$after:String){
       repository(owner:$owner,name:$name){ pullRequest(number:$n){ ${list} } } }`,
       "-f", `owner=${owner}`, "-f", `name=${name}`, "-F", `n=${number}`, "-f", `after=${after}`])).data.repository.pullRequest;
-    return field === "closing" ? pr.closingIssuesReferences : pr.commits.nodes[0]?.commit?.statusCheckRollup?.contexts;
+    return field === "closing" ? pr.closingIssuesReferences : field === "threads" ? pr.reviewThreads
+      : pr.commits.nodes[0]?.commit?.statusCheckRollup?.contexts;
   };
   prs.nodes = prs.nodes.map((pr) => completePullRequest(pr, (field, after) => nextPage(pr.number, field, after)));
 

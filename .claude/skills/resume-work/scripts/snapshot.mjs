@@ -47,6 +47,7 @@ for (const pr of prs.nodes) {
 }
 if (!prs.nodes.length) out.push("  none");
 if (!prs.complete) out.push("  (more pull requests are open than were read)");
+if (prs.nodes.some((pr) => pr.partial)) out.push("  (a pull request's checks or closing issues couldn't all be read)");
 out.push("");
 
 out.push("PLAN");

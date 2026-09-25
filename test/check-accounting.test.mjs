@@ -98,7 +98,7 @@ const fingerprint = createHash("sha256").update(body ?? "").digest("hex").slice(
 // fingerprint. If no — a rename, a refactor with identical behaviour — paste the
 // fingerprint and leave the version alone.
 const PINNED_ACCOUNTING = 3;
-const PINNED_FINGERPRINT = "6698a602b0950eac";
+const PINNED_FINGERPRINT = "56e05dde0422ee21";
 
 check(CHECK_ACCOUNTING === PINNED_ACCOUNTING,
   "CHECK_ACCOUNTING matches the version this fingerprint was taken under",

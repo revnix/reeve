@@ -1,7 +1,7 @@
 // plan: read where work stands from GitHub, in one place, so the snapshot and
 // the board judge the same facts. It only reads. The rules applied to what it
 // reads are in lib.mjs.
-import { gh, completePhase, completePullRequest } from "./lib.mjs";
+import { gh, completePhase, completePullRequest, isPhase } from "./lib.mjs";
 
 // A pull request's own lists, as the queries below read them.
 const CLOSING = "totalCount pageInfo{ hasNextPage endCursor } nodes{ number repository{ nameWithOwner } }";
@@ -61,8 +61,7 @@ export function readPlan(repo, run = gh) {
       id number title issueType{ name }
       subIssues(first:100){ totalCount nodes{ id number title state assignees(first:10){ nodes{ login } } subIssues{ totalCount } } }
     } } } }`, (d) => d.repository.issues);
-  const phases = issues.nodes.filter((i) => i.subIssues.nodes.length > 0 || i.issueType?.name === "Feature")
-    .map((phase) => completePhase(phase, (n) => readSubIssues(repo, n, run)));
+  const phases = issues.nodes.filter(isPhase).map((phase) => completePhase(phase, (n) => readSubIssues(repo, n, run)));
 
   return { prs, issues, phases };
 }
@@ -75,21 +74,26 @@ export function readSubIssues(repo, n, run = gh) {
 }
 
 /**
- * The closed issues that have sub-issues and no parent: phases the plan has
- * closed, found from GitHub itself rather than from their cards. A phase that
+ * The closed phases: closed issues with no parent that have sub-issues or are
+ * Features, found from GitHub itself rather than from their cards. A phase that
  * opened and closed between two syncs, with every task of it, never had a card,
- * and is still found. `complete` is false when there were more pages than read.
+ * and is still found. GitHub's issue search finds them in one request, however
+ * many issues have closed. Its index can lag a change by a moment, so each one
+ * found is checked as it is now, and one it misses is found by the next sync.
+ * `complete` is false when there were more than the search returns.
  */
 export function readClosedRoots(repo, run = gh) {
-  const [owner, name] = repo.split("/");
+  const q = `repo:${repo} is:issue is:closed no:parent-issue (has:sub-issue OR type:Feature)`;
   const nodes = [];
-  let after = null;
-  for (let page = 0; page < 50; page++) {
-    const conn = JSON.parse(run(["api", "graphql", "-f", `query=query($owner:String!,$name:String!,$after:String){ repository(owner:$owner,name:$name){
-      issues(states:CLOSED, first:100, after:$after){ pageInfo{ hasNextPage endCursor } nodes{ id number state parent{ number } subIssues{ totalCount } } } } }`,
-      "-f", `owner=${owner}`, "-f", `name=${name}`, ...(after ? ["-f", `after=${after}`] : [])])).data.repository.issues;
-    nodes.push(...conn.nodes.filter((i) => !i.parent && (i.subIssues?.totalCount ?? 0) > 0));
-    if (!conn.pageInfo.hasNextPage) return { nodes, complete: true };
+  let after = null, seen = 0;
+  // The search returns at most its first 1,000 results, 100 to a page.
+  for (let page = 0; page < 10; page++) {
+    const conn = JSON.parse(run(["api", "graphql", "-f", `query=query($q:String!,$after:String){ search(query:$q, type:ISSUE_ADVANCED, first:100, after:$after){
+      issueCount pageInfo{ hasNextPage endCursor } nodes{ ... on Issue{ id number state parent{ number } subIssues{ totalCount } issueType{ name } } } } }`,
+      "-f", `q=${q}`, ...(after ? ["-f", `after=${after}`] : [])])).data.search;
+    seen += conn.nodes.length;
+    nodes.push(...conn.nodes.filter((i) => i.state === "CLOSED" && !i.parent && isPhase(i)));
+    if (!conn.pageInfo.hasNextPage) return { nodes, complete: seen >= conn.issueCount };
     after = conn.pageInfo.endCursor;
   }
   return { nodes, complete: false };

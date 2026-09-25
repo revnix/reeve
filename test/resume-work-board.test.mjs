@@ -4,7 +4,7 @@
 // pull requests, never typed, so it can't drift. These tests check each column
 // rule, and which linked project counts as the board, from plain data. The sync
 // that writes the board (scripts/board.mjs) applies exactly these functions.
-import { boardColumn, pickBoard, BOARD_COLUMNS, allNodes, incompleteRead, closedCards, closedPhases, closedParent, syncClosedParents, openStrays, mustUnarchive, closersByIssue, completePullRequest, triagePullRequest, withClosedRoots, uncardedRoots } from "../.agents/skills/resume-work/scripts/lib.mjs";
+import { boardColumn, pickBoard, BOARD_COLUMNS, allNodes, incompleteRead, closedCards, closedPhases, closedParent, syncClosedParents, openStrays, mustUnarchive, closersByIssue, completePullRequest, triagePullRequest, withClosedRoots, uncardedRoots, cardOf } from "../.agents/skills/resume-work/scripts/lib.mjs";
 import { readClosedRoots, readPlan, openBlockers } from "../.agents/skills/resume-work/scripts/plan.mjs";
 
 let fail = 0;
@@ -201,36 +201,92 @@ check(two.board === null && /#2, #4/.test(two.why ?? ""), "two projects that bot
     "a closed task with sub-tasks met while syncing is read in its turn, card or no card, however deep", JSON.stringify(synced));
 }
 
-// ── closed phases found from GitHub, card or no card (#206) ─────────────────
-{
-  // Two pages of closed issues. Phase 50 opened and closed between two syncs,
-  // with its task 51, and neither ever had a card. Issue 60 has a parent, and
-  // issue 70 no sub-issues: neither is a phase.
-  const pages = [
-    { nodes: [{ id: "I50", number: 50, state: "CLOSED", parent: null, subIssues: { totalCount: 1 } },
-              { id: "I60", number: 60, state: "CLOSED", parent: { number: 148 }, subIssues: { totalCount: 2 } }],
-      pageInfo: { hasNextPage: true, endCursor: "p2" } },
-    { nodes: [{ id: "I70", number: 70, state: "CLOSED", parent: null, subIssues: { totalCount: 0 } },
-              { id: "I10", number: 10, state: "CLOSED", parent: null, subIssues: { totalCount: 3 } }],
-      pageInfo: { hasNextPage: false, endCursor: null } },
-  ];
+// ── closed phases found from GitHub, card or no card (#206, #213) ─────────────
+// A stand-in for GitHub's GraphQL over a list of issues. It pages the closed
+// issues, 100 at a time, and answers an advanced issue search as GitHub does for
+// the qualifiers the sync uses, with at most its first 1,000 results. A query it
+// can't answer fails the test. `stale` are issues its index still matches,
+// whatever they are now: search reads an index, which can lag a change.
+const issue = (number, over = {}) => ({ id: `I${number}`, number, state: "CLOSED", parent: null, subIssues: { totalCount: 0 }, issueType: null, ...over });
+const github = (issues, { stale = [] } = {}) => {
   const asked = [];
-  const run = (args) => { asked.push(args); const page = args.includes("after=p2") ? pages[1] : pages[0];
-    return JSON.stringify({ data: { repository: { issues: page } } }); };
+  const matches = (it, q) => {
+    const term = (t) => {
+      if (t === "repo:o/r" || t === "is:issue") return true;
+      if (t === "is:closed") return it.state === "CLOSED";
+      if (t === "no:parent-issue") return !it.parent;
+      if (t === "has:sub-issue") return it.subIssues.totalCount > 0;
+      if (t.startsWith("type:")) return it.issueType?.name === t.slice(5);
+      throw new Error(`the stand-in can't answer ${t}`);
+    };
+    const group = /\(([^)]*)\)/.exec(q);
+    return q.replace(/\([^)]*\)/, " ").split(/\s+/).filter(Boolean).every(term) && (!group || group[1].split(" OR ").some(term));
+  };
+  const run = (args) => {
+    asked.push(args);
+    const arg = (k) => args.find((a) => a.startsWith(`${k}=`))?.slice(k.length + 1);
+    const from = Number(arg("after") ?? 0);
+    const page = (list) => ({ nodes: list.slice(from, from + 100), pageInfo: { hasNextPage: from + 100 < list.length, endCursor: String(from + 100) } });
+    if (arg("query").includes("search(")) {
+      // Only advanced search reads these qualifiers: GitHub's older one finds nothing.
+      const found = arg("query").includes("type:ISSUE_ADVANCED") ? issues.filter((it) => stale.includes(it.number) || matches(it, arg("q"))) : [];
+      return JSON.stringify({ data: { search: { issueCount: found.length, ...page(found.slice(0, 1000)) } } });
+    }
+    return JSON.stringify({ data: { repository: { issues: page(issues.filter((it) => it.state === "CLOSED")) } } });
+  };
+  return { run, asked };
+};
+{
+  // Phase 50 opened and closed between two syncs with its task 51, and phase 80
+  // is a Feature that closed with no sub-issues: neither ever had a card. Issue
+  // 60 has a parent, and issue 70 no sub-issues: neither is a phase, and nor
+  // are 6,000 more closed issues.
+  const { run, asked } = github([issue(50, { subIssues: { totalCount: 1 } }), issue(60, { parent: { number: 148 }, subIssues: { totalCount: 2 } }),
+    issue(70), issue(80, { issueType: { name: "Feature" } }), issue(10, { subIssues: { totalCount: 3 } }),
+    ...Array.from({ length: 6000 }, (_, n) => issue(1000 + n))]);
   const roots = readClosedRoots("o/r", run);
-  check(roots.complete === true && roots.nodes.map((r) => r.number).join(",") === "50,10" && asked.length === 2,
-    "closed phases are read from GitHub, every page: closed issues with sub-issues and no parent", JSON.stringify({ roots, asked: asked.length }));
-  // Phase 10 has a card; phase 50 has none.
+  check(roots.complete === true && roots.nodes.map((r) => r.number).join(",") === "50,80,10",
+    "closed phases are read from GitHub: closed issues with no parent that have sub-issues or are Features",
+    JSON.stringify({ roots: roots.nodes.map((r) => r.number), complete: roots.complete }));
+  check(asked.length === 1, "reading them takes one request, however many issues are closed", `${asked.length} requests`);
+  // Phase 10 has a card; phases 50 and 80 have none.
   const cards = new Map([[10, { item: "p", state: "CLOSED", phase: true, parent: null }]]);
   const parents = withClosedRoots(new Map(closedPhases(cards).map((c) => [c.number, c])), roots.nodes);
   const synced = [], visited = new Set();
   syncClosedParents(parents, (n) => (n === 50 ? [{ number: 51, state: "CLOSED", subIssues: { totalCount: 0 } }] : []), visited,
     (task) => { visited.add(task.number); synced.push(task.number); });
   const uncarded = uncardedRoots(roots.nodes, cards);
-  check([...parents.keys()].join(",") === "10,50" && parents.get(10).item === "p" && synced.join(",") === "51"
-    && uncarded.map((r) => r.number).join(",") === "50",
+  check([...parents.keys()].join(",") === "10,50,80" && parents.get(10).item === "p" && synced.join(",") === "51"
+    && uncarded.map((r) => r.number).join(",") === "50,80",
     "a closed phase that never had a card is found, its tasks are synced, and it gets a card of its own in Done",
     JSON.stringify({ parents: [...parents.keys()], synced, uncarded }));
+}
+{
+  // The search index can lag a change: issue 90 has a parent now, and 91 was
+  // opened again. Each is checked as it is, and left out.
+  const roots = readClosedRoots("o/r", github([issue(90, { parent: { number: 158 }, subIssues: { totalCount: 1 } }),
+    issue(91, { state: "OPEN", subIssues: { totalCount: 2 } })], { stale: [90, 91] }).run);
+  check(roots.complete === true && roots.nodes.length === 0,
+    "what the search returns is checked against the issue as it is now", JSON.stringify(roots));
+  // Past the search's first page, every page is read; past its first 1,000
+  // results, the read is partial.
+  const phases = (n) => Array.from({ length: n }, (_, k) => issue(2000 + k, { subIssues: { totalCount: 1 } }));
+  const paged = readClosedRoots("o/r", github(phases(150)).run);
+  const capped = readClosedRoots("o/r", github(phases(1200)).run);
+  check(paged.complete === true && paged.nodes.length === 150 && capped.complete === false,
+    "every page of the search is read, and more phases than it returns are a partial read",
+    JSON.stringify({ paged: [paged.complete, paged.nodes.length], capped: [capped.complete, capped.nodes.length] }));
+}
+
+// ── a card's facts ───────────────────────────────────────────────────────────
+{
+  // A Feature with no sub-issues is a phase, as the plan counts one.
+  const item = (content) => ({ id: "P1", isArchived: false, status: { optionId: "o" },
+    content: { number: 5, state: "CLOSED", assignees: { totalCount: 0 }, parent: null, subIssues: { totalCount: 0 }, issueType: null, ...content } });
+  const phase = (content) => cardOf(item(content)).phase;
+  check(phase({ issueType: { name: "Feature" } }) === true && phase({ subIssues: { totalCount: 2 } }) === true
+    && phase({}) === false && phase({ issueType: { name: "Bug" } }) === false,
+    "a card is a phase's when its issue has sub-issues or is a Feature, as the plan counts a phase");
 }
 
 // ── an archived card ─────────────────────────────────────────────────────────

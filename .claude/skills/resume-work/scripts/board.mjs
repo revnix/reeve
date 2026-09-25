@@ -9,7 +9,7 @@
 // Exit codes: 0 synced, or no board to sync; 2 GitHub could not be asked; 64 usage.
 import { gh, repoFromGit, isRepo, parseArgs, closersByIssue, boardColumn, pickBoard, BOARD_COLUMNS,
          allNodes, incompleteRead, closedCards, closedPhases, closedParent, syncClosedParents, openStrays, mustUnarchive,
-         withClosedRoots, uncardedRoots } from "./lib.mjs";
+         withClosedRoots, uncardedRoots, cardOf } from "./lib.mjs";
 import { readPlan, openBlockers, readSubIssues, readClosedRoots } from "./plan.mjs";
 
 process.on("uncaughtException", (err) => {
@@ -51,16 +51,14 @@ const optionFor = Object.fromEntries(board.status.options.map((o) => [o.name, o.
 // ── its cards, by issue number ───────────────────────────────────────────────
 const items = allNodes((after) => gql(`query($id:ID!${after ? ",$after:String" : ""}){ node(id:$id){ ... on ProjectV2{
   items(first:100, archivedStates:[ARCHIVED, NOT_ARCHIVED]${after ? ",after:$after" : ""}){ pageInfo{ hasNextPage endCursor } nodes{ id isArchived
-    content{ ... on Issue{ number state assignees(first:1){ totalCount } parent{ number } subIssues{ totalCount }
+    content{ ... on Issue{ number state assignees(first:1){ totalCount } parent{ number } subIssues{ totalCount } issueType{ name }
       repository{ nameWithOwner } } }
     status: fieldValueByName(name:"Status"){ ... on ProjectV2ItemFieldSingleSelectValue{ optionId } } } } } } }`,
   { id: board.id, ...(after ? { after } : {}) }).node.items);
 const cards = new Map();
 for (const it of items.nodes) {
   if (it.content?.repository?.nameWithOwner?.toLowerCase() === repo.toLowerCase())
-    cards.set(it.content.number, { item: it.id, archived: it.isArchived === true, option: it.status?.optionId ?? null, state: it.content.state,
-                                   assigned: (it.content.assignees?.totalCount ?? 0) > 0,
-                                   parent: it.content.parent?.number ?? null, phase: (it.content.subIssues?.totalCount ?? 0) > 0 });
+    cards.set(it.content.number, cardOf(it));
 }
 
 // ── the plan ─────────────────────────────────────────────────────────────────

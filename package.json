@@ -12,7 +12,7 @@
     "node": ">=24.10.0"
   },
   "scripts": {
-    "test": "for f in test/*.test.mjs; do case \"$f\" in */escape.test.mjs) continue;; esac; node \"$f\" || exit 1; done",
+    "test": "node scripts/test.mjs",
     "lint": "eslint .",
     "test:escape": "node test/escape.test.mjs",
     "typecheck": "tsc -p ."

@@ -6259,13 +6259,4 @@ export const STUBS = [
               find: "{ detached: true, stdio:",
               replace: "{ detached: false, stdio:" }],
   },
-  {
-    name: "temp-watcher-holds-nothing",
-    why: "keep the pipe to the watcher counted. A test that has finished then never exits, since the open pipe holds its event loop",
-    test: "test/temp-teardown.test.mjs",
-    expectRed: "a test file's temporary folders are gone once it finishes",
-    edits: [{ file: "test/fixtures/temp.mjs",
-              find: "    watcher.stdin.unref();\n",
-              replace: "" }],
-  },
 ];

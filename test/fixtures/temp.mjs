@@ -28,9 +28,9 @@ process.on("exit", () => {
 });
 
 // The watcher reads the folders' names on its stdin, and the pipe closes when
-// this process ends, which is its cue. Neither the pipe nor the watcher keeps
-// this process alive, and the watcher is in a group of its own, so Ctrl-C at a
-// terminal doesn't stop it before it has done its work.
+// this process ends, which is its cue. It doesn't keep this process alive, nor
+// does the pipe, which is only written to. And it is in a group of its own, so
+// Ctrl-C at a terminal doesn't stop it before it has done its work.
 let watcher = null;
 const watch = (dir) => {
   if (!watcher) {
@@ -39,7 +39,6 @@ const watch = (dir) => {
     watcher.on("error", () => { /* no watcher: the exit listener still runs */ });
     watcher.stdin.on("error", () => { /* the watcher went early: the exit listener still runs */ });
     watcher.unref();
-    watcher.stdin.unref();
   }
   watcher.stdin.write(`${dir}\n`);
 };

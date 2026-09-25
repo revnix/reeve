@@ -5,8 +5,8 @@
 import { open, startRun, recordWorkerContract, noteWorkerResult, workerContractFor, sha256 } from "../src/db/ops.mjs";
 import { tick } from "../src/daemon.mjs";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { tempDir } from "./fixtures/temp.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -14,7 +14,7 @@ const check = (ok, name, detail) => {
   if (!ok) { if (detail) console.log("        " + detail); fail++; }
 };
 
-const dir = mkdtempSync(join(tmpdir(), "reeve-contract-"));
+const dir = tempDir("reeve-contract-");
 const db = open(join(dir, "c.db"));
 
 // ── the unit ─────────────────────────────────────────────────────────────────
@@ -54,7 +54,7 @@ const db = open(join(dir, "c.db"));
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     // Separate directories, as a real deployment must have them: the worker
     // policy denies reads of the clone, so a checkout inside it is refused.
-    profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-wc-clone-")) }, authority: { policy: "propose_and_merge" },
+    profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-wc-clone-") }, authority: { policy: "propose_and_merge" },
                rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 }, ci: { provider: "github-actions", requiredChecks: [] },
                watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 } },
     openPrs: () => [42], evaluate: () => evaluation,
@@ -106,7 +106,7 @@ const db = open(join(dir, "c.db"));
 // throw there escaped the cleanup, leaving the interval renewing a lease for a
 // worker that never ran, and every later dispatch for the PR refused.
 {
-  const dir2 = mkdtempSync(join(tmpdir(), "reeve-contract-fail-"));
+  const dir2 = tempDir("reeve-contract-fail-");
   const db2 = open(join(dir2, "c.db"));
   db2.exec("DROP TABLE worker_run");   // the insert will throw
   let spawned = 0;
@@ -129,10 +129,9 @@ const db = open(join(dir, "c.db"));
   db2.close(); rmSync(dir2, { recursive: true, force: true });
 }
 
-
 // ── result facts that cannot be recorded make the run failed, not published ──
 {
-  const dir3 = mkdtempSync(join(tmpdir(), "reeve-contract-note-"));
+  const dir3 = tempDir("reeve-contract-note-");
   const db3 = open(join(dir3, "n.db"));
   const ctx3 = { ...ctxFor(db3, join(dir3, "log.txt")), noteWorkerResult: () => { throw new Error("disk full"); },
                  spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s", model: "m" }) };

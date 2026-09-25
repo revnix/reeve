@@ -38,10 +38,11 @@ import { run, CLAIM_TOKEN, SCHEDULER_SEAMS, SCHEDULER_FALLBACKS } from "./fixtur
 // naming an outcome the supervisor had since renamed, and the branch it is meant
 // to reach would simply stop being taken.
 import { OUTCOMES } from "../src/supervisor.mjs";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, mkdtempSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { tempDir } from "./fixtures/temp.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APPROVED = join(HERE, "fixtures", "tick-approved");
@@ -333,7 +334,7 @@ const optionsOf = (o) => (typeof o === "function" ? o() : o);
 // release of the one the tick claims for itself.
 // An EXISTING file, because `halted()` is an existence check. Under the
 // temporary root, so the redactor normalises it like every other fixture path.
-const HALT_MARKER = join(mkdtempSync(join(tmpdir(), "reeve-halt-")), "HALT");
+const HALT_MARKER = join(tempDir("reeve-halt-"), "HALT");
 writeFileSync(HALT_MARKER, "");
 
 const CARRIED_RELEASE = [["o/r#41:FIX_CI",

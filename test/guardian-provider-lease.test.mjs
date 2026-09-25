@@ -19,8 +19,7 @@ import { resolveRepoId } from "../src/build/repoid.mjs";
 import { shapeAt, SCHEDULER_MIN_HUB_VERSION } from "../src/build/hubdb.mjs";
 import { isBuilderPr } from "../src/pr.mjs";
 import { CLAUSE_IDS } from "../src/verdict.mjs";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 // The daemon's constant, restated here only as an upper bound for an
@@ -33,8 +32,6 @@ const check = (ok, name, detail) => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
   if (!ok) { if (detail) console.log("        " + detail); fail++; }
 };
-
-
 
 /**
  * One tick with the scheduler injected at the daemon's seams.
@@ -51,6 +48,7 @@ const check = (ok, name, detail) => {
  * is now the connection production actually uses.
  */
 import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
+import { tempDir } from "./fixtures/temp.mjs";
 
 // ── the happy path: a lease is taken and given back ───────────────────────
 {
@@ -110,7 +108,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // a repository id therefore throws on every production tick, leaves `repoId`
 // null, and fail-closes every dispatch.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-guest-"));
+  const dir = tempDir("reeve-prov-guest-");
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
   const guest = openHubAsGuest(hubPath);
@@ -144,7 +142,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
   // `asks` -- so the connection itself is instrumented too, and the run's
   // outcome is asserted rather than discarded.
   const asks = [], sql = [];
-  const spyDir = mkdtempSync(join(tmpdir(), "reeve-prov-spy-"));
+  const spyDir = tempDir("reeve-prov-spy-");
   const spyPath = join(spyDir, "hub.db");
   openHub(spyPath).close();
   const realGuest = openHubAsGuest(spyPath);
@@ -203,7 +201,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // one -- so a pull request the builder had parked still reached FIX_CI. Proving
 // a mechanism works is not proving it is reachable.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-hold-"));
+  const dir = tempDir("reeve-prov-hold-");
   const hubPath = join(dir, "hub.db");
   const owner = openHub(hubPath);
   owner.exec(`INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,generation,source_kind,source_key,
@@ -219,7 +217,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
   // `evaluate` returns, so the hold has to arrive through the DAEMON's own read.
   // `evaluate` here deliberately reports no hold at all.
   let seen;
-  const dir2 = mkdtempSync(join(tmpdir(), "reeve-prov-hold-st-"));
+  const dir2 = tempDir("reeve-prov-hold-st-");
   const ctx = {
     nwo: "o/r", db: open(join(dir2, "s.db")), logPath: join(dir2, "log.txt"),
     execute: false, shadow: false, running: 0,
@@ -227,7 +225,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir2, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-hold-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir2, checkout: tempDir("reeve-prov-hold-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -270,7 +268,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // unreadable is a reading that says so.
 {
   let seen;
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-unread-"));
+  const dir = tempDir("reeve-prov-unread-");
   const base = {
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
     execute: false, shadow: false, running: 0,
@@ -278,7 +276,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-unread-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-unread-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -353,7 +351,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     ["dependabot",         "dependabot/x",     "dependabot[bot]",   false],
   ]) {
     let seen;
-    const dir = mkdtempSync(join(tmpdir(), "reeve-prov-cls-"));
+    const dir = tempDir("reeve-prov-cls-");
     const ctx = {
       nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
       execute: false, shadow: false, running: 0,
@@ -361,7 +359,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
       keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
       capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
       profile: {
-        identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-cls-cl-")) },
+        identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-cls-cl-") },
         authority: { policy: "propose_and_merge" },
         rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
         ci: { provider: "github-actions", requiredChecks: [] },
@@ -480,7 +478,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // so even past expiry the liveness-aware reaper keeps it and the slot is gone
 // for good.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-drop-"));
+  const dir = tempDir("reeve-prov-drop-");
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
   const guest = openHubAsGuest(hubPath);
@@ -493,7 +491,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-drop-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-drop-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -538,7 +536,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // claimed, never cancelled, owned by the live guardian so the reaper keeps it,
 // and blocking every builder admission behind it.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-sweep-"));
+  const dir = tempDir("reeve-prov-sweep-");
   const cancelled = [];
   const base = (decisionsWanted) => ({
     nwo: "o/r", db: open(join(dir, `s${cancelled.length}.db`)), logPath: join(dir, "log.txt"),
@@ -547,7 +545,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-sweep-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-sweep-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -635,7 +633,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // another request into the same exhausted window -- while builders stay eligible
 // against the same untouched provider_state.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-canary-"));
+  const dir = tempDir("reeve-prov-canary-");
   const cooldowns = [];
   const ctx = {
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
@@ -643,7 +641,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-canary-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-canary-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -716,7 +714,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // and a stub that reverted the fix produced no failures at all. This getter
 // hands out a different handle after the first call.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-fresh-"));
+  const dir = tempDir("reeve-prov-fresh-");
   const first = { tag: "pre-restore" };
   const second = { tag: "post-restore" };
   let asked = 0;
@@ -728,7 +726,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-fresh-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-fresh-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -774,7 +772,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // fallback never fired and a stub reverting the fix produced no failures. This
 // one goes unreadable after the first ask, which is what a restore looks like.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-gone-"));
+  const dir = tempDir("reeve-prov-gone-");
   const first = { tag: "pre-restore" };
   let asked = 0;
   const seen = [];
@@ -785,7 +783,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-gone-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-gone-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -828,7 +826,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // spares a live holder -- but `expires_at` stops describing reality, and
 // `expiredLeases` reads it.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-beat-"));
+  const dir = tempDir("reeve-prov-beat-");
   const beats = [];
   const ctx = {
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
@@ -837,7 +835,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-beat-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-beat-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -883,7 +881,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // the paid path, so the prediction does not exist.
 {
   const mk = ({ canary, isolation = "scratch-home" }) => {
-    const dir = mkdtempSync(join(tmpdir(), "reeve-prov-paid-"));
+    const dir = tempDir("reeve-prov-paid-");
     const claims = [];
     return { dir, claims, ctx: {
       nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
@@ -892,7 +890,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
       platform: "darwin", isolationReady: () => true,
       capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
       profile: {
-        identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-paid-cl-")) },
+        identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-paid-cl-") },
         authority: { policy: "propose_and_merge" },
         rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
         ci: { provider: "github-actions", requiredChecks: [] },
@@ -963,7 +961,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // Absence from `wanted` means "unknown", not "withdrawn": cancelling costs the
 // guardian its place in the queue and lets a builder take the opening.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-unread-q-"));
+  const dir = tempDir("reeve-prov-unread-q-");
   const cancelled = [];
   const ctx = {
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
@@ -972,7 +970,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-unread-q-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-unread-q-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -1013,7 +1011,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // needed it most, and the builder never calls it at all.
 {
   const mk = (openPrs) => {
-    const dir = mkdtempSync(join(tmpdir(), "reeve-prov-reap-"));
+    const dir = tempDir("reeve-prov-reap-");
     const reaped = [];
     return { dir, reaped, ctx: {
       nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
@@ -1022,7 +1020,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
       keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
       capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
       profile: {
-        identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-reap-cl-")) },
+        identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-reap-cl-") },
         authority: { policy: "propose_and_merge" },
         rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
         ci: { provider: "github-actions", requiredChecks: [] },
@@ -1064,7 +1062,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // outage: an unreadable hub fails the id lookup too, so the canary was refused
 // and skipDispatch set, over a lease that could not have been written anyway.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-nohub-"));
+  const dir = tempDir("reeve-prov-nohub-");
   const spawned = [];
   let permitted = null;
   const ctx = {
@@ -1074,7 +1072,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     platform: "darwin", isolationReady: () => true,
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-nohub-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-nohub-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -1117,7 +1115,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 {
   const pending = new Map();
   const notes = [];
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-cool-"));
+  const dir = tempDir("reeve-prov-cool-");
   const mk = (reachable) => ({
     nwo: "o/r", db: open(join(dir, `s${notes.length}.db`)), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
@@ -1125,7 +1123,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-cool-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-cool-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -1177,7 +1175,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // anchor cannot be read takes an earlier exit than the evaluation failure, so
 // the sweep saw it missing from `wanted` and cancelled its queued request.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-anchor-"));
+  const dir = tempDir("reeve-prov-anchor-");
   const cancelled = [];
   const ctx = {
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
@@ -1186,7 +1184,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-anchor-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-anchor-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -1226,7 +1224,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // against capacity throughout an outage, with the database that could clear it
 // healthy the whole time.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-outage-"));
+  const dir = tempDir("reeve-prov-outage-");
   const reaped = [];
   const ctx = {
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
@@ -1235,7 +1233,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-outage-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-outage-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -1270,7 +1268,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // AND the tick carries on -- an unreadable scheduler fails OPEN, so a permissions
 // fault on the builder's database must not stop the guardian working.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-idthrow-"));
+  const dir = tempDir("reeve-prov-idthrow-");
   const ctx = {
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
@@ -1278,7 +1276,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-idthrow-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-idthrow-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -1323,7 +1321,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // ever, `claimProvider` refuses every builder admission while any queued guardian
 // row exists, and the builder never reaps at all, so nothing else was coming.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-observe-"));
+  const dir = tempDir("reeve-prov-observe-");
   const reaped = [];
   const ctx = {
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
@@ -1333,7 +1331,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-observe-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-observe-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -1462,7 +1460,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // fails before its insert lands. The first tick is what makes the second one
 // mean anything.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-refund-"));
+  const dir = tempDir("reeve-prov-refund-");
   const store = open(join(dir, "s.db"));
   let calls = 0;
   const mk = () => ({
@@ -1472,7 +1470,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-refund-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-refund-cl-") },
       authority: { policy: "propose_and_merge" },
       // ABOVE ONE, which is the only configuration in which this defect can bite.
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 3 },
@@ -1531,7 +1529,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // it exists to retire left live anyway. A repair that can take the tick with it
 // is worse than the leak it repairs.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-retire-"));
+  const dir = tempDir("reeve-prov-retire-");
   const store = open(join(dir, "s.db"));
   let threw = null, r = null;
   const ctx = {
@@ -1541,7 +1539,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-retire-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-retire-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -1656,7 +1654,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // than an injected throw, because "a damaged table" is the failure the finding
 // describes and a seam added for the test would not have exercised it.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-attempt-"));
+  const dir = tempDir("reeve-prov-attempt-");
   const store = open(join(dir, "s.db"));
   const spawned = [];
   const ctx = {
@@ -1666,7 +1664,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-attempt-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-attempt-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -1745,7 +1743,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // cannot clear one whose holder is alive and sleeping under halt. So the guardian
 // must WITHDRAW rather than merely stop.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-halt-"));
+  const dir = tempDir("reeve-prov-halt-");
   const marker = join(dir, "HALT");
   writeFileSync(marker, "stop");
   const cancelled = [], spawned = [], reaped = [];
@@ -1756,7 +1754,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-halt-cl-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-halt-cl-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -1848,7 +1846,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // the limit the whole time -- the guardian throttling itself for five minutes
 // over a restore that took one second.
 {
-  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-retry-"));
+  const dir = tempDir("reeve-prov-retry-");
   const retryHubPath = join(dir, "hub.db");
   openHub(retryHubPath).close();
   const retryGuest = openHubAsGuest(retryHubPath);
@@ -1862,7 +1860,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-retry-clone-")) },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: tempDir("reeve-prov-retry-clone-") },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -1948,7 +1946,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
   //
   // What must actually be true is a property of the OBJECT the guardian gets.
   {
-    const dir = mkdtempSync(join(tmpdir(), "reeve-cap-"));
+    const dir = tempDir("reeve-cap-");
     const hubPath = join(dir, "hub.db");
     openHub(hubPath).close();
     const got = hubAccess(hubPath)();

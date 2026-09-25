@@ -5,13 +5,14 @@
 // test asserts the ABSENCE of each ambient credential with a positive control
 // (it plants them first), because an absence search that cannot see is not one.
 import { workerEnv, writeGitConfig, workerHomeFor, CONTAINMENT } from "../src/workerenv.mjs";
-import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from "node:fs";
-import { tmpdir, homedir } from "node:os";
+import { rmSync, readFileSync, existsSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
+import { tempDir } from "./fixtures/temp.mjs";
 
 // A worker never gets the founder's HOME (that is where the keychain lives) and
 // authenticates from a token instead of ~/.claude.
-const WORKER_HOME = mkdtempSync(join(tmpdir(), "reeve-worker-home-"));
+const WORKER_HOME = tempDir("reeve-worker-home-");
 const FAKE_TOKEN = "sk-ant-oat01-test-token-not-a-real-credential-000000000000";
 
 let fail = 0;
@@ -20,7 +21,7 @@ const check = (ok, name, detail) => {
   if (!ok) { if (detail) console.log("        " + detail); fail++; }
 };
 
-const dir = mkdtempSync(join(tmpdir(), "reeve-env-"));
+const dir = tempDir("reeve-env-");
 
 // Positive control: plant every credential the allowlist must drop.
 const planted = { GH_TOKEN: "x", GITHUB_TOKEN: "x", SSH_AUTH_SOCK: "/tmp/agent", AWS_SECRET_ACCESS_KEY: "x",
@@ -112,7 +113,6 @@ const env = workerEnv({ home: WORKER_HOME, oauthToken: FAKE_TOKEN, gitConfigPath
   check(threwToken, "and a worker without a token is refused rather than left unauthenticated");
 }
 
-
 {
   // A worker must be able to commit (its prompt requires it) without the
   // founder's identity: the reeve-owned config carries the App's bot identity,
@@ -134,8 +134,6 @@ const env = workerEnv({ home: WORKER_HOME, oauthToken: FAKE_TOKEN, gitConfigPath
   const out2 = ex("git", ["-C", repo, "log", "-1", "--format=%an <%ae> %cn"], { env, encoding: "utf8" }).trim();
   check(out2 === "merge-policy[bot] <319037914+merge-policy[bot]@users.noreply.github.com> merge-policy[bot]", "a repository-local identity cannot re-attribute a worker commit", out2);
 }
-
-
 
 for (const k of Object.keys(planted)) delete process.env[k];
 rmSync(dir, { recursive: true, force: true });

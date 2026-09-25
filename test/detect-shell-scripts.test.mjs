@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { detectCommands } from "../src/profile/detect.mjs";
-import { npmScriptShells, runnerShells, scriptShells } from "../src/profile/shellscript.mjs";
+import { npmScriptShells, runnerShells, scriptShell, scriptShells } from "../src/profile/shellscript.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let fail = 0;
@@ -288,7 +288,8 @@ try {
   // not have run leaves set -e unsure.
   const setShapes = ["set -- -e; false; true", "set x -e; false; true", "set - -e; false; true", "set -e; set $FLAGS; false; true",
                      "set -e; jest --ci && set +e; false; true"].map((s) => ({ s, r: detectTest(s, jest) }));
-  const setOn = detectTest("set -eo pipefail; false; true");
+  // A shell with pipefail: the dash of Debian 12 and Ubuntu 24.04 has none.
+  const setOn = detectTest("set -eo pipefail; false; true", {}, { shell: { ...bashLike, pipefail: true } });
   check(setShapes.every(({ r }) => r.state === "present") && broken(setOn, "always fails"),
     "set reads options only until --, - or its first operand, and one that may not have run leaves set -e unsure",
     JSON.stringify({ setShapes, setOn }));
@@ -421,6 +422,154 @@ try {
   const envAssigned = ['env "MSG=two words" jest --ci', "env A+=1 jest --ci"].map((s) => ({ s, r: detectTest(s, jest) }));
   check(envAssigned.every(({ r }) => r.state === "present"), "env takes any word with an = in it for an assignment, quoted or not",
     JSON.stringify(envAssigned));
+
+  // ── seven more shapes, and more found beside them (#209) ──────────────────
+  //
+  // The first three made a script that passes read as broken, and the next four
+  // a broken one read as present. The rest turned up comparing the reader with
+  // real dash and bash. The shells here say what dash and bash have, as
+  // scriptShell asks them, whatever this machine's are.
+  const BUILTINS = ["echo", "printf", "exit", "true", "false", "set", "export", "readonly", "unset", "cd", "read", "trap", "alias",
+                    "command", "exec", ":", ".", "test", "["];
+  const NO_SYNTAX = { "|&": false, "<<<": false, "&>": false, "&>>": false, ">&": false };
+  const dashShell = { name: "dash", paths: [], execOptions: false, execEndsOptions: false, appendAssign: false, pipefail: true,
+                      badOptionEnds: true, syntax: NO_SYNTAX, builtins: new Set(BUILTINS),
+                      keywords: new Set(["if", "for", "while", "until", "case", "!", "{", "}"]) };
+  // dash before Debian's 0.5.12-7, as Debian 12 and Ubuntu 24.04 have it.
+  const oldDashShell = { ...dashShell, pipefail: false };
+  const bashShell = { ...dashShell, name: "bash", execOptions: true, execEndsOptions: true, appendAssign: true, badOptionEnds: false,
+                      syntax: Object.fromEntries(Object.keys(NO_SYNTAX).map((op) => [op, true])),
+                      builtins: new Set([...BUILTINS, "source", "declare"]),
+                      keywords: new Set([...dashShell.keywords, "[[", "function", "select", "time"]) };
+
+  // A shell the runner names that can't be asked leaves the script unjudged:
+  // with script-shell=true, npm runs `true`, which ignores the script and passes.
+  // In an .npmrc, npm takes `true` for that program too, and `false` for no
+  // setting, as npm 11 does.
+  const unasked = [];
+  for (const sh of ["true", "echo"]) {
+    process.env.npm_config_script_shell = sh;
+    try { unasked.push({ sh, r: detectTest("no-such-runner --ci") }); } finally { delete process.env.npm_config_script_shell; }
+  }
+  unasked.push({ sh: ".npmrc true", r: detectTest("no-such-runner --ci", {}, { files: { ".npmrc": "script-shell=true\n" } }) });
+  const fromRc = ["true", "false"].map((v) => npmScriptShells(tree(`rc-${v}`, { "package.json": "{}", ".npmrc": `script-shell=${v}\n` }), npmEnv));
+  check(unasked.every(({ r }) => r.state === "present") && scriptShell("true") === null && scriptShell("echo") === null
+    && JSON.stringify(fromRc) === JSON.stringify([["true"], ["sh"]]),
+    "a script under a shell that can't be asked isn't judged: script-shell=true runs nothing of it", JSON.stringify({ unasked, fromRc }));
+
+  // A local env, nohup or time, first on npm's PATH, runs instead of the
+  // system's, whose reading of what follows is the only one known.
+  const localBin = Object.fromEntries(["env", "nohup", "time"].map((w) => [`node_modules/.bin/${w}`, "#!/bin/sh\nexit 0\n"]));
+  const shadowed = ["env no-such-runner", "nohup no-such-runner", "time no-such-runner", "env -i no-such-runner"]
+    .map((s) => ({ s, r: detectTest(s, {}, { shell: dashShell, files: localBin }) }));
+  const inTools = detectTest("PATH=./tools env no-such-runner", {}, { shell: dashShell, files: { "tools/env": "#!/bin/sh\nexit 0\n" } });
+  const asDependency = detectTest("env no-such-runner", { env: "^1.0.0" }, { shell: dashShell });
+  const systemEnv = detectTest("env no-such-runner", {}, { shell: dashShell });
+  check(shadowed.every(({ r }) => r.state === "present") && inTools.state === "present" && asDependency.state === "present"
+    && broken(systemEnv, "'no-such-runner'"),
+    "env, nohup or time is read as the system's only where the system's runs: a local one first on the PATH does whatever it does",
+    JSON.stringify({ shadowed, inTools, asDependency, systemEnv }));
+
+  // A read-only PATH keeps its value: a later assignment to it fails, and bash
+  // goes on looking programs up where it did.
+  const keptPath = ["readonly PATH=/usr/bin:/bin; readonly PATH=/nowhere; sh -c true",
+                    "readonly PATH=/usr/bin:/bin; export PATH=/nowhere; sh -c true",
+                    "readonly PATH=/usr/bin:/bin; unset PATH; sh -c true", "readonly PATH; PATH=/nowhere sh -c true"]
+    .map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
+  // Made read-only only if the test passed, PATH may have taken the new value or
+  // not. The test is a builtin, which changes nothing a later lookup reads.
+  const maybeKept = detectTest("[ -f package.json ] && readonly PATH=/usr/bin:/bin; PATH=/nowhere sh -c true", {}, { shell: bashShell });
+  const failedAssignment = detectTest("set -e; readonly PATH=/usr/bin:/bin; readonly PATH=/nowhere; true", {}, { shell: bashShell });
+  check(keptPath.every(({ r }) => r.state === "present") && maybeKept.state === "present" && broken(failedAssignment, "read-only"),
+    "an assignment to a read-only PATH fails, and leaves PATH as it was", JSON.stringify({ keptPath, maybeKept, failedAssignment }));
+
+  // pipefail fails a pipeline when any of its commands fails, in a shell that
+  // has it. In one that hasn't, `set -o pipefail` is an error, which ends dash.
+  const pipefailFails = ["set -o pipefail; false | true", "set -o pipefail; no-such-runner | cat", "set -eo pipefail; no-such-runner --ci | cat; true"]
+    .map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
+  const pipefailPasses = ["false | true", "set -o pipefail; set +o pipefail; false | true", "set -o pipefail; true | true"]
+    .map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
+  // Not surely failing: pipefail set only if jest passed, or echo stopped when
+  // true closes the pipe before it writes.
+  const pipefailUnsure = ["jest --ci && set -o pipefail; false | true", "jest --ci && set -o pipefail; ! false | true",
+                          "set -o pipefail; ! echo hi | true"].map((s) => ({ s, r: detectTest(s, jest, { shell: bashShell }) }));
+  const noPipefail = detectTest("set -o pipefail; jest --ci", jest, { shell: oldDashShell });
+  const noPipefailGoesOn = detectTest("set -o pipefail; true", {}, { shell: { ...oldDashShell, badOptionEnds: false } });
+  check(pipefailFails.every(({ r }) => broken(r)) && pipefailPasses.every(({ r }) => r.state === "present")
+    && pipefailUnsure.every(({ r }) => r.state === "present") && broken(noPipefail, "set -o pipefail") && noPipefailGoesOn.state === "present",
+    "pipefail fails a pipeline when any command in it fails, and set -o pipefail is an error in a shell without it",
+    JSON.stringify({ pipefailFails, pipefailPasses, pipefailUnsure, noPipefail, noPipefailGoesOn }));
+
+  // Other options may change what runs: noexec runs nothing more, and bash's
+  // keyword takes assignments anywhere. After an option the reader doesn't
+  // model, nothing is judged; one that changes nothing it judges is passed over.
+  const unmodelled = [["set -n; false", dashShell], ["set -o noexec; false", bashShell], ["set -k; command X=1 true", bashShell]]
+    .map(([s, sh]) => ({ s, r: detectTest(s, {}, { shell: sh }) }));
+  const harmless = ["set -u; false", "set -xv; false", "set -o nounset; false"].map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
+  check(unmodelled.every(({ r }) => r.state === "present") && harmless.every(({ r }) => broken(r, "always fails")),
+    "after a set option the reader doesn't model nothing is judged, and one that changes nothing it judges is passed over",
+    JSON.stringify({ unmodelled, harmless }));
+
+  // With PATH unset, dash and bash look a program up in the current folder only.
+  const unsetPath = detectTest("unset PATH; jest --ci", jest, { shell: dashShell });
+  const unsetKept = ["unset PATH; echo done", "unset PATH; cd tools && runner", "unset -f PATH; jest --ci", "unset HOME; jest --ci",
+                     "unset $NAMES; cd tools && runner"]
+    .map((s) => ({ s, r: detectTest(s, jest, { shell: dashShell, files: runner }) }));
+  check(broken(unsetPath, "'jest'") && unsetKept.every(({ r }) => r.state === "present"),
+    "with PATH unset, a program is looked up in the current folder only", JSON.stringify({ unsetPath, unsetKept }));
+
+  // bash's |&, <<< and >& to a file are syntax errors to dash, which doesn't
+  // run their line; its &> is & and then a redirection there. Where the shells
+  // that may run the script differ, the line isn't judged.
+  const bashOnly = ["jest --ci |& cat", "jest --ci <<< input", "jest --ci >& out.log", "echo ok; jest --ci |& cat"];
+  const syntaxOnDash = bashOnly.map((s) => ({ s, r: detectTest(s, jest, { shell: dashShell }) }));
+  const syntaxOnBash = bashOnly.map((s) => ({ s, r: detectTest(s, jest, { shell: bashShell }) }));
+  const both = ["no-such-runner &> out.log", "no-such-runner &>> out.log"];
+  const bothOnDash = both.map((s) => ({ s, r: detectTest(s, {}, { shell: dashShell }) }));
+  const bothOnBash = both.map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
+  const eitherShell = { ...dashShell, name: "dash or bash", syntax: Object.fromEntries(Object.keys(NO_SYNTAX).map((op) => [op, "maybe"])) };
+  const onEither = ["echo ok |& cat", "no-such-runner &> out.log"].map((s) => ({ s, r: detectTest(s, {}, { shell: eitherShell }) }));
+  check(syntaxOnDash.every(({ r }) => broken(r, "syntax error")) && syntaxOnBash.every(({ r }) => r.state === "present")
+    && bothOnDash.every(({ r }) => r.state === "present") && bothOnBash.every(({ r }) => broken(r, "'no-such-runner'"))
+    && onEither.every(({ r }) => r.state === "present"),
+    "bash's own operators are read as the shell that runs the script reads them, and not judged where the shells differ",
+    JSON.stringify({ syntaxOnDash, syntaxOnBash, bothOnDash, bothOnBash, onEither }));
+
+  // After command, a word names a command, never a reserved word: `command if`
+  // runs a program called if.
+  const commandWord = ["command if", "command [[ -f x ]]", "command {", "command -- while"]
+    .map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
+  const ifProgram = detectTest("PATH=./tools command if", {}, { shell: bashShell, files: { "tools/if": "#!/bin/sh\nexit 0\n" } });
+  // A reserved word no list holds, asked of the shell, is a name there too.
+  const askedWord = ["exec if", "command if"].map((s) => ({ s, r: detectTest(s, {}, { shell: { ...bashShell, paths: [which("bash")], keywords: new Set() } }) }));
+  check(commandWord.every(({ r }) => broken(r, "as a program")) && ifProgram.state === "present" && askedWord.every(({ r }) => broken(r, "as a program")),
+    "a reserved word after command or exec is a program's name", JSON.stringify({ commandWord, ifProgram, askedWord }));
+
+  // A redirection can fail, and then its command doesn't run: a file that isn't
+  // there, a folder that can't be written. So a command with one never surely
+  // succeeds, and an exit with one may not end the shell. The null device and
+  // the standard descriptors never fail.
+  const mayFail = ["true < missing-file || exit 0; false", "! true > no/such/folder/out", "exit 3 > no/such/folder/out; echo after",
+                   "echo x > no/such/folder/out || exit 0; false"].map((s) => ({ s, r: detectTest(s) }));
+  const cantFail = ["echo checking > /dev/null && exit 2", "echo checking 2>&1 && exit 2", "! true 2>/dev/null"].map((s) => ({ s, r: detectTest(s) }));
+  check(mayFail.every(({ r }) => r.state === "present") && cantFail.every(({ r }) => broken(r, "always fails")),
+    "a command with a redirection that may fail never surely succeeds, and one to the null device or a standard descriptor can't fail",
+    JSON.stringify({ mayFail, cantFail }));
+
+  // What the shell has is asked of it: bash has pipefail and bash's operators,
+  // and goes on after a bad set option. dash has none of the operators, and a
+  // bad option ends it; its pipefail depends on its version.
+  const bashAsked = scriptShell(which("bash"));
+  const dashPath = spawnSync("sh", ["-c", "command -v dash"], { encoding: "utf8" }).stdout.trim();
+  const dashAsked = dashPath ? scriptShell(dashPath) : null;
+  check(bashAsked?.pipefail === true && bashAsked.badOptionEnds === false && Object.values(bashAsked.syntax).every((v) => v === true)
+    && (!dashPath || (dashAsked?.badOptionEnds === true && Object.values(dashAsked.syntax).every((v) => v === false))),
+    "the shell is asked whether it has pipefail and bash's operators, and whether a bad set option ends it",
+    JSON.stringify({ bashAsked, dashAsked }));
+  const eitherAsked = dashPath ? scriptShells([dashPath, which("bash")]) : null;
+  check(!dashPath || (eitherAsked?.syntax?.["|&"] === "maybe" && eitherAsked.badOptionEnds === "maybe"),
+    "shells that may run a script, asked together, differ where one has an operator or ends on a bad option and another doesn't",
+    JSON.stringify(eitherAsked));
 } finally {
   rmSync(root, { recursive: true, force: true });
 }

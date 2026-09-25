@@ -90,13 +90,14 @@ const INTENTS = {
  * `runnerShells` names it and `scriptShells` asks it: it decides which words
  * are the shell's own. Given, as by a test, it is used as is. A runner whose
  * shell isn't one the reader models, yarn 2 and later say, has no script
- * judged.
+ * judged, and nor has one whose shell can't be asked: npm's `script-shell=true`
+ * runs nothing of a script.
  */
 export function detectCommands(dir, language, packageManager, options = {}) {
   const given = Object.hasOwn(options, "shell");
   const shells = given ? null : runnerShells(dir, packageManager);
   const shell = given ? options.shell : shells && scriptShells(shells);
-  const judged = given || shells !== null;
+  const judged = given || shell !== null;
   const out = {};
   const questions = [];
 

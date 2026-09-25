@@ -7,9 +7,10 @@
 // name nothing defines, and no-use-before-define on a variable read before its
 // definition in the same scope, which is the temporal dead zone.
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { tempDir } from "./fixtures/temp.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const bin = (name) => join(ROOT, "node_modules", ".bin", name);
@@ -23,14 +24,20 @@ const check = (ok, name, detail) => {
 const CORE = ["src/verdict.mjs", "src/pr.mjs", "src/github/reconciler.mjs", "src/watcher.mjs", "src/premerge.mjs",
               "src/mergecheck.mjs", "src/review/derive.mjs", "src/review/ingest.mjs", "src/review/shadow.mjs"];
 
-const project = spawnSync(bin("tsc"), ["-p", ROOT, "--listFilesOnly"], { encoding: "utf8", timeout: 120_000 });
+// tsc and eslint turn on Node's compile cache, which writes a node-compile-cache
+// folder into the temp directory, and CI fails a test file that leaves anything
+// there. So both run with the cache off, in a temp directory of their own.
+const childTmp = tempDir("reeve-typecheck-");
+const childEnv = { ...process.env, NODE_DISABLE_COMPILE_CACHE: "1", TMPDIR: childTmp, TEMP: childTmp, TMP: childTmp };
+
+const project = spawnSync(bin("tsc"), ["-p", ROOT, "--listFilesOnly"], { encoding: "utf8", timeout: 120_000, env: childEnv });
 const listed = new Set((project.stdout ?? "").split("\n").map((l) => l.trim()).filter(Boolean));
 const unchecked = CORE.filter((f) => !readFileSync(join(ROOT, f), "utf8").startsWith("// @ts-check\n") || !listed.has(join(ROOT, f)));
 check(project.status === 0 && unchecked.length === 0,
   "the core verdict and evidence modules are type-checked: each starts with // @ts-check and is in the project",
   JSON.stringify({ status: project.status, unchecked }));
 
-const typecheck = spawnSync(bin("tsc"), ["-p", ROOT], { encoding: "utf8", timeout: 120_000 });
+const typecheck = spawnSync(bin("tsc"), ["-p", ROOT], { encoding: "utf8", timeout: 120_000, env: childEnv });
 check(typecheck.status === 0, "the project type-checks", (typecheck.stdout ?? "").slice(0, 600));
 
 // A file that breaks each rule once, and does three things that are fine: calls
@@ -47,13 +54,15 @@ const fixture = [
   "process.exitCode = 0;",
 ].join("\n");
 const lint = spawnSync(bin("eslint"), ["--stdin", "--stdin-filename", join(ROOT, "src", "lint-fixture.mjs"), "--format", "json"],
-  { cwd: ROOT, input: fixture, encoding: "utf8", timeout: 120_000 });
+  { cwd: ROOT, input: fixture, encoding: "utf8", timeout: 120_000, env: childEnv });
 let messages = [];
 try { messages = JSON.parse(lint.stdout)[0]?.messages ?? []; } catch { /* reported below */ }
 const found = messages.map((m) => `${m.ruleId}@${m.line}`).sort();
 check(JSON.stringify(found) === JSON.stringify(["no-undef@6", "no-use-before-define@4"]),
   "lint flags a name nothing defines and a variable read before its definition, and not a hoisted function, a later read or a Node global",
   JSON.stringify({ found, stderr: (lint.stderr ?? "").slice(0, 300) }));
+
+check(readdirSync(childTmp).length === 0, "the type checker and the linter leave nothing in the temp directory", JSON.stringify(readdirSync(childTmp)));
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

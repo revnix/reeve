@@ -6286,4 +6286,13 @@ export const STUBS = [
               find: "const env = { ...process.env, TMPDIR: run, TEMP: run, TMP: run };",
               replace: "const env = { ...process.env };" }],
   },
+  {
+    name: "typecheck-compile-cache-off",
+    why: "run tsc and eslint with Node's compile cache on. Each writes a node-compile-cache folder into the temp directory, and CI fails the test file for what it left there",
+    test: "test/typecheck.test.mjs",
+    expectRed: "the type checker and the linter leave nothing in the temp directory",
+    edits: [{ file: "test/typecheck.test.mjs",
+              find: "const childEnv = { ...process.env, NODE_DISABLE_COMPILE_CACHE: \"1\", TMPDIR: childTmp, TEMP: childTmp, TMP: childTmp };",
+              replace: "const childEnv = { ...process.env, TMPDIR: childTmp, TEMP: childTmp, TMP: childTmp };" }],
+  },
 ];

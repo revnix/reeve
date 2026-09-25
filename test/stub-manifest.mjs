@@ -6171,12 +6171,12 @@ export const STUBS = [
   },
   {
     name: "typecheck-src-in-project",
-    why: "leave src out of the type-checked project. Every core module then goes unchecked, though each still says @ts-check",
+    why: "type-check tools alone, leaving src, scripts and test out of the project. Nothing in tools imports a core module, so every one goes unchecked, though each still says @ts-check",
     test: "test/typecheck.test.mjs",
     expectRed: "the core verdict and evidence modules are type-checked: each starts with // @ts-check and is in the project",
     edits: [{ file: "tsconfig.json",
-              find: "    \"src/**/*\",\n",
-              replace: "" }],
+              find: "    \"src/**/*\",\n    \"scripts/**/*\",\n    \"tools/**/*\",\n    \"test/**/*\"\n",
+              replace: "    \"tools/**/*\"\n" }],
   },
   {
     name: "typecheck-errors-fail",

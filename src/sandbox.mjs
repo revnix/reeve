@@ -245,7 +245,30 @@ export const CREDENTIAL_PATHS = [
   // be denied by path like every other credential file. (Codex #4e-[3].)
   "~/.git-credentials", "~/.config/git", "~/.netrc", "~/.npmrc", "~/.aws", "~/.azure",
   "~/.config/gcloud", "~/.kube", "~/.docker", "~/.gnupg",
+  // GNOME Keyring's files, where the Secret Service keeps secrets on Linux.
+  "~/.local/share/keyrings",
 ];
+
+/**
+ * The host's own ways out of the sandbox on Linux, denied by path. The seccomp
+ * filter that blocks Unix sockets closes the socket ones too, where the runtime
+ * can apply it; naming them keeps them closed where it can't, and closes the
+ * file reads no socket filter sees.
+ *
+ *   /mnt              WSL mounts the Windows drives here: every Windows user's
+ *                     files, and the Windows binaries interop runs.
+ *   /run/WSL          WSL's interop sockets. A Windows executable started inside
+ *                     the sandbox runs through one, OUTSIDE it, wherever the .exe
+ *                     came from, one committed to the repository included.
+ *   /run/user/<uid>   the session bus and the Secret Service behind it, keyring
+ *                     sockets, and the systemd user manager, which starts a
+ *                     command outside the sandbox on request.
+ *   /run/dbus         the system bus.
+ */
+export function hostEscapePaths({ platform = process.platform, uid = process.getuid?.() } = {}) {
+  if (platform !== "linux") return [];
+  return ["/mnt", "/run/WSL", ...(Number.isInteger(uid) ? [`/run/user/${uid}`] : []), "/run/dbus"];
+}
 // The same list as Read-tool rules: a file is named, a directory gets `/**`.
 const CREDENTIAL_FILE_NAMES = ["~/.claude.json", "~/.gitconfig", "~/.git-credentials", "~/.netrc", "~/.npmrc"];
 const isCredentialFile = p => CREDENTIAL_FILE_NAMES.map(expandTilde).includes(p);
@@ -273,6 +296,10 @@ export function credentialPaths() {
   return [...CREDENTIAL_PATHS.map(expandTilde), ...extra];
 }
 const credentialReadDenies = () => credentialPaths().map(p => (isCredentialFile(p) ? `Read(${ruleFor(p)})` : `Read(${ruleFor(p)}/**)`));
+// The Read tool is outside the OS sandbox, and would follow a committed symlink
+// into /mnt/c as readily as into ~/.ssh, so the host's ways out are denied to it
+// too. Every one is a directory.
+const hostEscapeReadDenies = () => hostEscapePaths().map(p => `Read(${ruleFor(p)}/**)`);
 
 /**
  * The clone a worker's checkout was made FROM.
@@ -572,12 +599,12 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
 
   // The OS deny list, built once: the read grant above is derived from it.
 
-  const osDenyRead = [...credentialPaths(), ...notifyCred, ...sourceCheckout, ...siblingRoots, ...stateRoots, ...quarantine.paths];
+  const osDenyRead = [...credentialPaths(), ...hostEscapePaths(), ...notifyCred, ...sourceCheckout, ...siblingRoots, ...stateRoots, ...quarantine.paths];
 
   // The Read tool is not under the OS sandbox, so the credential paths are
   // denied to it here as well; measured to hold for an absolute path and for a
   // symlink inside the worktree that points at one.
-  deny.push(...credentialReadDenies());
+  deny.push(...credentialReadDenies(), ...hostEscapeReadDenies());
   // reeve's own state is denied too: with a --log or --db outside ~/.reeve it is
   // not otherwise covered, and a worker could copy another run's output, the
   // event store, or the log into its worktree for reeve to publish.
@@ -797,7 +824,7 @@ export function validateSettings(settings, { tmpDir = null, stateRoots = [], qua
         if (JSON.stringify(fs.allowRead) !== JSON.stringify(want))
           errors.push(`sandbox.filesystem.allowRead must be exactly ${want.join(", ")}`);
       }
-      if (strs(fs.denyRead)) for (const c of [...credentialPaths(), ...extraDenies, ...sourceCheckout, ...siblingRoots, ...stateRoots, ...quarantineDenies]) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
+      if (strs(fs.denyRead)) for (const c of [...credentialPaths(), ...hostEscapePaths(), ...extraDenies, ...sourceCheckout, ...siblingRoots, ...stateRoots, ...quarantineDenies]) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
     }
     const net = sb.network;
     if (!isObj(net)) errors.push("sandbox.network must be an object");

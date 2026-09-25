@@ -16,6 +16,13 @@ import { execFileSync } from "node:child_process";
 /** Conclusions that do NOT block. Everything else does, including the ones a naive
  *  `conclusion === "failure"` branch would fall straight through. */
 const PASSING = new Set(["success", "skipped", "neutral"]);
+/**
+ * Passing, and yet not a pass: a skipped check didn't run, and a neutral one
+ * didn't judge. GitHub counts both as passing a required check, so a test job
+ * that a broken `if:` skips, or whose `needs:` failed, passes the gate. For a
+ * check nothing requires, a path filter's skip is what was meant, and it passes.
+ */
+const NOT_RUN = new Set(["skipped", "neutral"]);
 /** The full space, so an unrecognised value is treated as blocking rather than ignored. */
 const KNOWN_CONCLUSIONS = new Set([
   "success", "failure", "neutral", "cancelled", "skipped", "timed_out",
@@ -195,16 +202,27 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
   // Reviewer rows are RETURNED, never dropped: the review pipeline reads them as
   // evidence about the reviewer, and a signal that vanishes cannot be reported.
   const rev = excludeReviewerContexts(own.rows, reviewerContexts);
-  // `whole` only when both surfaces were read in full. `ok` stays true with one
-  // of them, as its callers have always read it, so a caller that must see every
-  // result under a check's name asks for `whole`.
-  return { ok: crRead || stRead, whole: crRead && stRead, rows: rev.rows, reviewerRows: rev.reviewerRows,
+  // `ok` only when both surfaces were read in full. Every result under a check's
+  // name must pass, and a failing one on a surface that went unread would leave
+  // the rest passing: with statuses unread, a failing status beside passing
+  // check runs read as green.
+  const ok = crRead && stRead;
+  return { ok, rows: rev.rows, reviewerRows: rev.reviewerRows,
            excluded: own.excluded, impostors: own.impostors,
-           why: crRead || stRead ? null : (cr.err || st.err || "check rows couldn't be parsed") };
+           why: ok ? null : !crRead ? (cr.err || "check runs couldn't be parsed") : (st.err || "statuses couldn't be parsed") };
 }
 
-/** Classify a set of check rows. Never returns "green" on absence. */
-export function classify(allRows, requiredChecks = []) {
+/**
+ * Classify a set of check rows. Never returns "green" on absence.
+ *
+ * `evidence` asks whether the rows show a pass, as a head's must. Then a
+ * required check that was skipped or neutral never passed, and a set where
+ * nothing ran shows nothing. A base is judged for health instead, which only
+ * its failures decide, so it asks without. `requiredKnown` is false when the
+ * base's own requirements couldn't be read: then a skipped or neutral check may
+ * be a required one, and doesn't read green.
+ */
+export function classify(allRows, requiredChecks = [], { requiredKnown = true, evidence = true } = {}) {
   // A row with no name is a PARSE DEFECT, not a check. It cannot be reported to a
   // fixer ("failing: undefined") and it must not block on its own, but it must
   // also not vanish silently, so it is counted and surfaced.
@@ -222,10 +240,23 @@ export function classify(allRows, requiredChecks = []) {
     (!KNOWN_CONCLUSIONS.has(String(r.conclusion)) || !PASSING.has(String(r.conclusion))));
   const names = new Set(rows.map(r => r.name));
   const missing = requiredChecks.filter(c => !names.has(c));
+  const notRun = (name) => rows.filter(r => r.name === name).every(r => r.state === "completed" && NOT_RUN.has(String(r.conclusion)));
 
   if (missing.length) return { verdict: "MISSING_REQUIRED", why: `required check(s) never reported: ${missing.join(", ")}`, failing, running, missing, malformed };
   if (failing.length) return { verdict: "RED", why: `${failing.length} check(s) not passing`, failing, running, malformed };
   if (running.length) return { verdict: "RUNNING", why: `${running.length} check(s) still in flight`, failing, running, malformed };
+  // After RED and RUNNING, which say more: a required job skipped because the
+  // job it needs failed is the failure's to fix, not a question for a person.
+  const skipped = evidence ? requiredChecks.filter(c => names.has(c) && notRun(c)) : [];
+  if (skipped.length) return { verdict: "MISSING_REQUIRED", why: `required check(s) skipped or neutral, so they never reported a pass: ${skipped.join(", ")}`,
+    failing, running, missing: [], skipped, malformed };
+  // A skipped or neutral check whose name the required set may be missing.
+  const unplaced = requiredKnown || !evidence ? [] : [...names].filter(n => !requiredChecks.includes(n) && notRun(n));
+  if (unplaced.length) return { verdict: "UNKNOWN", failing: [], running: [], malformed,
+    why: `${unplaced.join(", ")} skipped or neutral, and whether the base requires it couldn't be read` };
+  // A head where nothing ran has no evidence at all, however many rows say so.
+  if (evidence && rows.every(r => NOT_RUN.has(String(r.conclusion)) || UNINFORMATIVE.has(String(r.conclusion))))
+    return { verdict: "UNKNOWN", failing: [], running: [], malformed, why: "no check ran at this revision: every one was skipped, neutral, cancelled or stale" };
   // A cancelled or stale run is a SUPERSEDED run, and superseding is normal: a new
   // push cancels the old workflow. What matters is whether the superseded thing was
   // one the gate requires.

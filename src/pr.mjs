@@ -134,7 +134,7 @@ export function readMergeParts(nwo, baseRef, threads, { gh = ghJson, context = P
  * runs and statuses were read in full: every result under a name must pass, and
  * a failing one on a surface that went unread would leave the rest passing.
  */
-export const mergeRows = (read) => (read?.whole ? [...read.rows, ...read.reviewerRows, ...read.impostors] : null);
+export const mergeRows = (read) => (read?.ok ? [...read.rows, ...read.reviewerRows, ...read.impostors] : null);
 
 // What passes a required check, as GitHub counts it.
 const PASSING_RUN = new Set(["success", "neutral", "skipped"]);
@@ -166,6 +166,26 @@ function requiredCheckState(rows, { context, app, besideOwn = false }, now = Dat
   // Passing, but too long ago to count, or at a time that can't be read.
   if (candidates.some((r) => !(now - Date.parse(r.completedAt) <= REQUIRED_RESULT_MS))) return "expired";
   return "passing";
+}
+
+/**
+ * The checks a pull request's CI must include: those the profile names, and
+ * those its base's rules and protection require. Of the base's, reeve's own are
+ * aside, since its rows are never evidence, and so are reviewers' statuses,
+ * which the review clauses read. `known` is false when the base's couldn't be
+ * read.
+ */
+export function requiredChecksOf({ nwo, baseRef, profile = {}, requirements = requirementsOnBase, gh = ghJson, appId = ownAppId() }) {
+  const base = baseRef ? requirements({ nwo, base: baseRef, context: POLICY_CONTEXT, gh, appId }).checks : null;
+  const aside = new Set([POLICY_CONTEXT, shadowContextOf(POLICY_CONTEXT), ...(profile.ci?.reviewerStatusContexts ?? [])]);
+  const required = [...new Set([...(profile.ci?.requiredChecks ?? []), ...(base ?? []).filter((n) => !aside.has(n))])];
+  return { required, known: Array.isArray(base) };
+}
+
+/** A check read, classified against the required set: UNKNOWN unless it was read whole. */
+export function classifyRead(read, { required = [], known = true } = {}, { evidence = true } = {}) {
+  if (!read?.ok) return { verdict: "UNKNOWN", failing: [], running: [], why: `the checks couldn't be read in full: ${read?.why ?? "nothing was read"}` };
+  return classify(read.rows, required, { requiredKnown: known, evidence });
 }
 
 /** reeve's own App id, from its credentials, or null when there are none. */
@@ -535,7 +555,10 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   const reviewerContexts = profile.ci?.reviewerStatusContexts ?? [];
   const read = readChecks(nwo, pin.sha, { reviewerContexts });
   const { rows } = read;
-  const c = classify(rows, profile.ci?.requiredChecks ?? []);
+  // Required: what the profile names and what the base requires. A skipped
+  // required check didn't run, and a read that isn't whole is UNKNOWN.
+  const req = requiredChecksOf({ nwo, baseRef, profile });
+  const c = classifyRead(read, req);
   // ONE reading, folded into what the previous tick recorded. Settlement is about
   // the check SET being stable ACROSS TIME, so it can only be established by
   // successive ticks -- this used to call settle() three times over the same
@@ -563,11 +586,17 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   }
 
   const baseHead = pinHead(nwo, baseRef);
-  // Judged against the SAME required set as the head. Passing an empty list here
-  // meant every check on the base counted equally, so one cancelled ancillary job
-  // made the branch uncheckable and every open PR waited on it.
+  // Judged against the profile's required set. Passing an empty list here meant
+  // every check on the base counted equally, so one cancelled ancillary job made
+  // the branch uncheckable and every open PR waited on it.
+  //
+  // For health, not for evidence of a pass, and that is deliberate: anything but
+  // green holds every open pull request. A check the base's rules require may run
+  // only on pull requests, and a push its path filters skip is a healthy one, so
+  // neither the base's own requirements nor the head's rules about skipped checks
+  // apply. Only a partial read does: it can hide a failure.
   const base = baseHead.ok
-    ? classify(readChecks(nwo, baseHead.sha, { reviewerContexts }).rows, profile.ci?.requiredChecks ?? [])
+    ? classifyRead(readChecks(nwo, baseHead.sha, { reviewerContexts }), { required: profile.ci?.requiredChecks ?? [] }, { evidence: false })
     : { verdict: "UNKNOWN" };
 
   const threads = readThreads(nwo, pr);
@@ -644,7 +673,9 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
 
   const verdict = computeVerdict({
     head: pin.sha,
-    checks: { verdict: s.verdict, settled: s.settled, why: s.why, failing: c.failing, inherited: c.inherited },
+    checks: { verdict: s.verdict, settled: s.settled, why: s.why, failing: c.failing, inherited: c.inherited,
+              // Another App's check under reeve's own name: kept, never dropped.
+              impostors: read.impostors ?? [] },
     base: { verdict: base.verdict },
     reviewers, rounds, threads, cleared: facts.cleared,
     bodyFindings: facts.bodyFindings, unreadableBodies: facts.unreadableBodies,
@@ -736,6 +767,9 @@ const HARMLESS_RULES = new Set(["creation", "deletion", "non_fast_forward", "req
  *   unevaluated       what can stop a merge that reeve doesn't evaluate: deployments,
  *                     signatures, a merge queue, a locked branch, and any rule it
  *                     doesn't know, named
+ *   checks            the name of every required status check, reeve's own
+ *                     included: known once the rules and the branch are read,
+ *                     whatever else of protection could be
  *
  * GitHub requires things in two places, and both are read: the rules that apply to
  * the branch (every ruleset, the organisation's included, every page), and classic
@@ -744,8 +778,8 @@ const HARMLESS_RULES = new Set(["creation", "deletion", "non_fast_forward", "req
  * administrator's read. A requirement bound to another App isn't reeve's: GitHub
  * waits for that App.
  *
- * `own` is true, false, or null when it can't be told; the other three are null
- * when they can't be told. Null is never taken for "nothing required".
+ * `own` is true, false, or null when it can't be told; the others are null when
+ * they can't be told. Null is never taken for "nothing required".
  */
 export function requirementsOn({ rules, branch, protection = null }, context, { appId = null } = {}) {
   // Every page of the rules arrives as one object per line; a single array is
@@ -760,11 +794,12 @@ export function requirementsOn({ rules, branch, protection = null }, context, { 
   // App id isn't known.
   const ours = (bound) => (bound == null || Number(bound) === -1 ? true : appId == null ? null : String(bound) === String(appId));
   const verdictOf = (answers) => (answers.includes(true) ? true : answers.includes(null) ? null : false);
-  const others = [], unevaluated = [];
+  const others = [], unevaluated = [], names = [];
   let byRules = null, byProtection = null, threadResolution = false, strict = false, whole = true;
   // A required check is reeve's, another App's, or, bound to an App reeve can't
   // name, both: GitHub waits for whichever App it is.
   const required = (answers, c, bound) => {
+    if (typeof c === "string" && c) names.push(c);
     if (c !== context) { others.push({ context: c, app: bound == null || Number(bound) === -1 ? null : String(bound) }); return; }
     const mine = ours(bound);
     answers.push(mine);
@@ -817,8 +852,9 @@ export function requirementsOn({ rules, branch, protection = null }, context, { 
   }
 
   const own = byRules === true || byProtection === true ? true : byRules === null || byProtection === null ? null : false;
-  return whole ? { own, others, threadResolution, strict, unevaluated }
-    : { own, others: null, threadResolution: null, strict: null, unevaluated: null };
+  const every = Array.isArray(list) && b ? [...new Set(names)] : null;
+  return whole ? { own, others, threadResolution, strict, unevaluated, checks: every }
+    : { own, others: null, threadResolution: null, strict: null, unevaluated: null, checks: every };
 }
 
 const parsed = (r) => { try { return r?.ok ? JSON.parse(r.out || "{}") : undefined; } catch { return undefined; } };

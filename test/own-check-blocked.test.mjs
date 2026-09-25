@@ -244,7 +244,7 @@ const partsOf = (base, threads, rows = []) => readMergeParts("o/r", `base-${++ba
 }
 // readChecks, with a throw recorded rather than raised, so a stubbed rule that
 // makes it throw fails its check and leaves the rest of the file running.
-const read = (sha) => { try { return readChecks("o/r", sha); } catch (e) { return { threw: e.message, ok: false, whole: false, rows: [], reviewerRows: [], impostors: [] }; } };
+const read = (sha) => { try { return readChecks("o/r", sha); } catch (e) { return { threw: e.message, ok: false, rows: [], reviewerRows: [], impostors: [] }; } };
 // A stand-in for gh on the PATH, answering as \`gh api --paginate --jq\` does:
 // one JSON value per line, every page's in turn. \`script\` is the body of a
 // shell \`case\` on the request path. Every call's arguments are logged.
@@ -276,8 +276,8 @@ const withGh = (script, fn) => {
     echo '{"context":"lint/b","state":"pending"}';;`, (calls) => {
     const got = read("d".repeat(40));
     const paged = calls().filter((c) => /check-runs|\/status/.test(c));
-    check(got.whole === true && got.rows.length === 4 && paged.length === 2 && paged.every((c) => c.includes("--paginate") && c.includes("per_page=100")),
-      "a head's check runs and statuses are read past their first page, 100 at a time", JSON.stringify({ whole: got.whole, rows: got.rows.map((r) => r.name), paged }));
+    check(got.ok === true && got.rows.length === 4 && paged.length === 2 && paged.every((c) => c.includes("--paginate") && c.includes("per_page=100")),
+      "a head's check runs and statuses are read past their first page, 100 at a time", JSON.stringify({ ok: got.ok, rows: got.rows.map((r) => r.name), paged }));
   });
 }
 {
@@ -286,9 +286,9 @@ const withGh = (script, fn) => {
   */status*) echo '{"context":"ci/e2e","state":"success"}';;`, () => {
     const got = read("e".repeat(40));
     const parts = partsOf(baseOf({ rules: [OWN, { type: "required_status_checks", parameters: { required_status_checks: [{ context: "ci/e2e" }] } }] }), {}, mergeRows(got));
-    check(got.ok === true && got.whole === false && mergeRows(got) === null && parts.others === null && mergeable({ ...parts, readable: true }).state === UNKNOWN,
+    check(got.ok === false && mergeRows(got) === null && parts.others === null && mergeable({ ...parts, readable: true }).state === UNKNOWN,
       "a head whose check runs or statuses couldn't be read gives the base's other checks nothing to pass on, so BLOCKED is UNKNOWN",
-      JSON.stringify({ ok: got.ok, whole: got.whole, others: parts.others }));
+      JSON.stringify({ ok: got.ok, others: parts.others }));
   });
 }
 {

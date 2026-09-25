@@ -270,7 +270,7 @@ export function computeVerdict(i) {
   else if (MS === "BLOCKED" && parts) {
     const review = parts.reviewDecision === "CHANGES_REQUESTED" || parts.reviewDecision === "REVIEW_REQUIRED";
     const others = (state) => (parts.others ?? []).filter((c) => c.state === state).map((c) => c.context);
-    const failing = others("failing"), waiting = [...others("running"), ...others("superseded"), ...others("missing"), ...others("unknown")];
+    const failing = others("failing"), waiting = [...others("running"), ...others("superseded"), ...others("expired"), ...others("missing"), ...others("unknown")];
     if (parts.mergeable === "CONFLICTING") add("mergeable", BLOCK, "mergeStateStatus BLOCKED: the branch conflicts with its base");
     else if (review) add("mergeable", BLOCK, `mergeStateStatus BLOCKED: review ${parts.reviewDecision}`);
     else if (parts.ownCheckRequired === false) add("mergeable", BLOCK, "mergeStateStatus BLOCKED, and not by reeve's own check");

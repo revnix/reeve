@@ -175,6 +175,8 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
     app: c.app?.slug ?? null,
     // And the id, which is what a required check bound to an App names.
     appId: c.app?.id != null ? String(c.app.id) : null,
+    // When it finished: GitHub accepts a required check's pass for seven days.
+    completedAt: c.completed_at ?? null,
   }));
   const st = gh(`repos/${nwo}/commits/${sha}/status?per_page=100`, ".statuses[]", { paginate: true });
   const stRead = parse(st, x => ({
@@ -185,6 +187,7 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
     // A rate-limited CodeRabbit reports state=success with the truth relegated
     // here, so the description is carried rather than discarded.
     description: x.description ?? "",
+    completedAt: x.updated_at ?? x.created_at ?? null,
   }));
   // Filtered HERE rather than by each caller: the base head is read through this
   // same function, and a caller that forgot would reintroduce the latch silently.

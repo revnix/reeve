@@ -19,6 +19,8 @@ const check = (ok, name, detail) => {
 };
 
 const HEAD = "bfbbe6ed6a1c2d3e4f5061728394a5b6c7d8e9f0";
+// A result that finished an hour ago, well inside the seven days GitHub accepts.
+const RECENT = new Date(Date.now() - 3600_000).toISOString();
 // Satisfied in every other way, as test/verdict.test.mjs builds it, and BLOCKED.
 const blocked = (parts) => ({
   head: HEAD,
@@ -128,11 +130,11 @@ const partsOf = (base, threads, rows = []) => readMergeParts("o/r", `base-${++ba
     { context: "ops/merge-policy", integration_id: 1 }, { context: "ci/test" }, { context: "ci/lint", integration_id: 99 },
     { context: "deploy/preview" }, { context: "ci/slow" }, { context: "ci/bound-status", integration_id: 7 }, { context: "ci/absent" }] } }];
   const rows = [
-    { name: "ci/test", source: "check_run", state: "completed", conclusion: "success", appId: "15368" },
-    { name: "ci/lint", source: "check_run", state: "completed", conclusion: "success", appId: "42" },   // another App's
-    { name: "deploy/preview", source: "status", state: "completed", conclusion: "failure" },
+    { name: "ci/test", source: "check_run", state: "completed", conclusion: "success", appId: "15368", completedAt: RECENT },
+    { name: "ci/lint", source: "check_run", state: "completed", conclusion: "success", appId: "42", completedAt: RECENT },   // another App's
+    { name: "deploy/preview", source: "status", state: "completed", conclusion: "failure", completedAt: RECENT },
     { name: "ci/slow", source: "check_run", state: "running", conclusion: null, appId: "15368" },
-    { name: "ci/bound-status", source: "status", state: "completed", conclusion: "success" },
+    { name: "ci/bound-status", source: "status", state: "completed", conclusion: "success", completedAt: RECENT },
   ];
   const parts = partsOf(baseOf({ rules }), {}, rows);
   const state = Object.fromEntries((parts.others ?? []).map((c) => [c.context, c.state]));
@@ -143,8 +145,16 @@ const partsOf = (base, threads, rows = []) => readMergeParts("o/r", `base-${++ba
   // One name reported twice, as a status and as a check run: GitHub holds the
   // merge for either, so both must pass.
   const both = (status, run, runState = "completed") => partsOf(baseOf({ rules: [OWN, { type: "required_status_checks", parameters: { required_status_checks: [{ context: "ci/e2e" }] } }] }), {}, [
-    { name: "ci/e2e", source: "status", state: "completed", conclusion: status },
-    { name: "ci/e2e", source: "check_run", state: runState, conclusion: run, appId: "15368" }]).others?.[0]?.state;
+    { name: "ci/e2e", source: "status", state: "completed", conclusion: status, completedAt: RECENT },
+    { name: "ci/e2e", source: "check_run", state: runState, conclusion: run, appId: "15368", completedAt: RECENT }]).others?.[0]?.state;
+  // GitHub accepts a required check's pass for seven days after it completed.
+  const at = (completedAt) => partsOf(baseOf({ rules: [OWN, { type: "required_status_checks", parameters: { required_status_checks: [{ context: "ci/nightly" }] } }] }), {}, [
+    { name: "ci/nightly", source: "check_run", state: "completed", conclusion: "success", appId: "15368", completedAt }]).others?.[0]?.state;
+  const eightDays = new Date(Date.now() - 8 * 24 * 3600_000).toISOString(), sixDays = new Date(Date.now() - 6 * 24 * 3600_000).toISOString();
+  check(at(eightDays) === "expired" && at(sixDays) === "passing" && at(null) === "expired"
+    && mergeable({ others: [{ context: "ci/nightly", app: null, state: "expired" }] }).state === UNKNOWN,
+    "another required check's pass older than seven days, or of no readable time, no longer counts: BLOCKED waits for a rerun",
+    JSON.stringify([at(eightDays), at(sixDays), at(null)]));
   check(both("success", "cancelled") === "superseded" && both("success", "stale") === "superseded",
     "a required check whose run was cancelled or went stale is superseded, not failing", JSON.stringify([both("success", "cancelled"), both("success", "stale")]));
   check(both("success", "failure") === "failing" && both("failure", "success") === "failing" && both("success", null, "running") === "running"
@@ -250,7 +260,7 @@ const withGh = (script, fn) => {
 {
   // A required check bound to an App names the App's id, so the head's check runs
   // must carry it.
-  withGh(`  *check-runs*) echo '{"name":"ci/lint","status":"completed","conclusion":"success","id":1,"app":{"slug":"linter","id":42}}';;
+  withGh(`  *check-runs*) echo '{"name":"ci/lint","status":"completed","conclusion":"success","id":1,"completed_at":"${RECENT}","app":{"slug":"linter","id":42}}';;
   *) ;;`, () => {
     const got = read("c".repeat(40));
     const bound = (app) => partsOf(baseOf({ rules: [OWN, { type: "required_status_checks", parameters: { required_status_checks: [{ context: "ci/lint", integration_id: app }] } }] }), {}, got.rows);

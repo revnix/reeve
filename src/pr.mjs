@@ -95,8 +95,8 @@ export function readThreads(nwo, pr, io = null) {
  * the base, and everything else the base requires. The base is read only when
  * BLOCKED, the one state it explains, since it costs calls:
  *   others            each other required check, with its state at this head in
- *                     `rows`: passing, failing, running, superseded, missing, or
- *                     unknown
+ *                     `rows`: passing, failing, running, superseded, expired,
+ *                     missing, or unknown
  *   unresolvedBlocks  whether the base requires resolved conversations and one
  *                     isn't
  *   strict, behind    whether the base requires branches up to date, and how
@@ -141,6 +141,9 @@ const PASSING_RUN = new Set(["success", "neutral", "skipped"]);
 // A run a newer one replaces: no answer yet, rather than a failure, as the CI
 // clause reads it too.
 const SUPERSEDED_RUN = new Set(["cancelled", "stale"]);
+// GitHub accepts a required check's passing result for seven days after it
+// completed, and holds the merge for a rerun after that.
+const REQUIRED_RESULT_MS = 7 * 24 * 3600 * 1000;
 
 /**
  * A required check's state among a head's check runs and statuses. One bound to
@@ -149,7 +152,7 @@ const SUPERSEDED_RUN = new Set(["cancelled", "stale"]);
  * name must pass, since GitHub holds the merge for any of them: a passing status
  * beside a failing check run of the same name is failing.
  */
-function requiredCheckState(rows, { context, app, besideOwn = false }) {
+function requiredCheckState(rows, { context, app, besideOwn = false }, now = Date.now()) {
   const named = rows.filter((r) => r?.name === context);
   const candidates = app == null ? named : named.filter((r) => r.source === "check_run" && String(r.appId) === app);
   const passes = (r) => r.source === "status" ? r.conclusion === "success" : PASSING_RUN.has(r.conclusion);
@@ -160,6 +163,8 @@ function requiredCheckState(rows, { context, app, besideOwn = false }) {
   if (candidates.some((r) => r.state === "completed" && !passes(r) && !superseded(r))) return "failing";
   if (candidates.some((r) => r.state !== "completed")) return "running";
   if (candidates.some(superseded)) return "superseded";
+  // Passing, but too long ago to count, or at a time that can't be read.
+  if (candidates.some((r) => !(now - Date.parse(r.completedAt) <= REQUIRED_RESULT_MS))) return "expired";
   return "passing";
 }
 
@@ -679,14 +684,14 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
 export const shadowContextOf = (context) => `${context} (shadow)`;
 
 /**
- * reeve's own latest check run at this head under each name, read in one pass,
- * as `{ [name]: { id, conclusion, app } | null }`, or null when the runs couldn't
+ * The check runs at this head under these names, read in one pass: reeve's own
+ * latest under each, as `mine: { [name]: { id, conclusion, app } | null }`, and
+ * every other App's under any of them, as `others`. Null when the runs couldn't
  * be read. Read as the App, because a run the App created is one it may update.
- * Only the App's own runs count: another App's run under the same name is one
- * reeve may not update, and taking it for reeve's own left reeve's passing run
- * under the enforcement name standing. A failure to look is not "there are
- * none": returning null then creates a duplicate rather than losing anything,
- * which is the harmless direction.
+ * Only the App's own runs are its to update: taking another App's for reeve's
+ * own left reeve's passing run under the enforcement name standing. A failure to
+ * look is not "there are none": returning null then creates a duplicate rather
+ * than losing anything, which is the harmless direction.
  */
 function existingRuns(token, nwo, sha, names, api = apiAsInstallation) {
   const r = api(token, ["--paginate", `repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=latest`,
@@ -694,7 +699,24 @@ function existingRuns(token, nwo, sha, names, api = apiAsInstallation) {
   if (!r.ok) return null;
   const rows = [];
   for (const line of (r.out ?? "").split("\n").filter(Boolean)) { try { rows.push(JSON.parse(line)); } catch { return null; } }
-  return Object.fromEntries(names.map((n) => [n, rows.filter((c) => c.name === n && c.app === POLICY_APP).at(-1) ?? null]));
+  return { mine: Object.fromEntries(names.map((n) => [n, rows.filter((c) => c.name === n && c.app === POLICY_APP).at(-1) ?? null])),
+           others: rows.filter((c) => names.includes(c.name) && c.app !== POLICY_APP) };
+}
+
+/**
+ * Whether a result other than reeve's own passes under `context` at this head:
+ * another App's check run, or a commit status. True, false, or null when the
+ * runs or the statuses couldn't be read.
+ */
+function othersPassUnder(token, nwo, sha, context, runs, api) {
+  const byRun = runs ? runs.others.some((c) => c.name === context && PASSING_RUN.has(c.conclusion)) : null;
+  const st = api(token, ["--paginate", `repos/${nwo}/commits/${sha}/status?per_page=100`,
+    "--jq", `.statuses[] | select(.context == ${JSON.stringify(context)}) | {state}`]);
+  let byStatus = null;
+  if (st.ok) {
+    try { byStatus = (st.out ?? "").split("\n").filter(Boolean).some((l) => JSON.parse(l).state === "success"); } catch { byStatus = null; }
+  }
+  return byRun === true || byStatus === true ? true : byRun === null || byStatus === null ? null : false;
 }
 
 // Rule types that can't stop a pull request merging into a branch that already
@@ -870,7 +892,7 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = "o
     "-f", `output[summary]=${body.slice(0, 60000)}`,
   ];
   const runs = existingRuns(auth.token, nwo, verdict.head, [name, context], api);
-  const existing = runs?.[name]?.id ?? null;
+  const existing = runs?.mine[name]?.id ?? null;
 
   // Shadow mode supersedes first. A passing result an earlier version left under
   // the enforcement name passes that check for as long as it stands, so it is
@@ -879,7 +901,7 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = "o
   // fails the publication: the daemon says so, and the next tick tries again.
   let superseded = false, left = null, stale = null;
   if (shadow) {
-    stale = runs?.[context];
+    stale = runs?.mine[context];
     if (!runs) left = `the check runs at ${verdict.head.slice(0, 8)} couldn't be read, so a passing result an earlier version may have left there under ${context} couldn't be superseded`;
     else if (stale && stale.app === POLICY_APP && PASSING_RUN.has(stale.conclusion)) {
       const s = api(auth.token, ["-X", "PATCH", `repos/${nwo}/check-runs/${stale.id}`, "-f", "status=completed", "-f", "conclusion=cancelled",
@@ -902,16 +924,28 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = "o
 
   let held = null;
   if (shadow) {
-    const required = base ? requiredOnBase({ nwo, base, context, gh: (args) => api(auth.token, args), appId: auth.appId ?? null }) : null;
+    const req = base ? requirementsOnBase({ nwo, base, context, gh: (args) => api(auth.token, args), appId: auth.appId ?? null }) : null;
+    const required = req?.own ?? null;
+    // Bound to reeve's App, only reeve's run can pass the requirement. With no
+    // App bound, or the binding unread, anyone's result under the name can.
+    const unbound = required === true && !(Array.isArray(req.others) && !req.others.some((o) => o.context === context && o.besideOwn));
     // Required, the check isn't blocked while such a result stands: it passes,
     // and the pull request can merge unjudged. So too, maybe, when the rules
     // couldn't be read to say. That is for a person to know now, and so is a
     // head whose runs couldn't be read to rule such a result out: "every pull
     // request is blocked" would say the opposite of what may be true.
+    const blocked = `a rule requires ${context} on ${base}, and reeve publishes it only when enforcing, so every pull request there is blocked until it enforces or the rule stops requiring it`;
     if (left && required !== false)
       held = `a rule ${required ? "requires" : "may require"} ${context} on ${base ?? "the base"}, and ${left}, so pull request head ${verdict.head.slice(0, 8)} ${stale && required ? "can" : "may"} pass that check unjudged`;
-    else if (required === true)
-      held = `a rule requires ${context} on ${base}, and reeve publishes it only when enforcing, so every pull request there is blocked until it enforces or the rule stops requiring it`;
+    else if (unbound) {
+      // Not blocked, then, if another App or a commit status has put a passing
+      // result under the name, and that is for a person to know now.
+      const passing = othersPassUnder(auth.token, nwo, verdict.head, context, runs, api);
+      held = passing === false
+        ? `${blocked}; with no App bound to the rule, any passing result under ${context} would pass it, so bind the rule to reeve's App`
+        : `a rule requires ${context} on ${base} with no App bound, and ${passing ? "a passing result of another's stands under that name" : "whether a passing result of another's stands under that name couldn't be read"} at ${verdict.head.slice(0, 8)}, so pull request head ${verdict.head.slice(0, 8)} ${passing ? "can" : "may"} pass that check unjudged`;
+    }
+    else if (required === true) held = blocked;
   }
   const id = res.ok ? JSON.parse(res.out).id : null;
   if (unwritten || left)

@@ -30,7 +30,7 @@ const FORBIDDEN = { ok: false, err: "gh: Resource not accessible by integration 
 
 // A fake GitHub: the runs already at the head, the base's rules and protection,
 // and every write, in order.
-const github = ({ runs = [], rules = RULES_NONE, branch = NOT_PROTECTED, refuse = () => false } = {}) => {
+const github = ({ runs = [], rules = RULES_NONE, branch = NOT_PROTECTED, statuses = [], refuse = () => false } = {}) => {
   const writes = [], reads = [];
   const api = (_token, args) => {
     const path = args.find((a) => typeof a === "string" && a.startsWith("repos/"));
@@ -38,6 +38,7 @@ const github = ({ runs = [], rules = RULES_NONE, branch = NOT_PROTECTED, refuse 
     if (verb === "GET") {
       reads.push({ path, paginate: args.includes("--paginate") });
       if (path.includes("/check-runs?")) return runs.ok === false ? runs : { ok: true, out: runs.map((r) => JSON.stringify(r)).join("\n") };
+      if (path.includes("/status?")) return statuses.ok === false ? statuses : { ok: true, out: statuses.map((st) => JSON.stringify({ state: st.state })).join("\n") };
       if (path.includes("/rules/branches/")) return rules;
       if (/\/branches\/[^/]+$/.test(path)) return branch;
       return { ok: false, err: `unexpected read ${path}` };
@@ -120,6 +121,24 @@ const publish = (gh, over = {}) => publishVerdict({ nwo: NWO, verdict, shadow: t
   check(r.ok === false && /couldn't publish/.test(r.why ?? "") && r.superseded === true && /every pull request there is blocked/.test(r.held ?? "")
     && gh.writes.some((w) => w.verb === "PATCH" && w.path.endsWith("/check-runs/5") && w.conclusion === "cancelled"),
     "a shadow write that fails still supersedes a passing result under the required name, and still says the rule requires it", JSON.stringify({ r, writes: gh.writes }));
+}
+{
+  // The rule requires reeve's check with no App bound, so anyone's passing
+  // result under the name passes it, and shadow mode never posts reeve's.
+  const unbound = rulesRequiring(CONTEXT, null);
+  const byApp = await publish(github({ rules: unbound, runs: [{ name: CONTEXT, id: 11, conclusion: "success", app: "someone-else" }] }));
+  const byStatus = await publish(github({ rules: unbound, statuses: [{ context: CONTEXT, state: "success" }] }));
+  const unread = await publish(github({ rules: unbound, statuses: { ok: false, err: "gh: HTTP 502" } }));
+  const none = await publish(github({ rules: unbound }));
+  const bound = await publish(github({ rules: rulesRequiring(CONTEXT, APP), runs: [{ name: CONTEXT, id: 11, conclusion: "success", app: "someone-else" }] }));
+  check(/no App bound/.test(byApp.held ?? "") && /can pass that check unjudged/.test(byApp.held ?? "") && /can pass that check unjudged/.test(byStatus.held ?? "")
+    && /may pass that check unjudged/.test(unread.held ?? ""),
+    "a rule requiring reeve's check with no App bound, where another App's run or a commit status passes under its name, is held as a pull request that can merge unjudged",
+    JSON.stringify({ byApp: byApp.held, byStatus: byStatus.held, unread: unread.held }));
+  check(/every pull request there is blocked/.test(none.held ?? "") && /bind the rule to reeve's App/.test(none.held ?? "")
+    && /every pull request there is blocked/.test(bound.held ?? "") && !/unjudged|no App bound/.test(bound.held ?? ""),
+    "control: with nothing else passing under the name it is blocked, and says to bind the rule; bound to reeve's App, another's pass can't satisfy it",
+    JSON.stringify({ none: none.held, bound: bound.held }));
 }
 {
   // Another App's runs under the same names, listed after reeve's own. Only

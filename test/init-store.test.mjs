@@ -31,6 +31,9 @@ const marker = (path, write) => {
   } catch { return null; } finally { db.close(); }
 };
 const NWO = "acme/widget";
+// ensureStore, with a throw recorded rather than raised: a stubbed rule can make
+// it throw, and a file that dies there leaves every later assertion unrun.
+const ensure = (home, opts) => { try { return ensureStore(home, NWO, opts); } catch (e) { return { threw: e.message }; } };
 // The CLI, run from a scratch home. Returns the exit code and stderr.
 const reeve = (home, args) => {
   try {
@@ -45,7 +48,7 @@ const reeve = (home, args) => {
   const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
   try {
     check(storeStatus(home, NWO).state === "missing", "control: a fresh home has no state database");
-    const made = ensureStore(home, NWO);
+    const made = ensure(home);
     const path = statePathFor(home, NWO);
     check(made.changed && existsSync(path) && tables(path).length > 0 && /created/.test(made.line ?? ""),
       "on a fresh machine, init creates the state database", JSON.stringify(made));
@@ -56,11 +59,11 @@ const reeve = (home, args) => {
 {
   const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
   try {
-    ensureStore(home, NWO);
+    ensure(home);
     const path = statePathFor(home, NWO);
     marker(path, "real history");
     let opened = 0;
-    const again = ensureStore(home, NWO, { openStore: (p) => { opened++; return new DatabaseSync(p); } });
+    const again = ensure(home, { openStore: (p) => { opened++; return new DatabaseSync(p); } });
     check(!again.changed && opened === 0 && marker(path, null) === "real history",
       "an existing state database is left alone", JSON.stringify({ again, opened }));
   } finally { rmSync(home, { recursive: true, force: true }); }
@@ -76,7 +79,7 @@ const reeve = (home, args) => {
     const planned = storeStatus(home, NWO);
     check(planned.state === "legacy" && existsSync(legacy) && !existsSync(path),
       "control: working out the plan moves nothing", JSON.stringify(planned));
-    const made = ensureStore(home, NWO);
+    const made = ensure(home);
     check(made.changed && !existsSync(legacy) && marker(path, null) === "history at the old path",
       "a legacy store is moved into place, never replaced by an empty one", JSON.stringify(made));
   } finally { rmSync(home, { recursive: true, force: true }); }
@@ -124,7 +127,7 @@ const reeve = (home, args) => {
     marker(legacy, "history at the old path");
     // A file where the owner's directory belongs, so the move can't happen.
     writeFileSync(join(dirname(legacy), "acme"), "not a directory\n");
-    const made = ensureStore(home, NWO);
+    const made = ensure(home);
     check(!made.changed && /could not move/.test(made.line ?? "") && /\bE[A-Z]{3,}\b/.test(made.line ?? "") && marker(legacy, null) === "history at the old path",
       "a legacy store that can't be moved says why, and stays where it was", JSON.stringify(made));
   } finally { rmSync(home, { recursive: true, force: true }); }

@@ -81,28 +81,63 @@ const fromJson = (...objects) => Object.assign(Object.create(null), ...objects);
 // `for` loop over the test files, and was reported as running a missing program
 // called `for`.
 const SHELL_WORDS = new Set([
-  "!", "[[", "case", "for", "function", "if", "select", "time", "until", "while",
-  ".", ":", "[", "alias", "builtin", "cd", "command", "echo", "eval", "exec", "exit", "export", "false",
+  "!", "[[", "case", "for", "function", "if", "select", "until", "while",
+  ".", ":", "[", "alias", "builtin", "cd", "echo", "eval", "exit", "export", "false",
   "local", "printf", "pwd", "read", "readonly", "return", "set", "shift", "source", "test", "trap",
   "true", "type", "ulimit", "umask", "unset", "wait",
 ]);
+// Words that run the command after them: `exec jest` runs jest.
+const WRAPPERS = new Set(["command", "exec", "time", "env", "nohup"]);
 
 /**
- * The program a script runs, or null when its first word isn't one.
+ * The first command's words, split as a shell splits them: whitespace separates
+ * words except inside quotes or after a backslash, so `MSG=hello\ node` and
+ * `MSG="two words"` are one word each. Stops at the first operator. Returns null
+ * for text it can't split confidently, such as an unbalanced quote.
+ */
+function leadingWords(body) {
+  const s = String(body), words = [];
+  let cur = "", open = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "\\") { if (i + 1 >= s.length) return null; cur += s[++i]; open = true; }
+    else if (c === "'") { const end = s.indexOf("'", i + 1); if (end < 0) return null; cur += s.slice(i + 1, end); open = true; i = end; }
+    else if (c === '"') {
+      let j = i + 1;
+      for (; j < s.length && s[j] !== '"'; j++) cur += s[j] === "\\" && '"\\$`'.includes(s[j + 1] ?? "") ? s[++j] : s[j];
+      if (j >= s.length) return null;
+      open = true; i = j;
+    }
+    else if (c === "\n" || ";&|<>".includes(c)) break;
+    else if (/\s/.test(c)) { if (open) { words.push(cur); cur = ""; open = false; } }
+    else { cur += c; open = true; }
+  }
+  if (open) words.push(cur);
+  return words;
+}
+
+/**
+ * The program a script runs, or null when it names none that can be judged.
  *
- * Leading variable assignments are skipped: `NODE_ENV=test jest` runs jest. A
- * shell keyword, builtin, group or subshell names no program, and neither does
- * an assignment whose quoted value spans words, so there is nothing to judge: a
- * script that can't be read confidently is never called broken.
+ * Leading variable assignments are skipped (`NODE_ENV=test jest` runs jest),
+ * and so are wrappers that run the next command (`exec`, `command`, `time`,
+ * `env`, `nohup`), along with env's own assignments. A shell keyword, builtin,
+ * group, subshell or expansion names no program, and neither does a wrapper
+ * given options, whose meaning changes (`command -v` only looks a program up):
+ * a script that can't be read confidently is never called broken.
  */
 export function programOf(body) {
-  const words = String(body).trim().split(/\s+/).filter(Boolean);
-  while (words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) {
-    if ((words[0].match(/["']/g) ?? []).length % 2) return null;
-    words.shift();
+  const words = leadingWords(body);
+  if (!words) return null;
+  let i = 0;
+  for (;;) {
+    while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i])) i++;
+    if (i >= words.length || !WRAPPERS.has(words[i])) break;
+    i++;
+    if (words[i]?.startsWith("-")) return null;
   }
-  const first = words[0];
-  if (!first || /^[({]/.test(first) || SHELL_WORDS.has(first)) return null;
+  const first = words[i];
+  if (!first || /^[({]/.test(first) || /[$`]/.test(first) || SHELL_WORDS.has(first)) return null;
   return first;
 }
 

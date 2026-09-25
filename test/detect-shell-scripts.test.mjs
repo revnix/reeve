@@ -4,8 +4,9 @@
 // and reports the script broken when that program is neither a dependency nor
 // installed. reeve's own `npm test` is a `for` loop over the test files, so init
 // warned it ran a missing program called `for`. These tests give the detector one
-// fixture per case: a keyword, a builtin, a subshell, a leading assignment, a
-// quoted assignment, and a program that really is missing.
+// fixture per case: keywords, builtins, subshells, assignments (quoted, escaped
+// and unbalanced), wrappers that run the next command, expansions, and a program
+// that really is missing.
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -49,9 +50,27 @@ try {
   check(assignedMissing.state === "broken" && /'no-such-runner'/.test(assignedMissing.reason ?? ""),
     "a leading variable assignment is skipped, and the program behind it judged", JSON.stringify(assignedMissing));
 
-  // A quoted value that spans words can't be split reliably, so it isn't judged.
-  const quoted = detectTest('MSG="two words" jest');
-  check(quoted.state === "present", "an assignment whose quoted value spans words is not misread as a program", JSON.stringify(quoted));
+  // Quotes and escapes keep a value whole, as the shell does, so the program
+  // behind it is the one judged.
+  const quoted = detectTest('MSG="two words" no-such-runner');
+  check(quoted.state === "broken" && /'no-such-runner'/.test(quoted.reason ?? ""),
+    "a quoted assignment value that spans words is skipped whole, and the program behind it judged", JSON.stringify(quoted));
+  const escaped = detectTest("MSG=hello\\ node no-such-runner");
+  check(escaped.state === "broken" && /'no-such-runner'/.test(escaped.reason ?? ""),
+    "an escaped space keeps an assignment's value whole, so the program behind it is judged, not the word after the space", JSON.stringify(escaped));
+  const unbalanced = detectTest('MSG="unterminated jest');
+  check(unbalanced.state === "present", "a script with an unbalanced quote isn't misread, so it isn't judged", JSON.stringify(unbalanced));
+
+  // Wrappers run the command after them.
+  const wrapped = ["command", "exec", "time", "nohup", "env NODE_ENV=test"].map((w) => ({ w, r: detectTest(`${w} no-such-runner --ci`) }));
+  check(wrapped.every(({ r }) => r.state === "broken" && /'no-such-runner'/.test(r.reason ?? "")),
+    "a program run through command, exec, time, nohup or env is judged", JSON.stringify(wrapped));
+  const envOk = detectTest("env NODE_ENV=test jest --ci", { jest: "^29.0.0" });
+  check(envOk.state === "present", "env before a program that is a dependency is present, not a missing program called env", JSON.stringify(envOk));
+  const lookup = detectTest("command -v jest");
+  check(lookup.state === "present", "a wrapper given options isn't judged, since command -v only looks a program up", JSON.stringify(lookup));
+  const expansion = detectTest("$RUNNER --ci");
+  check(expansion.state === "present", "a program named by an expansion isn't judged", JSON.stringify(expansion));
 
   const missing = detectTest("no-such-runner --ci");
   check(missing.state === "broken" && /runs 'no-such-runner', which is neither a dependency nor installed/.test(missing.reason ?? ""),

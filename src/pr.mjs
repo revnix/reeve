@@ -183,10 +183,16 @@ function requiredCheckState(rows, { context, app, besideOwn = false }, now = Dat
 export function requiredChecksOf({ nwo, baseRef, profile = {}, requirements = requiredChecksOnBase, gh = ghJson }) {
   const base = baseRef ? requirements({ nwo, base: baseRef, gh }) : null;
   const shadow = shadowContextOf(POLICY_CONTEXT);
-  const aside = new Set([POLICY_CONTEXT, shadow, ...(profile.ci?.reviewerStatusContexts ?? [])]);
+  const reviewers = new Set(profile.ci?.reviewerStatusContexts ?? []);
+  // A reviewer's status is aside, but a check bound to an App under the same
+  // name is a check run, and required like any other.
+  const aside = (c) => c.context === POLICY_CONTEXT || c.context === shadow || (c.app == null && reviewers.has(c.context));
   const all = [...(profile.ci?.requiredChecks ?? []).map((context) => ({ context, app: null, origin: "profile" })),
-               ...(base ?? []).filter((c) => !aside.has(c.context)).map((c) => ({ ...c, origin: "base" }))];
-  const required = all.filter((c, i) => all.findIndex((d) => d.context === c.context && d.app === c.app) === i);
+               ...(base ?? []).filter((c) => !aside(c)).map((c) => ({ ...c, origin: "base" }))];
+  // One entry per check. Where the profile and the base both name it, the base
+  // wins: its requirement may be any App's, and settles only when it reports.
+  const required = all.filter((c, i) => all.findIndex((d) => d.context === c.context && d.app === c.app) === i)
+    .map((c) => (all.some((d) => d.context === c.context && d.app === c.app && d.origin === "base") ? { ...c, origin: "base" } : c));
   return { required, known: Array.isArray(base), shadowRequired: (base ?? []).some((c) => c.context === shadow) };
 }
 

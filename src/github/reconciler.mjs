@@ -85,7 +85,7 @@ export const POLICY_APP = "merge-policy";
  * Bump this whenever the set of things counted changes. A stored floor recorded
  * under an older number is discarded rather than compared against.
  */
-export const CHECK_ACCOUNTING = 4;
+export const CHECK_ACCOUNTING = 5;
 // 3: reviewer commit-status contexts (ci.reviewerStatusContexts) left the counted
 //    set. Measured the moment it shipped -- nextly #1011 read "only 34 checks
 //    reported where 35 were expected" against a floor stored under accounting 2,
@@ -94,6 +94,8 @@ export const CHECK_ACCOUNTING = 4;
 //    only thing standing between an exclusion and every PR stuck forever.
 // 4: check runs and statuses are read past their first page. Statuses came 30
 //    to a page and runs 100, so a head with more counts them all from here on.
+// 5: only a reviewer's commit STATUS leaves the counted set. A check run under a
+//    reviewer's context name counts, since a rule can bind it to its App.
 
 /**
  * Remove reeve's own opinion from the evidence.
@@ -141,7 +143,9 @@ export function excludeReviewerContexts(rows, contexts = []) {
   if (!contexts.length) return { rows, reviewerRows: [] };
   const set = new Set(contexts);
   const rest = [], reviewerRows = [];
-  for (const r of rows) (set.has(r.name) ? reviewerRows : rest).push(r);
+  // A reviewer's STATUS, and only that: a check run under the same name is a
+  // check run, which a rule binding it to its App requires like any other.
+  for (const r of rows) (set.has(r.name) && r.source !== "check_run" ? reviewerRows : rest).push(r);
   return { rows: rest, reviewerRows };
 }
 
@@ -321,9 +325,12 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
  * true: it means the caller has no basis to conclude anything.
  */
 export function suitesComplete(nwo, sha, { app = "github-actions", appId = null } = {}) {
-  const r = gh(`repos/${nwo}/commits/${sha}/check-suites?per_page=100`, ".check_suites");
+  // Every page: an App's suite past the first hundred would otherwise go unseen.
+  const r = gh(`repos/${nwo}/commits/${sha}/check-suites?per_page=100`, ".check_suites[]", { paginate: true });
   if (!r.ok || !r.out) return null;
-  let suites; try { suites = JSON.parse(r.out); } catch { return null; }
+  let suites;
+  try { suites = r.out.split("\n").filter(Boolean).flatMap((line) => { const v = JSON.parse(line); return Array.isArray(v) ? v : [v]; }); }
+  catch { return null; }
   // By the App's id where a requirement is bound to one, and otherwise by the
   // provider's name.
   const mine = suites.filter(s => (appId != null ? String(s.app?.id) === String(appId) : (s.app?.slug ?? null) === app));

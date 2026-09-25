@@ -13,7 +13,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classify, inheritedOrCaused, POLICY_CONTEXT, readChecks, settle } from "../src/github/reconciler.mjs";
+import { classify, excludeReviewerContexts, inheritedOrCaused, POLICY_CONTEXT, readChecks, settle, suitesComplete } from "../src/github/reconciler.mjs";
 import { classifyRead, clearRequirements, evaluatePr, missingSettled, requiredChecksOf, requiredChecksOnBase, requirementsOn, shadowContextOf } from "../src/pr.mjs";
 import { computeVerdict, CLAUSE_IDS } from "../src/verdict.mjs";
 import { ACTIONS, ESCALATIONS, nextAction } from "../src/watcher.mjs";
@@ -154,6 +154,24 @@ const status = (name, state) => ({ name, conclusion: state, state: "completed", 
     JSON.stringify({ imported, own, origins }));
 }
 
+// A reviewer's status is aside, but a check run bound to an App under the same
+// name is a check run the base requires. And where the profile and the base
+// both name a check, the base's caution about its absence wins.
+{
+  const status = { name: "CodeRabbit", source: "status", state: "completed", conclusion: "success" };
+  const boundRun = run("CodeRabbit", "skipped", { appId: "4242" });
+  const split = excludeReviewerContexts([status, boundRun], ["CodeRabbit"]);
+  const profile = { ci: { requiredChecks: ["Vercel"], reviewerStatusContexts: ["CodeRabbit"] } };
+  const req = requiredChecksOf({ nwo: "o/r", baseRef: "main", profile,
+    requirements: () => [{ context: "CodeRabbit", app: "4242" }, { context: "CodeRabbit", app: null }, { context: "Vercel", app: null }] }).required;
+  const vercel = req.find((c) => c.context === "Vercel");
+  check(split.rows.length === 1 && split.rows[0].source === "check_run" && split.reviewerRows.length === 1
+    && JSON.stringify(req.map((c) => `${c.context}:${c.app}`)) === JSON.stringify(["Vercel:null", "CodeRabbit:4242"]) && vercel.origin === "base"
+    && missingSettled("o/r", "a".repeat(40), [vercel], {}, () => true) === false,
+    "a check bound to an App stays required under a reviewer's status name, and a check both the profile and the base name settles as the base's",
+    JSON.stringify({ split, req }));
+}
+
 // A partial read of the base still shows the failures it did read.
 {
   const probe = inheritedOrCaused("o/r", "main", [run("CI Gate", "failure"), run("lint", "failure")], {
@@ -275,12 +293,12 @@ const decide = (ci) => nextAction({
   const db = open(join(dir, "state.db"));
   const profile = { ci: { requiredChecks: [], reviewerStatusContexts: [] }, reviewers: [] };
   let pr = 100;
-  const ciAfterTicks = (answers) => withFakes(answers, () => {
+  const ciAfterTicks = (answers, asProfile = profile) => withFakes(answers, () => {
     pr++;
     const anchor = { ok: true, headRef: "feature", baseRef: "main", state: "OPEN", title: "t", updatedAt: "2026-09-25T00:00:00Z",
                      head: HEAD, pin: { ok: true, sha: HEAD }, authorLogin: "someone" };
     let r;
-    for (let k = 0; k < 3; k++) r = evaluatePr({ nwo: "o/r", pr, profile, db, anchor });
+    for (let k = 0; k < 3; k++) r = evaluatePr({ nwo: "o/r", pr, profile: asProfile, db, anchor });
     const clause = (id) => (r.ok ? r.verdict.clauses.find((c) => c.id === id) : { state: "none", detail: r.why });
     return { ...clause("ci"), base: clause("base") };
   });
@@ -338,6 +356,17 @@ ${requiresGate}
   */branches/main) echo '{"protected":true,"protection":{"enabled":false}}';;
   */commits/${HEAD}/check-runs*) echo '${runJson("CI Gate", "success")}';;
   */commits/${HEAD}/status*) ;;`);
+  const reviewerBound = ciAfterTicks(`${base}
+  */rules/branches/*) echo '{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"CI Gate"},{"context":"CodeRabbit","integration_id":4242}]}}';;
+  */branches/main) echo '{"protected":true,"protection":{"enabled":false}}';;
+  */commits/${HEAD}/check-runs*) echo '${runJson("CI Gate", "success")}'
+    echo '${JSON.stringify({ name: "CodeRabbit", status: "completed", conclusion: "skipped", id: 9, completed_at: new Date().toISOString(), app: { slug: "coderabbitai", id: 4242 } })}';;
+  */commits/${HEAD}/status*) echo '{"context":"CodeRabbit","state":"success"}';;`,
+    { ...profile, ci: { ...profile.ci, reviewerStatusContexts: ["CodeRabbit"] } });
+  // Two pages of suites: the bound App's is on the second.
+  const pagedSuites = withFakes(`  */check-suites*) case "$*" in *--paginate*) echo '{"app":{"slug":"github-actions","id":15368},"status":"completed"}'
+    echo '{"app":{"slug":"third","id":4242},"status":"completed"}';; *) echo '[{"app":{"slug":"github-actions","id":15368},"status":"completed"}]';; esac;;`,
+    () => suitesComplete("o/r", HEAD, { appId: "4242" }));
   const boundWaiting = ciAfterTicks(thirdParty("queued"));
   const boundDone = ciAfterTicks(thirdParty("completed"));
   const shadowGated = ciAfterTicks(`${base}
@@ -367,6 +396,9 @@ ${requiresGate}
     "through evaluatePr, a head whose base's rules couldn't be read has no CI pass, though every check it has passes", JSON.stringify(rulesUnread));
   check(unboundImported.state === "UNKNOWN" && /Vercel/.test(unboundImported.detail),
     "through evaluatePr, an unbound check the base requires waits while it hasn't reported, though GitHub Actions has finished", JSON.stringify(unboundImported));
+  check(reviewerBound.state === "BLOCK" && /CodeRabbit/.test(reviewerBound.detail),
+    "through evaluatePr, a check bound to an App that was skipped blocks, though a reviewer's status shares its name", JSON.stringify(reviewerBound));
+  check(pagedSuites === true, "an App's suites are read past the first page before its absence settles", JSON.stringify(pagedSuites));
   check(boundWaiting.state === "UNKNOWN" && boundDone.state === "BLOCK" && /third-party/.test(boundDone.detail),
     "through evaluatePr, a required check from a third-party App waits for that App's suite, not GitHub Actions'", JSON.stringify({ boundWaiting, boundDone }));
   check(shadowGated.state === "BLOCK" && /shadow check/.test(shadowGated.detail),

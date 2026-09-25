@@ -3510,11 +3510,16 @@ export async function run(ctx) {
 
   // The assertion dies with this process, so a crashed daemon can never leave the
   // Mac permanently unable to sleep.
-  const caffeinatePid = stayAwake(process.pid);
-  if (caffeinatePid) log(logPath, `staying awake via caffeinate pid ${caffeinatePid}`);
+  const awake = stayAwake(process.pid);
+  if (awake.pid) log(logPath, `staying awake via ${awake.via} pid ${awake.pid}`);
+  else if (awake.why) log(logPath, `not keeping the machine awake: ${awake.why}`);
 
-  let stop = false;
-  const shutdown = sig => { log(logPath, `${sig} — finishing this tick then stopping`); stop = true; };
+  // A stop ends the sleep between ticks at once. Only a tick in progress is
+  // finished: waiting out the rest of the interval as well made a stop take up to
+  // 90 seconds more, past the time systemd gives a service to exit, so it was
+  // killed and recorded as failed.
+  let stop = false, wake = null;
+  const shutdown = sig => { log(logPath, `${sig} — finishing this tick then stopping`); stop = true; wake?.(); };
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
 
@@ -3528,7 +3533,8 @@ export async function run(ctx) {
       log(logPath, `tick threw: ${e.stack?.split("\n").slice(0, 3).join(" | ") ?? e.message}`);
     }
     if (stop) break;
-    await new Promise(r => setTimeout(r, intervalMs));
+    await new Promise(r => { const t = setTimeout(r, intervalMs); wake = () => { clearTimeout(t); r(); }; });
+    wake = null;
     if (stop) break;
   }
   log(logPath, "daemon stopped");

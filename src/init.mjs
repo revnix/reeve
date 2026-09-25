@@ -320,10 +320,11 @@ export function ensureStore(home, nwo, { openStore = open, log = () => {} } = {}
   const status = storeStatus(home, nwo);
   if (status.state === "exists") return { changed: false, line: null };
   if (status.state === "legacy") {
-    const used = adoptLegacyStore(status.path, status.legacy, { log });
+    let said = null;
+    const used = adoptLegacyStore(status.path, status.legacy, { log: (m) => { said = m; log(m); } });
     return used === status.path
       ? { changed: true, line: `moved the state database to ${status.path}` }
-      : { changed: false, line: `could not move the state database; it stays at ${used}` };
+      : { changed: false, line: said ?? `could not move the legacy store; using ${used}` };
   }
   mkdirSync(dirname(status.path), { recursive: true });
   openStore(status.path).close();

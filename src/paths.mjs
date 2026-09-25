@@ -138,20 +138,24 @@ export function runPathFor(home, taskId, { generation, phase, slice, attempt, st
  * fresh empty database beside it is how real history stops being read without
  * anything appearing to fail.
  */
-export function adoptLegacyStore(next, legacy, { log = (m) => console.error(m) } = {}) {
+export function adoptLegacyStore(next, legacy, { log = (m) => console.error(`reeve: ${m}`) } = {}) {
   try {
     if (!existsSync(next) && existsSync(legacy)) {
       mkdirSync(dirname(next), { recursive: true });
       for (const suffix of ["", "-wal", "-shm"]) {
         if (existsSync(legacy + suffix)) renameSync(legacy + suffix, next + suffix);
       }
-      log(`reeve: moved ${legacy} -> ${next}`);
+      log(`moved ${legacy} -> ${next}`);
     }
-  } catch (e) { log(`reeve: could not move the legacy store (${e.message}); using ${legacy}`); return legacy; }
+  } catch (e) { log(`could not move the legacy store (${e.message}); using ${legacy}`); return legacy; }
   return next;
 }
 
-/** What a command says when a repository has no state database, and how to make one. */
-export function missingStoreMessage(dbPath) {
-  return `no state database at ${dbPath}\n-> reeve init --write   creates it`;
+/**
+ * What a command says when a repository has no state database. The step that
+ * creates one is named only for the default path: init creates the store there,
+ * not wherever --db points.
+ */
+export function missingStoreMessage(dbPath, { initCreatesIt = true } = {}) {
+  return `no state database at ${dbPath}` + (initCreatesIt ? "\n-> reeve init --write   creates it" : "");
 }

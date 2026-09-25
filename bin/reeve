@@ -605,7 +605,7 @@ switch (cmd) {
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
     if (!nwo) { console.error("reeve backup: no repo."); process.exit(1); }
     const dbPath = opt("db") ?? stateFor(nwo);
-    if (!existsSync(dbPath)) { console.error(`reeve backup: no state at ${dbPath}`); process.exit(1); }
+    if (!existsSync(dbPath)) { console.error(`reeve backup: ${missingStoreMessage(dbPath, { initCreatesIt: !opt("db") })}`); process.exit(1); }
     const root = opt("to") ?? join(HOME, "backups");
     const db = open(dbPath);
     if (flag("events")) {
@@ -808,7 +808,7 @@ switch (cmd) {
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
     if (!nwo) { console.error("reeve shadow: no repo."); process.exit(1); }
     const dbPath = opt("db") ?? stateFor(nwo);
-    if (!existsSync(dbPath)) { console.error(`reeve shadow: no state at ${dbPath}`); process.exit(1); }
+    if (!existsSync(dbPath)) { console.error(`reeve shadow: ${missingStoreMessage(dbPath, { initCreatesIt: !opt("db") })}`); process.exit(1); }
     const db = open(dbPath);
     const { streak, divergences } = await import("../src/review/shadow.mjs");
     const need = Number(opt("days") ?? 5);
@@ -867,7 +867,7 @@ switch (cmd) {
       // Typed, because `status` honours `--json` everywhere else: a store that is
       // not there answered with prose and exit 1 gave a script a parse error where
       // the ANSWER was "this machine has never watched that repository".
-      fail("store_absent", `reeve ${cmd}: no state database${dbPath ? ` at ${dbPath}` : ""}`);
+      fail("store_absent", dbPath ? `reeve ${cmd}: ${missingStoreMessage(dbPath, { initCreatesIt: !opt("db") })}` : `reeve ${cmd}: no state database`);
     }
     const db = open(dbPath);
 
@@ -2286,7 +2286,7 @@ switch (cmd) {
     // non-absolute candidate, so a relative --db opened fine and was denied to
     // nobody. (Codex #4g-[2].)
     const dbPath = resolve(opt("db") ?? stateFor(nwo));
-    if (!existsSync(dbPath)) { console.error(`reeve run: ${missingStoreMessage(dbPath)}`); process.exit(1); }
+    if (!existsSync(dbPath)) { console.error(`reeve run: ${missingStoreMessage(dbPath, { initCreatesIt: !opt("db") })}`); process.exit(1); }
     // Resolved before the context so the REASON survives. A project that is
     // simply not registered is `{ project: null, why: null }` -- an ordinary
     // state. A registry that could not be parsed is a fault that says so.

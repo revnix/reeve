@@ -31,6 +31,14 @@ const marker = (path, write) => {
   } catch { return null; } finally { db.close(); }
 };
 const NWO = "acme/widget";
+// The CLI, run from a scratch home. Returns the exit code and stderr.
+const reeve = (home, args) => {
+  try {
+    execFileSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
+      { cwd: home, env: { ...process.env, REEVE_HOME: home }, stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" });
+    return { code: 0, err: "" };
+  } catch (e) { return { code: e.status, err: String(e.stderr) }; }
+};
 
 // ── a fresh machine ───────────────────────────────────────────────────────────
 {
@@ -88,11 +96,37 @@ const NWO = "acme/widget";
       ci: { provider: "github-actions" }, merge: { method: "squash", enforcement: "attested" }, reviewers: [] });
     mkdirSync(join(home, "profiles", "acme"), { recursive: true });
     writeFileSync(join(home, "profiles", "acme", "widget.json"), JSON.stringify(profile));
-    let code = 0, err = "";
-    try { execFileSync(process.execPath, [join(ROOT, "bin", "reeve"), "run", NWO], { cwd: home, env: { ...process.env, REEVE_HOME: home }, stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" }); }
-    catch (e) { code = e.status; err = String(e.stderr); }
+    const { code, err } = reeve(home, ["run", NWO]);
     check(code === 1 && /no state database/.test(err) && /reeve init --write/.test(err) && !existsSync(statePathFor(home, NWO)),
       "control: reeve run still refuses without a store, creates none, and says how to make one", `exit ${code}: ${err.trim()}`);
+
+    // init creates the store at the default path, not wherever --db points, so
+    // naming it there would send the reader to a step that doesn't help.
+    const elsewhere = join(home, "elsewhere.db");
+    const withDb = reeve(home, ["run", NWO, "--db", elsewhere]);
+    check(withDb.code === 1 && withDb.err.includes(`no state database at ${elsewhere}`) && !/reeve init/.test(withDb.err) && !existsSync(elsewhere),
+      "a --db that names a missing file isn't answered with init, which wouldn't create it", `exit ${withDb.code}: ${withDb.err.trim()}`);
+
+    // Every command that needs the store names the step that creates it.
+    const said = ["backup", "shadow", "status"].map((cmd) => ({ cmd, ...reeve(home, [cmd, NWO]) }));
+    check(said.every((r) => r.code !== 0 && /no state database/.test(r.err) && /reeve init --write/.test(r.err)),
+      "every command that needs the state database names the step that creates it",
+      said.map((r) => `${r.cmd}: exit ${r.code}: ${r.err.trim()}`).join(" | "));
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}
+
+// ── a legacy store that can't be moved says why, and stays where it was ───────
+{
+  const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
+  try {
+    const legacy = legacyStatePathFor(home, NWO);
+    mkdirSync(dirname(legacy), { recursive: true });
+    marker(legacy, "history at the old path");
+    // A file where the owner's directory belongs, so the move can't happen.
+    writeFileSync(join(dirname(legacy), "acme"), "not a directory\n");
+    const made = ensureStore(home, NWO);
+    check(!made.changed && /could not move/.test(made.line ?? "") && /\bE[A-Z]{3,}\b/.test(made.line ?? "") && marker(legacy, null) === "history at the old path",
+      "a legacy store that can't be moved says why, and stays where it was", JSON.stringify(made));
   } finally { rmSync(home, { recursive: true, force: true }); }
 }
 

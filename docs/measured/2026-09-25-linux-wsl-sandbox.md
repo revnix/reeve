@@ -80,4 +80,6 @@ tests for content that only the real tree has.
 
 - The real CLI under these settings: the canary does that, per CLI build.
 - A GitHub-hosted runner, whose Ubuntu restricts unprivileged user namespaces
-  by default.
+  by default. Its first run found one more dependency: srt also needs ripgrep,
+  to find the files it must protect under a writable path, and refuses to start
+  without it (`Sandbox dependencies not available: ripgrep (rg) not found`).

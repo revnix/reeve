@@ -131,14 +131,16 @@ console.log("── under the OS sandbox (the runtime's own profile, via srt)");
 let srt = null;
 try { srt = join(dirname(createRequire(import.meta.url).resolve("@anthropic-ai/sandbox-runtime")), "cli.js"); } catch { srt = null; }
 
-// On Linux the runtime is bubblewrap, with socat relaying to its network proxy.
-const linuxDeps = process.platform === "linux" ? ["bwrap", "socat"].filter(b => sh(root, "sh", ["-c", `command -v ${b}`]).status !== 0) : [];
+// On Linux the runtime is bubblewrap, with socat relaying to its network proxy
+// and ripgrep finding the files it must protect. Without any of them it starts
+// nothing (measured on a hosted runner without ripgrep).
+const linuxDeps = process.platform === "linux" ? ["bwrap", "socat", "rg"].filter(b => sh(root, "sh", ["-c", `command -v ${b}`]).status !== 0) : [];
 if (!["darwin", "linux"].includes(process.platform)) {
   skip("every sandboxed shape", `the OS sandbox is measured on macOS and Linux only; this is ${process.platform}`);
 } else if (!srt || !existsSync(srt)) {
   check(false, "the sandbox runtime is installed (npm install; it is a devDependency, and on macOS and Linux the sandboxed shapes are mandatory)", "srt not resolvable");
 } else if (linuxDeps.length) {
-  check(false, "the sandbox's Linux dependencies are installed: bubblewrap and socat (apt install bubblewrap socat)", `missing: ${linuxDeps.join(", ")}`);
+  check(false, "the sandbox's Linux dependencies are installed: bubblewrap, socat and ripgrep (apt install bubblewrap socat ripgrep)", `missing: ${linuxDeps.join(", ")}`);
 } else {
   // The block every worker gets, turned into the runtime's own settings
   // shape. The CLI adds cwd to the write scope implicitly; srt adds nothing,
@@ -297,7 +299,7 @@ ${JSON.stringify(process.execPath)} -e 'require("net").createServer().listen("./
     check(r.noverify !== 0 && !refsAt(dest).includes("escape-noverify"), "HELD: `git push --no-verify <url>` cannot land: the destination is outside the write scope", `noverify=${r.noverify}`);
     check(r.hookspath !== 0 && !refsAt(dest).includes("escape-hookspath"), "HELD: `-c core.hooksPath=/dev/null` cannot land either, for the same reason", `hookspath=${r.hookspath}`);
     check(r.https !== 0, "HELD: a push to GitHub fails: no network", `https=${r.https}`);
-    check(r.commit === 0, "measured: the worker CAN commit in a linked worktree under the CLI's scope", `commit=${r.commit} ${readFileSync(join(wt.path, "probe-commit.err"), "utf8").slice(0, 120)}`);
+    check(r.commit === 0, "measured: the worker CAN commit in a linked worktree under the CLI's scope", `commit=${r.commit} ${existsSync(join(wt.path, "probe-commit.err")) ? readFileSync(join(wt.path, "probe-commit.err"), "utf8").slice(0, 120) : "(the script never ran)"}`);
     check(r.updateref === 0 && git(clone, "rev-parse", "refs/heads/main") === git(wt.path, "rev-parse", "HEAD"),
       "KNOWN-OPEN: a linked worktree can move the checkout's OWN branches through the shared ref store (closes with per-run standalone clones)", `updateref=${r.updateref}`);
     git(clone, "update-ref", "refs/heads/main", head);   // put the fixture's main back

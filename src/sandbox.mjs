@@ -296,6 +296,23 @@ export function credentialPaths() {
   return [...CREDENTIAL_PATHS.map(expandTilde), ...extra];
 }
 const credentialReadDenies = () => credentialPaths().map(p => (isCredentialFile(p) ? `Read(${ruleFor(p)})` : `Read(${ruleFor(p)}/**)`));
+
+/**
+ * The credential paths as the OS sandbox is given them.
+ *
+ * On Linux the runtime hides a denied directory by mounting over it, and
+ * bubblewrap refuses to start when it reaches that directory through a symlink.
+ * Measured on WSL2 with srt 0.0.73, where ~/.aws and ~/.azure link to
+ * /mnt/c/Users/<you>: "Can't mount tmpfs on .../.aws", and nothing ran. So on
+ * Linux a path that resolves elsewhere is denied at its target, which covers
+ * every way of reaching it. A path that isn't there yet is kept as written, and
+ * the runtime passes over it. Elsewhere the paths are given as written, as they
+ * were measured.
+ */
+export function osCredentialPaths({ platform = process.platform } = {}) {
+  if (platform !== "linux") return credentialPaths();
+  return [...new Set(credentialPaths().map(p => { try { return realpathSync(p); } catch { return p; } }))];
+}
 // The Read tool is outside the OS sandbox, and would follow a committed symlink
 // into /mnt/c as readily as into ~/.ssh, so the host's ways out are denied to it
 // too. Every one is a directory.
@@ -599,7 +616,7 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
 
   // The OS deny list, built once: the read grant above is derived from it.
 
-  const osDenyRead = [...credentialPaths(), ...hostEscapePaths(), ...notifyCred, ...sourceCheckout, ...siblingRoots, ...stateRoots, ...quarantine.paths];
+  const osDenyRead = [...osCredentialPaths(), ...hostEscapePaths(), ...notifyCred, ...sourceCheckout, ...siblingRoots, ...stateRoots, ...quarantine.paths];
 
   // The Read tool is not under the OS sandbox, so the credential paths are
   // denied to it here as well; measured to hold for an absolute path and for a
@@ -824,7 +841,7 @@ export function validateSettings(settings, { tmpDir = null, stateRoots = [], qua
         if (JSON.stringify(fs.allowRead) !== JSON.stringify(want))
           errors.push(`sandbox.filesystem.allowRead must be exactly ${want.join(", ")}`);
       }
-      if (strs(fs.denyRead)) for (const c of [...credentialPaths(), ...hostEscapePaths(), ...extraDenies, ...sourceCheckout, ...siblingRoots, ...stateRoots, ...quarantineDenies]) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
+      if (strs(fs.denyRead)) for (const c of [...osCredentialPaths(), ...hostEscapePaths(), ...extraDenies, ...sourceCheckout, ...siblingRoots, ...stateRoots, ...quarantineDenies]) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
     }
     const net = sb.network;
     if (!isObj(net)) errors.push("sandbox.network must be an object");

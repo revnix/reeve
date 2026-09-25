@@ -26,10 +26,11 @@
 // And a sixth, unprompted: denied twice, the model reached for a THIRD tool that
 // was not in the allowlist at all. Any tool that can run a command is a write
 // primitive, so this must be a closed allowlist, never a denylist.
-import { sandboxFor, reviewDiff, validateSettings, validateToolGrant, scopeGrant, credentialPaths, quarantineOsDenies, siblingRootsOf, CREDENTIAL_PATHS } from "../src/sandbox.mjs";
-import { readFileSync, mkdtempSync, rmSync, realpathSync } from "node:fs";
+import { sandboxFor, reviewDiff, validateSettings, validateToolGrant, scopeGrant, credentialPaths, osCredentialPaths, hostEscapePaths, quarantineOsDenies, siblingRootsOf, CREDENTIAL_PATHS } from "../src/sandbox.mjs";
+import { readFileSync, mkdtempSync, mkdirSync, rmSync, realpathSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { tempDir } from "./fixtures/temp.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -349,8 +350,9 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   const fs = sb?.filesystem ?? {};
   // ABSOLUTE, not `~/...`: the sandbox expands a tilde against the PROCESS's
   // home, and a worker's home is reeve's scratch directory — so `~/.ssh` would
-  // expand to `<scratch>/.ssh` and protect nothing. Measured 2026-08-22.
-  check(credentialPaths().every(c => fs.denyRead?.includes(c)), "credential paths are deny-read at the OS layer", JSON.stringify(fs.denyRead?.slice(0, 3)));
+  // expand to `<scratch>/.ssh` and protect nothing. Measured 2026-08-22. On
+  // Linux a linked one is given at its target, which the section below measures.
+  check(osCredentialPaths().every(c => fs.denyRead?.includes(c)), "credential paths are deny-read at the OS layer", JSON.stringify(fs.denyRead?.slice(0, 3)));
   check(fs.denyRead.every(p => !p.startsWith("~")), "and every one of them is an absolute path, never a tilde", JSON.stringify(fs.denyRead.filter(p => p.startsWith("~"))));
   check(JSON.stringify(fs.allowWrite) === JSON.stringify([TMP]),
     "the run's own tmp is the only write grant beyond cwd", JSON.stringify(fs.allowWrite));
@@ -650,6 +652,58 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
     const ok = sandboxFor({ profile, action: "FIX_CI", worktree: "/Users/x/code/wt", tmpDir: "/t" });
     check(ok.stateHomeContainsWorktree.length === 0, "and a normal layout reports nothing", JSON.stringify(ok.stateHomeContainsWorktree));
   } finally { if (saved === undefined) delete process.env.REEVE_HOME; else process.env.REEVE_HOME = saved; }
+}
+
+// ── Linux and WSL: the host's own ways out, and linked credentials (#156) ────
+//
+// Measured on WSL2 with srt 0.0.73 and bubblewrap 0.11. Without these denies a
+// sandboxed shell read /mnt/c, every Windows user's files, and saw WSL's interop
+// sockets and the session bus. The runtime's seccomp filter, which blocks new
+// Unix sockets, was all that stopped Windows interop and D-Bus; with it off,
+// both worked, and only these paths closed them.
+const linuxOnly = (name, run) => (process.platform === "linux" ? run() : console.log(`SKIP  ${name} (Linux only; this is ${process.platform})`));
+{
+  check(JSON.stringify(hostEscapePaths({ platform: "linux", uid: 1000 })) === JSON.stringify(["/mnt", "/run/WSL", "/run/user/1000", "/run/dbus"])
+    && hostEscapePaths({ platform: "darwin", uid: 501 }).length === 0,
+    "on Linux the host's ways out are /mnt, WSL's interop sockets, the session's runtime directory and the system bus, and elsewhere there are none",
+    JSON.stringify({ linux: hostEscapePaths({ platform: "linux", uid: 1000 }), darwin: hostEscapePaths({ platform: "darwin", uid: 501 }) }));
+  check(["~/.local/share/keyrings", "~/.config/gh"].every(p => CREDENTIAL_PATHS.includes(p)),
+    "Linux's credential stores are denied by path: GNOME Keyring's files, and gh's config", JSON.stringify(CREDENTIAL_PATHS.slice(-3)));
+  linuxOnly("the host's ways out are denied to the shell and to the Read tool", () => {
+    const s = sandboxFor({ profile, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: TMP });
+    const host = hostEscapePaths();
+    check(host.length === 4 && host.every(p => s.settings.sandbox.filesystem.denyRead.includes(p)) && host.every(p => s.settings.permissions.deny.includes(`Read(/${p}/**)`)),
+      "the host's ways out are denied to the shell and to the Read tool", JSON.stringify({ host, deny: s.settings.permissions.deny.filter(d => /\/(mnt|run)\//.test(d)) }));
+    const open = structuredClone(s.settings);
+    open.sandbox.filesystem.denyRead = open.sandbox.filesystem.denyRead.filter(p => p !== "/mnt");
+    const v = validateSettings(open, { tmpDir: TMP });
+    check(!v.ok && v.errors.some(e => e.includes("/mnt")), "a Linux policy that leaves /mnt readable is refused", JSON.stringify(v.errors));
+  });
+
+  // A credential directory reached through a symlink, as WSL links ~/.aws into
+  // the Windows profile. bubblewrap refused to start with the link in the deny
+  // list, so on Linux the target is denied, and the policy still validates.
+  const home = realpathSync(tempDir("reeve-linked-home-"));
+  mkdirSync(join(home, "elsewhere", "aws"), { recursive: true });
+  symlinkSync(join(home, "elsewhere", "aws"), join(home, ".aws"));
+  const savedHome = process.env.HOME, savedReeve = process.env.REEVE_HOME;
+  process.env.HOME = home; delete process.env.REEVE_HOME;
+  try {
+    const linux = osCredentialPaths({ platform: "linux" }), darwin = osCredentialPaths({ platform: "darwin" });
+    check(linux.includes(join(home, "elsewhere", "aws")) && !linux.includes(join(home, ".aws")) && linux.includes(join(home, ".ssh"))
+      && darwin.includes(join(home, ".aws")) && !darwin.includes(join(home, "elsewhere", "aws")),
+      "on Linux a linked credential directory is denied at its target, a missing one as written, and elsewhere every one as written",
+      JSON.stringify({ linux: linux.filter(p => p.includes("aws") || p.endsWith(".ssh")), darwin: darwin.filter(p => p.includes("aws")) }));
+    linuxOnly("the policy denies a linked credential at its target, and still validates", () => {
+      const s = sandboxFor({ profile, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: TMP });
+      const v = validateSettings(s.settings, { tmpDir: TMP });
+      check(s.settings.sandbox.filesystem.denyRead.includes(join(home, "elsewhere", "aws")) && !s.settings.sandbox.filesystem.denyRead.includes(join(home, ".aws")) && v.ok,
+        "the policy denies a linked credential at its target, and still validates", JSON.stringify({ errors: v.errors }));
+    });
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedReeve !== undefined) process.env.REEVE_HOME = savedReeve;
+  }
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

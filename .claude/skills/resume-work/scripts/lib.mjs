@@ -286,3 +286,39 @@ export function claimOutcome(comments, { session, me, assignees }) {
 export function unreleasedClaim(comments, me) {
   return comments.some((c, i) => c.body.startsWith(CLAIM) && c.who === me && !releasedAfter(comments, i, me));
 }
+
+// ── the plan board ───────────────────────────────────────────────────────────
+// A GitHub Project linked to the repository, whose Status field has these five
+// columns. Every card's column is computed from the issues and pull requests.
+// The board is never read as state, so a card moved by hand is put back.
+export const BOARD_COLUMNS = ["Blocked", "Ready", "In progress", "In review", "Done"];
+
+/**
+ * The column a task belongs in. `closers` are the open pull requests that will
+ * close it, in the shape readPlan returns. One that needs its author (a draft,
+ * review findings, changes requested, failing checks, a conflict) means the work
+ * is still being done: In progress. Otherwise it waits on a person: In review.
+ */
+export function boardColumn({ open, blocked, closers = [], assigned }) {
+  if (!open) return "Done";
+  if (blocked) return "Blocked";
+  if (closers.length) return closers.some((pr) => triagePullRequest(pr, null).reasons.length) ? "In progress" : "In review";
+  if (assigned) return "In progress";
+  return "Ready";
+}
+
+/**
+ * The plan board among the projects linked to a repository: the one whose Status
+ * field has exactly the five columns. None, or more than one, is no board, and
+ * says why, rather than a guess at which to write.
+ */
+export function pickBoard(projects) {
+  const boards = (projects ?? []).filter((p) => {
+    const names = (p.status?.options ?? []).map((o) => o.name);
+    return names.length === BOARD_COLUMNS.length && BOARD_COLUMNS.every((c) => names.includes(c));
+  });
+  if (boards.length === 1) return { board: boards[0], why: null };
+  return { board: null, why: boards.length
+    ? `${boards.length} linked projects have the plan board's columns: ${boards.map((b) => `#${b.number}`).join(", ")}`
+    : `no linked project has a Status field with the columns ${BOARD_COLUMNS.join(", ")}` };
+}

@@ -41,6 +41,19 @@ It changes nothing. It prints:
 If the repository documents its own tool for readiness and claims, use that
 tool instead. For example, nextly-control has `ctl next` and `ctl status`.
 
+Then bring the plan board up to date, if the repository has one: a GitHub
+Project linked to it whose Status field has the columns Blocked, Ready, In
+progress, In review and Done.
+
+```sh
+node scripts/board.mjs --repo <owner/name>
+```
+
+It sets each task's column from the same facts the snapshot reads, and writes
+only cards whose column changed. The board is a view of the issues, never
+state, so this needs no agreement. Without a linked board it says so and
+changes nothing. It needs the `project` scope: `gh auth refresh -s project`.
+
 ## 4. Report, then propose
 
 Keep the report short and in plain language:
@@ -69,6 +82,8 @@ have already said to go ahead.
   - `--release` gives the task back. Running it again finishes a release
     that stopped halfway.
 - **Use a git worktree,** never the main checkout.
+- **Keep the board current.** Run `node scripts/board.mjs` again after you
+  claim a task, open or update a pull request, or post a checkpoint.
 - **Handle review findings properly:**
   1. Classify each one: blocking, important, suggestion or invalid.
   2. Fix the real ones.
@@ -89,3 +104,5 @@ node scripts/checkpoint.mjs --issue <n> --done "…" --remaining "…" --validat
 
 It refuses if the branch has uncommitted, unpushed or stashed work, because a
 checkpoint that points at one machine's disk can't be resumed anywhere else.
+
+Then run `node scripts/board.mjs`, so the board shows where you stopped.

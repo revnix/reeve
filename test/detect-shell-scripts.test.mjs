@@ -593,10 +593,14 @@ try {
   const withP = [["readonly -p PATH; PATH=/nowhere; sh -c true", dashShell, "broken"], ["readonly -p PATH; PATH=/nowhere; sh -c true", bashShell, "broken"],
                  ["export -p PATH=/nowhere; sh -c true", dashShell, "present"], ["export -p PATH=/nowhere; sh -c true", bashShell, "broken"]]
     .map(([s, sh, want]) => ({ s, sh: sh.name, want, r: detectTest(s, {}, { shell: sh }) }));
-  // Where the shells that may run the script differ, what -p did is unknown.
-  const eitherP = detectTest("export -p PATH=/nowhere; sh -c true", {}, { shell: { ...dashShell, pTakesOperands: "maybe" } });
-  check(withP.every(({ want, r }) => (want === "present" ? r.state === "present" : broken(r))) && eitherP.state === "present",
-    "readonly and export with -p take their operands only in a shell that does: dash only lists", JSON.stringify({ withP, eitherP }));
+  // Where the shells that may run the script differ, what -p did is unknown,
+  // but a bare name gives PATH no value in either.
+  const maybeP = { ...dashShell, pTakesOperands: "maybe" };
+  const eitherP = detectTest("export -p PATH=/nowhere; sh -c true", {}, { shell: maybeP });
+  const bareP = detectTest("export -p PATH; no-such-runner", {}, { shell: maybeP });
+  check(withP.every(({ want, r }) => (want === "present" ? r.state === "present" : broken(r))) && eitherP.state === "present"
+    && broken(bareP, "'no-such-runner'"),
+    "readonly and export with -p take their operands only in a shell that does: dash only lists", JSON.stringify({ withP, eitherP, bareP }));
 
   // A bare assignment to a read-only PATH ends both shells. Before a command, or
   // through export, readonly or unset, bash goes on.
@@ -611,6 +615,15 @@ try {
     .map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
   check(quiet.every(({ r }) => broken(r, "always fails")),
     "under pipefail, a command before the last that writes nothing surely succeeds", JSON.stringify(quiet));
+
+  // Each command of a pipeline runs in a subshell of its own, where an expansion
+  // that fails, $((1/0)) or ${x:?}, fails that command rather than ending the
+  // script. So a command with an expansion there never surely succeeds, first
+  // or last: both of these pass in dash and bash.
+  const expanding = ["set -o pipefail; ! true $((1/0)) | true", "! true | true $((1/0))"]
+    .map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
+  check(expanding.every(({ r }) => r.state === "present"),
+    "a command in a pipeline with an expansion that may fail never surely succeeds", JSON.stringify(expanding));
 
   // What the shell does is asked of it.
   const asked216 = [scriptShell(which("bash")), dashPath ? scriptShell(dashPath) : null];

@@ -778,11 +778,12 @@ function builtin(name, args, path, state, ctx) {
       if (text[k] === "--") k++;
       if (listing && ctx.shell?.pTakesOperands === false) return OK;
       if (listing && ctx.shell?.pTakesOperands !== true) {
-        // Whether PATH was given its value, or made read-only, depends on the shell.
-        if (args.slice(k).some((w) => (assignment(w, ctx.shell)?.name ?? w.text) === "PATH" || w.expansion)) {
-          state.path = null;
-          if (name === "readonly" && state.pathReadonly === false) state.pathReadonly = "maybe";
-        }
+        // Whether PATH took a value, or was made read-only, depends on the
+        // shell. A bare name gives it no value in either.
+        const operands = args.slice(k);
+        if (operands.some((w) => assignment(w, ctx.shell)?.name === "PATH" || w.expansion)) state.path = null;
+        if (name === "readonly" && state.pathReadonly === false
+            && operands.some((w) => (assignment(w, ctx.shell)?.name ?? w.text) === "PATH" || w.expansion)) state.pathReadonly = "maybe";
         return UNKNOWN;
       }
       for (const w of args.slice(k)) {
@@ -1048,13 +1049,17 @@ function pipeline(list, i, state, ctx) {
   // own state or makes another's program in time to count, and the last one's
   // status is the pipeline's.
   const run = (k) => redirected(list[k], simple(list[k].words, { ...state, mutated: state.mutated || list[k].subst }, ctx));
-  const r = run(j);
+  // Each runs in a subshell of its own, where an expansion that fails, $((1/0))
+  // or ${x:?}, fails that command rather than ending the script. So one with an
+  // expansion never surely succeeds.
+  const sure = (k, e) => (e.o === "ok" && list[k].words.some((w) => w.expansion) ? UNKNOWN : e);
+  const r = sure(j, run(j));
   // Under pipefail it fails when any of them fails. One before the last that
   // writes may be stopped by the next closing the pipe, so it never surely
   // succeeds.
   let status = r;
   if (state.pipefail !== false) {
-    const each = [...list.slice(i, j).map((_, n) => { const e = run(i + n); return e.o === "ok" && !writesNothing(list[i + n], ctx.shell) ? UNKNOWN : e; }), r];
+    const each = [...list.slice(i, j).map((_, n) => { const e = sure(i + n, run(i + n)); return e.o === "ok" && !writesNothing(list[i + n], ctx.shell) ? UNKNOWN : e; }), r];
     const withIt = each.findLast((e) => e.o === "fail") ?? (each.every((e) => e.o === "ok") ? OK : UNKNOWN);
     status = state.pipefail === true ? withIt : either(withIt, r);
   }

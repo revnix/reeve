@@ -10,7 +10,7 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { publishVerdict, requiredOn, requiredOnBase, shadowContextOf } from "../src/pr.mjs";
+import { publishVerdict, requiredOn, requiredOnBase, requirementsOnBase, shadowContextOf } from "../src/pr.mjs";
 import { tick } from "../src/daemon.mjs";
 import { open } from "../src/db/ops.mjs";
 
@@ -135,6 +135,12 @@ const publish = (gh, over = {}) => publishVerdict({ nwo: NWO, verdict, shadow: t
     && /may pass that check unjudged/.test(unread.held ?? ""),
     "a rule requiring reeve's check with no App bound, where another App's run or a commit status passes under its name, is held as a pull request that can merge unjudged",
     JSON.stringify({ byApp: byApp.held, byStatus: byStatus.held, unread: unread.held }));
+  // GitHub needs every result under the name to pass: another App's pass beside
+  // a failing status is still blocked, not exposed.
+  const mixed = await publish(github({ rules: unbound, runs: [{ name: CONTEXT, id: 11, conclusion: "success", app: "someone-else" }],
+    statuses: [{ context: CONTEXT, state: "failure" }] }));
+  check(/every pull request there is blocked/.test(mixed.held ?? "") && !/unjudged/.test(mixed.held ?? ""),
+    "and one where another's pass stands beside another's failure under the name is blocked, not exposed", JSON.stringify(mixed.held));
   check(/every pull request there is blocked/.test(none.held ?? "") && /bind the rule to reeve's App/.test(none.held ?? "")
     && /every pull request there is blocked/.test(bound.held ?? "") && !/unjudged|no App bound/.test(bound.held ?? ""),
     "control: with nothing else passing under the name it is blocked, and says to bind the rule; bound to reeve's App, another's pass can't satisfy it",
@@ -202,6 +208,17 @@ check(requiredOn({ rules: FORBIDDEN, branch: NOT_PROTECTED }, CONTEXT, { appId: 
   const ruleReads = gh.reads.filter((x) => x.path.includes("/rules/"));
   check(first === true && second === true && later === true && ruleReads.length === 2 && ruleReads.every((x) => x.paginate),
     "a base's rules are read with every page, once a minute however many pull requests target it", JSON.stringify(gh.reads));
+}
+{
+  // A partial reading, from a token without the reads it needed, isn't kept: the
+  // next caller, reeve's App say, reads the base again.
+  const denied = github({ rules: FORBIDDEN });
+  const allowed = github({ rules: rulesRequiring(CONTEXT, APP) });
+  const ask = (gh) => requirementsOnBase({ nwo: NWO, base: "partial", context: CONTEXT, gh: (args) => gh.api("t", args), appId: APP, now: 5_000 });
+  const partial = ask(denied), whole = ask(allowed);
+  check(partial.own === null && partial.others === null && whole.own === true && Array.isArray(whole.others)
+    && allowed.reads.some((x) => x.path.includes("/rules/")),
+    "a partial reading of a base isn't kept, so the next caller reads it again", JSON.stringify({ partial, whole }));
 }
 
 // ── what the daemon does with it ──────────────────────────────────────────────

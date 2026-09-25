@@ -704,19 +704,21 @@ function existingRuns(token, nwo, sha, names, api = apiAsInstallation) {
 }
 
 /**
- * Whether a result other than reeve's own passes under `context` at this head:
- * another App's check run, or a commit status. True, false, or null when the
- * runs or the statuses couldn't be read.
+ * Whether the results other than reeve's own under `context` at this head,
+ * other Apps' check runs and commit statuses, would pass it: there is one, and
+ * every one passes, as GitHub requires of every result under a name. True,
+ * false, or null when the runs or the statuses couldn't be read.
  */
 function othersPassUnder(token, nwo, sha, context, runs, api) {
-  const byRun = runs ? runs.others.some((c) => c.name === context && PASSING_RUN.has(c.conclusion)) : null;
+  if (!runs) return null;
   const st = api(token, ["--paginate", `repos/${nwo}/commits/${sha}/status?per_page=100`,
     "--jq", `.statuses[] | select(.context == ${JSON.stringify(context)}) | {state}`]);
-  let byStatus = null;
-  if (st.ok) {
-    try { byStatus = (st.out ?? "").split("\n").filter(Boolean).some((l) => JSON.parse(l).state === "success"); } catch { byStatus = null; }
-  }
-  return byRun === true || byStatus === true ? true : byRun === null || byStatus === null ? null : false;
+  if (!st.ok) return null;
+  let states;
+  try { states = (st.out ?? "").split("\n").filter(Boolean).map((l) => JSON.parse(l).state); } catch { return null; }
+  const results = [...runs.others.filter((c) => c.name === context).map((c) => PASSING_RUN.has(c.conclusion)),
+                   ...states.map((state) => state === "success")];
+  return results.length > 0 && results.every(Boolean);
 }
 
 // Rule types that can't stop a pull request merging into a branch that already
@@ -850,8 +852,11 @@ export function requirementsOnBase({ nwo, base, context, gh, appId = null, now =
     // The rest of classic protection only where the branch has some.
     protection: classicProtection(parsed(branch)) === false ? null : gh([`${path}/protection`]),
   }, context, { appId });
+  // Kept only when whole. A reading that came back partial, a token without
+  // the reads it needed, say, is read again by the next caller, which may be
+  // one that can: reeve's App reads what the ambient token couldn't.
   if (REQUIRED.size > 256) REQUIRED.clear();
-  REQUIRED.set(key, { at: now, value });
+  if (value.own !== null && value.others !== null) REQUIRED.set(key, { at: now, value });
   return value;
 }
 

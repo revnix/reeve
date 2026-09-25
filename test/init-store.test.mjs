@@ -251,25 +251,26 @@ const reeve = (home, args) => {
   const rowsAt = (path) => { try { const db = new DatabaseSync(path, { readOnly: true }); try { return db.prepare("SELECT v FROM t").all().map((r) => r.v); } finally { db.close(); } } catch { return null; } };
   const whole = (path) => (rowsAt(path) ?? []).includes("committed, in the wal");
   const renamesBy = () => { const calls = []; return { calls, rename: (a, b) => { calls.push(a); renameSync(a, b); } }; };
-  // Another process moving the store. It stops once its -wal has moved, the
-  // point where the two paths each hold part of the store, and there either
-  // waits `pause` milliseconds and finishes, or is killed.
+  // Another process moving the store. It stops once the file `at` names has
+  // moved, its -wal by default, the point where the two paths each hold part of
+  // the store, and there either waits `pause` milliseconds and finishes, or is
+  // killed.
   const MOVER = `
     import { renameSync } from "node:fs";
     import { adoptLegacyStore } from ${JSON.stringify(new URL("../src/paths.mjs", import.meta.url).href)};
-    const { MOVE_NEXT: next, MOVE_LEGACY: legacy, MOVE_PAUSE: pause } = process.env;
+    const { MOVE_NEXT: next, MOVE_LEGACY: legacy, MOVE_PAUSE: pause, MOVE_AT: at } = process.env;
     const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
     adoptLegacyStore(next, legacy, { log: () => {}, rename: (from, to) => {
       renameSync(from, to);
-      if (!from.endsWith("-wal")) return;
+      if (from !== legacy + at) return;
       console.log("part way");
       if (pause === "killed") process.kill(process.pid, "SIGKILL");
       sleep(Number(pause));
     } });
     console.log("done");`;
-  const mover = async (next, legacy, pause) => {
+  const mover = async (next, legacy, pause, at = "-wal") => {
     const child = spawn(process.execPath, ["--input-type=module", "-e", MOVER],
-      { env: { ...process.env, MOVE_NEXT: next, MOVE_LEGACY: legacy, MOVE_PAUSE: String(pause) }, stdio: ["ignore", "pipe", "pipe"] });
+      { env: { ...process.env, MOVE_NEXT: next, MOVE_LEGACY: legacy, MOVE_PAUSE: String(pause), MOVE_AT: at }, stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     const ended = new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal, out })));
     const partWay = await new Promise((resolve) => {
@@ -327,14 +328,27 @@ const reeve = (home, args) => {
         JSON.stringify({ partWay: other.partWay, theirs, used }));
     } finally { rmSync(home, { recursive: true, force: true }); }
   }
+  const leftBeside = (next) => readdirSync(dirname(next)).filter((f) => ![basename(next), `${basename(next)}-wal`, `${basename(next)}-shm`].includes(f));
   {
     const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
     try {
       const { legacy, next } = legacyStore(home);
-      rmSync(`${next}.moving`, { force: true });
       const used = adopt(next, legacy);
-      const left = readdirSync(dirname(next)).filter((f) => ![basename(next), `${basename(next)}-wal`, `${basename(next)}-shm`].includes(f));
+      const left = leftBeside(next);
       check(used === next && whole(next) && left.length === 0, "nothing but the store is left beside it once the move is done", JSON.stringify({ used, left }));
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }
+  {
+    const home = mkdtempSync(join(tmpdir(), "reeve-store-"));
+    try {
+      const { legacy, next } = legacyStore(home);
+      // Killed after its last rename, before it let go of the lock.
+      const other = await mover(next, legacy, "killed", "");
+      const theirs = await other.ended;
+      const used = adopt(next, legacy, { timeoutMs: 1000 });
+      const left = leftBeside(next);
+      check(other.partWay && theirs.signal === "SIGKILL" && used === next && whole(next) && left.length === 0,
+        "a mover killed after its last rename leaves nothing behind once the next run finds the store", JSON.stringify({ theirs, used, left }));
     } finally { rmSync(home, { recursive: true, force: true }); }
   }
 

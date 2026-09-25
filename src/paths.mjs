@@ -145,7 +145,16 @@ export function runPathFor(home, taskId, { generation, phase, slice, attempt, st
  */
 export function adoptLegacyStore(next, legacy, { log = (m) => console.error(`reeve: ${m}`), rename = renameSync,
                                                   timeoutMs = 10_000 } = {}) {
-  if (existsSync(next) || !existsSync(legacy)) return next;
+  const lockPath = `${next}.move-lock`;
+  if (existsSync(next)) {
+    // A mover killed after its last rename leaves its lock file behind, and
+    // nothing looks for it again once the store is in place. Removing it is safe
+    // once the main file is here, because the main file moves last: a process
+    // still waiting on the lock finds the store moved and moves nothing.
+    try { rmSync(lockPath, { force: true }); } catch { /* left for a later run */ }
+    return next;
+  }
+  if (!existsSync(legacy)) return next;
   // One process moves at a time. Two commands started together, the daemon and
   // a status check say, each saw the main file missing and moved sidecars in the
   // other's way, and a rollback could strand the WAL. The holder of the lock
@@ -157,11 +166,13 @@ export function adoptLegacyStore(next, legacy, { log = (m) => console.error(`ree
   // race: read before the pid was written, a live holder looked dead and lost
   // its lock; a dead holder's pid, reused, held the store for ever; and two
   // processes taking over one dead lock could each delete the other's.
-  const lockPath = `${next}.move-lock`;
   let lock = null;
   try {
     mkdirSync(dirname(next), { recursive: true });
     lock = new DatabaseSync(lockPath, { timeout: timeoutMs });
+    // Nothing is ever written to it, so its journal stays in memory. On disk,
+    // a holder killed while holding the lock left a journal beside it for good.
+    lock.exec("PRAGMA journal_mode=MEMORY");
     lock.exec("BEGIN EXCLUSIVE");
   } catch (e) {
     try { lock?.close(); } catch { /* never opened */ }

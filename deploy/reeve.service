@@ -1,0 +1,65 @@
+# The reeve daemon as a systemd user service, for Linux and WSL2. The macOS
+# equivalent is com.revnix.reeve.plist, and this file follows the same rules.
+#
+# Before installing, edit ExecStart: `run nextlyhq/nextly` names the repository
+# the daemon watches, so change it to yours. Change the node and checkout paths
+# too if they live elsewhere.
+#
+# Install (README, "Running it unattended"):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/reeve.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now reeve
+#   sudo loginctl enable-linger "$USER"    # keep it running after you log out
+# Check it:
+#   systemctl --user status reeve
+#   tail -f ~/.reeve/reeve.log
+# Remove it (this leaves ~/.reeve, the state and logs, in place):
+#   systemctl --user disable --now reeve
+#   rm ~/.config/systemd/user/reeve.service
+#   systemctl --user daemon-reload
+#   sudo loginctl disable-linger "$USER"   # only if reeve alone needed it
+
+[Unit]
+Description=reeve daemon
+Wants=network-online.target
+After=network-online.target
+# No start limit: an unattended daemon keeps trying. This key belongs here in
+# [Unit]; under [Service] systemd ignores it.
+StartLimitIntervalSec=0
+
+[Service]
+# An ABSOLUTE node path is mandatory. systemd doesn't source a shell profile,
+# and nvm is a shell function, so a bare `node` finds the system's node or none.
+# v24 is required: node:sqlite is unflagged there.
+#
+# The repository is stated, never inferred, and is the one value every install
+# changes. With no repository, `reeve run` reads WorkingDirectory's git remote
+# and watches whatever checkout it starts in. Neither --enforce nor --execute
+# appears: the shadow period publishes neutral conclusions and dispatches
+# nothing, and both flags are opt-in.
+ExecStart=%h/.nvm/versions/node/v24.21.0/bin/node %h/code/nextly-workspace/reeve/bin/reeve run nextlyhq/nextly
+WorkingDirectory=%h/code/nextly-workspace/reeve
+
+# ~/.local/bin holds the claude binary the workers are spawned from.
+Environment=PATH=%h/.nvm/versions/node/v24.21.0/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=REEVE_HOME=%h/.reeve
+
+# Restart after any exit, 10 seconds apart, like launchd's KeepAlive with
+# ThrottleInterval 10.
+Restart=always
+RestartSec=10
+
+# On a stop the daemon finishes the tick in progress, and a tick can outlast
+# systemd's default 90 seconds: measured on WSL2, one pass over 3 open pull
+# requests took 109 seconds, about 25 per pull request, and a tick reads up to
+# 20. Past this limit systemd kills it mid-tick and records the unit as failed.
+TimeoutStopSec=10min
+
+# The daemon notices that stdout already points at its log file, by device and
+# inode, and doesn't echo each line twice.
+StandardOutput=append:%h/.reeve/reeve.log
+StandardError=append:%h/.reeve/reeve.err.log
+
+[Install]
+WantedBy=default.target

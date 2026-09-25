@@ -23,6 +23,7 @@
 import { spawn, execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, openSync, writeSync, closeSync, readSync, fstatSync } from "node:fs";
 import { dirname } from "node:path";
+import { platform } from "./platform.mjs";
 
 export const OUTCOMES = {
   OK: "ok",
@@ -39,7 +40,10 @@ export const OUTCOMES = {
 // ps prints lstart in the CALLER's timezone and locale. So the same process read
 // under TZ=UTC and under TZ=Asia/Karachi gave two different tokens, and a CLI run
 // in another timezone called a live daemon dead and suggested --takeover. The
-// token is read pinned to UTC and the C locale, so every caller gets the same one.
+// token is read pinned to UTC and the C locale, so every caller gets the same
+// one. Its format is exactly what the pin first wrote, and must stay so: a
+// process still running an earlier version compares tokens as strings, and a
+// changed format reads to it as a dead process, whose lock it may then reap.
 const PINNED = { TZ: "UTC", LC_ALL: "C" };
 
 function psStart(pid, env) {
@@ -77,12 +81,13 @@ function tailOf(path, n) {
 export function isSameProcess(pid, storedStart) {
   const now = readStart(pid);
   if (now === null) return false;
-  if (now === storedStart) return true;
-  // A token recorded before the pin was written in the recorder's own timezone.
-  // Read the same way it still matches, so the upgrade doesn't make every live
-  // daemon and worker look dead, which would invite a takeover or a second
-  // worker on the same task. Remove once no stored record predates the pin.
-  return psStart(pid, process.env) === storedStart;
+  // Exactly, and nothing looser. A token recorded before the pin was written in
+  // its recorder's timezone and names no process now. Readings that tried to
+  // recognise those tokens could also recognise a stranger that reused the pid
+  // at just the wrong moment, and keep a dead holder's lock alive for it; and no
+  // deployment holds such a token. Upgrading across the pin means stopping the
+  // daemon and its workers first.
+  return now === storedStart;
 }
 
 /**
@@ -483,33 +488,26 @@ export function runWorker({
 
 /**
  * Should the scheduler start more work? Driven by observed load rather than a
- * frozen constant: 10 performance cores here, and the machine already carries a
- * load average around 3.6 from interactive sessions.
+ * frozen constant, and read through the platform module: on Linux the macOS
+ * `sysctl` keys don't exist, and a failed read used to fall back to a guess of
+ * 10 cores whatever the host had.
  */
-export function capacity({ maxWorkers = 5, hardCeiling = 6, running = 0 } = {}) {
-  let load1 = 0;
-  try { load1 = Number(execFileSync("sysctl", ["-n", "vm.loadavg"], { encoding: "utf8" }).replace(/[{}]/g, "").trim().split(/\s+/)[0]); }
-  catch { /* unreadable load is not a reason to over-schedule */ }
-  const perfCores = (() => {
-    try { return Number(execFileSync("sysctl", ["-n", "hw.perflevel0.logicalcpu"], { encoding: "utf8" }).trim()) || 10; }
-    catch { return 10; }
-  })();
+export function capacity({ maxWorkers = 5, hardCeiling = 6, running = 0, host = platform } = {}) {
+  const { load1, cores } = host.loadAndCores();
   // Back off when the machine is already busy, so reeve never competes with the
   // founder's own interactive work.
-  const loadHeadroom = Math.max(0, Math.floor(perfCores - load1) - 1);
+  const loadHeadroom = Math.max(0, Math.floor(cores - load1) - 1);
   const allowed = Math.min(maxWorkers, hardCeiling, loadHeadroom);
-  return { allowed, running, canStart: Math.max(0, allowed - running), load1, perfCores };
+  return { allowed, running, canStart: Math.max(0, allowed - running), load1, perfCores: cores };
 }
 
-/** Keep the Mac awake for exactly as long as the daemon lives, never longer. */
-export function stayAwake(pid = process.pid) {
-  if (process.platform !== "darwin") return null;
-  // -i prevents system idle sleep while leaving the display free to sleep.
-  // -w ties the assertion to this pid, so a crashed daemon cannot leave the Mac
-  // permanently unable to sleep.
-  const c = spawn("caffeinate", ["-i", "-w", String(pid)], { detached: true, stdio: "ignore" });
-  c.unref();
-  return c.pid;
+/**
+ * Keep the machine awake for exactly as long as the daemon lives, never longer.
+ * Returns `{ pid, via }`. The pid is null where the host has no mechanism, or
+ * where the lock was refused, and then `why` says so.
+ */
+export function stayAwake(pid = process.pid, host = platform) {
+  return host.stayAwake(pid);
 }
 
 /** The halt switch. A marker file, so it can be set from a phone over ntfy or ssh. */

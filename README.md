@@ -46,22 +46,30 @@ publishes after checking what git says changed.
 - **Node ≥ 24.10.0.** `node:sqlite` still emits an experimental warning on 22.x
   and the state layer is the authority, and `DatabaseSync.setAuthorizer` -- which
   the guardian's restricted hub connection refuses to open without -- arrived in
-  24.10.0. `package.json` enforces the same floor. On this machine `node` on
-  `PATH` is v22, so use the absolute path:
-  `~/.nvm/versions/node/v24.17.0/bin/node`.
+  24.10.0. `package.json` enforces the same floor. If `node` on `PATH` is
+  older, call a 24.x node by its absolute path, as the service files in
+  `deploy/` do.
 - `git` and the `gh` CLI, authenticated.
 - `claude` on `PATH` for dispatch (not needed to observe).
 
 ## Install
 
 ```sh
-git clone git@github.com:revnix/reeve.git && cd reeve
-alias reeve='~/.nvm/versions/node/v24.17.0/bin/node ~/Work/Products/reeve/bin/reeve'
+git clone git@github.com:revnix/reeve.git
+alias reeve="node $PWD/reeve/bin/reeve"
 
-reeve init                 # detect this repo, and ASK about anything ambiguous
+cd <a checkout of the repository reeve will watch>
+reeve init                 # detect it, and ASK about anything ambiguous
 reeve init --set project.kind=product --write
 reeve doctor <owner/repo>  # what is actually true right now
 ```
+
+`init --write` writes the profile and creates the state database (see Layout).
+Run it first on a new machine: `reeve run` refuses to start without that
+database rather than create an empty one itself, because a fresh empty store in
+place of the real one is how history stops being read without anything failing.
+`init` never touches a database that exists, and moves one from the old path
+into place.
 
 `init` never guesses where guessing would change what the gate judges. Two
 lockfiles, a mixed merge history or two formatters come back as **questions** with
@@ -112,6 +120,46 @@ sources a shell profile, so a bare `node` fails **exit 78 with an empty stderr
 log**. The plist names an absolute interpreter and an explicit repository for
 exactly that reason — passing no repository made it detect one from its working
 directory and spend every tick watching the wrong project.
+
+On Linux and WSL2 it runs as a systemd user service, `deploy/reeve.service`,
+which follows the same rules: an absolute interpreter and an explicit repository.
+
+Edit the file first. `run nextlyhq/nextly` names the repository the daemon
+watches, so change it to yours, and change the node and checkout paths if they
+live elsewhere. Then:
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp deploy/reeve.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now reeve
+sudo loginctl enable-linger "$USER"   # keep it running after you log out
+systemctl --user status reeve
+```
+
+Without lingering, systemd stops the service when your last session ends. On
+WSL2, systemd must be enabled (`[boot] systemd=true` in `/etc/wsl.conf`), and
+keeping the daemon awake holds only the Linux side: Windows decides when the
+host sleeps.
+
+To stop it and remove it:
+
+```sh
+systemctl --user disable --now reeve
+rm ~/.config/systemd/user/reeve.service
+systemctl --user daemon-reload
+sudo loginctl disable-linger "$USER"  # only if reeve alone needed it
+```
+
+On macOS:
+
+```sh
+launchctl bootout gui/$(id -u)/com.revnix.reeve
+rm ~/Library/LaunchAgents/com.revnix.reeve.plist
+```
+
+Either way, `~/.reeve`, the state and the logs, stays in place. Delete it only
+when you're done with reeve on this machine.
 
 ## Runbook
 

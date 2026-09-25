@@ -75,6 +75,27 @@ export function readSubIssues(repo, n, run = gh) {
 }
 
 /**
+ * The closed issues that have sub-issues and no parent: phases the plan has
+ * closed, found from GitHub itself rather than from their cards. A phase that
+ * opened and closed between two syncs, with every task of it, never had a card,
+ * and is still found. `complete` is false when there were more pages than read.
+ */
+export function readClosedRoots(repo, run = gh) {
+  const [owner, name] = repo.split("/");
+  const nodes = [];
+  let after = null;
+  for (let page = 0; page < 50; page++) {
+    const conn = JSON.parse(run(["api", "graphql", "-f", `query=query($owner:String!,$name:String!,$after:String){ repository(owner:$owner,name:$name){
+      issues(states:CLOSED, first:100, after:$after){ pageInfo{ hasNextPage endCursor } nodes{ id number state parent{ number } subIssues{ totalCount } } } } }`,
+      "-f", `owner=${owner}`, "-f", `name=${name}`, ...(after ? ["-f", `after=${after}`] : [])])).data.repository.issues;
+    nodes.push(...conn.nodes.filter((i) => !i.parent && (i.subIssues?.totalCount ?? 0) > 0));
+    if (!conn.pageInfo.hasNextPage) return { nodes, complete: true };
+    after = conn.pageInfo.endCursor;
+  }
+  return { nodes, complete: false };
+}
+
+/**
  * How many of a task's blockers are still open, from every page of them: an
  * open blocker on a later page would otherwise leave the task looking ready.
  */

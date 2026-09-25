@@ -4,8 +4,8 @@
 // pull requests, never typed, so it can't drift. These tests check each column
 // rule, and which linked project counts as the board, from plain data. The sync
 // that writes the board (scripts/board.mjs) applies exactly these functions.
-import { boardColumn, pickBoard, BOARD_COLUMNS, allNodes, incompleteRead, closedCards, closedPhases, closedParent, syncClosedParents, openStrays, mustUnarchive, closersByIssue, completePullRequest, triagePullRequest } from "../.agents/skills/resume-work/scripts/lib.mjs";
-import { readPlan, openBlockers } from "../.agents/skills/resume-work/scripts/plan.mjs";
+import { boardColumn, pickBoard, BOARD_COLUMNS, allNodes, incompleteRead, closedCards, closedPhases, closedParent, syncClosedParents, openStrays, mustUnarchive, closersByIssue, completePullRequest, triagePullRequest, withClosedRoots, uncardedRoots } from "../.agents/skills/resume-work/scripts/lib.mjs";
+import { readClosedRoots, readPlan, openBlockers } from "../.agents/skills/resume-work/scripts/plan.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -199,6 +199,38 @@ check(two.board === null && /#2, #4/.test(two.why ?? ""), "two projects that bot
   syncClosedParents(parents, (n) => subIssues[n] ?? [], visited, syncTask);
   check(synced.join(",") === "20,30",
     "a closed task with sub-tasks met while syncing is read in its turn, card or no card, however deep", JSON.stringify(synced));
+}
+
+// ── closed phases found from GitHub, card or no card (#206) ─────────────────
+{
+  // Two pages of closed issues. Phase 50 opened and closed between two syncs,
+  // with its task 51, and neither ever had a card. Issue 60 has a parent, and
+  // issue 70 no sub-issues: neither is a phase.
+  const pages = [
+    { nodes: [{ id: "I50", number: 50, state: "CLOSED", parent: null, subIssues: { totalCount: 1 } },
+              { id: "I60", number: 60, state: "CLOSED", parent: { number: 148 }, subIssues: { totalCount: 2 } }],
+      pageInfo: { hasNextPage: true, endCursor: "p2" } },
+    { nodes: [{ id: "I70", number: 70, state: "CLOSED", parent: null, subIssues: { totalCount: 0 } },
+              { id: "I10", number: 10, state: "CLOSED", parent: null, subIssues: { totalCount: 3 } }],
+      pageInfo: { hasNextPage: false, endCursor: null } },
+  ];
+  const asked = [];
+  const run = (args) => { asked.push(args); const page = args.includes("after=p2") ? pages[1] : pages[0];
+    return JSON.stringify({ data: { repository: { issues: page } } }); };
+  const roots = readClosedRoots("o/r", run);
+  check(roots.complete === true && roots.nodes.map((r) => r.number).join(",") === "50,10" && asked.length === 2,
+    "closed phases are read from GitHub, every page: closed issues with sub-issues and no parent", JSON.stringify({ roots, asked: asked.length }));
+  // Phase 10 has a card; phase 50 has none.
+  const cards = new Map([[10, { item: "p", state: "CLOSED", phase: true, parent: null }]]);
+  const parents = withClosedRoots(new Map(closedPhases(cards).map((c) => [c.number, c])), roots.nodes);
+  const synced = [], visited = new Set();
+  syncClosedParents(parents, (n) => (n === 50 ? [{ number: 51, state: "CLOSED", subIssues: { totalCount: 0 } }] : []), visited,
+    (task) => { visited.add(task.number); synced.push(task.number); });
+  const uncarded = uncardedRoots(roots.nodes, cards);
+  check([...parents.keys()].join(",") === "10,50" && parents.get(10).item === "p" && synced.join(",") === "51"
+    && uncarded.map((r) => r.number).join(",") === "50",
+    "a closed phase that never had a card is found, its tasks are synced, and it gets a card of its own in Done",
+    JSON.stringify({ parents: [...parents.keys()], synced, uncarded }));
 }
 
 // ── an archived card ─────────────────────────────────────────────────────────

@@ -2069,9 +2069,9 @@ export const STUBS = [
   },
   {
     name: "an-alert-is-sanitised-before-it-leaves-the-machine",
-    why: "assemble the outbound message without `redact`. The boundary is two properties, not one, and this is the half that neutralises SECRET SHAPES and applies the length cap — a credential echoed into CI output then leaves the machine in a notification. `buildAlert` applies it and `notify` itself does not, so a second producer of alerts is a second place it has to be applied. The control-character half lives in the per-part `clean`, which is why this entry names the redaction assertion and not the escaping one",
+    why: "assemble the outbound message without `redact`. That is the only place the whole alert is cut to what a phone shows, so a 2,000-character CI error goes out whole. It is also a second layer against secret shapes, but the body's credentials are scrubbed before it is stored (a-credential-never-becomes-durable), which is why this entry names the cap and not the credential check. `buildAlert` applies it and `notify` itself does not, so a second producer of alerts is a second place it has to be applied",
     test: "test/build-escalations.test.mjs",
-    expectRed: "and a credential shape is redacted rather than sent",
+    expectRed: "a message is capped before it leaves, however long its body",
     edits: [{
       file: "src/build/announce.mjs",
       find: "    const message = redact(raw);",
@@ -2749,7 +2749,7 @@ export const STUBS = [
     name: "an-unproven-answer-names-what-could-not-prove-it",
     why: "print one note for both reasons an answer is unproven. A legacy cursor and a hub that cannot supply an identity are opposite faults with opposite advice, and the shared note tells the second operator that the cursor above carries an id and the next call will be provable -- both false, since next_cursor was formatted with no identity at all",
     test: "test/build-dash.test.mjs",
-    expectRed: "the note blames the HUB, which is what cannot supply the identity",
+    expectRed: "and when its timestamp proves the cursor, the note still blames the HUB, not the cursor",
     edits: [{
       file: "src/build/dash.mjs",
       find: "  if (m.cursor_proof === \"timestamp\" && m.incarnation !== null)",

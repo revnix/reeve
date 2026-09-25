@@ -7,7 +7,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { npmScriptShell, scriptOutcome, scriptShell } from "./shellscript.mjs";
+import { runnerShells, scriptOutcome, scriptShells } from "./shellscript.mjs";
 
 function sh(cmd, args, cwd) {
   try {
@@ -86,11 +86,17 @@ const INTENTS = {
 };
 
 /**
- * `shell` is the shell npm runs the package's scripts with, the one its
- * `script-shell` setting names, as `scriptShell()` asks it: it decides which
- * words are the shell's own. Given, as by a test, it is used as is.
+ * `shell` is the shell the package's runner runs its scripts with, as
+ * `runnerShells` names it and `scriptShells` asks it: it decides which words
+ * are the shell's own. Given, as by a test, it is used as is. A runner whose
+ * shell isn't one the reader models, yarn 2 and later say, has no script
+ * judged.
  */
-export function detectCommands(dir, language, packageManager, { shell = scriptShell(npmScriptShell(dir)) } = {}) {
+export function detectCommands(dir, language, packageManager, options = {}) {
+  const given = Object.hasOwn(options, "shell");
+  const shells = given ? null : runnerShells(dir, packageManager);
+  const shell = given ? options.shell : shells && scriptShells(shells);
+  const judged = given || shells !== null;
   const out = {};
   const questions = [];
 
@@ -105,7 +111,7 @@ export function detectCommands(dir, language, packageManager, { shell = scriptSh
       // A declared script that can't pass is BROKEN, not present: it runs a
       // program that isn't there, or it always fails. Only when that is certain;
       // a script that can't be read with confidence stays present.
-      const verdict = scriptOutcome(scripts[hit], { dir, deps: fromJson(pkg.dependencies, pkg.devDependencies) }, shell);
+      const verdict = judged ? scriptOutcome(scripts[hit], { dir, deps: fromJson(pkg.dependencies, pkg.devDependencies) }, shell) : { broken: false };
       if (verdict.broken) {
         out[intent].state = "broken";
         out[intent].reason = `script '${hit}' ${verdict.why}`;

@@ -8,12 +8,12 @@
 // and unbalanced), wrappers that run the next command, expansions, and a program
 // that really is missing.
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { detectCommands } from "../src/profile/detect.mjs";
-import { npmScriptShell, scriptShell } from "../src/profile/shellscript.mjs";
+import { npmScriptShells, runnerShells, scriptShells } from "../src/profile/shellscript.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let fail = 0;
@@ -30,7 +30,7 @@ process.env.npm_config_userconfig = join(root, "no-user-npmrc");
 process.env.npm_config_globalconfig = join(root, "no-global-npmrc");
 // What detection says about one script, run as the `test` intent. `shell` stands
 // in for the shell npm runs, when a case needs one whatever this machine's is.
-const detectTest = (script, devDependencies = {}, { shell, files = {} } = {}) => {
+const detectTest = (script, devDependencies = {}, { shell, files = {}, runner = "npm" } = {}) => {
   const dir = join(root, `fixture-${Math.random().toString(36).slice(2)}`);
   mkdirSync(dir);
   writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "fixture", scripts: { test: script }, devDependencies }));
@@ -39,7 +39,7 @@ const detectTest = (script, devDependencies = {}, { shell, files = {} } = {}) =>
     writeFileSync(join(dir, file), body);
     chmodSync(join(dir, file), 0o755);
   }
-  return detectCommands(dir, "typescript", "npm", shell ? { shell } : {}).commands.test;
+  return detectCommands(dir, "typescript", runner, shell ? { shell } : {}).commands.test;
 };
 const broken = (r, word) => r.state === "broken" && (word === undefined || r.reason?.includes(word));
 
@@ -114,21 +114,21 @@ try {
     "env -i empties the environment, PATH with it, so a dependency's runner isn't found", JSON.stringify(emptied));
 
   // Words the shell npm runs has, or doesn't, asked of that shell.
-  const shell = scriptShell(npmScriptShell(root));
+  const shell = scriptShells(npmScriptShells(root));
   const asked = (word) => {
-    const r = spawnSync(npmScriptShell(root), ["-c", `command -V '${word}'`], { encoding: "utf8", env: { ...process.env, LC_ALL: "C" } });
+    const r = spawnSync(npmScriptShells(root)[0], ["-c", `command -V '${word}'`], { encoding: "utf8", env: { ...process.env, LC_ALL: "C" } });
     return / is a (special )?shell builtin| is a (shell keyword|reserved word)/.test(r.stdout + r.stderr);
   };
-  const words = [["source", "source ./env.sh && jest --ci"], ["[[", "[[ -f jest.config.js ]] && jest --ci"],
+  const words = [["source", "source ./env.sh && jest --ci"], ["[[", "[[ -f jest.config.js ]] && jest --ci"], ["chdir", "chdir . && jest --ci"],
                  ["function", "function t { jest; }; t"], ["select", "select x in a; do jest; done"]]
     .map(([word, script]) => ({ word, hasIt: asked(word), r: detectTest(script, jest) }));
   check(shell !== null && words.every(({ hasIt, r }) => (r.state === "broken") === !hasIt),
     "a word is the shell's own exactly when the shell npm runs scripts with says so", JSON.stringify({ shell: shell?.name, words }));
-  const dashLike = { name: "dash", execOptions: false,
+  const dashLike = { name: "dash", execOptions: false, appendAssign: false,
                      builtins: new Set(["echo", "printf", "exit", "true", "false", "set", "export", "unset", "cd", "read", "trap", "alias",
                                         "command", "exec", ":", "."]),
                      keywords: new Set(["if", "for", "while", "until", "case", "!", "{", "}"]) };
-  const bashLike = { ...dashLike, name: "bash", execOptions: true, builtins: new Set([...dashLike.builtins, "source", "declare"]),
+  const bashLike = { ...dashLike, name: "bash", execOptions: true, appendAssign: true, builtins: new Set([...dashLike.builtins, "source", "declare"]),
                      keywords: new Set([...dashLike.keywords, "[[", "function", "select", "time"]) };
   const onDash = detectTest("[[ -f x ]] && jest --ci", jest, { shell: dashLike });
   const onBash = detectTest("[[ -f x ]] && jest --ci", jest, { shell: bashLike });
@@ -202,23 +202,23 @@ try {
   const replaced = tree("rc-replaced", { "package.json": "{}", ".npmrc": 'script-shell="${SHELL_DIR}/bash"\n' });
   const relativeRc = tree("rc-relative", { "package.json": "{}", ".npmrc": "script-shell=./tools/sh\n" });
   const settings = {
-    plain: npmScriptShell(plain, npmEnv),
-    project: npmScriptShell(project, npmEnv),
-    fromEnv: npmScriptShell(project, { ...npmEnv, npm_config_script_shell: "zsh" }),
-    fromEnvUpper: npmScriptShell(project, { ...npmEnv, NPM_CONFIG_SCRIPT_SHELL: "zsh" }),
-    user: npmScriptShell(plain, { ...npmEnv, npm_config_userconfig: userRc }),
-    projectOverUser: npmScriptShell(project, { ...npmEnv, npm_config_userconfig: userRc }),
-    global: npmScriptShell(plain, { ...npmEnv, npm_config_globalconfig: globalRc }),
-    workspace: npmScriptShell(join(mono, "packages", "web"), npmEnv),
-    notWorkspace: npmScriptShell(join(mono, "tools"), npmEnv),
-    section: npmScriptShell(sectioned, npmEnv),
-    replaced: npmScriptShell(replaced, { ...npmEnv, SHELL_DIR: "/usr/bin" }),
-    relative: npmScriptShell(relativeRc, npmEnv),
+    plain: npmScriptShells(plain, npmEnv),
+    project: npmScriptShells(project, npmEnv),
+    fromEnv: npmScriptShells(project, { ...npmEnv, npm_config_script_shell: "zsh" }),
+    fromEnvUpper: npmScriptShells(project, { ...npmEnv, NPM_CONFIG_SCRIPT_SHELL: "zsh" }),
+    user: npmScriptShells(plain, { ...npmEnv, npm_config_userconfig: userRc }),
+    projectOverUser: npmScriptShells(project, { ...npmEnv, npm_config_userconfig: userRc }),
+    global: npmScriptShells(plain, { ...npmEnv, npm_config_globalconfig: globalRc }),
+    workspace: npmScriptShells(join(mono, "packages", "web"), npmEnv),
+    notWorkspace: npmScriptShells(join(mono, "tools"), npmEnv),
+    section: npmScriptShells(sectioned, npmEnv),
+    replaced: npmScriptShells(replaced, { ...npmEnv, SHELL_DIR: "/usr/bin" }),
+    relative: npmScriptShells(relativeRc, npmEnv),
   };
-  const wanted = { plain: "sh", project: "/bin/bash", fromEnv: "zsh", fromEnvUpper: "zsh", user: "bash", projectOverUser: "/bin/bash",
-                   global: "ksh", workspace: "bash", notWorkspace: "zsh", section: "sh", replaced: "/usr/bin/bash",
-                   relative: join(relativeRc, "tools", "sh") };
-  check(Object.entries(wanted).every(([k, v]) => settings[k] === v),
+  const wanted = { plain: ["sh"], project: ["/bin/bash"], fromEnv: ["zsh"], fromEnvUpper: ["zsh"], user: ["bash"], projectOverUser: ["/bin/bash"],
+                   global: ["ksh"], workspace: ["bash"], notWorkspace: ["zsh"], section: ["sh"], replaced: ["/usr/bin/bash"],
+                   relative: [join(relativeRc, "tools", "sh")] };
+  check(Object.entries(wanted).every(([k, v]) => JSON.stringify(settings[k]) === JSON.stringify(v)),
     "npm's script-shell is read as npm reads it: the environment, then the project's .npmrc, a workspace root's for its workspaces, the user's, the global one",
     JSON.stringify({ settings, wanted }));
   const underBash = detectTest("[[ -f x ]] && jest --ci", jest, { files: { ".npmrc": "script-shell=bash\n" } });
@@ -329,6 +329,98 @@ try {
   check(inWorkspace[0].r.state === "present" && inWorkspace[1].r.state === "present" && broken(inWorkspace[2].r, "'no-such-runner'"),
     "a program is found as npm finds it: in any node_modules/.bin from the package up, or as a dependency of a folder above it, such as a workspace root",
     JSON.stringify(inWorkspace));
+
+  // ── the runner's shell, and more of each shell (#205, second round) ─────────
+  //
+  // Each shape here made a script that passes read as broken.
+
+  // The runner picks the shell. bun takes the first of bash, sh and zsh on the
+  // PATH. yarn 2 and later, pnpm's shell emulator and bun's own shell are shells
+  // the reader doesn't model, so their scripts aren't judged.
+  const which = (name) => realpathSync(spawnSync("sh", ["-c", `command -v ${name}`], { encoding: "utf8" }).stdout.trim());
+  const shellsIn = tree("runner-shells", {});
+  for (const [folder, name] of [["both", "bash"], ["both", "sh"], ["plain-sh", "sh"]]) {
+    mkdirSync(join(shellsIn, folder), { recursive: true });
+    symlinkSync(which(name), join(shellsIn, folder, name));
+  }
+  const at = (folder) => ({ ...npmEnv, PATH: join(shellsIn, folder) });
+  const runners = {
+    bunWithBash: runnerShells(plain, "bun", at("both")),
+    bunWithSh: runnerShells(plain, "bun", at("plain-sh")),
+    bunOwnShell: runnerShells(tree("bun-own", { "package.json": "{}", "bunfig.toml": '[run]\nshell = "bun"\n' }), "bun", at("both")),
+    yarnBerry: runnerShells(tree("yarn-berry", { "package.json": "{}", ".yarnrc.yml": "nodeLinker: node-modules\n" }), "yarn", npmEnv),
+    yarnPinned: runnerShells(tree("yarn-pinned", { "package.json": JSON.stringify({ packageManager: "yarn@4.1.0" }) }), "yarn", npmEnv),
+    yarnClassic: runnerShells(tree("yarn-classic", { "package.json": "{}", ".yarnrc": 'script-shell "/bin/bash"\n' }), "yarn", npmEnv),
+    pnpmEmulated: runnerShells(tree("pnpm-emulated", { "package.json": "{}", "pnpm-workspace.yaml": "packages: []\nshellEmulator: true\n" }), "pnpm", npmEnv),
+    pnpmNpmrcEmulated: runnerShells(tree("pnpm-npmrc-emulated", { "package.json": "{}", ".npmrc": "shell-emulator=true\n" }), "pnpm", npmEnv),
+    pnpmScriptShell: runnerShells(tree("pnpm-yaml-shell", { "package.json": "{}", "pnpm-workspace.yaml": "scriptShell: bash\n" }), "pnpm", npmEnv),
+    unmodelled: runnerShells(plain, "uv", npmEnv),
+  };
+  check(JSON.stringify(runners.bunWithBash) === JSON.stringify([which("bash")]) && JSON.stringify(runners.bunWithSh) === JSON.stringify([which("sh")])
+    && runners.bunOwnShell === null && runners.yarnBerry === null && runners.yarnPinned === null
+    && runners.yarnClassic.includes("/bin/bash") && runners.pnpmEmulated === null && runners.pnpmNpmrcEmulated === null
+    && runners.pnpmScriptShell.includes("bash") && runners.unmodelled === null,
+    "the runner picks the shell: bun the first of bash, sh and zsh, yarn 1 and pnpm their settings, and yarn 2, an emulator or bun's own shell none the reader models",
+    JSON.stringify(runners));
+  const underBun = detectTest("[[ -f package.json ]] && jest --ci", jest, { runner: "bun" });
+  const underBerry = detectTest("no-such-runner --ci", {}, { runner: "yarn", files: { ".yarnrc.yml": "nodeLinker: node-modules\n" } });
+  check(underBun.state === "present" && underBerry.state === "present",
+    "a script bun runs is read as bash reads it, and one yarn 2 runs isn't judged", JSON.stringify({ underBun, underBerry }));
+
+  // A list run in the background can't end the script, or move it.
+  const background = detectTest("exit 1 & true");
+  const movedApart = detectTest("cd tools & ./runner", {}, { files: runner });
+  check(background.state === "present" && broken(movedApart, "'./runner'"),
+    "a list ended by & runs apart: its exit ends only itself, and its cd moves nothing after it", JSON.stringify({ background, movedApart }));
+
+  // A tilde is a home folder, expanded before the word is used.
+  const tildes = ["~/no-such-folder/runner --ci", "PATH=~/no-such-folder no-such-runner"].map((s) => ({ s, r: detectTest(s) }));
+  check(tildes.every(({ r }) => r.state === "present"), "a word or a PATH that starts from ~ isn't judged: it's a home folder", JSON.stringify(tildes));
+
+  // bash's own time takes -- as the end of its options.
+  const timed = detectTest("time -- jest --ci", jest, { shell: bashLike });
+  check(timed.state === "present", "the shell's own time takes -- before the command it times", JSON.stringify(timed));
+
+  // A builtin the lists don't hold is asked of the shell before it's called
+  // missing, and bash lists its own.
+  const shopt = detectTest("echo setup; shopt -s globstar", {}, { files: { ".npmrc": "script-shell=bash\n" } });
+  const askedBash = detectTest("echo setup; shopt -s globstar", {}, { shell: { ...bashLike, paths: ["bash"], builtins: new Set(["echo"]) } });
+  check(shopt.state === "present" && askedBash.state === "present",
+    "a builtin no list holds is asked of the shell before it's called a missing program", JSON.stringify({ shopt, askedBash }));
+
+  // A workspace pattern's braces are expanded as npm's globs expand them, and a
+  // pattern the reader can't match leaves both folders' settings in play.
+  const braced = tree("rc-braced", {
+    "package.json": JSON.stringify({ workspaces: ["{packages,apps}/*"] }), ".npmrc": "script-shell=bash\n",
+    "apps/web/package.json": JSON.stringify({ name: "web", scripts: { test: "[[ -f package.json ]] && jest --ci" }, devDependencies: jest }),
+    "apps/web/.npmrc": "script-shell=/bin/sh\n",
+  });
+  const classed = tree("rc-classed", {
+    "package.json": JSON.stringify({ workspaces: ["packages/[a-z]*"] }), ".npmrc": "script-shell=bash\n",
+    "packages/web/package.json": JSON.stringify({ name: "web", scripts: { test: "[[ -f package.json ]] && jest --ci" }, devDependencies: jest }),
+    "packages/web/.npmrc": "script-shell=/bin/sh\n",
+  });
+  const bracedShells = npmScriptShells(join(braced, "apps", "web"), npmEnv);
+  const classedShells = npmScriptShells(join(classed, "packages", "web"), npmEnv);
+  const bracedVerdict = detectCommands(join(braced, "apps", "web"), "typescript", "npm").commands.test;
+  const classedVerdict = detectCommands(join(classed, "packages", "web"), "typescript", "npm").commands.test;
+  check(JSON.stringify(bracedShells) === JSON.stringify(["bash"]) && classedShells.length === 2 && classedShells.includes("bash")
+    && bracedVerdict.state === "present" && classedVerdict.state === "present",
+    "a workspace pattern's braces are expanded as npm's are, and one the reader can't match leaves both folders' shells in play",
+    JSON.stringify({ bracedShells, classedShells, bracedVerdict, classedVerdict }));
+
+  // bash's NAME+=value is an assignment; dash's shell runs it as a program.
+  const appended = ["echo setup; PATH+=:/tmp", "PATH+=:/nowhere; no-such-runner"].map((s) => ({ s, r: detectTest(s, {}, { shell: bashLike }) }));
+  const appendedDash = detectTest("echo setup; PATH+=:/tmp", {}, { shell: dashLike });
+  const appendedBash = detectTest("echo setup; PATH+=:/tmp", {}, { files: { ".npmrc": "script-shell=bash\n" } });
+  check(appended.every(({ r }) => r.state === "present") && broken(appendedDash, "'PATH+=:/tmp'") && appendedBash.state === "present",
+    "NAME+=value assigns where the shell has it, and adds to PATH what can't be known; where it doesn't, it's a program's name",
+    JSON.stringify({ appended, appendedDash, appendedBash }));
+
+  // env takes any word with an = in it for an assignment, quoted or not.
+  const envAssigned = ['env "MSG=two words" jest --ci', "env A+=1 jest --ci"].map((s) => ({ s, r: detectTest(s, jest) }));
+  check(envAssigned.every(({ r }) => r.state === "present"), "env takes any word with an = in it for an assignment, quoted or not",
+    JSON.stringify(envAssigned));
 } finally {
   rmSync(root, { recursive: true, force: true });
 }

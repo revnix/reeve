@@ -399,6 +399,19 @@ export function closedPhases(cards) {
   return [...cards].filter(([, c]) => c.state === "CLOSED" && c.phase).map(([n, c]) => ({ number: n, ...c }));
 }
 
+/**
+ * Closed phases found from GitHub, added to the closed parents whose sub-issues
+ * are synced, beside those found from their cards. A parent already there stays
+ * as it is.
+ */
+export function withClosedRoots(parents, roots) {
+  for (const root of roots) if (!parents.has(root.number)) parents.set(root.number, root);
+  return parents;
+}
+
+/** The closed phases with no card on the board, which get one, in Done. */
+export const uncardedRoots = (roots, cards) => roots.filter((root) => !cards.has(root.number));
+
 /** A closed issue that has sub-issues of its own, whose sub-issues the plan doesn't read. */
 export const closedParent = (issue) => issue?.state === "CLOSED" && (issue.subIssues?.totalCount ?? 0) > 0;
 

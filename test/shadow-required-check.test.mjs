@@ -94,6 +94,16 @@ const publish = (gh, over = {}) => publishVerdict({ nwo: NWO, verdict, shadow: t
   check(control.ok === true && control.superseded === true, "control: one that is superseded publishes cleanly", JSON.stringify(control));
 }
 {
+  // The shadow write itself fails. A passing result an earlier version left
+  // under the required name is still superseded, and the rule is still said.
+  const gh = github({ runs: [{ name: CONTEXT, id: 5, conclusion: "neutral", app: "merge-policy" }], rules: rulesRequiring(CONTEXT, APP),
+    refuse: (verb, path) => verb === "POST" && path.endsWith("/check-runs") });
+  const r = await publish(gh);
+  check(r.ok === false && /couldn't publish/.test(r.why ?? "") && r.superseded === true && /every pull request there is blocked/.test(r.held ?? "")
+    && gh.writes.some((w) => w.verb === "PATCH" && w.path.endsWith("/check-runs/5") && w.conclusion === "cancelled"),
+    "a shadow write that fails still supersedes a passing result under the required name, and still says the rule requires it", JSON.stringify({ r, writes: gh.writes }));
+}
+{
   // Another App's runs under the same names, listed after reeve's own. Only
   // reeve's own are its to update or supersede.
   const gh = github({ runs: [
@@ -176,7 +186,15 @@ check(requiredOn({ rules: FORBIDDEN, branch: NOT_PROTECTED }, CONTEXT, { appId: 
       observe: () => ({ observations: [], incomplete: false, threads: { readable: true, total: 0, unresolved: 0, seen: 0 } }),
       derivePr: () => ({}), reviewState: () => ({ readable: true, total: 0, open: 0, resolved: 0, unspilledCritical: 0, rounds: 1 }),
     };
+    // A reading kept from before this tick, which a rule change may have made
+    // wrong: the tick starts from a fresh one.
+    const counting = github({ rules: rulesRequiring(CONTEXT, APP) });
+    const ask = () => requiredOnBase({ nwo: NWO, base: "ticked", context: CONTEXT, gh: (args) => counting.api("t", args), appId: APP });
+    ask();
     const t = await tick(ctx);
+    ask();
+    const ruleReads = counting.reads.filter((x) => x.path.includes("/rules/")).length;
+    check(ruleReads === 2, "each tick starts from a fresh reading of what the base requires, however soon it follows the last", `rule reads: ${ruleReads}`);
     const log = readFileSync(ctx.logPath, "utf8");
     check(calls.length === 2 && calls.every((c) => c.base === "main"), "the daemon tells the publisher which branch the pull request targets", JSON.stringify(calls.map((c) => c.base)));
     const raised = [...(t.escalations?.entries?.() ?? [])].filter(([cause]) => /shadow mode/.test(cause));

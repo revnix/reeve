@@ -14,7 +14,7 @@
 //     it WOULD do. Shipping a loop that acts before its decisions have been
 //     watched is how an unattended run becomes an incident.
 
-import { evaluatePr, publishVerdict, prAnchor, isBuilderPr } from "./pr.mjs";
+import { evaluatePr, publishVerdict, prAnchor, isBuilderPr, clearRequirements } from "./pr.mjs";
 import { nextAction, describe, ACTIONS, ESCALATIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, isSameProcess, OUTCOMES } from "./supervisor.mjs";
@@ -1064,6 +1064,9 @@ export async function tick(ctx) {
   // filtered to absolute paths. (Codex #4f-[1].)
   const logPath = ctx.logPath ? resolve(ctx.logPath) : ctx.logPath;
   if (logPath !== ctx.logPath) ctx = { ...ctx, logPath };
+  // What each base requires is read afresh every tick. Kept across ticks, a rule
+  // added between them went unseen for as long as the reading was kept.
+  clearRequirements();
   const decisions = [];
   // Pull requests this tick could not read. Their queued provider requests are
   // preserved rather than cancelled: absence from `decisions` means "unknown",

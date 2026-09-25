@@ -33,7 +33,7 @@ const blocked = (parts) => ({
   ledgerBlockers: 0,
   mergeState: "BLOCKED",
   mergeParts: { mergeable: "MERGEABLE", reviewDecision: "APPROVED", ownCheckRequired: true,
-                others: [{ context: "ci/test", app: null, state: "passing" }], unresolvedBlocks: false, unevaluated: [], ...parts },
+                others: [{ context: "ci/test", app: null, state: "passing" }], unresolvedBlocks: false, strict: false, behind: null, unevaluated: [], ...parts },
 });
 const verdictOf = (parts) => computeVerdict(blocked(parts));
 // The mergeable clause, with a throw recorded rather than raised: a stubbed rule
@@ -73,6 +73,13 @@ check(mergeable({ mergeable: "UNKNOWN" }).state === UNKNOWN,
   const waiting = ["missing", "running", "unknown"].map((state) => mergeable({ others: [{ context: "deploy/preview", app: null, state }] }));
   check(waiting.every((c) => c.state === UNKNOWN && /deploy\/preview/.test(c.detail)),
     "another required check that hasn't reported, is still running, or can't be matched to its App keeps it from passing", JSON.stringify(waiting));
+  const replaced = mergeable({ others: [{ context: "ci/e2e", app: null, state: "superseded" }] });
+  check(replaced.state === UNKNOWN && /ci\/e2e/.test(replaced.detail),
+    "a required check whose run was cancelled or went stale waits for the run that replaces it: UNKNOWN, never BLOCK", JSON.stringify(replaced));
+  const behind = mergeable({ strict: true, behind: 3 }), current = mergeable({ strict: true, behind: 0 }), unmeasured = mergeable({ strict: true, behind: null });
+  check(behind.state === BLOCK && /3 commit/.test(behind.detail) && current.state === PASS && unmeasured.state === UNKNOWN,
+    "a base that wants branches up to date blocks one that is behind, passes one that isn't, and is UNKNOWN when that couldn't be read",
+    JSON.stringify([behind, current, unmeasured]));
   const rule = mergeable({ unevaluated: ["rule required_deployments"] });
   check(rule.state === UNKNOWN && /required_deployments/.test(rule.detail),
     "a requirement reeve doesn't evaluate keeps it from passing, and is named", JSON.stringify(rule));
@@ -138,9 +145,35 @@ const partsOf = (base, threads, rows = []) => readMergeParts("o/r", `base-${++ba
   const both = (status, run, runState = "completed") => partsOf(baseOf({ rules: [OWN, { type: "required_status_checks", parameters: { required_status_checks: [{ context: "ci/e2e" }] } }] }), {}, [
     { name: "ci/e2e", source: "status", state: "completed", conclusion: status },
     { name: "ci/e2e", source: "check_run", state: runState, conclusion: run, appId: "15368" }]).others?.[0]?.state;
+  check(both("success", "cancelled") === "superseded" && both("success", "stale") === "superseded",
+    "a required check whose run was cancelled or went stale is superseded, not failing", JSON.stringify([both("success", "cancelled"), both("success", "stale")]));
   check(both("success", "failure") === "failing" && both("failure", "success") === "failing" && both("success", null, "running") === "running"
     && both("success", "success") === "passing",
     "a check reported both as a status and as a check run passes only when both do", JSON.stringify([both("success", "failure"), both("failure", "success"), both("success", null, "running"), both("success", "success")]));
+}
+{
+  // Branches required up to date, by a rule or by classic protection: how far
+  // the head is behind is read, and only then.
+  const strictRule = { type: "required_status_checks", parameters: { strict_required_status_checks_policy: true,
+    required_status_checks: [{ context: "ops/merge-policy", integration_id: 1 }] } };
+  const compare = (behind) => (base) => ({ calls: base.calls, gh: (args) => {
+    const path = args.find((a) => a.startsWith("repos/"));
+    if (!/\/compare\//.test(path)) return base.gh(args);
+    base.calls.push(path);
+    return behind == null ? { ok: false, err: "HTTP 502" } : { ok: true, out: String(behind) };
+  } });
+  const at = (base) => readMergeParts("o/r", `base-${++bases}`, { mergeState: "BLOCKED", mergeable: "MERGEABLE", reviewDecision: "APPROVED", readable: true, unresolved: 0 },
+    { gh: base.gh, appId: "1", rows: [], head: "f".repeat(40) });
+  const byRule = at(compare(2)(baseOf({ rules: [strictRule] })));
+  const unread = at(compare(null)(baseOf({ rules: [strictRule] })));
+  const classic = { protected: true, protection: { enabled: true, required_status_checks: { contexts: ["ops/merge-policy"], checks: [] } } };
+  const byProtection = at(compare(0)(baseOf({ rules: [], branch: classic, protection: { required_status_checks: { strict: true, contexts: ["ops/merge-policy"] } } })));
+  const loose = baseOf();
+  const plain = at(compare(5)(loose));
+  check(byRule.strict === true && byRule.behind === 2 && unread.strict === true && unread.behind === null
+    && byProtection.strict === true && byProtection.behind === 0 && plain.strict === false && plain.behind === null && !loose.calls.some((c) => /compare/.test(c)),
+    "a base that wants branches up to date, by a rule or by classic protection, has the head's distance behind read, and only then",
+    JSON.stringify({ byRule, unread, byProtection, plain }));
 }
 {
   const rules = [OWN, { type: "deletion" }, { type: "non_fast_forward" }, { type: "creation" }, { type: "required_linear_history" },

@@ -43,6 +43,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, s
 import { dirname, join } from "node:path";
 import { GIT_NEUTRALISE, GIT_NEUTRALISE_FOUNDER, REFUSING_HOOK, recordConfig, reason, gitEnv, founderGitEnv } from "./gitguard.mjs";
 import { writeFileSync, chmodSync } from "node:fs";
+import { platform } from "./platform.mjs";
 
 /** Every daemon git command in a worker-controlled directory carries the neutralisers. */
 function git(cwd, args, opts) {
@@ -156,17 +157,19 @@ export function dependencyPathsFor(profile) {
 /**
  * Can this filesystem clone files copy-on-write?
  *
- * `cp -c` fails on anything but APFS (and cross-volume), which is a fact about
- * the host, not an error: the caller falls back to a plain copy and pays the
- * space. Measured once per process against the directory that will actually be
+ * The probe fails where the filesystem can't clone (anything but APFS for
+ * `cp -c` on macOS; anything without reflinks, such as ext4, on Linux). That is
+ * a fact about the host, not an error: the caller falls back to a plain copy
+ * and pays the space. Measured against the directory that will actually be
  * copied, because the answer is per-volume.
  */
-export function canCloneFiles(nearPath) {
+export function canCloneFiles(nearPath, host = platform) {
+  if (!host.cloneProbeArgs) return false;
   const probe = join(nearPath, `.reeve-cow-probe-${process.pid}`);
   const copy = `${probe}.copy`;
   try {
     writeFileSync(probe, "probe\n");
-    execFileSync("cp", ["-c", probe, copy], { stdio: ["ignore", "ignore", "pipe"] });
+    execFileSync("cp", host.cloneProbeArgs(probe, copy), { stdio: ["ignore", "ignore", "pipe"] });
     return true;
   } catch { return false; }
   finally { rmSync(probe, { force: true }); rmSync(copy, { force: true }); }
@@ -176,21 +179,38 @@ export function canCloneFiles(nearPath) {
  * Copy a dependency tree into the run's checkout, sharing blocks where the
  * filesystem allows it. Returns `{ ok, why, cow }`; `cow` says whether the cheap
  * path was taken, so the caller can report honestly rather than assume.
+ *
+ * `to` must not exist yet. `cp -R from to` copies INTO a directory that already
+ * exists, one level too deep, and still succeeds. So an existing destination is
+ * refused, and what a failed attempt made is removed: before the plain retry,
+ * and when the copy fails for good.
  */
-export function copyDeps(from, to, { cow = null } = {}) {
+export function copyDeps(from, to, { cow = null, host = platform, exec = execFileSync } = {}) {
   if (!existsSync(from)) return { ok: true, why: "nothing to copy", cow: false, skipped: true };
-  const useCow = cow ?? canCloneFiles(from.replace(/\/[^/]+$/, "") || "/tmp");
-  const args = useCow ? ["-Rc", from, to] : ["-R", from, to];
+  if (present(to)) return { ok: false, why: `${to} is already in the checkout, and copying there would put the dependencies one level too deep; leave it out with worker.dependencyPaths`, cow: false };
+  const useCow = cow ?? canCloneFiles(from.replace(/\/[^/]+$/, "") || "/tmp", host);
+  const failed = (e) => {
+    rmSync(to, { recursive: true, force: true });       // what the failed copy made; `to` didn't exist before
+    return { ok: false, why: `could not copy dependencies: ${String(e.stderr || e.message).trim()}`, cow: false };
+  };
   try {
-    execFileSync("cp", args, { stdio: ["ignore", "ignore", "pipe"] });
+    exec("cp", host.copyTreeArgs(from, to, useCow), { stdio: ["ignore", "ignore", "pipe"] });
     return { ok: true, why: null, cow: useCow };
   } catch (e) {
-    // A failed copy-on-write copy is retried as a plain one: the host may be
-    // APFS while this particular pair of paths crosses volumes.
-    if (!useCow) return { ok: false, why: `could not copy dependencies: ${String(e.stderr || e.message).trim()}`, cow: false };
-    try { execFileSync("cp", ["-R", from, to], { stdio: ["ignore", "ignore", "pipe"] }); return { ok: true, why: null, cow: false }; }
-    catch (e2) { return { ok: false, why: `could not copy dependencies: ${String(e2.stderr || e2.message).trim()}`, cow: false }; }
+    if (!useCow) return failed(e);
+    // A failed copy-on-write copy is retried as a plain one: the source may
+    // clone while this pair of paths crosses volumes. The failed attempt can
+    // already have made `to` and part of the tree, and a retry into that would
+    // nest, so it goes first.
+    rmSync(to, { recursive: true, force: true });
+    try { exec("cp", host.copyTreeArgs(from, to, false), { stdio: ["ignore", "ignore", "pipe"] }); return { ok: true, why: null, cow: false }; }
+    catch (e2) { return failed(e2); }
   }
+}
+
+/** Is anything at `p`, a dangling symlink included? `existsSync` follows links. */
+function present(p) {
+  try { lstatSync(p); return true; } catch { return false; }
 }
 
 /**

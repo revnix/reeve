@@ -174,12 +174,14 @@ function npmSetting(key, project, env) {
  * The shells npm may run the scripts of the package in `dir` with: its
  * `script-shell` setting, or `sh`. One, unless which `.npmrc` is the project's
  * can't be told, and `projects` adds folders whose `.npmrc` may be read too. A
- * relative path is the package's.
+ * relative path is the package's. In an `.npmrc`, npm takes `true` for the
+ * program true, and `false` for no setting.
  */
 export function npmScriptShells(dir, env = process.env, projects = []) {
   dir = resolve(dir);
   const shells = [...npmProjects(dir), ...projects].map((project) => {
-    const shell = npmSetting("script-shell", project, env);
+    const setting = npmSetting("script-shell", project, env);
+    const shell = setting === true ? "true" : setting;
     if (typeof shell !== "string" || !shell) return "sh";
     return shell.includes("/") && !isAbsolute(shell) ? resolve(dir, shell) : shell;
   });
@@ -243,12 +245,20 @@ export function runnerShells(dir, packageManager, env = process.env) {
   }
 }
 
+// Operators bash has and dash doesn't: `|&` and `<<<`, which dash reads as a
+// syntax error, as it does `>&` before a file's name; and `&>` and `&>>`, which
+// it reads as `&` and then a redirection.
+const SYNTAX = ["|&", "<<<", "&>", "&>>", ">&"];
+
 const asked = new Map();
 /**
  * A shell, as `{ name, paths, builtins, keywords, execOptions, execEndsOptions,
- * appendAssign }`, asked once: which of the candidate words it treats as its
- * own, whether its `exec` takes options, and `--`, and whether `NAME+=value`
- * assigns. Null when it can't be asked; then no candidate word is judged.
+ * appendAssign, pipefail, badOptionEnds, syntax }`, asked once: which of the
+ * candidate words it treats as its own, whether its `exec` takes options, and
+ * `--`, whether `NAME+=value` assigns, whether it has `set -o pipefail`, whether
+ * a `set` option it doesn't have ends it, and which of bash's operators it has,
+ * in `syntax`. Null when it can't be asked, or answers as no shell does; then
+ * no script is judged.
  */
 export function scriptShell(path = "sh") {
   if (asked.has(path)) return asked.get(path);
@@ -257,33 +267,55 @@ export function scriptShell(path = "sh") {
     'if (exec -a probe true) >/dev/null 2>&1; then printf "exec-options\\tyes\\n"; fi; ' +
     'if (exec -- true) >/dev/null 2>&1; then printf "exec-ends-options\\tyes\\n"; fi; ' +
     'if (x=a; x+=b; test "$x" = ab) >/dev/null 2>&1; then printf "append-assign\\tyes\\n"; fi; ' +
+    'if (set -o pipefail) >/dev/null 2>&1; then printf "pipefail\\tyes\\n"; fi; ' +
+    'if ! (set -o reeve-no-such-option; exit 0) >/dev/null 2>&1; then printf "bad-option-ends\\tyes\\n"; fi; ' +
+    // Each operator in a shell of its own, since a syntax error ends the shell
+    // it's read in. dash reads `&>` as `&` and a redirection, which leaves the
+    // command's output where it was.
+    'if (eval "true |& true") >/dev/null 2>&1; then printf "syntax\\t|&\\n"; fi; ' +
+    'if (eval ": <<< x") >/dev/null 2>&1; then printf "syntax\\t<<<\\n"; fi; ' +
+    'if (x=$(echo x &>/dev/null); test -z "$x") >/dev/null 2>&1; then printf "syntax\\t&>\\n"; fi; ' +
+    'if (x=$(echo x &>>/dev/null); test -z "$x") >/dev/null 2>&1; then printf "syntax\\t&>>\\n"; fi; ' +
+    'if (eval ": >& /dev/null") >/dev/null 2>&1; then printf "syntax\\t>&\\n"; fi; ' +
     'for w in "$@"; do printf "%s\\t" "$w"; command -V "$w" 2>&1 | head -n 1; done', "sh", path, ...CANDIDATES],
     { encoding: "utf8", env: { ...process.env, LC_ALL: "C" }, timeout: 10_000 });
-  let shell = null;
+  let shell = null, answered = false;
   if (r.status === 0 && r.stdout) {
     shell = { name: basename(path), paths: [path], builtins: new Set(), keywords: new Set(),
-              execOptions: false, execEndsOptions: false, appendAssign: false };
+              execOptions: false, execEndsOptions: false, appendAssign: false, pipefail: false, badOptionEnds: false,
+              syntax: Object.fromEntries(SYNTAX.map((op) => [op, false])) };
     for (const line of r.stdout.split("\n")) {
       const tab = line.indexOf("\t");
       if (tab < 0) continue;
       const word = line.slice(0, tab), said = line.slice(tab + 1);
-      if (word === "shell") shell.name = basename(said) || shell.name;
+      if (word === "shell") { shell.name = basename(said) || shell.name; answered = true; }
       else if (word === "exec-options") shell.execOptions = true;
       else if (word === "exec-ends-options") shell.execEndsOptions = true;
       else if (word === "append-assign") shell.appendAssign = true;
+      else if (word === "pipefail") shell.pipefail = true;
+      else if (word === "bad-option-ends") shell.badOptionEnds = true;
+      else if (word === "syntax" && SYNTAX.includes(said)) shell.syntax[said] = true;
       else if (/ is a (special )?shell builtin$/.test(said)) shell.builtins.add(word);
       else if (/ is a (shell keyword|reserved word)$/.test(said)) shell.keywords.add(word);
     }
   }
+  // A "shell" that ran without answering isn't one: npm's script-shell can be
+  // `true`, or `echo`, which pass whatever the script says.
+  if (!answered) shell = null;
   asked.set(path, shell);
   return shell;
 }
+
+// Whether shells that may run a script all have something: true, false, or
+// "maybe" when some do and some don't.
+const allHave = (values) => (values.every((v) => v === true) ? true : values.every((v) => v === false) ? false : "maybe");
 
 /**
  * The shell a script runs under when it may be any of several, as one: a word
  * is its own when any of them has it, exec takes options when any exec does,
  * and `NAME+=value` assigns when any shell assigns it. So no word is called
- * missing that one of them has. Null when any can't be asked.
+ * missing that one of them has. pipefail, how a bad option ends, and bash's
+ * operators are "maybe" where they differ. Null when any can't be asked.
  */
 export function scriptShells(paths) {
   const shells = (paths ?? []).map((path) => scriptShell(path));
@@ -292,7 +324,9 @@ export function scriptShells(paths) {
   return { name: [...new Set(shells.map((s) => s.name))].join(" or "), paths: shells.flatMap((s) => s.paths),
            builtins: new Set(shells.flatMap((s) => [...s.builtins])), keywords: new Set(shells.flatMap((s) => [...s.keywords])),
            execOptions: shells.some((s) => s.execOptions), execEndsOptions: shells.some((s) => s.execEndsOptions),
-           appendAssign: shells.some((s) => s.appendAssign) };
+           appendAssign: shells.some((s) => s.appendAssign), pipefail: allHave(shells.map((s) => s.pipefail)),
+           badOptionEnds: allHave(shells.map((s) => s.badOptionEnds)),
+           syntax: Object.fromEntries(SYNTAX.map((op) => [op, allHave(shells.map((s) => s.syntax[op]))])) };
 }
 
 const told = new Map();
@@ -354,8 +388,10 @@ function expansionEnd(s, i) {
  * splits them. A word carries whether any of it was quoted, the part before its
  * first quote, whether it holds an expansion, a command substitution among
  * them, and whether it holds an unquoted pathname pattern. A redirection says
- * whether it writes a file. Null for what isn't read: an unbalanced quote, a
- * here-document, or case syntax.
+ * whether it writes a file, and whether it may fail. An operator only bash and
+ * its kin have carries `syntax`, and `otherwise`, the tokens a shell without it
+ * reads. Null for what isn't read: an unbalanced quote, a here-document, or
+ * case syntax.
  */
 export function tokenize(body) {
   const s = String(body), tokens = [];
@@ -422,10 +458,9 @@ export function tokenize(body) {
       i++; continue;
     }
     if (s.startsWith(";;", i) || s.startsWith(";&", i)) return null;
-    const op = ["&&", "||", "|&", ";", "&", "|"].find((o) => s.startsWith(o, i));
-    if (op) { tokens.push({ t: "op", op: op === "|&" ? "|" : op }); i += op.length; continue; }
-    if (c === "(" || c === ")") { tokens.push({ t: c }); i++; continue; }
-    const r = /^(\d*)(<<-?|<<<|<>|>>|>\||>&|<&|<|>)/.exec(s.slice(i));
+    // A redirection, after a descriptor's number or not; bash's `&>` and `&>>`
+    // take none.
+    const r = /^(\d*)(<<<|<<-?|<>|>>|>\||>&|<&|<|>)/.exec(s.slice(i)) ?? /^()(&>>?)/.exec(s.slice(i));
     if (r) {
       if (r[2] === "<<" || r[2] === "<<-") return null;   // a here-document's body follows, unread
       i += r[0].length;
@@ -433,10 +468,28 @@ export function tokenize(body) {
       const target = word();
       if (!target || (target.text === "" && !target.quoted)) return null;
       // `>&2` and `>&-` only point at a descriptor; the rest write a file.
-      const writes = [">", ">>", ">|", "<>"].includes(r[2]) || (r[2] === ">&" && !/^(\d+|-)$/.test(target.text));
-      tokens.push({ t: "redir", writes, subst: target.subst });
+      const writes = [">", ">>", ">|", "<>", "&>", "&>>"].includes(r[2]) || (r[2] === ">&" && !/^(\d+|-)$/.test(target.text));
+      // A redirection can fail, and then its command doesn't run: a file that
+      // isn't there, a folder that can't be written, a descriptor that isn't
+      // open. The null device, a here-string and the standard descriptors can't.
+      const mayFail = !(r[2] === "<<<" || (target.text === "/dev/null" && !target.expansion)
+        || ((r[2] === ">&" || r[2] === "<&") && /^[012-]$/.test(target.text)));
+      const token = { t: "redir", writes, subst: target.subst, mayFail };
+      // dash reads bash's `&>` as `&` and then a redirection, and its `<<<`, and
+      // `>&` before a file, as syntax errors.
+      if (r[2] === "&>" || r[2] === "&>>") tokens.push({ ...token, syntax: r[2], otherwise: [{ t: "op", op: "&" }, token] });
+      else if (r[2] === "<<<") tokens.push({ ...token, syntax: r[2], otherwise: [{ t: "error", what: "'<<<'" }] });
+      else if (r[2] === ">&" && writes && !target.expansion) tokens.push({ ...token, syntax: r[2], otherwise: [{ t: "error", what: "'>&' before a file" }] });
+      else tokens.push(token);
       continue;
     }
+    const op = ["&&", "||", "|&", ";", "&", "|"].find((o) => s.startsWith(o, i));
+    if (op) {
+      // bash's `|&` pipes both outputs; dash reads it as a syntax error.
+      tokens.push(op === "|&" ? { t: "op", op: "|", syntax: op, otherwise: [{ t: "error", what: "'|&'" }] } : { t: "op", op });
+      i += op.length; continue;
+    }
+    if (c === "(" || c === ")") { tokens.push({ t: c }); i++; continue; }
     const w = word();
     if (!w) return null;
     tokens.push(w);
@@ -510,7 +563,37 @@ function found(name, path, pkg, cwd) {
   return unsure ? null : false;
 }
 
-function program(words, path, state, ctx) {
+/**
+ * Which program by the name `name` runs: "system", the machine's own, in a
+ * folder the PATH npm runs with names in full, or in a standard folder of a
+ * PATH given; "local", one the package or a folder above it brings, which npm
+ * puts first on its PATH, or one in any other folder; "missing"; or null when
+ * that can't be told.
+ */
+function locate(name, path, pkg, cwd) {
+  if (path === null) return null;
+  let system = (d) => STANDARD_PATH.includes(d);
+  if (path === undefined) {
+    if (pkg.deps[name]) return "local";
+    for (let d = pkg.dir; ; d = dirname(d)) {
+      if (runnable(join(d, "node_modules", ".bin", name)) || (d !== pkg.dir && declares(d, name))) return "local";
+      if (d === dirname(d)) break;
+    }
+    path = (process.env.PATH ?? "").split(delimiter);
+    system = (d) => isAbsolute(d);
+  }
+  for (const d of path) {
+    if (!isAbsolute(d) && cwd === null) return null;
+    if (runnable(join(isAbsolute(d) ? d : resolve(cwd, d), name))) return system(d) ? "system" : "local";
+  }
+  return "missing";
+}
+
+/**
+ * A program's words, run as a program. `named` says they follow `command`,
+ * `exec` or a wrapper, where a reserved word is only a name.
+ */
+function program(words, path, state, ctx, named = false) {
   const [name, ...rest] = words;
   if (!name) return OK;
   if (name.expansion || name.glob) return { o: "?", mutates: true };
@@ -528,7 +611,7 @@ function program(words, path, state, ctx) {
   // may open a compound: nothing after it is read.
   const own = shell && !shell.builtins.has(name.text) && !shell.keywords.has(name.text) ? ownWord(shell, name.text) : null;
   if (own === "builtin" || own === "unknown") return { o: "?", mutates: true };
-  if (own === "keyword" && !name.quoted) return { o: "?", opaque: true };
+  if (own === "keyword" && !name.quoted && !named) return { o: "?", opaque: true };
   if (CANDIDATES.includes(name.text) && shell) {
     return failing(shell.keywords.has(name.text) || shell.builtins.has(name.text) || own === "keyword"
       ? `runs '${name.text}' as a program, and none is installed: the shell's own '${name.text}' isn't what runs there`
@@ -541,9 +624,13 @@ function program(words, path, state, ctx) {
 }
 
 // Programs that run the command after them: env, nohup, and time where it is a
-// program rather than the shell's own word. Each one's options are its own.
+// program rather than the shell's own word. Each one's options are its own, and
+// known only for the system's: a local program by the name, which npm's PATH
+// finds first, runs instead and does whatever it does.
 function wrapper(name, rest, path, state, ctx) {
   let i = 0, p = path, cwd = state.cwd;
+  if (["env", "nohup", "time"].includes(name) && !["system", "missing"].includes(locate(name, path, ctx.pkg, state.cwd)))
+    return { o: "?", mutates: true };
   if (name === "env") {
     for (; i < rest.length; i++) {
       const w = rest[i], o = w.text;
@@ -581,7 +668,7 @@ function wrapper(name, rest, path, state, ctx) {
     }
   } else return null;
   if (i >= rest.length) return name === "env" ? OK : UNKNOWN;
-  const inner = program(rest.slice(i), p, cwd === state.cwd ? state : { ...state, cwd }, ctx);
+  const inner = program(rest.slice(i), p, cwd === state.cwd ? state : { ...state, cwd }, ctx, true);
   if (inner.o === "fail") return inner;
   return found(name, path, ctx.pkg, state.cwd) === false && !state.mutated
     ? failing(`runs '${name}', which is neither a dependency nor installed`) : { ...inner, mutates: true };
@@ -592,6 +679,46 @@ function wrapper(name, rest, path, state, ctx) {
 // what the command they run changes. Any other builtin may change anything.
 const PURE = new Set(["true", ":", "false", "exit", "set", "export", "readonly", "unset", "cd", "trap", "alias",
   "unalias", "echo", "printf", "pwd", "umask", "test", "[", "shift", "type", "wait", "jobs", "times", "command", "exec"]);
+
+// set's options by letter, as bash and dash name them.
+const SET_LETTERS = { a: "allexport", b: "notify", B: "braceexpand", C: "noclobber", e: "errexit", E: "errtrace", f: "noglob",
+  h: "hashall", H: "histexpand", I: "ignoreeof", k: "keyword", m: "monitor", n: "noexec", p: "privileged", P: "physical",
+  t: "onecmd", T: "functrace", u: "nounset", v: "verbose", V: "vi", x: "xtrace" };
+// Options that change nothing the reader judges: what is printed or exported,
+// how patterns match, and errors, such as an unset variable's, that only make
+// a script fail more.
+const UNJUDGED_OPTIONS = new Set(["allexport", "notify", "braceexpand", "noclobber", "errtrace", "noglob", "hashall", "ignoreeof",
+  "monitor", "privileged", "functrace", "nounset", "verbose", "vi", "emacs", "xtrace", "history", "interactive-comments", "nolog"]);
+
+/**
+ * One of set's options, turned on or off: errexit and pipefail are followed,
+ * and one that changes nothing judged is passed over. In a shell without
+ * pipefail, setting it is an error, which may end the shell. Any other option
+ * may change what runs, noexec say, which runs nothing more: nothing after it
+ * is read. The outcome that ends the command, or null.
+ */
+function setOption(name, on, state, shell) {
+  if (name === "errexit") state.errexit = on;
+  else if (name === "pipefail") {
+    if (shell?.pipefail === true) state.pipefail = on;
+    else if (shell?.pipefail === false)
+      return { ...failing(`uses 'set -o pipefail', which ${shell.name}, the shell that runs the script, doesn't have`), stop: shell.badOptionEnds ?? "maybe" };
+    else return { o: "?", opaque: true };
+  } else if (!UNJUDGED_OPTIONS.has(name)) return { o: "?", opaque: true };
+  return null;
+}
+
+/**
+ * PATH assigned in `state`. While it is read-only the assignment fails, and PATH
+ * keeps its value: dash ends there, and bash goes on. The outcome of a failed
+ * assignment, or null.
+ */
+function assignPath(state, path, what = "assigns PATH") {
+  if (state.pathReadonly === true) return { ...failing(`${what} after making it read-only, which fails`), stop: "maybe" };
+  if (state.pathReadonly === "maybe") { state.path = null; return { o: "?", stop: "maybe" }; }
+  state.path = path;
+  return null;
+}
 
 // A builtin of the shell, run in `state`.
 function builtin(name, args, path, state, ctx) {
@@ -608,22 +735,52 @@ function builtin(name, args, path, state, ctx) {
     }
     case "set":
       // Options, until `--`, `-` or the first word that isn't one: the rest are
-      // positional parameters, which change nothing here.
+      // positional parameters, which change nothing here. `o` takes the next
+      // word as an option's name, and alone lists them. An option an expansion
+      // gives may be any.
       for (let k = 0; k < args.length; k++) {
-        if (args[k].expansion || args[k].glob) { state.errexit = "maybe"; break; }
+        if (args[k].expansion || args[k].glob) return { o: "?", opaque: true };
         const m = /^([-+])([a-zA-Z]+)$/.exec(text[k]);
         if (!m) break;
-        if (m[2].includes("e")) state.errexit = m[1] === "-";
-        // `o` takes the next word as an option's name.
-        if (m[2].includes("o") && ++k < args.length) {
-          if (args[k].expansion) state.errexit = "maybe";
-          else if (text[k] === "errexit") state.errexit = m[1] === "-";
+        for (const letter of m[2]) {
+          if (letter === "o" && ++k >= args.length) return OK;
+          if (letter === "o" && (args[k].expansion || args[k].glob)) return { o: "?", opaque: true };
+          const r = setOption(letter === "o" ? text[k] : SET_LETTERS[letter] ?? letter, m[1] === "-", state, ctx.shell);
+          if (r) return r;
         }
       }
       return OK;
-    case "export": case "readonly":
-      for (const w of args) { const a = assignment(w, ctx.shell); if (a?.name === "PATH") state.path = literalPath(a.value); }
+    case "export": case "readonly": {
+      // -f names functions, which PATH isn't, and -p only lists. A read-only
+      // PATH keeps its value.
+      let k = 0, r = OK;
+      for (; k < args.length && /^-[a-zA-Z]+$/.test(text[k]); k++) if (text[k].includes("f")) return OK;
+      if (text[k] === "--") k++;
+      for (const w of args.slice(k)) {
+        const a = assignment(w, ctx.shell);
+        if (a?.name === "PATH") r = assignPath(state, literalPath(a.value)) ?? r;
+        if (name === "readonly" && (a?.name ?? w.text) === "PATH") state.pathReadonly = true;
+      }
+      return r;
+    }
+    case "unset": {
+      // With PATH unset, dash and bash look programs up in the current folder
+      // only. -f unsets functions, which PATH isn't, and a name an expansion
+      // gives may be PATH.
+      let k = 0;
+      for (; k < args.length && /^-[a-zA-Z]+$/.test(text[k]); k++) if (text[k].includes("f")) return OK;
+      if (text[k] === "--") k++;
+      for (const w of args.slice(k)) {
+        if (w.expansion || w.glob) {
+          if (state.pathReadonly !== false) return { o: "?", stop: "maybe" };
+          state.path = null;
+        } else if (w.text === "PATH") {
+          const r = assignPath(state, [""], "unsets PATH");
+          if (r) return r;
+        }
+      }
       return OK;
+    }
     case "cd": {
       let k = 0;
       while (/^-[LPe@]+$/.test(text[k] ?? "")) k++;
@@ -656,7 +813,9 @@ function builtin(name, args, path, state, ctx) {
         if (!/^-p+$/.test(args[k].text)) return UNKNOWN;
         p = STANDARD_PATH;   // the standard path, whatever PATH says
       }
-      return args.length > k ? command(args.slice(k), p, state, ctx) : OK;
+      // What follows names a command, never a reserved word: `command if` runs
+      // a program called if.
+      return args.length > k ? command(args.slice(k), p, state, ctx, true) : OK;
     }
     case "exec": {
       let k = 0;
@@ -671,7 +830,7 @@ function builtin(name, args, path, state, ctx) {
       } else if (ctx.shell?.execEndsOptions && text[0] === "--") k = 1;
       if (args.length <= k) return OK;
       // The program replaces the shell, which ends with it.
-      return { ...program(args.slice(k), path, state, ctx), stop: true };
+      return { ...program(args.slice(k), path, state, ctx, true), stop: true };
     }
     default: return UNKNOWN;
   }
@@ -680,13 +839,15 @@ function builtin(name, args, path, state, ctx) {
 /**
  * One command's words, after its leading assignments: a keyword, a builtin, a
  * wrapper or a program. After `command`, `exec` or a wrapper, a word shaped like
- * an assignment is a program's name.
+ * an assignment is a program's name, and so is a reserved word: `named` says
+ * the words follow `command`.
  */
-function command(words, path, state, ctx) {
+function command(words, path, state, ctx, named = false) {
   const [name, ...args] = words;
   if (name.expansion || name.glob) return { o: "?", mutates: true };
   const shell = ctx.shell;
   if (!shell && CANDIDATES.includes(name.text)) return { o: "?", mutates: true };
+  if (named && !shell?.builtins.has(name.text)) return program(words, path, state, ctx, true);
   if (!name.quoted && shell?.keywords.has(name.text)) {
     if (name.text !== "time") return { o: "?", opaque: true };
     // The shell's own `time` times the command after it, assignments and all.
@@ -707,11 +868,18 @@ function simple(words, state, ctx) {
   if (!words.length) return OK;
   let k = 0, path = state.path;
   for (let a; k < words.length && (a = assignment(words[k], ctx.shell)); k++) if (a.name === "PATH") path = literalPath(a.value);
+  const assigned = words.slice(0, k).some((w) => assignment(w, ctx.shell)?.name === "PATH");
   if (k === words.length) {
     // Assignments alone last for the rest of the script, and end with the
     // status of a command substitution among them.
-    if (path !== state.path) state.path = path;
+    if (assigned) { const r = assignPath(state, path); if (r) return r; }
     return words.some((w) => w.expansion) ? UNKNOWN : OK;
+  }
+  // Before a command, an assignment to a read-only PATH fails: dash ends
+  // there, and bash runs the command with PATH as it was.
+  if (assigned && state.pathReadonly !== false) {
+    const r = command(words.slice(k), state.pathReadonly === true ? state.path : null, state, ctx);
+    return { ...(r.o === "fail" ? r : UNKNOWN), mutates: r.mutates, stop: "maybe" };
   }
   return command(words.slice(k), path, state, ctx);
 }
@@ -723,16 +891,31 @@ const JOINS = new Set(["&&", "||", "|"]);
 
 /**
  * The script split into commands, each with the operator after it, whether a
- * redirection of it writes a file, and whether it holds a command substitution.
- * The rest is opaque from the first compound. A syntax error ends the list,
- * replacing the commands of its own line, which don't run: a keyword that
- * closes nothing, or `&&`, `||` or `|` without a command on both sides.
+ * redirection of it writes a file or may fail, and whether it holds a command
+ * substitution. The rest is opaque from the first compound. A syntax error
+ * ends the list, replacing the commands of its own line, which don't run: a
+ * keyword that closes nothing, `&&`, `||` or `|` without a command on both
+ * sides, or an operator of bash's the shell doesn't have.
  */
 function commands(tokens, ctx) {
   const list = [];
-  let cmd = { words: [], redirs: 0, writes: false, subst: false }, lineStart = 0;
+  let cmd = { words: [], redirs: 0, writes: false, subst: false, mayFail: false }, lineStart = 0;
   const syntaxError = (why) => { list.splice(lineStart); list.push({ syntaxError: why, op: null }); return list; };
-  for (const t of tokens) {
+  // An operator of bash's is read as the shell that runs the script reads it.
+  // Where the shells that may run it differ, its line may not run at all, so
+  // nothing is read from that line on.
+  const reading = (t) => {
+    if (!t.syntax) return [t];
+    const has = ctx.shell?.syntax?.[t.syntax];
+    return has === true ? [t] : has === false ? t.otherwise : [{ t: "unsure" }];
+  };
+  for (const t of tokens.flatMap(reading)) {
+    if (t.t === "error") return syntaxError(`${ctx.shell.name} has no ${t.what}`);
+    if (t.t === "unsure") {
+      list.splice(lineStart);
+      list.push({ opaque: true, op: null });
+      return list;
+    }
     if (t.t === "word") {
       const { words } = cmd;
       // A reserved word counts first in a command, or after the `!` that
@@ -752,6 +935,7 @@ function commands(tokens, ctx) {
       cmd.redirs++;
       cmd.writes ||= t.writes;
       cmd.subst ||= t.subst;
+      cmd.mayFail ||= t.mayFail;
     } else if (t.t === "(" || t.t === ")") {
       list.push({ opaque: true, op: null });
       return list;
@@ -764,7 +948,7 @@ function commands(tokens, ctx) {
         continue;
       }
       list.push({ ...cmd, op: t.op });
-      cmd = { words: [], redirs: 0, writes: false, subst: false };
+      cmd = { words: [], redirs: 0, writes: false, subst: false, mayFail: false };
       if (t.newline) lineStart = list.length;
     }
   }
@@ -779,10 +963,15 @@ const inverted = (r) => {
   return { ...r, o, why: o === "fail" ? "always fails: '!' inverts a pipeline that succeeds" : null, negated: true };
 };
 
+// A command whose redirection may fail: then it doesn't run, and fails. So it
+// never surely succeeds, and an exit or exec with one may not end the shell:
+// bash goes on, where dash ends.
+const redirected = (cmd, r) => (cmd.mayFail ? { ...r, o: r.o === "ok" ? "?" : r.o, stop: r.stop === true ? "maybe" : r.stop } : r);
+
 /**
  * Run one pipeline from `i`: one command, or several joined by `|`, each run
- * apart with the last deciding, the whole inverted by a leading `!`. Returns the
- * outcome and where the next begins.
+ * apart with the last deciding, or under pipefail any that fails, the whole
+ * inverted by a leading `!`. Returns the outcome and where the next begins.
  */
 function pipeline(list, i, state, ctx) {
   const first = list[i];
@@ -802,7 +991,7 @@ function pipeline(list, i, state, ctx) {
   if (j === i) {
     // A command substitution runs first, and may change what its command finds.
     if (first.subst) state.mutated = true;
-    const r = simple(first.words, state, ctx);
+    const r = redirected(first, simple(first.words, state, ctx));
     const mutates = r.mutates || first.writes || first.subst;
     return { r: mutates ? { ...r, mutates: true } : r, next: i + 1, opaque: Boolean(r.opaque) };
   }
@@ -810,8 +999,17 @@ function pipeline(list, i, state, ctx) {
   // The commands of a pipeline run apart and at once: none changes the shell's
   // own state or makes another's program in time to count, and the last one's
   // status is the pipeline's.
-  const r = simple(list[j].words, { ...state, mutated: state.mutated || list[j].subst }, ctx);
-  return { r: { o: r.o, why: r.why, mutates: true }, next: j + 1, opaque: Boolean(r.opaque) };
+  const run = (k) => redirected(list[k], simple(list[k].words, { ...state, mutated: state.mutated || list[k].subst }, ctx));
+  const r = run(j);
+  // Under pipefail it fails when any of them fails. One before the last may be
+  // stopped by the next closing the pipe, so it never surely succeeds.
+  let status = r;
+  if (state.pipefail !== false) {
+    const each = [...list.slice(i, j).map((_, n) => { const e = run(i + n); return e.o === "ok" ? UNKNOWN : e; }), r];
+    const withIt = each.findLast((e) => e.o === "fail") ?? (each.every((e) => e.o === "ok") ? OK : UNKNOWN);
+    status = state.pipefail === true ? withIt : either(withIt, r);
+  }
+  return { r: { o: status.o, why: status.why, mutates: true }, next: j + 1, opaque: Boolean(r.opaque) };
 }
 
 /**
@@ -846,6 +1044,8 @@ function andOr(list, i, state, ctx) {
     if (maybeState.path !== state.path) state.path = null;
     if (maybeState.cwd !== state.cwd) state.cwd = null;
     if (maybeState.errexit !== state.errexit) state.errexit = "maybe";
+    if (maybeState.pipefail !== state.pipefail) state.pipefail = "maybe";
+    if (maybeState.pathReadonly !== state.pathReadonly) state.pathReadonly = "maybe";
     if (maybeState.trapped) state.trapped = true;
     ran(p.r);
     acc = op === "&&" ? (p.r.o === "fail" ? p.r : UNKNOWN) : (p.r.o === "ok" ? OK : UNKNOWN);
@@ -867,16 +1067,17 @@ function listEnd(list, i) {
  * Whether the script certainly fails, as `{ broken, why }`. It runs the script's
  * commands in order as the shell would: `&&` and `||` skip what they skip, `;`
  * and newlines go on, `&` runs a list apart, `set -e` stops at a failure,
- * `exit` stops, a pipeline ends with its last command, and `!` inverts one.
- * Anything unsure stays unsure.
+ * `exit` stops, a pipeline ends with its last command, or under pipefail with
+ * any that fails, and `!` inverts one. Anything unsure stays unsure.
  */
 export function scriptOutcome(body, pkg, shell = scriptShells(runnerShells(pkg.dir, "npm"))) {
   const tokens = tokenize(body);
   if (!tokens) return { broken: false, why: null };
   const ctx = { pkg, shell };
   const list = commands(tokens, ctx);
-  // errexit is true, false or "maybe".
-  const state = { errexit: false, path: undefined, cwd: pkg.dir, status: OK, mutated: false, trapped: false };
+  // errexit, pipefail and whether PATH is read-only are true, false or "maybe".
+  const state = { errexit: false, pipefail: false, path: undefined, pathReadonly: false, cwd: pkg.dir, status: OK, mutated: false,
+                  trapped: false };
   const maybe = [];   // outcomes the script may already have stopped with
   let last = OK, i = 0;
   while (i < list.length) {

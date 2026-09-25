@@ -249,10 +249,29 @@ export function computeVerdict(i) {
   }
 
   // 7. GitHub's own mergeability. UNKNOWN is GitHub still computing; retry.
+  //
+  // BLOCKED counts reeve's own check once that check is required, and the check
+  // can only pass once this verdict does: taking BLOCKED at its word blocked
+  // every verdict after the first, for ever. So BLOCKED is taken apart. A
+  // conflict or an outstanding review still blocks. Beyond those, BLOCKED while
+  // reeve's check is required is reeve's own and doesn't count; CI is judged by
+  // its own clause, and a rule reeve can't read still stops the merge at GitHub.
+  // This never looks at whether reeve's check is passing, because a verdict that
+  // did would flip on each publish whenever another rule also blocked.
   const MS = String(i.mergeState ?? "").toUpperCase();
+  const parts = i.mergeParts ?? null;
   if (!MS) add("mergeable", UNKNOWN, "mergeStateStatus not read");
   else if (MS === "CLEAN" || MS === "UNSTABLE") add("mergeable", PASS, MS);
   else if (MS === "UNKNOWN") add("mergeable", UNKNOWN, "GitHub is still computing mergeability");
+  else if (MS === "BLOCKED" && parts) {
+    const review = parts.reviewDecision === "CHANGES_REQUESTED" || parts.reviewDecision === "REVIEW_REQUIRED";
+    if (parts.mergeable === "CONFLICTING") add("mergeable", BLOCK, "mergeStateStatus BLOCKED: the branch conflicts with its base");
+    else if (review) add("mergeable", BLOCK, `mergeStateStatus BLOCKED: review ${parts.reviewDecision}`);
+    else if (parts.ownCheckRequired === false) add("mergeable", BLOCK, "mergeStateStatus BLOCKED, and not by reeve's own check");
+    else if (parts.ownCheckRequired === null) add("mergeable", UNKNOWN, "mergeStateStatus BLOCKED, and whether reeve's own required check is among the reasons couldn't be read");
+    else if (parts.mergeable !== "MERGEABLE") add("mergeable", UNKNOWN, `mergeStateStatus BLOCKED, and GitHub hasn't settled whether the branch merges (${parts.mergeable ?? "unread"})`);
+    else add("mergeable", PASS, "mergeStateStatus BLOCKED by reeve's own required check, which this verdict decides; no conflict, and no review outstanding");
+  }
   else add("mergeable", BLOCK, `mergeStateStatus ${MS}`);
 
   const state = clauses.reduce((acc, c) => worst(acc, c.state), PASS);

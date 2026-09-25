@@ -12,7 +12,7 @@ import { rootCause } from "./ci-rootcause.mjs";
 import { computeVerdict, renderVerdict, PASS, BLOCK, UNKNOWN } from "./verdict.mjs";
 // The builder App's name has one home already; the classifier reads it rather
 // than restating it.
-import { POLICY_APP } from "./github/reconciler.mjs";
+import { POLICY_APP, POLICY_CONTEXT } from "./github/reconciler.mjs";
 import { reviewState } from "./review/derive.mjs";
 import { compare } from "./review/shadow.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
@@ -36,7 +36,7 @@ function ghJson(args) {
 // `reviewsAgree` for what that does and does not catch.
 const THREADS_QUERY = `query($o:String!,$r:String!,$n:Int!,$c:String){
   repository(owner:$o,name:$r){ pullRequest(number:$n){
-    mergeStateStatus
+    mergeStateStatus mergeable reviewDecision
     reviews(first:1){ totalCount }
     reviewThreads(first:100, after:$c){
       totalCount
@@ -57,7 +57,7 @@ export function readThreads(nwo, pr, io = null) {
   const call = io?.gh ?? ghJson;
   const [o, r] = nwo.split("/");
   let cursor = null, total = null, seen = 0, unresolved = 0, mergeState = null, pages = 0;
-  let reviewTotal = null;
+  let reviewTotal = null, mergeable = null, reviewDecision = null;
   for (;;) {
     const args = ["graphql", "-f", `query=${THREADS_QUERY}`, "-F", `o=${o}`, "-F", `r=${r}`, "-F", `n=${pr}`];
     if (cursor) args.push("-F", `c=${cursor}`);
@@ -66,6 +66,8 @@ export function readThreads(nwo, pr, io = null) {
     const pr_ = JSON.parse(res.out).data?.repository?.pullRequest;
     if (!pr_) return { readable: false, why: "no pullRequest in response", mergeState };
     mergeState = pr_.mergeStateStatus;
+    mergeable = pr_.mergeable ?? null;
+    reviewDecision = pr_.reviewDecision ?? null;
     // Read from the FIRST page only: it is a totalCount, identical on every page,
     // and re-reading it per page would just be the same number again.
     if (reviewTotal === null) reviewTotal = pr_.reviews?.totalCount ?? null;
@@ -78,7 +80,24 @@ export function readThreads(nwo, pr, io = null) {
     cursor = t.pageInfo.endCursor;
   }
   // Only claim readability when the count seen matches the count declared.
-  return { readable: seen >= total, total, unresolved, seen, mergeState, reviewTotal };
+  return { readable: seen >= total, total, unresolved, seen, mergeState, reviewTotal, mergeable, reviewDecision };
+}
+
+/**
+ * The parts of GitHub's mergeability that reeve can read, for when
+ * mergeStateStatus is BLOCKED and the verdict has to take it apart: whether the
+ * branch conflicts, the review decision, and whether reeve's own check is
+ * required on the base. The last is read only when BLOCKED, the one state it
+ * explains, since it costs two calls.
+ */
+export function readMergeParts(nwo, baseRef, threads, { gh = ghJson, context = POLICY_CONTEXT } = {}) {
+  const parts = { mergeable: threads?.mergeable ?? null, reviewDecision: threads?.reviewDecision ?? null, ownCheckRequired: null };
+  if (String(threads?.mergeState ?? "").toUpperCase() === "BLOCKED" && baseRef)
+    parts.ownCheckRequired = requiredOn({
+      rules: gh([`repos/${nwo}/rules/branches/${encodeURIComponent(baseRef)}`]),
+      branch: gh([`repos/${nwo}/branches/${encodeURIComponent(baseRef)}`]),
+    }, context);
+  return parts;
 }
 
 /**
@@ -555,7 +574,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     reviewers, rounds, threads, cleared: facts.cleared,
     bodyFindings: facts.bodyFindings, unreadableBodies: facts.unreadableBodies,
     ledgerBlockers,
-    mergeState: threads.mergeState, profile,
+    mergeState: threads.mergeState, mergeParts: readMergeParts(nwo, baseRef, threads), profile,
     // Passed through, never read here. `pr_hold` is a HUB row and this function
     // holds the per-repository state database, so the reading is taken by the
     // caller that has the hub connection and handed in. Null when the caller has

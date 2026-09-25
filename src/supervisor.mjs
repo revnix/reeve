@@ -23,6 +23,7 @@
 import { spawn, execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, openSync, writeSync, closeSync, readSync, fstatSync } from "node:fs";
 import { dirname } from "node:path";
+import { platform } from "./platform.mjs";
 
 export const OUTCOMES = {
   OK: "ok",
@@ -533,33 +534,26 @@ export function runWorker({
 
 /**
  * Should the scheduler start more work? Driven by observed load rather than a
- * frozen constant: 10 performance cores here, and the machine already carries a
- * load average around 3.6 from interactive sessions.
+ * frozen constant, and read through the platform module: on Linux the macOS
+ * `sysctl` keys don't exist, and a failed read used to fall back to a guess of
+ * 10 cores whatever the host had.
  */
-export function capacity({ maxWorkers = 5, hardCeiling = 6, running = 0 } = {}) {
-  let load1 = 0;
-  try { load1 = Number(execFileSync("sysctl", ["-n", "vm.loadavg"], { encoding: "utf8" }).replace(/[{}]/g, "").trim().split(/\s+/)[0]); }
-  catch { /* unreadable load is not a reason to over-schedule */ }
-  const perfCores = (() => {
-    try { return Number(execFileSync("sysctl", ["-n", "hw.perflevel0.logicalcpu"], { encoding: "utf8" }).trim()) || 10; }
-    catch { return 10; }
-  })();
+export function capacity({ maxWorkers = 5, hardCeiling = 6, running = 0, host = platform } = {}) {
+  const { load1, cores } = host.loadAndCores();
   // Back off when the machine is already busy, so reeve never competes with the
   // founder's own interactive work.
-  const loadHeadroom = Math.max(0, Math.floor(perfCores - load1) - 1);
+  const loadHeadroom = Math.max(0, Math.floor(cores - load1) - 1);
   const allowed = Math.min(maxWorkers, hardCeiling, loadHeadroom);
-  return { allowed, running, canStart: Math.max(0, allowed - running), load1, perfCores };
+  return { allowed, running, canStart: Math.max(0, allowed - running), load1, perfCores: cores };
 }
 
-/** Keep the Mac awake for exactly as long as the daemon lives, never longer. */
-export function stayAwake(pid = process.pid) {
-  if (process.platform !== "darwin") return null;
-  // -i prevents system idle sleep while leaving the display free to sleep.
-  // -w ties the assertion to this pid, so a crashed daemon cannot leave the Mac
-  // permanently unable to sleep.
-  const c = spawn("caffeinate", ["-i", "-w", String(pid)], { detached: true, stdio: "ignore" });
-  c.unref();
-  return c.pid;
+/**
+ * Keep the machine awake for exactly as long as the daemon lives, never longer.
+ * Returns `{ pid, via }`. The pid is null where the host has no mechanism, or
+ * where the lock was refused, and then `why` says so.
+ */
+export function stayAwake(pid = process.pid, host = platform) {
+  return host.stayAwake(pid);
 }
 
 /** The halt switch. A marker file, so it can be set from a phone over ntfy or ssh. */

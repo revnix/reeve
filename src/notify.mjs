@@ -17,6 +17,7 @@
 
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { platform } from "./platform.mjs";
 
 /**
  * Patterns for things that must never leave this machine.
@@ -122,6 +123,27 @@ function postViaOsascript({ title, body }) {
 }
 
 /**
+ * The same desk channel on Linux. notify-send takes the title and the body as
+ * its own argv entries and parses neither as a script, so escalation text stays
+ * text. The `--` keeps a title that starts with a dash from being read as an
+ * option.
+ */
+export function postViaNotifySend({ title, body }, exec = execFileSync) {
+  try {
+    exec("notify-send", ["--app-name=reeve", "--", title, body], { stdio: ["ignore", "ignore", "pipe"], timeout: 8000 });
+    return { ok: true };
+  } catch (e) { return { ok: false, why: String(e.message).split("\n")[0] }; }
+}
+
+// The sender for this host. A host with none declines with a reason, the same
+// way an unconfigured channel does, rather than reporting a silent success.
+const DESKTOP_SENDERS = { osascript: postViaOsascript, "notify-send": postViaNotifySend };
+export function desktopSenderFor(host = platform) {
+  return DESKTOP_SENDERS[host.desktopNotifier]
+    ?? (() => ({ ok: false, why: `no desktop notifier on ${host.name}` }));
+}
+
+/**
  * Read curl's combined output: the response body, then the status code on the
  * last line.
  *
@@ -167,7 +189,7 @@ function postViaCurl({ url, auth, title, priority, tags, body }) {
  * network or a real secret. Declines when unconfigured or uncredentialed, and
  * never sends unauthenticated: an open topic is a public one.
  */
-export function notify({ profile, alert, post = postViaCurl, desktop = postViaOsascript, readCredential = null }) {
+export function notify({ profile, alert, post = postViaCurl, desktop = desktopSenderFor(), readCredential = null }) {
   if (!alert) return { ok: false, why: "nothing to send" };
   const cfg = profile?.notify ?? {};
   const channels = [];

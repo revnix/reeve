@@ -46,22 +46,30 @@ publishes after checking what git says changed.
 - **Node ≥ 24.10.0.** `node:sqlite` still emits an experimental warning on 22.x
   and the state layer is the authority, and `DatabaseSync.setAuthorizer` -- which
   the guardian's restricted hub connection refuses to open without -- arrived in
-  24.10.0. `package.json` enforces the same floor. On this machine `node` on
-  `PATH` is v22, so use the absolute path:
-  `~/.nvm/versions/node/v24.17.0/bin/node`.
+  24.10.0. `package.json` enforces the same floor. If `node` on `PATH` is
+  older, call a 24.x node by its absolute path, as the service files in
+  `deploy/` do.
 - `git` and the `gh` CLI, authenticated.
 - `claude` on `PATH` for dispatch (not needed to observe).
 
 ## Install
 
 ```sh
-git clone git@github.com:revnix/reeve.git && cd reeve
-alias reeve='~/.nvm/versions/node/v24.17.0/bin/node ~/Work/Products/reeve/bin/reeve'
+git clone git@github.com:revnix/reeve.git
+alias reeve="node $PWD/reeve/bin/reeve"
 
-reeve init                 # detect this repo, and ASK about anything ambiguous
+cd <a checkout of the repository reeve will watch>
+reeve init                 # detect it, and ASK about anything ambiguous
 reeve init --set project.kind=product --write
 reeve doctor <owner/repo>  # what is actually true right now
 ```
+
+`init --write` writes the profile and creates the state database (see Layout).
+Run it first on a new machine: `reeve run` refuses to start without that
+database rather than create an empty one itself, because a fresh empty store in
+place of the real one is how history stops being read without anything failing.
+`init` never touches a database that exists, and moves one from the old path
+into place.
 
 `init` never guesses where guessing would change what the gate judges. Two
 lockfiles, a mixed merge history or two formatters come back as **questions** with

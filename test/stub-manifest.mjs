@@ -4758,9 +4758,9 @@ export const STUBS = [
   },
   {
     name: "ci-base-judged-for-health",
-    why: "judge the base for evidence of a pass, as a head is judged. A push that skipped a check the base requires, which runs only on pull requests say, then reads unknown, and every open pull request waits on the base",
+    why: "judge the base for evidence of a pass, as a head is judged. A push whose path filters skipped every check then reads unknown, and every open pull request waits on the base",
     test: "test/ci-read-completely.test.mjs",
-    expectRed: "through evaluatePr, a base whose push skipped a check the base requires is healthy: the base is judged by its failures",
+    expectRed: "through evaluatePr, a base whose push skipped every check, the one it requires among them, is healthy: the base is judged by its failures",
     edits: [{ file: "src/pr.mjs",
               find: "{ required: profile.ci?.requiredChecks ?? [] }, { evidence: false })",
               replace: "{ required: profile.ci?.requiredChecks ?? [] }, { evidence: true })" }],

@@ -178,8 +178,10 @@ ${requiresGate}
 ${requiresGate}
   */commits/${HEAD}/check-runs*) echo '${runJson("CI Gate", "success")}';;
   */commits/${HEAD}/status*) ;;`);
+  // A push whose path filters skipped every check, the one the base requires
+  // among them.
   const baseSkipped = ciAfterTicks(`  */commits/${BASE}/check-runs*) echo '${runJson("CI Gate", "skipped")}'
-    echo '${runJson("lint", "success")}';;
+    echo '${runJson("lint", "skipped")}';;
   */commits/${BASE}/status*) ;;
   */check-suites*) echo '[{"app":{"slug":"github-actions"},"status":"completed"}]';;
 ${requiresGate}
@@ -193,7 +195,7 @@ ${requiresGate}
   check(control.state === "PASS" && control.base?.state === "PASS",
     "control: through evaluatePr, a whole read of a passing required check settles to PASS, on the head and the base", JSON.stringify(control));
   check(baseSkipped.base?.state === "PASS",
-    "through evaluatePr, a base whose push skipped a check the base requires is healthy: the base is judged by its failures", JSON.stringify(baseSkipped));
+    "through evaluatePr, a base whose push skipped every check, the one it requires among them, is healthy: the base is judged by its failures", JSON.stringify(baseSkipped));
   check(baseUnread.base?.state === "UNKNOWN",
     "through evaluatePr, a base whose statuses couldn't be read has unknown health, though its check runs pass", JSON.stringify(baseUnread));
   check(statusesUnread.state === "UNKNOWN" && /couldn't be read in full/.test(statusesUnread.detail),

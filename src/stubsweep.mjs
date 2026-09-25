@@ -192,7 +192,8 @@ export function validateManifest(entries) {
  * Which assertions a run reported as failing.
  *
  * Tied to this repository's own test output — `PASS  name` / `FAIL  name` — rather
- * than to a framework, because that is what these tests emit.
+ * than to a framework, because that is what these tests emit. A node:test file
+ * emits them too: the sweep runs every file with scripts/test-reporter.mjs.
  */
 const ASSERTION = /^(PASS|FAIL) {2}(.+)$/;
 

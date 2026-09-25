@@ -480,6 +480,7 @@ const killTree = child => {
   }
 };
 
+const TEST_REPORTER = fileURLToPath(new URL("./test-reporter.mjs", import.meta.url));
 const runTest = (file, expectRed = null) => new Promise(resolve => {
   // DETACHED, so the child leads its own process GROUP.
   //
@@ -487,7 +488,14 @@ const runTest = (file, expectRed = null) => new Promise(resolve => {
   // outlives the sweep keeps producing side effects against a tree that has since
   // been restored, with no timer left anywhere to stop it. A group can be killed
   // whole, which is the only way to end work we did not start ourselves.
-  const child = spawn(process.execPath, [join(ROOT, file)], { cwd: ROOT, detached: true });
+  //
+  // WITH THE REPOSITORY'S node:test REPORTER. A file written with node:test
+  // prints neither PASS nor FAIL through node's own reporters, so it read as
+  // reporting no assertion at all (#224). The reporter prints both, and a file
+  // that doesn't use node:test never loads it. It is this script's own, not the
+  // tree's under test: a fixture repository has none.
+  const child = spawn(process.execPath, [`--test-reporter=${TEST_REPORTER}`, "--test-reporter-destination=stdout", join(ROOT, file)],
+    { cwd: ROOT, detached: true });
   activeChild = child;
   // BOUNDED. A deliberately broken test that logs continuously would otherwise
   // grow one unbounded string for as long as the timeout allows, and exhausting

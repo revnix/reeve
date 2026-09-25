@@ -322,3 +322,39 @@ export function pickBoard(projects) {
     ? `${boards.length} linked projects have the plan board's columns: ${boards.map((b) => `#${b.number}`).join(", ")}`
     : `no linked project has a Status field with the columns ${BOARD_COLUMNS.join(", ")}` };
 }
+
+/**
+ * Every page of a GitHub connection. `fetch(after)` returns one page as
+ * `{ nodes, pageInfo }`. Stops after `limit` pages, and says whether it read
+ * them all, so nothing is judged from part of a list silently.
+ */
+export function allNodes(fetch, limit = 50) {
+  const nodes = [];
+  let after = null;
+  for (let page = 0; page < limit; page++) {
+    const conn = fetch(after);
+    nodes.push(...conn.nodes);
+    if (!conn.pageInfo?.hasNextPage) return { nodes, complete: true };
+    after = conn.pageInfo.endCursor;
+  }
+  return { nodes, complete: false };
+}
+
+/**
+ * Why the board must not be written from these reads, or null. A list read in
+ * part moves cards the wrong way: a task whose pull request went unread would
+ * leave In review.
+ */
+export function incompleteRead(reads) {
+  const missing = Object.entries(reads).filter(([, r]) => r?.complete === false).map(([name]) => name);
+  return missing.length ? `not every one of the ${missing.join(", ")} could be read, so no card was moved` : null;
+}
+
+/**
+ * The cards the plan didn't visit whose issue is closed. A closed task is Done
+ * whether or not its phase is still open, and a phase closed with its last tasks
+ * is no longer read at all.
+ */
+export function closedCards(cards, visited) {
+  return [...cards].filter(([n, c]) => !visited.has(n) && c.state === "CLOSED").map(([n, c]) => ({ number: n, ...c }));
+}

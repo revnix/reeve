@@ -4,7 +4,7 @@
 // pull requests, never typed, so it can't drift. These tests check each column
 // rule, and which linked project counts as the board, from plain data. The sync
 // that writes the board (scripts/board.mjs) applies exactly these functions.
-import { boardColumn, pickBoard, BOARD_COLUMNS } from "../.agents/skills/resume-work/scripts/lib.mjs";
+import { boardColumn, pickBoard, BOARD_COLUMNS, allNodes, incompleteRead, closedCards } from "../.agents/skills/resume-work/scripts/lib.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -52,6 +52,26 @@ check(none.board === null && /no linked project/.test(none.why ?? ""),
   "a project with other columns, or extra ones, is not taken for the board", JSON.stringify(none));
 const two = pickBoard([project(2, BOARD_COLUMNS), project(4, [...BOARD_COLUMNS].reverse())]);
 check(two.board === null && /#2, #4/.test(two.why ?? ""), "two projects that both look like the board are named, not guessed between", JSON.stringify(two));
+
+// ── reading whole lists, and refusing to write from part of one ──────────────
+{
+  const pages = [[1, 2], [3, 4], [5, 6]];
+  const fetch = (after) => { const i = after === null ? 0 : Number(after); return { nodes: pages[i], pageInfo: { hasNextPage: i + 1 < pages.length, endCursor: String(i + 1) } }; };
+  const all = allNodes(fetch), cut = allNodes(fetch, 2);
+  check(all.complete && all.nodes.length === 6 && !cut.complete && cut.nodes.length === 4,
+    "every page of a connection is read, and a list cut short says so", JSON.stringify({ all, cut }));
+  const why = incompleteRead({ "pull requests": { complete: false }, issues: { complete: true }, "board cards": { complete: true } });
+  check(/pull requests/.test(why ?? "") && /no card was moved/.test(why ?? "") && incompleteRead({ issues: { complete: true } }) === null,
+    "a list read in part stops the sync before any card moves", String(why));
+}
+
+// ── a closed task is Done, even when its phase is gone from the plan ─────────
+{
+  const cards = new Map([[1, { item: "a", state: "CLOSED" }], [2, { item: "b", state: "CLOSED" }], [3, { item: "c", state: "OPEN" }]]);
+  const done = closedCards(cards, new Set([1]));
+  check(done.length === 1 && done[0].number === 2,
+    "a closed task no open phase lists any more still goes to Done", JSON.stringify(done));
+}
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

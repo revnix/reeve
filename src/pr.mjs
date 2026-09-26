@@ -1077,7 +1077,11 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = "o
  * completed run, as the shadow supersede above does, and the run keeps its
  * identity, so the next publish finds it again. A second run left in progress
  * might not be the one that publish updates, and would hold the check for ever.
- * With no `id`, reeve's own latest run under the name at the head is looked up.
+ * The run cancelled is reeve's LATEST under the name at the head, looked up
+ * each time, which is the one a required check reads. The one on record may
+ * not be it: a publication that couldn't read the runs made a new one, and its
+ * record may not have been written. When the runs can't be read, the one on
+ * record is cancelled all the same, and it isn't reported as done.
  *
  * The run's text shows on the watched repository's pull requests, so it names
  * the merge policy, never reeve.
@@ -1086,17 +1090,20 @@ export async function withdrawVerdict({ nwo, head, name, id = null, why,
                                         auth: authenticateAs = authenticate, api = apiAsInstallation }) {
   const auth = await authenticateAs(nwo);
   if (!auth.ok) return { ok: false, why: auth.why };
-  let run = id;
-  if (run == null) {
-    const runs = existingRuns(auth.token, nwo, head, [name], api);
-    if (!runs) return { ok: false, why: `the check runs at ${head.slice(0, 8)} couldn't be read` };
-    run = runs.mine[name]?.id ?? null;
-    // Nothing of reeve's stands there, so there is nothing to take back.
-    if (run == null) return { ok: true, id: null };
-  }
-  const res = api(auth.token, ["-X", "PATCH", `repos/${nwo}/check-runs/${run}`, "-f", "status=completed", "-f", "conclusion=cancelled",
+  const cancel = (run) => api(auth.token, ["-X", "PATCH", `repos/${nwo}/check-runs/${run}`, "-f", "status=completed", "-f", "conclusion=cancelled",
     "-f", `output[title]=${`Withdrawn: ${why}`.slice(0, 250)}`,
     "-f", `output[summary]=The merge policy withdrew its result here: ${why}. A withdrawn result doesn't pass. It publishes a new one once it can check this pull request again.`]);
+  const runs = existingRuns(auth.token, nwo, head, [name], api);
+  if (!runs) {
+    const unread = `the check runs at ${head.slice(0, 8)} couldn't be read`;
+    if (id == null) return { ok: false, why: unread };
+    const res = cancel(id);
+    return { ok: false, why: res.ok ? `${unread}, so a later run of reeve's there may still pass` : String(res.err ?? "").split("\n")[0] };
+  }
+  const run = runs.mine[name]?.id ?? null;
+  // Nothing of reeve's stands there, so there is nothing to take back.
+  if (run == null) return { ok: true, id: null };
+  const res = cancel(run);
   if (!res.ok) return { ok: false, why: String(res.err ?? "").split("\n")[0] };
   return { ok: true, id: run };
 }

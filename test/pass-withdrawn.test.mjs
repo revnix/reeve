@@ -412,6 +412,39 @@ test("a withdrawal the store couldn't record is reported, not taken as done", as
   assert.equal(left.length, 2, JSON.stringify(left));
 });
 
+test("a withdrawal cancels reeve's latest run at the head, not only the one on record", async () => {
+  const auth = async () => ({ ok: true, token: "t" });
+  const listing = (id) => JSON.stringify({ name: "ops/merge-policy", id, conclusion: "success", app: "merge-policy" });
+  // The record names run 55, and a later publication at the head made run 77.
+  const calls = [];
+  const api = (_token, args) => { calls.push(args); return args.some((x) => /check-runs\?/.test(x)) ? { ok: true, out: listing(77) } : { ok: true, out: JSON.stringify({ id: 77 }) }; };
+  const r = await pr.withdrawVerdict({ nwo: NWO, head: headOf(7), name: "ops/merge-policy", id: 55, why: "the merge policy stopped", auth, api });
+  assert.equal(r.ok, true);
+  assert.ok(calls.some((x) => x.includes("PATCH") && x.includes(`repos/${NWO}/check-runs/77`)), JSON.stringify(calls));
+  // The runs can't be read: the one on record is cancelled all the same, and it isn't done.
+  const blind = [];
+  const api2 = (_token, args) => { blind.push(args); return args.some((x) => /check-runs\?/.test(x)) ? { ok: false, err: "HTTP 502" } : { ok: true, out: JSON.stringify({ id: 55 }) }; };
+  const r2 = await pr.withdrawVerdict({ nwo: NWO, head: headOf(7), name: "ops/merge-policy", id: 55, why: "the merge policy stopped", auth, api: api2 });
+  assert.equal(r2.ok, false);
+  assert.ok(blind.some((x) => x.includes("PATCH") && x.includes(`repos/${NWO}/check-runs/55`)), JSON.stringify(blind));
+});
+
+test("a tick that throws withdraws every PASS reeve has standing before the daemon sleeps", async () => {
+  const { ctx, withdrawn } = setup();
+  await daemon.tick(ctx);
+  let ticks = 0;
+  // Stopped by its second tick, or after five seconds whatever it does.
+  const deadline = setTimeout(() => process.emit("SIGTERM"), 5000);
+  await daemon.run({ ...ctx, intervalMs: 20, tick: async () => {
+    if (++ticks === 1) throw new Error("database is locked");
+    process.emit("SIGTERM");   // the second tick ends the daemon
+    return { halted: false };
+  } });
+  clearTimeout(deadline);
+  const onThrow = withdrawn.filter((w) => /couldn't finish/.test(w.why));
+  assert.deepEqual(prsOf(onThrow), [7, 8], JSON.stringify(withdrawn));
+});
+
 test("a publish that throws doesn't end the tick: the pull requests after it are still published", async () => {
   const published = [];
   const { ctx } = setup({ publish: async (args) => {
@@ -546,6 +579,19 @@ test("a stopped daemon tries to withdraw every PASS it has standing before it ex
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
   }
+});
+
+test("the unit's ExecStopPost reads the same store as its ExecStart: the same repository, home, database and log", () => {
+  const unit = readFileSync(join(ROOT, "deploy", "reeve.service"), "utf8");
+  // The repository and the options that say where reeve keeps its state.
+  const where = (line) => {
+    const args = line.trim().split(/\s+/).slice(3);
+    const at = (flag) => { const i = args.indexOf(flag); return i >= 0 ? args[i + 1] ?? "" : null; };
+    return { repo: args.find((x) => /^[\w.-]+\/[\w.-]+$/.test(x)) ?? null, home: at("--home"), db: at("--db"), log: at("--log"), profile: at("--profile") };
+  };
+  const start = /^ExecStart=(.*)$/m.exec(unit)?.[1], after = /^ExecStopPost=(.*)$/m.exec(unit)?.[1];
+  assert.ok(start && after, "control: the unit has both");
+  assert.deepEqual(where(after), where(start));
 });
 
 test("reeve withdraw, which systemd runs after the daemon however it stopped, tries every PASS left standing and says which failed", () => {

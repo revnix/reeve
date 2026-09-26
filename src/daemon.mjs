@@ -3830,12 +3830,17 @@ export async function run(ctx) {
 
   for (;;) {
     try {
-      const r = await tick(ctx);
+      // `ctx.tick` for a test that needs a tick to throw; production's is tick().
+      const r = await (ctx.tick ?? tick)(ctx);
       if (r.halted) { log(logPath, "halted — sleeping until the marker is removed"); }
     } catch (e) {
       // A tick that throws must not kill the daemon: launchd would restart it on a
       // 10s floor and the failure would repeat invisibly.
       log(logPath, `tick threw: ${e.stack?.split("\n").slice(0, 3).join(" | ") ?? e.message}`);
+      // Nor leave its PASSes standing while it sleeps (#161). A tick that threw
+      // didn't finish re-checking, and one that throws every time never would.
+      // The next tick that finishes publishes them again.
+      tellStuck(ctx, await withdrawStanding(ctx, "the merge policy couldn't finish checking this repository"));
     }
     if (stop) break;
     await new Promise(r => { const t = setTimeout(r, intervalMs); wake = () => { clearTimeout(t); r(); }; });

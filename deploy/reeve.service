@@ -3,6 +3,8 @@
 #
 # Before installing, edit ExecStart: `run nextlyhq/nextly` names the repository
 # the daemon watches, so change it to yours, and ExecStopPost's to the same one.
+# ExecStopPost must read the same store as ExecStart, so give it the same
+# --home, --db, --log and --profile as ExecStart, if ExecStart has any.
 # Change the node and checkout paths too if they live elsewhere.
 #
 # Install (README, "Running it unattended"):

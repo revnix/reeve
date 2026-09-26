@@ -1,3 +1,4 @@
+// @ts-check
 // verdict — the single answer to "may this revision merge?"
 //
 // The whole design rests on one inversion: reeve does not merge. It computes this

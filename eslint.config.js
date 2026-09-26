@@ -1,11 +1,17 @@
 /**
- * Lint configuration. One local rule, and nothing else on by default.
+ * Lint configuration. One local rule, two of ESLint's own, and nothing else on
+ * by default.
  *
  * No recommended set: this repository has a suite that is the authority on
  * behaviour, and turning on a hundred stylistic rules at once would bury the one
  * rule that exists for a measured defect. Rules are added here when something has
- * actually gone wrong, the way this one was.
+ * actually gone wrong, the way these were (#153): a missing import, which
+ * no-undef reports, and a variable read before its definition in the same scope,
+ * which no-use-before-define reports. Functions are hoisted and a function may
+ * read a variable its scope defines further down, so neither of those is
+ * flagged: the rule is kept to the use that throws.
  */
+import globals from "globals";
 import noUrlPathname from "./tools/eslint-rules/no-url-pathname.js";
 
 export default [
@@ -28,8 +34,8 @@ export default [
     // config resolves for every tracked file under bin/.
     files: ["src/**/*.mjs", "scripts/**/*.mjs", "test/**/*.mjs", "tools/**/*.js",
             "bin/!(*.*)", "bin/*.mjs"],
-    languageOptions: { ecmaVersion: 2024, sourceType: "module" },
+    languageOptions: { ecmaVersion: 2024, sourceType: "module", globals: globals.node },
     plugins: { reeve: { rules: { "no-url-pathname": noUrlPathname } } },
-    rules: { "reeve/no-url-pathname": "error" },
+    rules: { "reeve/no-url-pathname": "error", "no-undef": "error", "no-use-before-define": ["error", { functions: false, classes: false, variables: false }] },
   },
 ];

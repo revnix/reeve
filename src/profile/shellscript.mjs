@@ -747,8 +747,15 @@ function builtin(name, args, path, state, ctx) {
     case "exit": {
       if (!args.length) return { ...state.status, stop: true };   // with the status just before
       if (args[0].expansion) return { o: "?", stop: true };
+      // A number both shells read alike is digits, no more than an int holds.
+      // dash refuses any other and exits 2; bash reads 0x1 or 1e0 as no number
+      // at all, and goes on with 2 (#236).
+      if (!/^\d{1,10}$/.test(text[0])) return { o: "?", stop: "maybe" };
       const n = Number(text[0]);
-      if (!Number.isInteger(n)) return { o: "?", stop: true };
+      if (n > 2147483647) return { o: "?", stop: true };
+      // Given more than one, dash exits with the first, and bash 5.3 exits 1.
+      if (args.length > 1) return n % 256 === 0 ? { o: "?", stop: true }
+        : { ...failing(`always fails: it exits ${n}, or 1 in a shell that refuses its other arguments`), stop: true };
       return n % 256 === 0 ? { o: "ok", stop: true } : { ...failing(`always fails: it exits ${n}`), stop: true };
     }
     case "set":
@@ -788,11 +795,7 @@ function builtin(name, args, path, state, ctx) {
         if (state.pathReadonly !== true && operands.some((w) => assignment(w, ctx.shell)?.name === "PATH" || w.expansion)) state.path = null;
         if (name === "readonly" && state.pathReadonly === false
             && operands.some((w) => (assignment(w, ctx.shell)?.name ?? w.text) === "PATH" || w.expansion)) state.pathReadonly = "maybe";
-        // It succeeds in both when it assigns nothing but a writable PATH: bash
-        // assigns, and dash lists. Another name may be read-only, as bash's EUID
-        // is, and then bash fails where dash doesn't.
-        const onlyPath = operands.every((w) => !w.expansion && (assignment(w, ctx.shell)?.name ?? "PATH") === "PATH");
-        return onlyPath && state.pathReadonly === false ? OK : UNKNOWN;
+        return UNKNOWN;
       }
       for (const w of args.slice(k)) {
         const a = assignment(w, ctx.shell);
@@ -888,13 +891,35 @@ function builtin(name, args, path, state, ctx) {
   }
 }
 
+// Builtins that surely succeed: true and :, which take nothing they can refuse,
+// and command, whose status is the command it runs. Any other can fail in a way
+// the reader doesn't follow: a read-only variable, a name or an option it
+// refuses, a write that fails, or a version of the shell. So its status is
+// unsure, though what it changes is still followed, and so is a failure that
+// is certain (#236).
+const SUCCEEDS = new Set(["true", ":", "command"]);
+
+// What two readings of one command leave, where the shells that may run the
+// script read it differently: what both leave, and unknown where they differ.
+function merged(state, a, b) {
+  state.path = a.path === b.path ? a.path : null;
+  state.cwd = a.cwd === b.cwd ? a.cwd : null;
+  state.errexit = a.errexit === b.errexit ? a.errexit : "maybe";
+  state.pipefail = a.pipefail === b.pipefail ? a.pipefail : "maybe";
+  state.pathReadonly = a.pathReadonly === b.pathReadonly ? a.pathReadonly : "maybe";
+  state.trapped = a.trapped || b.trapped;
+  state.mutated = a.mutated || b.mutated;
+}
+
 /**
  * One command's words, after its leading assignments: a keyword, a builtin, a
  * wrapper or a program. After `command`, `exec` or a wrapper, a word shaped like
  * an assignment is a program's name, and so is a reserved word: `named` says
- * the words follow `command`.
+ * the words follow `command`. `first` says the command's name is the first word
+ * of its pipeline, the one place bash takes `time` for its own: after a `|`, an
+ * assignment or a redirection, it runs the program (#236).
  */
-function command(words, path, state, ctx, named = false) {
+function command(words, path, state, ctx, named = false, first = false) {
   const [name, ...args] = words;
   if (name.expansion || name.glob) return { o: "?", mutates: true };
   const shell = ctx.shell;
@@ -902,29 +927,39 @@ function command(words, path, state, ctx, named = false) {
   if (named && !shell?.builtins.has(name.text)) return program(words, path, state, ctx, true);
   if (!name.quoted && shell?.keywords.has(name.text)) {
     if (name.text !== "time") return { o: "?", opaque: true };
+    if (!first || name.afterRedirection) return program(words, path, state, ctx);
     // The shell's own `time` times the command after it, assignments and all.
     let k = 0;
     while (args[k]?.text === "-p") k++;
     if (args[k]?.text === "--") k++;
-    const timed = args.length > k ? simple(args.slice(k), state, ctx) : OK;
     // Where only some of the shells that may run the script have `time` as a
     // keyword, it is a program in the others, which a local one may shadow:
-    // read it both ways, and take what both say (#228).
-    if (shell.allKeywords && !shell.allKeywords.has("time")) {
-      const asProgram = program(words, path, { ...state }, ctx);
-      return { ...either(timed, asProgram), mutates: Boolean(timed.mutates || asProgram.mutates) };
-    }
-    return timed;
+    // read it both ways, each on a state of its own, and take what both say
+    // (#228, #236).
+    const both = shell.allKeywords && !shell.allKeywords.has("time");
+    const kept = both ? { ...state } : state;
+    const timed = args.length > k ? simple(args.slice(k), kept, ctx) : OK;
+    if (!both) return timed;
+    const apart = { ...state };
+    const asProgram = program(words, path, apart, ctx);
+    merged(state, kept, apart);
+    const stops = (r) => r.stop ?? false;
+    return { ...either(timed, asProgram), mutates: Boolean(timed.mutates || asProgram.mutates),
+             stop: stops(timed) === stops(asProgram) ? stops(timed) : "maybe", opaque: Boolean(timed.opaque || asProgram.opaque) };
   }
   if (shell?.builtins.has(name.text)) {
     const r = builtin(name.text, args, path, state, ctx);
-    return PURE.has(name.text) ? r : { ...r, mutates: true };
+    const status = r.o === "ok" && r.stop !== true && !SUCCEEDS.has(name.text) ? { ...r, o: "?" } : r;
+    return PURE.has(name.text) ? status : { ...status, mutates: true };
   }
   return program(words, path, state, ctx);
 }
 
-/** One simple command in `state`: its leading assignments, then its command. */
-function simple(words, state, ctx) {
+/**
+ * One simple command in `state`: its leading assignments, then its command.
+ * `first` says it begins its pipeline.
+ */
+function simple(words, state, ctx, first = true) {
   if (!words.length) return OK;
   let k = 0, path = state.path;
   for (let a; k < words.length && (a = assignment(words[k], ctx.shell)); k++) if (a.name === "PATH") path = literalPath(a.value);
@@ -945,7 +980,7 @@ function simple(words, state, ctx) {
     const r = command(words.slice(k), state.pathReadonly === true ? state.path : null, state, ctx);
     return { ...(r.o === "fail" ? r : UNKNOWN), mutates: r.mutates, stop: "maybe" };
   }
-  return command(words.slice(k), path, state, ctx);
+  return command(words.slice(k), path, state, ctx, false, first && k === 0);
 }
 
 // Keywords that continue or close a compound. Before any compound is open, one
@@ -974,6 +1009,20 @@ function commands(tokens, ctx) {
     const has = ctx.shell?.syntax?.[t.syntax];
     return has === true ? [t] : has === false ? t.otherwise : [{ t: "unsure" }];
   };
+  // Whether a reserved word counts after `words`: first in a command, or after
+  // the `!` that inverts its pipeline, or after `time`, with its -p or --,
+  // where a shell that may run the script takes it for its own, at the start
+  // of a pipeline and with no redirection before it (#236).
+  const counts = (words) => {
+    let timed = false;
+    for (const w of words) {
+      if (w.quoted) return false;
+      if (w.text === "!") continue;
+      if (w.text === "time" && ctx.shell?.keywords.has("time") && !w.afterRedirection && list.at(-1)?.op !== "|") { timed = true; continue; }
+      if (!timed || (w.text !== "-p" && w.text !== "--")) return false;
+    }
+    return true;
+  };
   for (const t of tokens.flatMap(reading)) {
     if (t.t === "error") return syntaxError(`${ctx.shell.name} has no ${t.what}`);
     if (t.t === "unsure") {
@@ -983,9 +1032,7 @@ function commands(tokens, ctx) {
     }
     if (t.t === "word") {
       const { words } = cmd;
-      // A reserved word counts first in a command, or after the `!` that
-      // inverts its pipeline.
-      const leading = words.length === 0 || (words.length === 1 && !words[0].quoted && words[0].text === "!");
+      const leading = counts(words);
       if (leading && !t.quoted && ctx.shell?.keywords.has(t.text) && CLOSERS.has(t.text))
         return syntaxError(`'${t.text}' closes nothing`);
       // A keyword opening a compound, or a subshell, spans what follows: from
@@ -994,7 +1041,9 @@ function commands(tokens, ctx) {
         list.push({ opaque: true, op: null });
         return list;
       }
-      words.push(t);
+      // After a redirection, no word is a reserved one: bash runs a program
+      // called time there.
+      words.push(cmd.redirs ? { ...t, afterRedirection: true } : t);
       cmd.subst ||= t.subst;
       cmd.expansion ||= t.expansion;
     } else if (t.t === "redir") {
@@ -1025,10 +1074,11 @@ function commands(tokens, ctx) {
 }
 
 const either = (a, b) => (a.o === b.o ? (a.o === "fail" ? a : b) : UNKNOWN);
-const inverted = (r) => {
-  const o = r.o === "ok" ? "fail" : r.o === "fail" ? "ok" : "?";
-  return { ...r, o, why: o === "fail" ? "always fails: '!' inverts a pipeline that succeeds" : null, negated: true };
-};
+// `!` makes a pipeline that fails succeed. It never makes one that the reader
+// takes to succeed a failure: a builtin can fail for a read-only variable, a
+// name, an option or a version the reader doesn't follow, and then the script
+// passes. So only a failure is ever inverted (#236).
+const inverted = (r) => ({ ...r, o: r.o === "fail" ? "ok" : "?", why: null, negated: true });
 
 // A command that writes nothing, which the next closing the pipe can't stop:
 // `true`, `:` or `exit`, or assignments alone, though a pipeline doubts an
@@ -1038,16 +1088,13 @@ const writesNothing = (cmd, shell) => {
   return !word || (!word.expansion && ["true", ":", "exit"].includes(word.text));
 };
 
-// Builtins whose operands the shell assigns, as it does a leading assignment.
-const ASSIGNING = new Set(["export", "readonly", "declare", "typeset", "local"]);
 // Whether a command assigns: a word shaped like an assignment before its name,
-// or an operand of one of those builtins. After any other name, `X=1` is an
-// argument, and `true X=1` assigns nothing.
+// or nothing but assignments. After a name, `X=1` is an argument, and `true
+// X=1` assigns nothing. A builtin that assigns its operands, export say, never
+// surely succeeds anyway (#236).
 const assigns = (cmd, shell) => {
   const k = cmd.words.findIndex((w) => !assignment(w, shell));
-  if (k > 0 || (k < 0 && cmd.words.length)) return true;
-  const name = cmd.words[0];
-  return Boolean(name && !name.quoted && ASSIGNING.has(name.text) && cmd.words.slice(1).some((w) => assignment(w, shell)));
+  return k > 0 || (k < 0 && cmd.words.length > 0);
 };
 
 // A command whose redirection may fail: then it doesn't run, and fails. So it
@@ -1086,7 +1133,7 @@ function pipeline(list, i, state, ctx) {
   // The commands of a pipeline run apart and at once: none changes the shell's
   // own state or makes another's program in time to count, and the last one's
   // status is the pipeline's.
-  const run = (k) => redirected(list[k], simple(list[k].words, { ...state, mutated: state.mutated || list[k].subst }, ctx));
+  const run = (k) => redirected(list[k], simple(list[k].words, { ...state, mutated: state.mutated || list[k].subst }, ctx, k === i));
   // Each runs in a subshell of its own, where an expansion that fails, $((1/0))
   // or ${x:?}, fails that command rather than ending the script, and so does an
   // assignment to a read-only variable, as bash's own EUID and UID are. So one

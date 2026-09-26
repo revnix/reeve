@@ -18,7 +18,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { canaryScript, linuxProbeTargets, sandboxCanary } from "../src/canary.mjs";
+import { canaryIdFor, canaryScript, instrumentHash, linuxProbeTargets, probeShapeOf, sandboxCanary } from "../src/canary.mjs";
 import { cheapContainmentReasons } from "../src/containment.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
@@ -92,6 +92,17 @@ test("a Linux canary passes when every probe held and each control ran", async (
   assert.deepEqual(r.evidence.linux.targets, { mntFile: everything.mntFile, windowsExe: null, bus: everything.bus });
 });
 
+test("a Linux canary records the id its cache is looked in under, with the probes it ran in both", async () => {
+  // measureContainment builds its cache key from the targets it found, and the
+  // canary records its id from the targets it ran. They must be one value, or a
+  // pass is stored under an id nothing looks for (#156).
+  const r = await run();
+  assert.equal(r.ok, true, r.why);
+  const key = canaryIdFor({ cliVersion: base.cliVersion, sandbox: base.sandbox, worktree: base.dir, permissionsDeny: base.permissionsDeny,
+                            instrument: instrumentHash({ hasNet: true }), probes: probeShapeOf(everything) });
+  assert.equal(r.id, key);
+});
+
 test("a worker that can create a Unix socket fails the Linux canary: the socket filter is not in force", async () => {
   const r = await run({ leak: ["unix_socket"] });
   assert.equal(r.ok, false);
@@ -137,7 +148,8 @@ test("a shape the host doesn't have isn't probed, and the evidence says why", as
 });
 
 test("the gate accepts Linux as it does macOS, and still refuses a platform never measured", () => {
-  const reasons = (platform) => cheapContainmentReasons({ platform, isolated: true, keychain: { measured: false, items: [] } }).reasons;
+  // A mount table of its own, so the simulated Linux host doesn't need /proc.
+  const reasons = (platform) => cheapContainmentReasons({ platform, isolated: true, keychain: { measured: false, items: [] }, mounts: "" }).reasons;
   assert.deepEqual(reasons("linux"), []);
   assert.deepEqual(reasons("darwin"), []);
   assert.match(reasons("win32").join(" "), /unmeasured on win32/);

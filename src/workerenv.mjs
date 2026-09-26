@@ -194,7 +194,11 @@ export function workerTmpDir(stateDir) {
 export function tmpDirTooLong(tmpDir, platform = process.platform) {
   const bytes = Buffer.byteLength(tmpDir);
   if (platform !== "linux" || bytes <= TMPDIR_MAX) return null;
-  return `the worker's TMPDIR, ${tmpDir}, is ${bytes} bytes, and the sandbox's sockets there need it at ${TMPDIR_MAX} or fewer; set REEVE_HOME to a shorter path`;
+  // It sits under reeve's state folder, which is REEVE_HOME's, or --log's where
+  // the log is kept elsewhere; naming only REEVE_HOME sent the operator to a
+  // setting that can't change it.
+  return `the worker's TMPDIR, ${tmpDir}, is ${bytes} bytes, and the sandbox's sockets there need it at ${TMPDIR_MAX} or fewer. ` +
+         `It sits under reeve's state folder, ${dirname(dirname(tmpDir))}: move that to a shorter path, with REEVE_HOME, or with --log where the log is kept elsewhere`;
 }
 
 /**

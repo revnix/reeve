@@ -15,7 +15,7 @@
 // a write to the run's own tmp), so an absent file means "denied", not
 // "the script never ran".
 import { runWorker, workerArgs } from "./supervisor.mjs";
-import { validateSettings, ruleFor, scopedFileTools, carveOuts } from "./sandbox.mjs";
+import { validateSettings, ruleFor, scopedFileTools, carveOuts, windowsDriveRoots } from "./sandbox.mjs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer, connect } from "node:net";
@@ -38,7 +38,7 @@ const canonical = v => {
  * every run and says nothing about what the sandbox denies.
  */
 export function canaryIdFor({ cliVersion, sandbox, binaryId = null, worktree = null, permissionsDeny = null, allowedTools = null,
-                              instrument = null }) {
+                              instrument = null, probes = null }) {
   if (!cliVersion || !sandbox) throw new Error("canaryIdFor: cliVersion and the sandbox block are required");
   // The INSTRUMENT is part of the identity too. A record made before a probe
   // existed describes a weaker measurement than the one being asked for now, and
@@ -54,8 +54,16 @@ export function canaryIdFor({ cliVersion, sandbox, binaryId = null, worktree = n
   // never invalidated a cached pass. The normalised hash is stable, so one value
   // serves as both. (Codex #10-[4] adjacent; found while measuring it.)
   return createHash("sha256").update(
-    `${cliVersion}\n${binaryId ?? "?"}\n${canonical(normalisePolicy(sandbox, worktree))}\n${canonical(normaliseRules(permissionsDeny, worktree))}\n${canonical(normaliseRules(allowedTools, worktree))}\n${instrument ?? "?"}`,
+    `${cliVersion}\n${binaryId ?? "?"}\n${canonical(normalisePolicy(sandbox, worktree))}\n${canonical(normaliseRules(permissionsDeny, worktree))}\n${canonical(normaliseRules(allowedTools, worktree))}\n${instrument ?? "?"}` +
+    // Which of the Linux probes the host let the canary run (#156). Appended only
+    // when given, so an id without them is unchanged.
+    (probes ? `\n${canonical(probes)}` : ""),
   ).digest("hex").slice(0, 16);
+}
+
+/** Which Linux probes a canary with these targets runs: the part of them that belongs in its id. */
+export function probeShapeOf(targets) {
+  return targets ? { mnt: !!targets.mntFile, interop: !!targets.windowsExe, bus: !!targets.bus } : null;
 }
 
 /**
@@ -337,13 +345,17 @@ echo done
  *                 daemon can connect to it.
  */
 export async function linuxProbeTargets({ uid = process.getuid?.(), node = process.execPath,
-                                          mntCandidates = ["/mnt/c/Windows/System32/drivers/etc/hosts", "/mnt/reeve-escape-decoy.txt"],
-                                          windowsExe = "/mnt/c/Windows/System32/cmd.exe", connectTimeoutMs = 2_000 } = {}) {
+                                          // Every Windows drive, wherever it's mounted, as the policy denies them (#156).
+                                          driveRoots = windowsDriveRoots() ?? [],
+                                          mntCandidates = [...driveRoots.map(r => join(r, "Windows", "System32", "drivers", "etc", "hosts")), "/mnt/reeve-escape-decoy.txt"],
+                                          windowsExe = driveRoots.map(r => join(r, "Windows", "System32", "cmd.exe")).find(f => existsSync(f)) ?? "/mnt/c/Windows/System32/cmd.exe",
+                                          connectTimeoutMs = 2_000 } = {}) {
   const readable = f => { try { accessSync(f, constants.R_OK); return statSync(f).isFile(); } catch { return false; } };
   const skipped = {};
+  const searched = [...new Set(["/mnt", ...driveRoots])];
   const mntFile = mntCandidates.find(readable)
-    ?? (spawnSync("sh", ["-c", "find /mnt -maxdepth 3 -type f -readable -print -quit 2>/dev/null"], { encoding: "utf8", timeout: 10_000 }).stdout?.trim() || null);
-  if (!mntFile) skipped.mnt = "nothing under /mnt is readable on this host";
+    ?? (spawnSync("find", [...searched, "-maxdepth", "3", "-type", "f", "-readable", "-print", "-quit"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }).stdout?.trim().split("\n")[0] || null);
+  if (!mntFile) skipped.mnt = "nothing on a Windows drive or under /mnt is readable on this host";
   const exeRuns = existsSync(windowsExe) && spawnSync(windowsExe, ["/c", "exit 0"], { stdio: "ignore", timeout: 15_000 }).status === 0;
   if (!exeRuns) skipped.interop = "no Windows interop on this host";
   const busPath = Number.isInteger(uid) ? `/run/user/${uid}/bus` : null;
@@ -611,7 +623,7 @@ export async function sandboxCanary({
   // value. The two can only disagree when a listener was handed over and failed
   // to bind, and a canary whose network control is missing fails on that alone.
   const id = canaryIdFor({ cliVersion, sandbox, binaryId, worktree: dir, permissionsDeny, allowedTools,
-                           instrument: instrumentHash({ hasNet: !!netProbe }) });
+                           instrument: instrumentHash({ hasNet: !!netProbe }), probes: probeShapeOf(linux) });
   const evidence = { id, cliVersion, dir, outcome: null, why: null, results: null, readTool: null, writeTool: null, network: null };
   const fail = why => ({ ok: false, id, why, evidence });
 

@@ -97,7 +97,7 @@ test("a worker whose TMPDIR leaves no room for the sandbox's sockets isn't start
 test("the canary's worker gets a short TMPDIR under reeve's home too", async () => {
   const stateDir = tempDir("rc-");
   const seen = {};
-  const ctx = { logPath: join(stateDir, "reeve.log"), platform: "linux", isolationReady: () => true,
+  const ctx = { logPath: join(stateDir, "reeve.log"), platform: "linux", isolationReady: () => true, mounts: "",
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "2.1.278 (Claude Code)",
     oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
     netProbe: { url: "http://127.0.0.1:1/canary", selfReachable: () => true, wasHit: () => false },
@@ -115,6 +115,14 @@ test("a TMPDIR's room is counted in bytes, as the kernel counts a socket's path"
   assert.ok(workerenv.tmpDirTooLong(wide, "linux"), "a TMPDIR over the room in bytes was let through");
   assert.match(workerenv.tmpDirTooLong(wide, "linux"), /81 bytes/);
   assert.equal(workerenv.tmpDirTooLong("/" + "e".repeat(40), "linux"), null, "control: the same length in plain characters fits");
+});
+
+test("a TMPDIR with no room names the state folder it sits under, which --log can put outside REEVE_HOME", () => {
+  const state = "/" + "s".repeat(70);
+  const why = workerenv.tmpDirTooLong(join(state, "t", "0123456789ab"), "linux");
+  assert.ok(why, "control: it's past the room");
+  assert.ok(why.includes(state), `it doesn't name the state folder: ${why}`);
+  assert.match(why, /--log/, "it names only REEVE_HOME, which --log can make beside the point");
 });
 
 test("a run's TMPDIR is removed even when the run can't be closed", async () => {

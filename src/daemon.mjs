@@ -20,13 +20,13 @@ import { nextAction, describe, ACTIONS, ESCALATIONS } from "./watcher.mjs";
 import { POLICY_CONTEXT, reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, isSameProcess, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
-import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf, siblingRootsOf, hostEscapePaths } from "./sandbox.mjs";
+import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf, siblingRootsOf, hostEscapePaths, worktreeRootOf, linkFree } from "./sandbox.mjs";
 import { verifyConfig, GIT_NEUTRALISE, gitEnv } from "./gitguard.mjs";
 import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor, commitRunWork, digestOf } from "./checkout.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor, workerTmpDir } from "./workerenv.mjs";
 import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
-import { canaryIdFor, netListener, instrumentHash } from "./canary.mjs";
+import { canaryIdFor, netListener, instrumentHash, linuxProbeTargets, probeShapeOf } from "./canary.mjs";
 import { claimProvider, releaseProvider, bindProviderLease, noteRateLimit, heartbeatProvider,
          reapProviderLeases, cancelQueued, queuedGuardianRequests } from "./provider.mjs";
 import { openHold } from "./build/holds.mjs";
@@ -46,7 +46,7 @@ import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
 import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
 import { execFileSync, spawn } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, readFileSync, writeFileSync, rmSync, openSync, closeSync, readSync, unlinkSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
@@ -526,7 +526,14 @@ function changedFiles(worktree, since = null, ref = "HEAD") {
  * (Codex #4e-[5].)
  */
 export /** The daemon's log path, always absolute: everything else is derived from it. */
-function logPathOf(ctx) { return ctx.logPath ? resolve(ctx.logPath) : "/tmp/x"; }
+function logPathOf(ctx) {
+  if (!ctx.logPath) return "/tmp/x";
+  // Its folder at its target on Linux: the state roots and every worker's TMPDIR
+  // are built under it, and a sandbox path through a link is one bubblewrap
+  // can't mount a deny over, or a grant the deny doesn't name (#156).
+  const p = resolve(ctx.logPath);
+  return join(linkFree(dirname(p)), basename(p));
+}
 
 export function stateRootsFor(stateDir, logPath, worktree, dbPath = null) {
   const under = (p, child) => child === p || child.startsWith(p.endsWith("/") ? p : p + "/");
@@ -572,8 +579,9 @@ export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSp
   // same defect again. Removing the copy removes the class.
   const cache = (ctx.containmentCache ??= new Map());
   try {
-    const root = profile.identity?.worktreeRoot;
-    if (!root || !isAbsolute(root)) return { credentialRead: "open", why: "no absolute identity.worktreeRoot to run the canary under" };
+    if (!profile.identity?.worktreeRoot || !isAbsolute(profile.identity.worktreeRoot)) return { credentialRead: "open", why: "no absolute identity.worktreeRoot to run the canary under" };
+    // At its target on Linux, as every root the sandbox is given (#156).
+    const root = worktreeRootOf(profile);
     // Cheap gates FIRST: on a host where the verdict is already open, preparing a
     // canary would create a per-invocation tmp tree every tick that nothing then
     // cleans up, because the canary itself never runs. (Codex #4e-[9].)
@@ -585,7 +593,7 @@ export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSp
     const isolated = mode === "scratch-home" && (ctx.isolationReady ?? isolationTopologyReady)();
     if (mode === "dedicated-user") log(logPath, `  containment: worker.isolation is "dedicated-user", which is not built; use "scratch-home"`);
     const cheapKc = typeof ctx.keychain === "function" ? await ctx.keychain() : ctx.keychain ?? null;
-    const cheap = cheapContainmentReasons({ platform: ctx.platform ?? process.platform, isolated, keychain: cheapKc });
+    const cheap = cheapContainmentReasons({ platform: ctx.platform ?? process.platform, isolated, keychain: cheapKc, mounts: ctx.mounts });
     if (cheap.reasons.length) {
       return { credentialRead: "open", why: cheap.reasons.join("; "),
                canary: { ok: false, id: null, why: "not run: containment is already open for a cheaper reason", skipped: true },
@@ -612,14 +620,16 @@ export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSp
       // `~/.reeve` while the policy denied the home the operator named, so the
       // canary measured a file the sandbox had no rule about and could report
       // containment CLOSED for a policy that closed nothing.
-      decoyPath: join(resolveHome(), "canary", nwo.replace("/", "-"), `decoy-${process.pid}-${Date.now()}.txt`),
+      // At its target on Linux too, where the policy denies REEVE_HOME: a decoy
+      // under the link's spelling is under no deny, and the canary can't run (#156).
+      decoyPath: join(linkFree(resolveHome()), "canary", nwo.replace("/", "-"), `decoy-${process.pid}-${Date.now()}.txt`),
     };
     // The block every worker gets; the canary's id covers it, so a block that
     // changes (a new deny, a new domain) is measured again before it is trusted.
     // The reeve-owned trees are denied to workers too; the canary proves the
     // block that includes them. (Codex #4d-[15], #4e-[5].)
     const stateRoots = stateRootsFor(stateDir, logPathOf(ctx), canaryPaths.dir, ctx.dbPath ?? null);
-    const policy = sandboxFor({ profile, action: "FIX_CI", worktree: canaryPaths.dir, tmpDir: canaryPaths.tmpDir, stateRoots });
+    const policy = sandboxFor({ profile, action: "FIX_CI", worktree: canaryPaths.dir, tmpDir: canaryPaths.tmpDir, stateRoots, mounts: ctx.mounts });
     // A root the policy denies would deny the canary its own script, so it could
     // never pass. Named as the layout it is, before anything is written under the
     // root (#156).
@@ -648,11 +658,14 @@ export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSp
     // dependency, no timing window, and a hit at any point in the run is a leak.
     // (Codex #4d-[12], #4c-[13].) Injectable for tests.
     const netProbe = ctx.netProbe ?? netListener();
+    // The Linux probes' targets, found before the cache is looked in: which of
+    // them the host lets the canary run is part of its id (#156).
+    const linuxTargets = (ctx.platform ?? process.platform) === "linux" ? await (ctx.linuxProbeTargets ?? linuxProbeTargets)() : null;
     // Computed exactly as measureContainment computes it. A cache key that
     // drifts from the id is how every tick came to pay for a five-minute canary.
     const before = cache.get(canaryIdFor({ cliVersion: version, sandbox: policy.settings.sandbox, binaryId, worktree: canaryPaths.dir,
                                            permissionsDeny: policy.settings.permissions.deny, allowedTools: policy.allowedTools,
-                                           instrument: instrumentHash({ hasNet: !!netProbe }) }))?.ok === true;
+                                           instrument: instrumentHash({ hasNet: !!netProbe }), probes: probeShapeOf(linuxTargets) }))?.ok === true;
     if (!before) log(logPath, `containment: running the sandbox canary under ${version}`);
     let c;
     try {
@@ -678,6 +691,7 @@ export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSp
       // seam because the next topology will not be. (Codex #4c-[9].)
       isolated,
       canary: ctx.canary ?? null, keychain: cheap.keychain,
+      mounts: ctx.mounts, linuxTargets,
       });
     } finally {
       // The listener is torn down whatever happened, so a canary run never
@@ -2733,7 +2747,8 @@ export async function tick(ctx) {
       // lease should be held while the (slow) preparation happens rather than
       // leaving a window another daemon could race into. A preparation that
       // fails is handled as one, below: refunded, backed off, nothing published.
-      const checkoutRoot = profile.identity?.worktreeRoot ?? null;
+      // At its target on Linux, so the checkout and the sibling deny agree (#156).
+      const checkoutRoot = worktreeRootOf(profile);
       const repoCheckout = profile.identity?.checkout ?? null;
       if (!checkoutRoot || !repoCheckout) {
         const why = !checkoutRoot ? "no identity.worktreeRoot in the profile" : "no identity.checkout in the profile — a checkout is made FROM a clone";
@@ -3017,7 +3032,7 @@ export async function tick(ctx) {
         // of that directory: the write scope, the quarantine denies and the
         // overlap check all resolve against it.
         const dStateRoots = stateRootsFor(stateDir, logPathOf(ctx), worktree, ctx.dbPath ?? null);
-        const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane, tmpDir, stateRoots: dStateRoots });
+        const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane, tmpDir, stateRoots: dStateRoots, mounts: ctx.mounts });
         // A denied path that CONTAINS the worktree would deny the worker its own
         // code, and the failure would read as a broken sandbox rather than the
         // configuration error it is. (Codex #4g-[4].) Refused before anything is
@@ -3034,7 +3049,7 @@ export async function tick(ctx) {
         const env = workerEnv({ gitConfigPath: writeGitConfig(join(tmpDir, "git")),
                                 tmpDir, bgWaitMs: budgetMs,
                                 extraPath: [dirname(claudeBin)],
-                                home: workerHomeFor(profile.identity?.worktreeRoot ?? dirname(worktree), nwo),
+                                home: workerHomeFor(worktreeRootOf(profile) ?? dirname(worktree), nwo),
                                 oauthToken: dToken.token });
         const outPath = join(runDir, "worker.out"), errPath = join(runDir, "worker.err");
         // Validated BEFORE it is written or hashed. Measured: under -p the CLI
@@ -3052,7 +3067,7 @@ export async function tick(ctx) {
         const sv = (ctx.settingsValidator ?? validateSettings)(sandbox.settings, { tmpDir, stateRoots: dStateRoots, quarantineDenies: qDenies,
                                                                                   extraDenies: notifyCred, sourceCheckout: sourceCheckoutOf(profile),
                                                                                   siblingRoots: siblingRootsOf(profile).filter(r => worktree !== r && !r.startsWith(worktree + "/")),
-                                                                                  worktree });
+                                                                                  worktree, mounts: ctx.mounts });
         if (!sv.ok) throw new Error(`settings invalid: ${sv.errors.join("; ")}`);
         // The settings file is immutable per run, in the run's own directory:
         // a path keyed by PR alone was shared by every daemon on the host, and

@@ -26,7 +26,7 @@
 // was never offered. Any tool that can run a command is a write primitive, so the
 // grant is a CLOSED ALLOWLIST and the denies are belt-and-braces on top of it.
 
-import { existsSync, writeFileSync, mkdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { resolveHome, DEFAULT_HOME } from "./home.mjs";
@@ -255,8 +255,11 @@ export const CREDENTIAL_PATHS = [
  * can apply it; naming them keeps them closed where it can't, and closes the
  * file reads no socket filter sees.
  *
- *   /mnt              WSL mounts the Windows drives here: every Windows user's
- *                     files, and the Windows binaries interop runs.
+ *   /mnt              WSL mounts the Windows drives here by default: every
+ *                     Windows user's files, and the Windows binaries interop runs.
+ *   each drive        wherever else the mount table puts one: `[automount] root`
+ *                     in /etc/wsl.conf moves them all, and `mount -t drvfs` puts
+ *                     one anywhere (#156).
  *   /run/WSL          WSL's interop sockets. A Windows executable started inside
  *                     the sandbox runs through one, OUTSIDE it, wherever the .exe
  *                     came from, one committed to the repository included.
@@ -265,10 +268,33 @@ export const CREDENTIAL_PATHS = [
  *                     command outside the sandbox on request.
  *   /run/dbus         the system bus.
  */
-export function hostEscapePaths({ platform = process.platform, uid = process.getuid?.() } = {}) {
+export function hostEscapePaths({ platform = process.platform, uid = process.getuid?.(), mounts } = {}) {
   if (platform !== "linux") return [];
-  return ["/mnt", "/run/WSL", ...(Number.isInteger(uid) ? [`/run/user/${uid}`] : []), "/run/dbus"];
+  const drives = (windowsDriveRoots(mounts) ?? []).filter(d => d !== "/mnt" && !d.startsWith("/mnt/"));
+  return ["/mnt", ...drives, "/run/WSL", ...(Number.isInteger(uid) ? [`/run/user/${uid}`] : []), "/run/dbus"];
 }
+
+/**
+ * Where the Windows drives are mounted, from the mount table, or null when it
+ * can't be read. A drive shows as drvfs, as 9p with `aname=drvfs` on WSL2
+ * (measured on this host: `C:\134 /mnt/c 9p rw,...,aname=drvfs;path=C:\;...`),
+ * or under any type with a drive letter for its source. WSL's own 9p mounts,
+ * such as its driver store, aren't drives.
+ */
+export function windowsDriveRoots(mounts = readMounts()) {
+  if (mounts == null) return null;
+  const roots = [];
+  for (const line of mounts.split("\n")) {
+    const [source = "", target, type = "", options = ""] = line.split(" ");
+    if (!target) continue;
+    const drvfs = type === "drvfs" || /(^|[,;])aname=drvfs([,;]|$)/.test(options) || /^[A-Za-z]:\\/.test(unescapeMount(source));
+    if (drvfs) roots.push(unescapeMount(target));
+  }
+  return [...new Set(roots)];
+}
+const readMounts = () => { try { return readFileSync("/proc/mounts", "utf8"); } catch { return null; } };
+// The mount table writes a space, a tab, a newline and a backslash as octal.
+const unescapeMount = s => s.replace(/\\([0-7]{3})/g, (_, o) => String.fromCharCode(parseInt(o, 8)));
 // The same list as Read-tool rules: a file is named, a directory gets `/**`.
 const CREDENTIAL_FILE_NAMES = ["~/.claude.json", "~/.gitconfig", "~/.git-credentials", "~/.netrc", "~/.npmrc"];
 const isCredentialFile = p => CREDENTIAL_FILE_NAMES.map(expandTilde).includes(p);
@@ -335,10 +361,6 @@ export function linkFree(p, platform = process.platform) {
   if (platform !== "linux") return p;
   try { return realpathSync(p); } catch { return p; }
 }
-// The Read tool is outside the OS sandbox, and would follow a committed symlink
-// into /mnt/c as readily as into ~/.ssh, so the host's ways out are denied to it
-// too. Every one is a directory.
-const hostEscapeReadDenies = () => hostEscapePaths().map(p => `Read(${ruleFor(p)}/**)`);
 
 /**
  * The clone a worker's checkout was made FROM.
@@ -372,8 +394,20 @@ export function sourceCheckoutOf(profile) {
  * enumeration of the siblings that existed at policy time would not.
  */
 export function siblingRootsOf(profile) {
+  const root = worktreeRootOf(profile);
+  return root?.startsWith("/") ? [root] : [];
+}
+
+/**
+ * `identity.worktreeRoot` as reeve uses it. On Linux an absolute root is taken at
+ * its target, so every path built under it is the target's too: the sibling
+ * deny, a checkout, the canary's folders. Bubblewrap can't mount a deny over a
+ * link, and a grant made through one names a path the deny doesn't (#156).
+ */
+export function worktreeRootOf(profile, platform = process.platform) {
   const root = profile?.identity?.worktreeRoot;
-  return typeof root === "string" && root.startsWith("/") ? [root.replace(/\/+$/, "")] : [];
+  if (typeof root !== "string" || !root) return null;
+  return root.startsWith("/") ? linkFree(root.replace(/\/+$/, "") || "/", platform) : root;
 }
 
 /**
@@ -539,7 +573,7 @@ const denyWriteVerbs = glob =>
  * with its worktree as the working directory, and adding anything to that widens
  * the only boundary keeping it inside its own checkout.
  */
-export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = null, stateRoots: givenRoots = [] }) {
+export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = null, stateRoots: givenRoots = [], mounts }) {
   // At their targets on Linux, as the credential paths are: bubblewrap can't
   // mount over a link, and a REEVE_HOME that is one stopped every sandbox (#156).
   const stateRoots = [...new Set(givenRoots.map(p => linkFree(p)))];
@@ -641,12 +675,16 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
 
   // The OS deny list, built once: the read grant above is derived from it.
 
-  const osDenyRead = [...osCredentialPaths(), ...hostEscapePaths(), ...notifyCred, ...sourceCheckout, ...siblingRoots, ...stateRoots, ...quarantine.paths];
+  // The mount table is read once, so every list below names the same drives.
+  const hostEscapes = hostEscapePaths({ mounts });
+  const osDenyRead = [...osCredentialPaths(), ...hostEscapes, ...notifyCred, ...sourceCheckout, ...siblingRoots, ...stateRoots, ...quarantine.paths];
 
   // The Read tool is not under the OS sandbox, so the credential paths are
   // denied to it here as well; measured to hold for an absolute path and for a
-  // symlink inside the worktree that points at one.
-  deny.push(...credentialReadDenies(), ...hostEscapeReadDenies());
+  // symlink inside the worktree that points at one. So are the host's ways out,
+  // each a directory: it would follow a committed symlink into /mnt/c as readily
+  // as into ~/.ssh.
+  deny.push(...credentialReadDenies(), ...hostEscapes.map(p => `Read(${ruleFor(p)}/**)`));
   // reeve's own state is denied too: with a --log or --db outside ~/.reeve it is
   // not otherwise covered, and a worker could copy another run's output, the
   // event store, or the log into its worktree for reeve to publish.
@@ -739,7 +777,7 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
     // worktree root under /mnt on Linux, where WSL mounts the Windows drives:
     // the policy closes /mnt to every worker (#156).
     stateHomeContainsWorktree: worktree
-      ? [...credentialPaths().map(expandTilde), ...hostEscapePaths(), ...sourceCheckout, ...stateRoots].filter(d => d.startsWith("/") && (worktree === d || worktree.startsWith(d.endsWith("/") ? d : d + "/")))
+      ? [...credentialPaths().map(expandTilde), ...hostEscapes, ...sourceCheckout, ...stateRoots].filter(d => d.startsWith("/") && (worktree === d || worktree.startsWith(d.endsWith("/") ? d : d + "/")))
       : [],
   };
 }
@@ -803,7 +841,7 @@ export function validateToolGrant(allowedTools, { worktree = null } = {}) {
 }
 
 export function validateSettings(settings, { tmpDir = null, stateRoots: givenRoots = [], quarantineDenies = [], extraDenies = [], sourceCheckout = [],
-                                            siblingRoots = [], worktree = null, readCarveOuts = [] } = {}) {
+                                            siblingRoots = [], worktree = null, readCarveOuts = [], mounts } = {}) {
   // Judged as the generator writes them: at their targets on Linux (#156).
   const stateRoots = [...new Set(givenRoots.map(p => linkFree(p)))];
   const errors = [];
@@ -870,7 +908,7 @@ export function validateSettings(settings, { tmpDir = null, stateRoots: givenRoo
         if (JSON.stringify(fs.allowRead) !== JSON.stringify(want))
           errors.push(`sandbox.filesystem.allowRead must be exactly ${want.join(", ")}`);
       }
-      if (strs(fs.denyRead)) for (const c of [...osCredentialPaths(), ...hostEscapePaths(), ...extraDenies, ...sourceCheckout, ...siblingRoots, ...stateRoots, ...quarantineDenies]) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
+      if (strs(fs.denyRead)) for (const c of [...osCredentialPaths(), ...hostEscapePaths({ mounts }), ...extraDenies, ...sourceCheckout, ...siblingRoots, ...stateRoots, ...quarantineDenies]) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
     }
     const net = sb.network;
     if (!isObj(net)) errors.push("sandbox.network must be an object");

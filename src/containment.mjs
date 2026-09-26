@@ -20,7 +20,8 @@
 // open. A probe that cannot run is open. Closed is a conclusion, never a default.
 import { spawnSync } from "node:child_process";
 import { realpathSync, statSync } from "node:fs";
-import { sandboxCanary, canaryIdFor, instrumentHash, policyHashOf, readCanaryState, writeCanaryState } from "./canary.mjs";
+import { sandboxCanary, canaryIdFor, instrumentHash, policyHashOf, readCanaryState, writeCanaryState, linuxProbeTargets, probeShapeOf } from "./canary.mjs";
+import { windowsDriveRoots } from "./sandbox.mjs";
 
 /**
  * Is the isolation the profile declares actually implemented?
@@ -95,13 +96,17 @@ export function probeKeychain({ platform = process.platform, exec = spawnSync } 
  * litter — a new tmp tree every tick that nothing ever cleans up.
  * (Codex #4e-[9].)
  */
-export function cheapContainmentReasons({ platform = process.platform, isolated = false, keychain = null } = {}) {
+export function cheapContainmentReasons({ platform = process.platform, isolated = false, keychain = null, mounts } = {}) {
   const reasons = [];
   // macOS and Linux are measured (docs/measured/2026-09-25-linux-wsl-sandbox.md).
   // On Linux the canary decides as it does on macOS, with probes of its own: the
   // runtime's socket filter must be in force, or the host is refused (#156).
   if (platform !== "darwin" && platform !== "linux") reasons.push(`the OS sandbox is unmeasured on ${platform}; only macOS and Linux have been measured`);
   if (!isolated) reasons.push("no isolated worker environment declared (worker.isolation)");
+  // On Linux the Windows drives are denied where the mount table says they are,
+  // so a table that can't be read leaves them unfound and undenied (#156).
+  if (platform === "linux" && windowsDriveRoots(mounts) === null)
+    reasons.push("the host's mount table couldn't be read, so the Windows drives on it can't be found and denied");
   // The keychain is PROBED here for the record, and it is deliberately no longer
   // a gate. It used to be one because a worker ran with the founder's HOME and
   // could ask the keychain directly, so "the keychain holds nothing we
@@ -118,6 +123,10 @@ export async function measureContainment({
   cliVersion, sandbox, permissionsDeny, allowedTools = null, canaryPaths, bin, env, binaryId = null, stateRoots = null,
   stateDir, nwo, platform = process.platform, isolated = false, netProbe = null,
   canary = null, keychain = null, cache = new Map(), now = () => Date.now(),
+  // The mount table, for a test; the host's own when absent.
+  mounts,
+  // The Linux probes' targets, when the caller has found them already.
+  linuxTargets = null,
   // Handed to the canary runner so its detached child can be bound before it
   // runs. Only used on the paid path: a cached or injected verdict spawns
   // nothing, so there is nothing to bind.
@@ -137,7 +146,7 @@ export async function measureContainment({
   // checkout. What is left to establish is that the OS sandbox holds under the
   // CLI in use -- which the canary measures directly, per build and per policy.
   const probed = typeof keychain === "function" ? await keychain() : keychain;
-  const cheap = cheapContainmentReasons({ platform, isolated, keychain: probed });
+  const cheap = cheapContainmentReasons({ platform, isolated, keychain: probed, mounts });
   const reasons = [...cheap.reasons];
   const kc = cheap.keychain;
 
@@ -154,8 +163,13 @@ export async function measureContainment({
   // the id alone, and the id was unstable, so the two were different values: a
   // canary script strengthened with a new probe did not invalidate a pass taken
   // before it, which is the reuse the instrument was put in the id to prevent.
+  // On Linux the probes the canary can run are found BEFORE the cache is looked
+  // in, and they're part of the id: a pass taken when the host had no target for
+  // a probe is a weaker measurement than one with it, and mustn't stand in for
+  // it once the host has one (#156).
+  const targets = platform === "linux" && cliVersion && sandbox ? (linuxTargets ?? await linuxProbeTargets()) : null;
   const id = cliVersion && sandbox ? canaryIdFor({ cliVersion, sandbox, binaryId, worktree: canaryPaths?.dir ?? null, permissionsDeny, allowedTools,
-                                                   instrument: instrumentHash({ hasNet: !!netProbe }) }) : null;
+                                                   instrument: instrumentHash({ hasNet: !!netProbe }), probes: probeShapeOf(targets) }) : null;
   const cheapReasons = reasons.length > 0;
   if (canary && typeof canary !== "function") cn = canary;
   else if (cheapReasons) cn = { ok: false, id, why: "not run: containment is already open for a cheaper reason", skipped: true };
@@ -165,7 +179,7 @@ export async function measureContainment({
   else if (!id) cn = { ok: false, id: null, why: "no CLI version or sandbox block to run a canary under" };
   else {
     const run = typeof canary === "function" ? canary : sandboxCanary;
-    cn = await run({ cliVersion, sandbox, permissionsDeny, allowedTools, binaryId, ...canaryPaths, bin, env, onSpawn, beforeSpawn, platform, ...(netProbe ? { netProbe } : {}) });
+    cn = await run({ cliVersion, sandbox, permissionsDeny, allowedTools, binaryId, ...canaryPaths, bin, env, onSpawn, beforeSpawn, platform, ...(netProbe ? { netProbe } : {}), ...(targets ? { linuxTargets: targets } : {}) });
     cn = { ...cn, at: now() };
     cache.set(id, cn);
     if (stateDir && nwo) { try { writeCanaryState(stateDir, nwo, { id: cn.id, cliVersion, bin, binaryId, instrument: instrumentHash({ hasNet: !!netProbe }), policyHash: policyHashOf(sandbox, canaryPaths?.dir ?? null, { permissionsDeny, allowedTools }), stateRoots, allowedTools, canaryDir: canaryPaths?.dir ?? null, ok: cn.ok, why: cn.why, at: cn.at, evidence: cn.evidence ?? null }); } catch { /* the verdict stands without the doctor's copy */ } }

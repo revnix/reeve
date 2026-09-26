@@ -96,8 +96,10 @@ const db = open(join(dir, "c.db"));
   check(!!row?.out_path && !!row?.err_path, "and the durable output paths", JSON.stringify([row?.out_path, row?.err_path]));
   check(/runs\/o-r\/42\/[^/]+\/worker\.out$/.test(row?.out_path ?? ""),
     "the run dir is keyed by repository, PR, and run id, never PR alone", String(row?.out_path));
-  check(typeof seenEnv?.TMPDIR === "string" && seenEnv.TMPDIR.includes("/runs/o-r/42/") && /\/tmp$/.test(seenEnv.TMPDIR),
-    "and the worker's TMPDIR is inside that run dir", String(seenEnv?.TMPDIR));
+  // Its own, and short, under reeve's home: inside the run dir it left the
+  // sandbox's sockets no room (#156; test/worker-tmpdir.test.mjs).
+  check(typeof seenEnv?.TMPDIR === "string" && /\/t\/[0-9a-f]{12}$/.test(seenEnv.TMPDIR) && !seenEnv.TMPDIR.includes("/runs/"),
+    "and the worker's TMPDIR is its own, under reeve's home, not inside the run dir", String(seenEnv?.TMPDIR));
 }
 
 // ── a contract that cannot be recorded releases the lease ────────────────────

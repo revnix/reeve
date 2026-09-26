@@ -28,6 +28,7 @@
 // unreachable by CONSTRUCTION rather than by deny rule. The deny list stays as
 // the second layer, and the canary proves the property per CLI build rather
 // than trusting this comment.
+import { randomBytes } from "node:crypto";
 import { writeFileSync, mkdirSync, chmodSync, renameSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
@@ -169,6 +170,35 @@ export function workerEnv({ gitConfigPath, tmpDir, bgWaitMs, maxRetries = 1, ext
     env[k] = String(v);
   }
   return env;
+}
+
+/**
+ * A worker's TMPDIR, short on purpose (#156). On Linux the CLI's sandbox makes
+ * its network bridges as two Unix sockets there, the longer named
+ * `claude-socks-<16 hex>.sock`, and a socket's path has room for 107
+ * characters. Measured 2026-09-26 with CLI 2.1.278 on WSL2: a 90-character
+ * TMPDIR stopped the sandbox from starting, so every command a worker ran was
+ * refused. A run's own folder is deeper than that, so the TMPDIR sits under
+ * reeve's home instead, which workers are denied, and each worker is granted
+ * only its own.
+ */
+export const TMPDIR_MAX = 107 - "/claude-socks-0123456789abcdef.sock".length;
+export function workerTmpDir(stateDir) {
+  return join(stateDir, "t", randomBytes(6).toString("hex"));
+}
+/**
+ * Why `tmpDir` is too long for the sandbox's sockets on this platform, or null.
+ * In bytes, as the kernel counts a socket's path: a name in another alphabet
+ * takes two or more bytes a character.
+ */
+export function tmpDirTooLong(tmpDir, platform = process.platform) {
+  const bytes = Buffer.byteLength(tmpDir);
+  if (platform !== "linux" || bytes <= TMPDIR_MAX) return null;
+  // It sits under reeve's state folder, which is REEVE_HOME's, or --log's where
+  // the log is kept elsewhere; naming only REEVE_HOME sent the operator to a
+  // setting that can't change it.
+  return `the worker's TMPDIR, ${tmpDir}, is ${bytes} bytes, and the sandbox's sockets there need it at ${TMPDIR_MAX} or fewer. ` +
+         `It sits under reeve's state folder, ${dirname(dirname(tmpDir))}: move that to a shorter path, with REEVE_HOME, or with --log where the log is kept elsewhere`;
 }
 
 /**

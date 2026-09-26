@@ -1440,7 +1440,7 @@ for (const [what, report] of [
   check(launchedV === 1, "control: the default validator accepts the generated settings and a worker launches", String(launchedV));
   check(settingsSeen?.sandbox?.enabled === true && settingsSeen?.sandbox?.failIfUnavailable === true,
     "and the file the worker received carries the sandbox block", JSON.stringify(settingsSeen?.sandbox)?.slice(0, 200));
-  check(Array.isArray(settingsSeen?.sandbox?.filesystem?.allowWrite) && settingsSeen.sandbox.filesystem.allowWrite.length === 1 && settingsSeen.sandbox.filesystem.allowWrite[0].endsWith("/tmp"),
+  check(Array.isArray(settingsSeen?.sandbox?.filesystem?.allowWrite) && settingsSeen.sandbox.filesystem.allowWrite.length === 1 && /\/t\/[0-9a-f]{12}$/.test(settingsSeen.sandbox.filesystem.allowWrite[0]),
     "whose only write grant is the run's own tmp", JSON.stringify(settingsSeen?.sandbox?.filesystem?.allowWrite));
   ctxV.db.close();
   rmSync(dirV, { recursive: true, force: true });

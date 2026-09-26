@@ -6315,7 +6315,7 @@ export const STUBS = [
     test: "test/sandbox.test.mjs",
     expectRed: "on Linux a linked credential directory is denied at its target, a missing one as written, and elsewhere every one as written",
     edits: [{ file: "src/sandbox.mjs",
-              find: "  if (platform !== \"linux\") return credentialPaths();",
+              find: "  return [...new Set(credentialPaths().map(p => linkFree(p, platform)))];",
               replace: "  return credentialPaths();" }],
   },
   {
@@ -6324,7 +6324,7 @@ export const STUBS = [
     test: "test/sandbox.test.mjs",
     expectRed: "on Linux a linked credential directory is denied at its target, a missing one as written, and elsewhere every one as written",
     edits: [{ file: "src/sandbox.mjs",
-              find: "  if (platform !== \"linux\") return credentialPaths();\n",
+              find: "  if (platform !== \"linux\") return p;\n",
               replace: "" }],
   },
   {

@@ -328,7 +328,6 @@ const credentialReadDenies = () => {
  * were measured.
  */
 export function osCredentialPaths({ platform = process.platform } = {}) {
-  if (platform !== "linux") return credentialPaths();
   return [...new Set(credentialPaths().map(p => linkFree(p, platform)))];
 }
 /** A path as the Linux sandbox must be given it: at its target when it's a link. Elsewhere, and where nothing is there yet, as written. */

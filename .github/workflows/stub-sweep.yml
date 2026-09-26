@@ -53,6 +53,10 @@ jobs:
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+          # A readable file under /mnt for the probe to try. WSL keeps the Windows
+          # drives there; a hosted runner has nothing readable in it.
+          echo decoy | sudo tee /mnt/reeve-escape-decoy.txt > /dev/null
+          sudo chmod 644 /mnt/reeve-escape-decoy.txt
 
       # The sweep refuses a dirty tree, so assert the precondition up front.
       - name: The checkout must be clean

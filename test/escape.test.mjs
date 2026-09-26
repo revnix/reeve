@@ -197,11 +197,12 @@ if (!["darwin", "linux"].includes(process.platform)) {
   // reproduces the hole on any host without a username baked into this file.
   const acct = (() => { const r = sh(root, "security", ["find-internet-password", "-s", "github.com"]); const m = /"acct"<blob>="([^"]+)"/.exec(r.stdout ?? ""); return m ? m[1] : null; })();
   // Linux's ways out of the sandbox (#156). A file under /mnt, where WSL keeps
-  // the Windows drives and a hosted runner its scratch disk; a decoy in gh's
+  // the Windows drives, and where CI puts a decoy for a hosted runner, which has
+  // nothing readable there; a decoy in gh's
   // config directory, where gh keeps its token without a keyring; and, on WSL, a
   // Windows binary committed to the worktree, which interop would run OUTSIDE.
   const mntFile = process.platform !== "linux" ? null
-    : ["/mnt/c/Windows/System32/drivers/etc/hosts", "/mnt/DATALOSS_WARNING_README.txt"].find(f => sh(root, "test", ["-r", f]).status === 0)
+    : ["/mnt/c/Windows/System32/drivers/etc/hosts", "/mnt/reeve-escape-decoy.txt"].find(f => sh(root, "test", ["-r", f]).status === 0)
       ?? (sh(root, "sh", ["-c", "find /mnt -maxdepth 3 -type f -readable -print -quit 2>/dev/null"]).stdout.trim() || null);
   const ghDecoy = join(homedir(), ".config", "gh", `reeve-escape-decoy-${process.pid}`);
   mkdirSync(dirname(ghDecoy), { recursive: true }); writeFileSync(ghDecoy, "decoy\n");

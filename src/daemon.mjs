@@ -19,7 +19,7 @@ import { nextAction, describe, ACTIONS, ESCALATIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, isSameProcess, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
-import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf, siblingRootsOf } from "./sandbox.mjs";
+import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf, siblingRootsOf, hostEscapePaths } from "./sandbox.mjs";
 import { verifyConfig, GIT_NEUTRALISE, gitEnv } from "./gitguard.mjs";
 import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor, commitRunWork, digestOf } from "./checkout.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
@@ -540,6 +540,17 @@ export function stateRootsFor(stateDir, logPath, worktree, dbPath = null) {
 }
 
 /**
+ * Why a checkout under a denied path can't be served, and what to change. The
+ * host paths are named too: on Linux a root under /mnt, where WSL mounts the
+ * Windows drives, is denied like reeve's own state (#156).
+ */
+export function layoutRefusal(denied, worktree) {
+  const host = hostEscapePaths();
+  return `a denied path (${denied.join(", ")}) contains the checkout ${worktree}, so the policy would deny the worker its own code — ` +
+         `move identity.worktreeRoot apart from REEVE_HOME and identity.checkout${host.length ? `, and out of ${host.join(", ")}` : ""}`;
+}
+
+/**
  * The containment verdict the daemon acts on: cheap gates first, then the paid
  * sandbox canary. Exported so `reeve canary` can run exactly this, rather than a
  * reconstruction of it that could drift from what dispatch actually does.
@@ -602,6 +613,17 @@ export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSp
       // containment CLOSED for a policy that closed nothing.
       decoyPath: join(resolveHome(), "canary", nwo.replace("/", "-"), `decoy-${process.pid}-${Date.now()}.txt`),
     };
+    // The block every worker gets; the canary's id covers it, so a block that
+    // changes (a new deny, a new domain) is measured again before it is trusted.
+    // The reeve-owned trees are denied to workers too; the canary proves the
+    // block that includes them. (Codex #4d-[15], #4e-[5].)
+    const stateRoots = stateRootsFor(stateDir, logPathOf(ctx), canaryPaths.dir, ctx.dbPath ?? null);
+    const policy = sandboxFor({ profile, action: "FIX_CI", worktree: canaryPaths.dir, tmpDir: canaryPaths.tmpDir, stateRoots });
+    // A root the policy denies would deny the canary its own script, so it could
+    // never pass. Named as the layout it is, before anything is written under the
+    // root (#156).
+    if (policy.stateHomeContainsWorktree?.length)
+      return { credentialRead: "open", why: layoutRefusal(policy.stateHomeContainsWorktree, canaryPaths.dir) };
     const claudeBin = resolveClaude(ctx.claudeBin ?? "claude");
     // The credential-less git config lives in the run's tmp, which the sandbox
     // grants read: putting it under ~/.reeve (deny-read) left the sandboxed git
@@ -616,12 +638,6 @@ export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSp
                             bgWaitMs: 5 * 60_000, extraPath: [dirname(claudeBin)],
                             home: workerHome, oauthToken: token.token });
     const version = ctx.cliVersion ?? cliVersion(claudeBin, env);
-    // The block every worker gets; the canary's id covers it, so a block that
-    // changes (a new deny, a new domain) is measured again before it is trusted.
-    // The reeve-owned trees are denied to workers too; the canary proves the
-    // block that includes them. (Codex #4d-[15], #4e-[5].)
-    const stateRoots = stateRootsFor(stateDir, logPathOf(ctx), canaryPaths.dir, ctx.dbPath ?? null);
-    const policy = sandboxFor({ profile, action: "FIX_CI", worktree: canaryPaths.dir, tmpDir: canaryPaths.tmpDir, stateRoots });
     // The resolved binary's identity is part of the canary id, so a swapped
     // executable that prints the same --version is re-measured. (Codex #4-[3].)
     const binaryId = binaryIdentity(claudeBin);
@@ -2708,6 +2724,12 @@ export async function tick(ctx) {
         // overlap check all resolve against it.
         const dStateRoots = stateRootsFor(stateDir, logPathOf(ctx), worktree, ctx.dbPath ?? null);
         const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane, tmpDir, stateRoots: dStateRoots });
+        // A denied path that CONTAINS the worktree would deny the worker its own
+        // code, and the failure would read as a broken sandbox rather than the
+        // configuration error it is. (Codex #4g-[4].) Refused before anything is
+        // written under the root, the worker's home included (#156).
+        if (sandbox.stateHomeContainsWorktree?.length)
+          throw new Error(layoutRefusal(sandbox.stateHomeContainsWorktree, worktree));
         const budgetMs = (profile.watch?.workerBudgetMinutes ?? 20) * 60_000;
         const claudeBin = resolveClaude(ctx.claudeBin ?? "claude");
         // In the run's tmp (sandbox-readable), never under the deny-read ~/.reeve:
@@ -2731,11 +2753,6 @@ export async function tick(ctx) {
         // (Codex #4e-[8].)
         if (sandbox.unrepresentableQuarantine?.length)
           throw new Error(`quarantined path(s) cannot be enforced by the OS sandbox: ${sandbox.unrepresentableQuarantine.join(", ")}`);
-        // A denied path that CONTAINS the worktree would deny the worker its own
-        // code, and the failure would read as a broken sandbox rather than the
-        // configuration error it is. (Codex #4g-[4].)
-        if (sandbox.stateHomeContainsWorktree?.length)
-          throw new Error(`a denied path (${sandbox.stateHomeContainsWorktree.join(", ")}) contains the checkout ${worktree}, so the policy would deny the worker its own code — move identity.worktreeRoot apart from REEVE_HOME and from identity.checkout`);
         const qDenies = quarantineOsDenies(worktree, profile.risk?.quarantinePaths ?? []).paths;
         const notifyCred = typeof profile.notify?.credentialFile === "string" && isAbsolute(profile.notify.credentialFile) ? [profile.notify.credentialFile] : [];
         const sv = (ctx.settingsValidator ?? validateSettings)(sandbox.settings, { tmpDir, stateRoots: dStateRoots, quarantineDenies: qDenies,

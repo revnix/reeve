@@ -1,3 +1,4 @@
+// @ts-check
 // reconciler — GitHub is authoritative for PR, head, check, review and merge facts.
 //
 // Every rule here is a measured failure, not a precaution:
@@ -426,7 +427,7 @@ export function lastForcePush(events) {
  * between what we believed and what GitHub says is measurable rather than
  * silently corrected.
  */
-export function reconcilePr(db, { nwo, pr, profile = {} }) {
+export function reconcilePr(db, { nwo, pr, profile = /** @type {{ identity?: { key?: string } }} */ ({}) }) {
   const meta = gh(`repos/${nwo}/pulls/${pr}`, '[.state, .merged, .head.ref, .base.ref, (.merge_commit_sha // ""), .title] | @tsv');
   if (!meta.ok) return { ok: false, why: meta.err };
   const [state, merged, headRef, baseRef, mergeSha, title] = meta.out.split("\t");

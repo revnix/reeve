@@ -1,3 +1,4 @@
+// @ts-check
 // Gather everything a verdict needs about one PR, then publish it.
 //
 // Shadow mode is the default and it is not a debug flag. Flipping a gate against
@@ -17,6 +18,15 @@ import { reviewState } from "./review/derive.mjs";
 import { compare } from "./review/shadow.mjs";
 import { authenticate, apiAsInstallation, loadAppCredentials } from "./github/app.mjs";
 import { execFileSync } from "node:child_process";
+
+/**
+ * The profile's CI settings, as far as this module reads them.
+ * @typedef {{ ci?: { requiredChecks?: string[], reviewerStatusContexts?: string[], appSlug?: string } }} CiProfile
+ */
+/**
+ * What a test passes to reviewFacts in place of its reads.
+ * @typedef {{ reviewState?: typeof reviewState, compare?: typeof compare, foldPrecedesEvaluation?: boolean }} ReviewIo
+ */
 
 function ghJson(args) {
   try { return { ok: true, out: execFileSync("gh", ["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() }; }
@@ -183,7 +193,8 @@ function requiredCheckState(rows, { context, app, besideOwn = false }, now = Dat
  * App's run, and is required like any other check. `appId` is reeve's App, or
  * null when it can't be told, and then any binding may be reeve's.
  */
-export function requiredChecksOf({ nwo, baseRef, profile = {}, requirements = requiredChecksOnBase, gh = ghJson, appId = ownAppId() }) {
+export function requiredChecksOf({ nwo, baseRef, profile = /** @type {CiProfile} */ ({}), requirements = requiredChecksOnBase, gh = ghJson,
+                                 appId = ownAppId() }) {
   const base = baseRef ? requirements({ nwo, base: baseRef, gh }) : null;
   const shadow = shadowContextOf(POLICY_CONTEXT);
   const reviewers = new Set(profile.ci?.reviewerStatusContexts ?? []);
@@ -218,7 +229,7 @@ export function classifyRead(read, { required = [], known = true } = {}, { evide
  * asked. A third-party App that hasn't scheduled its run yet isn't finished
  * because GitHub Actions is.
  */
-export function missingSettled(nwo, sha, missing = [], profile = {}, suites = suitesComplete) {
+export function missingSettled(nwo, sha, missing = [], profile = /** @type {CiProfile} */ ({}), suites = suitesComplete) {
   // An unbound check the base requires may come from any App, or be a commit
   // status from none, so no suite can say it has finished: its absence stays
   // unsettled until it reports.
@@ -348,7 +359,7 @@ export function readReviewerStates(nwo, pr, head, reviewers, io = null) {
  * all of them null.
  */
 export function reviewFacts({ db, nwo, pr, profile, head, live = null,
-                             at = Math.floor(Date.now() / 1000), io = {} }) {
+                             at = Math.floor(Date.now() / 1000), io = /** @type {ReviewIo} */ ({}) }) {
   // NOBODY TO GATE means nothing to be unknown about. With no blocking reviewer
   // configured, no uncleared thread can hold a pull request -- so a transient
   // projection failure must not produce an UNKNOWN clearance clause and stop an

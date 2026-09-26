@@ -13,6 +13,7 @@ import { causeKey } from "../src/ci-rootcause.mjs";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
+import { tempDir } from "./fixtures/temp.mjs";
 
 const dir = tempDir("reeve-e2e-");
 // The clone and the worktree root are separate directories, as a real
@@ -29,7 +30,6 @@ execFileSync("git", ["-C", clone, "config", "user.email", "founder@example.inval
 const dbPath = join(dir, "e.db");
 const logPath = join(dir, "log.txt");
 import { fingerprint } from "../src/checkout.mjs";
-import { tempDir } from "./fixtures/temp.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {

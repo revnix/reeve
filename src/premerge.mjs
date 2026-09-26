@@ -1,3 +1,4 @@
+// @ts-check
 /**
  * Should this merge happen? -- asked BEFORE it does.
  *
@@ -92,6 +93,8 @@ export function completeness({ nodes, totalCount, what }) {
  * So mergeability is DELEGATED, and this module keeps only what GitHub does not
  * enforce: that the merge is bound to the head that was verified, and that review
  * evidence belongs to that head rather than to an earlier one.
+ *
+ * @param {{ mergeable?: string | null, mergeStateStatus?: string | null }} [pr] GitHub's own mergeability fields
  */
 export function mergeabilityState({ mergeable, mergeStateStatus } = {}) {
   // MERGEABLE is GitHub's own tri-state and UNKNOWN means it is still computing.
@@ -134,6 +137,8 @@ export function mergeabilityState({ mergeable, mergeStateStatus } = {}) {
  * `reviewDecision` is GitHub's own answer and is head-aware wherever the repository
  * dismisses stale reviews. Null means no review is REQUIRED, which is not the same as
  * one having been given, so it is UNREVIEWED rather than clear.
+ *
+ * @param {{ reviewDecision?: string | null, reviews?: any[] | null, reviewsTotal?: number | null, head?: string | null }} [pr]
  */
 export function reviewState({ reviewDecision, reviews = null, reviewsTotal = null,
                               head = null } = {}) {
@@ -196,6 +201,8 @@ export function reviewState({ reviewDecision, reviews = null, reviewsTotal = nul
  * pull request is approved. Whose review counts, and which head it was about, is
  * `reviewState`'s question -- answering it from a thread count is how an author
  * resolving their own comment could read as a review.
+ *
+ * @param {{ totalCount?: number, nodes?: any[] }} [threads]
  */
 export function threadState({ totalCount, nodes } = {}) {
   const complete = completeness({ nodes, totalCount, what: "review threads" });
@@ -214,6 +221,8 @@ export function threadState({ totalCount, nodes } = {}) {
  * prove only that the merge would take a commit the branch has moved past -- not
  * that anything is missing from the default branch, which a force-reset, a
  * cherry-pick or a second merge would also produce.
+ *
+ * @param {{ prHead?: string | null, branchNow?: string | null, branchRead?: string }} [heads]
  */
 export function headState({ prHead, branchNow, branchRead } = {}) {
   if (!prHead)
@@ -256,6 +265,8 @@ export function headState({ prHead, branchNow, branchRead } = {}) {
  * steps, and telling those apart needs a per-job call this deliberately does not
  * make. The gate is about whether to merge NOW, and a zero-step success is a
  * different investigation.
+ *
+ * @param {{ nodes?: any[], totalCount?: number | null }} [rollup]
  */
 export function checkState({ nodes, totalCount = null } = {}) {
   if (!Array.isArray(nodes))
@@ -307,6 +318,9 @@ export function checkState({ nodes, totalCount = null } = {}) {
  * summary line can read as a pass while carrying a reason not to merge. Both
  * reasons are always reported, because knowing only the first means fixing it and
  * being surprised by the second.
+ *
+ * @param {{ head?: Parameters<typeof headState>[0], threads?: Parameters<typeof threadState>[0], checks?: Parameters<typeof checkState>[0],
+ *   mergeability?: Parameters<typeof mergeabilityState>[0], review?: Parameters<typeof reviewState>[0] }} [facts]
  */
 export function gate({ head, threads, checks, mergeability, review } = {}) {
   const parts = [headState(head), threadState(threads), checkState(checks),

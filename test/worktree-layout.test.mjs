@@ -78,3 +78,42 @@ test("a worker whose checkout is under /mnt isn't started, and the refusal says 
   assert.equal(prepared, 0, "a checkout was prepared under the denied root");
   assert.match(logged, /a denied path \(\/mnt\) contains the checkout[^\n]*out of \/mnt/, logged.slice(-1500));
 });
+
+test("a checkout that lands under a denied path, though its root doesn't, is refused before the worker starts", linux, async () => {
+  // The root checks out, but the checkout is made under /mnt all the same, by a
+  // link or a mistake in making it. The policy's own check of the checkout's
+  // path is what refuses it.
+  const stateDir = tempDir("rl2-");
+  const clone = tempDir("rl2-clone-");
+  execFileSync("git", ["-C", clone, "init", "-q"]);
+  const HEAD = "a".repeat(40);
+  const cl = (id, state, detail = "") => ({ id, state, detail });
+  const evaluation = { ok: true, pr: 42, state: "open", head: HEAD, title: "t", headRef: "f", baseRef: "main",
+    verdict: { state: "BLOCK", summary: "ci is red",
+               clauses: ["ci", "base", "review", "rounds", "threads", "findings", "mergeable"].map((id) => (id === "ci" ? cl("ci", "BLOCK", "failing: CI Gate") : cl(id, "PASS"))) },
+    rounds: { n: 1, softCap: 5, hardCap: 10, unspilledCritical: 0 },
+    checks: { verdict: "RED", caused: ["CI Gate"], failing: [{ name: "CI Gate", id: "99" }] },
+    reviewers: [], threads: {}, settled: { settled: true } };
+  let spawned = 0;
+  mkdirSync(stateDir, { recursive: true });
+  const ctx = {
+    nwo: "o/r", db: open(join(stateDir, "e.db")), logPath: join(stateDir, "reeve.log"), dbPath: join(stateDir, "e.db"),
+    profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: tempDir("rl2-root-"), checkout: clone },
+               authority: { policy: "propose_and_merge" }, rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+               ci: { provider: "github-actions", requiredChecks: [] }, watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 } },
+    execute: true, shadow: true, running: 0,
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    containment: { credentialRead: "closed", why: "test" }, keychain: { measured: true, items: [], why: null },
+    claudeBin: "/bin/sh", cliVersion: "test",
+    openPrs: () => [42], evaluate: () => evaluation, publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    resolveCause: () => ({ ok: true, job: "CI Gate", step: "Test", cause: [{ where: "src/x.ts:1", message: "boom" }] }),
+    observe: () => ({ ok: false, observations: [], incomplete: true, threads: { readable: false, total: null, unresolved: 0, seen: 0 } }),
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    prepareCheckout: () => ({ ok: true, path: join(UNDER_MNT, "o-r-42"), why: null, deps: { ok: true, cow: false } }),
+    spawnWorker: async () => { spawned++; return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s1" }; },
+  };
+  await daemon.tick(ctx);
+  const logged = readFileSync(ctx.logPath, "utf8");
+  assert.equal(spawned, 0, "the worker started in a checkout under /mnt");
+  assert.match(logged, /a denied path \(\/mnt\) contains the checkout \/mnt\/reeve-layout-test\/o-r-42/, logged.slice(-1500));
+});

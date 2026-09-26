@@ -109,6 +109,19 @@ test("a Linux canary records the id its cache is looked in under, with the probe
                                     instrument: instrumentHash({ hasNet: true }), probes: probeShapeOf(everything), runtime }));
 });
 
+test("a Linux canary whose Windows binary couldn't be planted fails: the interop probe would prove nothing", async () => {
+  // Proven to run, but not copied into the canary's folder: the script's run of
+  // it then exits 127, which would read as interop held.
+  const r = await run({}, { ...everything, windowsExe: join(root, "no-such-dir", "cmd.exe") });
+  assert.equal(r.ok, false, "a canary passed without its interop control in place");
+  assert.match(r.why, /couldn't be planted/);
+  // The control: one that can be copied is planted, and the canary passes.
+  const exe = join(root, "cmd.exe");
+  writeFileSync(exe, "MZ not really a Windows binary\n");
+  const ok = await run({}, { ...everything, windowsExe: exe });
+  assert.equal(ok.ok, true, ok.why);
+});
+
 test("a worker that can create a Unix socket fails the Linux canary: the socket filter is not in force", async () => {
   const r = await run({ leak: ["unix_socket"] });
   assert.equal(r.ok, false);

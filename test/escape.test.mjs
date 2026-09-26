@@ -26,7 +26,7 @@ import { REFUSING_HOOK } from "../src/gitguard.mjs";
 import { workerEnv, writeGitConfig, CONTAINMENT } from "../src/workerenv.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { probeKeychain } from "../src/containment.mjs";
-import { netListener } from "../src/canary.mjs";
+import { netListener, shq } from "../src/canary.mjs";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
@@ -210,7 +210,8 @@ if (!["darwin", "linux"].includes(process.platform)) {
   // Windows binary committed to the worktree, which interop would run OUTSIDE.
   const mntFile = process.platform !== "linux" ? null
     : ["/mnt/c/Windows/System32/drivers/etc/hosts", "/mnt/reeve-escape-decoy.txt"].find(f => sh(root, "test", ["-r", f]).status === 0)
-      ?? (sh(root, "sh", ["-c", "find /mnt -maxdepth 3 -type f -readable -print -quit 2>/dev/null"]).stdout.trim() || null);
+      // NUL-ended and whole, as the canary reads it: a name can hold a newline.
+      ?? (spawnSync("find", ["/mnt", "-maxdepth", "3", "-type", "f", "-readable", "-print0", "-quit"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).stdout?.split("\0")[0] || null);
   const ghDecoy = join(homedir(), ".config", "gh", `reeve-escape-decoy-${process.pid}`);
   mkdirInHome(dirname(ghDecoy)); writeFileSync(ghDecoy, "decoy\n");
   const windowsExe = "/mnt/c/Windows/System32/cmd.exe";
@@ -221,36 +222,36 @@ if (!["darwin", "linux"].includes(process.platform)) {
 out="./probe-results.txt"; : > "$out"
 rec() { echo "$1=$2" >> "$out"; }
 touch ./INSIDE; rec inside $?
-touch ${JSON.stringify(join(tmpDir, "TMP"))}; rec tmp $?
-touch ${JSON.stringify(join(outside, "OUTSIDE"))}; rec outside $?
+touch ${shq(join(tmpDir, "TMP"))}; rec tmp $?
+touch ${shq(join(outside, "OUTSIDE"))}; rec outside $?
 curl -sS -m 5 https://example.com -o ./curl-body 2>/dev/null; rec curl $?
-cp ${JSON.stringify(decoy)} ./decoy-copy 2>/dev/null; rec decoy $?
-ln -sf ${JSON.stringify(decoy)} ./decoy-link; cp ./decoy-link ./decoy-copy2 2>/dev/null; rec symlink $?
+cp ${shq(decoy)} ./decoy-copy 2>/dev/null; rec decoy $?
+ln -sf ${shq(decoy)} ./decoy-link; cp ./decoy-link ./decoy-copy2 2>/dev/null; rec symlink $?
 git -c user.email=w@w -c user.name=w commit -q --allow-empty -m probe 2>./probe-commit.err; rec commit $?
 git update-ref refs/heads/main HEAD 2>/dev/null; rec updateref $?
-git push --no-verify ${JSON.stringify(dest)} HEAD:refs/heads/escape-noverify 2>./probe-push.err; rec noverify $?
-git -c core.hooksPath=/dev/null push ${JSON.stringify(dest)} HEAD:refs/heads/escape-hookspath 2>/dev/null; rec hookspath $?
+git push --no-verify ${shq(dest)} HEAD:refs/heads/escape-noverify 2>./probe-push.err; rec noverify $?
+git -c core.hooksPath=/dev/null push ${shq(dest)} HEAD:refs/heads/escape-hookspath 2>/dev/null; rec hookspath $?
 git push --no-verify https://github.com/revnix/reeve-does-not-exist HEAD:refs/heads/x 2>/dev/null; rec https $?
 printf 'protocol=https\\nhost=github.com\\n\\n' | git -c credential.helper=osxkeychain credential fill 2>/dev/null | grep -q '^password='; rec keychain $?
-/usr/bin/security find-internet-password -s github.com ${JSON.stringify(LOGIN_KEYCHAIN)} >/dev/null 2>&1; rec kc_by_path $?
-/usr/bin/security find-generic-password -s "Claude Code-credentials" ${JSON.stringify(LOGIN_KEYCHAIN)} >/dev/null 2>&1; rec kc_claude_by_path $?
-mkdir -p ./ghcfg && printf 'github.com:\\n    user: %s\\n    git_protocol: https\\n' ${JSON.stringify(acct ?? "unknown")} > ./ghcfg/hosts.yml
-GH_CONFIG_DIR=./ghcfg ${JSON.stringify(gh || "/usr/bin/false")} auth token >/dev/null 2>&1; rec ghkeyring $?
-GIT_CONFIG_GLOBAL=${JSON.stringify(deniedCfg)} git config --global --list >/dev/null 2>./probe-cfg.err; rec denied_cfg $?
-GIT_CONFIG_GLOBAL=${JSON.stringify(join(tmpDir, "gitconfig"))} git config --global --list >/dev/null 2>/dev/null; rec ok_cfg $?
-curl -sS -m 4 ${JSON.stringify(netUrl)} -o ./netbody 2>/dev/null; rec netprobe $?
-cat ${JSON.stringify(xdgDecoy)} >/dev/null 2>&1; rec xdg_git $?
-cat ${JSON.stringify(fileDecoy)} >/dev/null 2>&1; rec file_decoy $?
-cat ${JSON.stringify(fileControl)} >/dev/null 2>&1; rec file_control $?
-cat ${JSON.stringify(founderWip)} >/dev/null 2>&1; rec founder_wip $?
-cat ${JSON.stringify(founderEnv)} >/dev/null 2>&1; rec founder_env $?
-cat ${JSON.stringify(mntFile ?? "/nonexistent")} >/dev/null 2>&1; rec mnt_file $?
+/usr/bin/security find-internet-password -s github.com ${shq(LOGIN_KEYCHAIN)} >/dev/null 2>&1; rec kc_by_path $?
+/usr/bin/security find-generic-password -s "Claude Code-credentials" ${shq(LOGIN_KEYCHAIN)} >/dev/null 2>&1; rec kc_claude_by_path $?
+mkdir -p ./ghcfg && printf 'github.com:\\n    user: %s\\n    git_protocol: https\\n' ${shq(acct ?? "unknown")} > ./ghcfg/hosts.yml
+GH_CONFIG_DIR=./ghcfg ${shq(gh || "/usr/bin/false")} auth token >/dev/null 2>&1; rec ghkeyring $?
+GIT_CONFIG_GLOBAL=${shq(deniedCfg)} git config --global --list >/dev/null 2>./probe-cfg.err; rec denied_cfg $?
+GIT_CONFIG_GLOBAL=${shq(join(tmpDir, "gitconfig"))} git config --global --list >/dev/null 2>/dev/null; rec ok_cfg $?
+curl -sS -m 4 ${shq(netUrl)} -o ./netbody 2>/dev/null; rec netprobe $?
+cat ${shq(xdgDecoy)} >/dev/null 2>&1; rec xdg_git $?
+cat ${shq(fileDecoy)} >/dev/null 2>&1; rec file_decoy $?
+cat ${shq(fileControl)} >/dev/null 2>&1; rec file_control $?
+cat ${shq(founderWip)} >/dev/null 2>&1; rec founder_wip $?
+cat ${shq(founderEnv)} >/dev/null 2>&1; rec founder_env $?
+cat ${shq(mntFile ?? "/nonexistent")} >/dev/null 2>&1; rec mnt_file $?
 ./committed.exe /c exit 0 >/dev/null 2>&1 </dev/null; rec interop $?
 [ -n "$(ls -A /run/WSL 2>/dev/null)" ]; rec run_wsl $?
 socat -u OPEN:/dev/null UNIX-CONNECT:/run/user/${uid}/bus >/dev/null 2>&1; rec session_bus $?
 socat -u OPEN:/dev/null UNIX-CONNECT:/run/dbus/system_bus_socket >/dev/null 2>&1; rec system_bus $?
-cat ${JSON.stringify(ghDecoy)} >/dev/null 2>&1; rec gh_decoy $?
-${JSON.stringify(process.execPath)} -e 'require("net").createServer().listen("./probe.sock", function () { this.close(); })' >/dev/null 2>&1; rec new_socket $?
+cat ${shq(ghDecoy)} >/dev/null 2>&1; rec gh_decoy $?
+${shq(process.execPath)} -e 'require("net").createServer().listen("./probe.sock", function () { this.close(); })' >/dev/null 2>&1; rec new_socket $?
 `;
   const runProbe = (cwd, settings) => {
     for (const f of ["probe-results.txt", "INSIDE", "curl-body", "decoy-copy", "decoy-copy2", "decoy-link", "probe.sock"]) rmSync(join(cwd, f), { force: true });

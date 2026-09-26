@@ -112,3 +112,16 @@ test("the canary finds a drive file whose name holds a newline whole, never a pr
   const t = await linuxProbeTargets({ mounts: "", driveRoots: [drive], searchRoots: [drive], mntCandidates: [], uid: -1 });
   assert.equal(t.mntFile, join(drive, name));
 });
+
+test("a search of the drives that couldn't run isn't read as a drive with nothing to read", async () => {
+  // find missing, erroring out or out of time answers nothing, which is not
+  // proof that nothing is readable: the probe would be skipped, and the canary
+  // could pass with the deny open.
+  const empty = realpathSync(tempDir("wd-empty-"));
+  await assert.rejects(linuxProbeTargets({ mounts: "", driveRoots: [empty], searchRoots: [empty], mntCandidates: [], uid: -1, findBin: "/nonexistent/find" }),
+                       /couldn't be searched/);
+  // The control: a search that ran and found nothing skips the probe, and says why.
+  const t = await linuxProbeTargets({ mounts: "", driveRoots: [empty], searchRoots: [empty], mntCandidates: [], uid: -1 });
+  assert.equal(t.mntFile, null);
+  assert.match(t.skipped.mnt ?? "", /readable/);
+});

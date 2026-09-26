@@ -362,15 +362,23 @@ export async function linuxProbeTargets({ uid = process.getuid?.(), node = proce
                                           systemDrive = windowsSystemDrive(mounts),
                                           windowsExe = systemDrive ? join(systemDrive, "Windows", "System32", "cmd.exe") : null,
                                           // Where to look for a file when none of the usual ones is readable.
-                                          searchRoots = [...new Set(["/mnt", ...driveRoots])],
+                                          searchRoots = [...new Set(["/mnt", ...driveRoots])], findBin = "find",
                                           connectTimeoutMs = 2_000 } = {}) {
   const readable = f => { try { accessSync(f, constants.R_OK); return statSync(f).isFile(); } catch { return false; } };
   const skipped = {};
   // NUL-ended and untrimmed, as a filename can hold a newline or end in a
   // space: cut short, the probe would copy a path that isn't there, and the
   // failed copy would read as a deny that held (#156).
-  const mntFile = mntCandidates.find(readable)
-    ?? (spawnSync("find", [...searchRoots, "-maxdepth", "3", "-type", "f", "-readable", "-print0", "-quit"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }).stdout?.split("\0")[0] || null);
+  let mntFile = mntCandidates.find(readable) ?? null;
+  if (!mntFile) {
+    const found = spawnSync(findBin, [...searchRoots, "-maxdepth", "3", "-type", "f", "-readable", "-print0", "-quit"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] });
+    // A search that couldn't run, or ran out of time, answers nothing, and that
+    // isn't proof nothing is readable: the probe would be skipped, and the canary
+    // could pass with the deny open. Unreadable folders on the way are normal,
+    // and find passes over them (#156).
+    if (found.error || found.signal) throw new Error(`the drives couldn't be searched for a file to probe: ${found.error?.code ?? found.error?.message ?? found.signal}`);
+    mntFile = found.stdout?.split("\0")[0] || null;
+  }
   if (!mntFile) skipped.mnt = "nothing on a Windows drive or under /mnt is readable on this host";
   const exeRuns = !!windowsExe && existsSync(windowsExe) && spawnSync(windowsExe, ["/c", "exit 0"], { stdio: "ignore", timeout: 15_000 }).status === 0;
   if (!exeRuns) skipped.interop = windowsExe ? "no Windows interop on this host" : "no system drive (C:) is mounted, so no Windows binary the daemon trusts to run";
@@ -668,8 +676,11 @@ export async function sandboxCanary({
   writeFileSync(fileControlPath, "reeve canary control: readable on purpose\n");
   writeFileSync(join(dir, "canary.sh"), scriptText);
   writeFileSync(join(dir, "inside-control.txt"), `${CANARY_INSIDE_CONTROL}\n`);
-  // A Windows binary in the canary's own directory, as a repository could commit one.
-  if (linux?.windowsExe) { try { copyFileSync(linux.windowsExe, join(dir, "committed.exe")); } catch { /* the interop probe then fails to run, and says so */ } }
+  // A Windows binary in the canary's own directory, as a repository could commit
+  // one. Whether it's there is judged: a run of one that isn't exits 127, which
+  // would read as interop held (#156).
+  let interopPlanted = false;
+  if (linux?.windowsExe) { try { copyFileSync(linux.windowsExe, join(dir, "committed.exe")); interopPlanted = true; } catch { /* judged below */ } }
   // A link to the decoy, as a repository could commit one, for the Read TOOL. On
   // Linux the policy names a linked credential only at its target, because the
   // CLI mounts its Read denies and bubblewrap can't mount over a link; this is
@@ -803,7 +814,7 @@ export async function sandboxCanary({
     // worker's shell doesn't see it. Proved on every build rather than assumed.
     if (!("token_env" in results)) problems.push("the token probe did not run, so whether a worker's shell can see its login token is unproven");
     else if (results.token_env === 0) problems.push("the worker's shell can see its own login token");
-    if (platform === "linux") linuxProblems(results, linux, problems, evidence, dir);
+    if (platform === "linux") linuxProblems(results, linux, problems, evidence, dir, { interop: interopPlanted });
     // The keychain is the boundary the OS sandbox cannot enforce, so it is the
     // one the canary must prove: with a scratch HOME the founder's login
     // keychain is not in the worker's search list and every probe fails. A
@@ -901,8 +912,8 @@ export async function sandboxCanary({
  * sockets it has (#156). Each other probe ran only where the daemon reached the
  * shape first, and a probe that should have run and didn't is a problem too.
  */
-function linuxProblems(results, t, problems, evidence, dir) {
-  evidence.linux = { targets: t ? { mntFile: t.mntFile, windowsExe: t.windowsExe, bus: t.bus } : null, skipped: t?.skipped ?? null };
+function linuxProblems(results, t, problems, evidence, dir, planted = {}) {
+  evidence.linux = { targets: t ? { mntFile: t.mntFile, windowsExe: t.windowsExe, bus: t.bus } : null, skipped: t?.skipped ?? null, planted };
   // The login token in any process's environment the shell can read (#156).
   if (!("proc_control" in results) || !("token_proc" in results)) problems.push("the token probe did not read /proc, so whether a process's environment shows the login token is unproven");
   else if (results.proc_control !== 0) problems.push("control: the shell couldn't read its own /proc environment, so the token probe there proves nothing");
@@ -921,7 +932,8 @@ function linuxProblems(results, t, problems, evidence, dir) {
     else if (results[key] === 0 || (copy && existsSync(join(dir, copy)))) problems.push(leak);
   };
   probe(t.mntFile, "mnt_read", "read a file under /mnt, where WSL keeps the Windows drives", "mnt-copy");
-  probe(t.windowsExe, "interop", "ran a Windows binary committed to the worktree, which WSL's interop runs outside the sandbox");
+  if (t.windowsExe && !planted.interop) problems.push("the Windows binary couldn't be planted in the canary's folder, so the interop probe proves nothing");
+  else probe(t.windowsExe, "interop", "ran a Windows binary committed to the worktree, which WSL's interop runs outside the sandbox");
   probe(t.bus, "session_bus", "reached the session bus, and the Secret Service behind it");
 }
 

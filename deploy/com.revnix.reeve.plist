@@ -17,6 +17,11 @@
        is not installed, so every publish returned HTTP 404 and no evidence
        accumulated. Neither --enforce nor --execute appears: the shadow week runs
        on neutral conclusions with no dispatch, and both are opt-in. -->
+  <!-- NO WITHDRAWAL AFTER A CRASH. launchd has nothing like systemd's
+       ExecStopPost, which runs `reeve withdraw` however the daemon stopped. Here
+       a crash or a kill leaves any PASS the daemon published standing until reeve
+       publishes there again: shadow results can't pass the enforcement check,
+       but enforcing under this file would leave a real PASS (#241). -->
   <key>ProgramArguments</key>
   <array>
     <string>/Users/mobeen/.nvm/versions/node/v24.17.0/bin/node</string>

@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS event (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS event_subject ON event(subject, seq);
 CREATE INDEX IF NOT EXISTS event_run     ON event(run_id, seq);
+-- By op: what reeve has published and withdrawn is found without reading every
+-- decision it ever recorded (#161).
+CREATE INDEX IF NOT EXISTS event_op      ON event(op, subject, seq);
 
 -- ---------------------------------------------------------------- graph
 CREATE TABLE IF NOT EXISTS node (

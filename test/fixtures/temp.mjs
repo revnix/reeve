@@ -11,42 +11,44 @@
 // busy in synchronous code would run on, and then exit 0, rather than stop
 // (#220). A signal ends a test at once, and runs no exit listener; nor does
 // SIGKILL. So the first folder starts a watcher, a small process of its own
-// that is told each folder's name and removes them all once this process is
-// gone, however it went (#223). The suite's runner, scripts/test.mjs, removes
-// its run's folder too.
+// that removes this process's folders once it is gone, however it went (#223).
+// Every folder is made inside one of this process's own, whose name the
+// watcher is given as it starts, before that folder exists: so a kill at any
+// moment leaves nothing the watcher doesn't know of (#231). The suite's runner,
+// scripts/test.mjs, removes its run's folder too.
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const made = [];
+// The folder this process makes its folders in, once it has made the first.
+let home = null;
 process.on("exit", () => {
-  for (const dir of made) {
-    try { rmSync(dir, { recursive: true, force: true }); } catch { /* already gone, or busy: nothing more to do at exit */ }
-  }
+  if (!home) return;
+  try { rmSync(home, { recursive: true, force: true }); } catch { /* already gone, or busy: nothing more to do at exit */ }
 });
 
-// The watcher reads the folders' names on its stdin, and the pipe closes when
-// this process ends, which is its cue. It doesn't keep this process alive, nor
-// does the pipe, which is only written to. And it is in a group of its own, so
-// Ctrl-C at a terminal doesn't stop it before it has done its work.
-let watcher = null;
+// The watcher waits for its stdin to close, which it does when this process
+// ends. It doesn't keep this process alive, nor does the pipe, which is never
+// written to. And it is in a group of its own, so Ctrl-C at a terminal doesn't
+// stop it before it has done its work.
 const watch = (dir) => {
-  if (!watcher) {
-    watcher = spawn(process.execPath, [fileURLToPath(new URL("temp-watcher.mjs", import.meta.url))],
-      { detached: true, stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
-    watcher.on("error", () => { /* no watcher: the exit listener still runs */ });
-    watcher.stdin.on("error", () => { /* the watcher went early: the exit listener still runs */ });
-    watcher.unref();
-  }
-  watcher.stdin.write(`${dir}\n`);
+  const watcher = spawn(process.execPath, [fileURLToPath(new URL("temp-watcher.mjs", import.meta.url)), dir],
+    { detached: true, stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
+  watcher.on("error", () => { /* no watcher: the exit listener still runs */ });
+  watcher.stdin.on("error", () => { /* the watcher went early: the exit listener still runs */ });
+  watcher.unref();
 };
 
 /** A new folder under the temp directory, named from `prefix`, removed when the process exits. */
 export function tempDir(prefix = "reeve-") {
-  const dir = mkdtempSync(join(tmpdir(), prefix));
-  made.push(dir);
-  watch(dir);
-  return dir;
+  if (!home) {
+    const dir = join(tmpdir(), `reeve-test-${process.pid}-${randomBytes(6).toString("hex")}`);
+    watch(dir);
+    mkdirSync(dir, { mode: 0o700 });
+    home = dir;
+  }
+  return mkdtempSync(join(home, prefix));
 }

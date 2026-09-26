@@ -9,7 +9,13 @@
  * no-undef reports, and a variable read before its definition in the same scope,
  * which no-use-before-define reports. Functions are hoisted and a function may
  * read a variable its scope defines further down, so neither of those is
- * flagged: the rule is kept to the use that throws.
+ * flagged: the rule is kept to the use that throws. One use that doesn't throw
+ * is flagged on purpose: an import read above its declaration. Imports are
+ * bound before any code runs, but here they go first in a module (#230).
+ *
+ * The globals are an ES module's own. Node's CommonJS names, require, module,
+ * exports, __dirname and __filename, each throw in an .mjs file, so no-undef
+ * reports them (#230).
  */
 import globals from "globals";
 import noUrlPathname from "./tools/eslint-rules/no-url-pathname.js";
@@ -34,7 +40,7 @@ export default [
     // config resolves for every tracked file under bin/.
     files: ["src/**/*.mjs", "scripts/**/*.mjs", "test/**/*.mjs", "tools/**/*.js",
             "bin/!(*.*)", "bin/*.mjs"],
-    languageOptions: { ecmaVersion: 2024, sourceType: "module", globals: globals.node },
+    languageOptions: { ecmaVersion: 2024, sourceType: "module", globals: globals.nodeBuiltin },
     plugins: { reeve: { rules: { "no-url-pathname": noUrlPathname } } },
     rules: { "reeve/no-url-pathname": "error", "no-undef": "error", "no-use-before-define": ["error", { functions: false, classes: false, variables: false }] },
   },

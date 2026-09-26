@@ -12,32 +12,11 @@ import { bashShell, broken, dashShell, detectTest, eitherShell } from "./fixture
 
 const show = (r) => JSON.stringify(r);
 
-test("an assignment-shaped argument isn't an assignment: only a leading one, or export's and readonly's operands, can fail", () => {
-  // dash 1, bash 1: `true` ignores its arguments and succeeds.
-  for (const sh of [dashShell, bashShell]) {
-    const r = detectTest("set -o pipefail; ! true X=1 | true", {}, { shell: sh });
-    assert.ok(broken(r, "always fails"), `${sh.name}: ${show(r)}`);
-  }
-  // Still unsure where an assignment may fail: before the command, or through export.
-  // Each passes in bash: the assignment fails in its subshell.
-  for (const s of ["readonly x; set -o pipefail; ! x=1 true | true", "readonly x; set -o pipefail; ! export x=1 | true", "readonly x; ! true | export x=1"]) {
-    const r = detectTest(s, {}, { shell: bashShell });
-    assert.equal(r.state, "present", `${s}: ${show(r)}`);
-  }
-});
+// Where an assignment-shaped argument can fail, and where exit writes nothing
+// in a pipeline, are in detect-shell-scripts-round6: `!` no longer turns a
+// success into a failure, so the scripts that showed them here pass (#236).
 
-test("under pipefail, exit before the last command writes nothing, so it surely succeeds as its status says", () => {
-  // dash 1, bash 1.
-  for (const sh of [dashShell, bashShell]) {
-    const r = detectTest("set -o pipefail; ! exit 0 | true", {}, { shell: sh });
-    assert.ok(broken(r, "always fails"), `${sh.name}: ${show(r)}`);
-  }
-});
-
-test("where either shell may run the script, export -p to a writable PATH succeeds in both, and a read-only PATH keeps its value", () => {
-  // dash 1, bash 1: dash lists, bash assigns, and both succeed.
-  const bang = detectTest("! export -p PATH=/nowhere", {}, { shell: eitherShell });
-  assert.ok(broken(bang, "always fails"), show(bang));
+test("where either shell may run the script, a read-only PATH keeps its value through export -p", () => {
   // dash 127, bash 127: neither changes a read-only PATH.
   const kept = detectTest("readonly PATH; export -p PATH=/nowhere; no-such-runner", {}, { shell: eitherShell });
   assert.ok(broken(kept, "'no-such-runner'"), show(kept));

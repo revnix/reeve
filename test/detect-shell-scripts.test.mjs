@@ -136,7 +136,7 @@ try {
     "[[ is a missing program under dash and a keyword under bash", JSON.stringify({ onDash, onBash }));
 
   // A script that always fails.
-  const always = ["false", "exit 1", "echo checking && exit 2", "! true"].map((s) => ({ s, r: detectTest(s) }));
+  const always = ["false", "exit 1", "echo checking && exit 2"].map((s) => ({ s, r: detectTest(s) }));
   const never = ["true", "exit 0", ":"].map((s) => ({ s, r: detectTest(s) }));
   check(always.every(({ r }) => broken(r, "always fails")) && never.every(({ r }) => r.state === "present"),
     "a script that always fails is broken, and one that always passes isn't", JSON.stringify({ always, never }));
@@ -227,10 +227,10 @@ try {
 
   // `!` inverts a whole pipeline, and set -e never stops at one it inverts. An
   // exit inside it ends the script before anything is inverted.
-  const bangPasses = ["! true | false", "set -e; ! true; echo reached"].map((s) => ({ s, r: detectTest(s) }));
-  const bangFails = ["! false | true", "! exit 1"].map((s) => ({ s, r: detectTest(s) }));
+  const bangPasses = ["! true | false"].map((s) => ({ s, r: detectTest(s) }));
+  const bangFails = ["! exit 1"].map((s) => ({ s, r: detectTest(s) }));
   check(bangPasses.every(({ r }) => r.state === "present") && bangFails.every(({ r }) => broken(r, "always fails")),
-    "! inverts a whole pipeline, set -e never stops at one, and an exit inside it ends the script first", JSON.stringify({ bangPasses, bangFails }));
+    "! inverts a whole pipeline, and an exit inside it ends the script first", JSON.stringify({ bangPasses, bangFails }));
 
   // A line continuation, or a newline after &&, || or |, joins two lines into
   // one list; an operator with nothing after it is a syntax error.
@@ -491,10 +491,8 @@ try {
     .map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
   const pipefailPasses = ["false | true", "set -o pipefail; set +o pipefail; false | true", "set -o pipefail; true | true"]
     .map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
-  // Not surely failing: pipefail set only if jest passed, or echo stopped when
-  // true closes the pipe before it writes.
-  const pipefailUnsure = ["jest --ci && set -o pipefail; false | true", "jest --ci && set -o pipefail; ! false | true",
-                          "set -o pipefail; ! echo hi | true"].map((s) => ({ s, r: detectTest(s, jest, { shell: bashShell }) }));
+  // Not surely failing: pipefail set only if jest passed.
+  const pipefailUnsure = ["jest --ci && set -o pipefail; false | true"].map((s) => ({ s, r: detectTest(s, jest, { shell: bashShell }) }));
   const noPipefail = detectTest("set -o pipefail; jest --ci", jest, { shell: oldDashShell });
   const noPipefailGoesOn = detectTest("set -o pipefail; true", {}, { shell: { ...oldDashShell, badOptionEnds: false } });
   check(pipefailFails.every(({ r }) => broken(r)) && pipefailPasses.every(({ r }) => r.state === "present")
@@ -549,14 +547,12 @@ try {
 
   // A redirection can fail, and then its command doesn't run: a file that isn't
   // there, a folder that can't be written. So a command with one never surely
-  // succeeds, and an exit with one may not end the shell. The null device and
-  // the standard descriptors never fail.
-  const mayFail = ["true < missing-file || exit 0; false", "! true > no/such/folder/out", "exit 3 > no/such/folder/out; echo after",
+  // succeeds, and an exit with one may not end the shell. That the null device
+  // and the standard descriptors never fail is in detect-shell-scripts-round6.
+  const mayFail = ["true < missing-file || exit 0; false", "exit 3 > no/such/folder/out; echo after",
                    "echo x > no/such/folder/out || exit 0; false"].map((s) => ({ s, r: detectTest(s) }));
-  const cantFail = ["echo checking > /dev/null && exit 2", "echo checking 2>&1 && exit 2", "! true 2>/dev/null"].map((s) => ({ s, r: detectTest(s) }));
-  check(mayFail.every(({ r }) => r.state === "present") && cantFail.every(({ r }) => broken(r, "always fails")),
-    "a command with a redirection that may fail never surely succeeds, and one to the null device or a standard descriptor can't fail",
-    JSON.stringify({ mayFail, cantFail }));
+  check(mayFail.every(({ r }) => r.state === "present"),
+    "a command with a redirection that may fail never surely succeeds", JSON.stringify({ mayFail }));
 
   // What the shell has is asked of it: bash has pipefail and bash's operators,
   // and goes on after a bad set option. dash has none of the operators, and a
@@ -609,50 +605,23 @@ try {
   check(broken(bare, "read-only") && prefix.state === "present",
     "a bare assignment to a read-only PATH ends the shell, where one before a command may not", JSON.stringify({ bare, prefix }));
 
-  // Under pipefail, a command that writes nothing can't be stopped by the pipe
-  // closing, so it surely succeeds as the last one does.
-  const quiet = ["set -o pipefail; ! true | true", "set -o pipefail; ! : | true"]
-    .map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
-  check(quiet.every(({ r }) => broken(r, "always fails")),
-    "under pipefail, a command before the last that writes nothing surely succeeds", JSON.stringify(quiet));
-
-  // An assignment to a read-only variable fails, and in a pipeline's subshell
-  // it fails only that command. bash has read-only variables of its own, EUID
-  // and UID among them, so a command in a pipeline with an assignment never
-  // surely succeeds, first or last: each of these passes in bash.
-  const assigning = ["readonly x; set -o pipefail; ! x=1 | true", "set -o pipefail; ! EUID=1 | true", "readonly x; ! true | x=1",
-                     "readonly x; set -o pipefail; ! x=1 true | true"]
-    .map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
-  check(assigning.every(({ r }) => r.state === "present"),
-    "a command in a pipeline with an assignment never surely succeeds: a read-only variable fails it", JSON.stringify(assigning));
-
-  // Each command of a pipeline runs in a subshell of its own, where an expansion
-  // that fails, $((1/0)) or ${x:?}, fails that command rather than ending the
-  // script. So a command with an expansion there, in a word or in a
-  // here-string, never surely succeeds, first or last: all of these pass in
-  // bash, and the first two in dash.
-  const expanding = ["set -o pipefail; ! true $((1/0)) | true", "! true | true $((1/0))",
-                     "set -o pipefail; ! true <<< $((1/0)) | true", "! true | true <<< $((1/0))"]
-    .map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
-  check(expanding.every(({ r }) => r.state === "present"),
-    "a command in a pipeline with an expansion that may fail never surely succeeds", JSON.stringify(expanding));
-
   // Outside a pipeline, a here-string whose expansion fails ends the script, as
   // one in a word does. Either way it fails, so its command is read as though
   // the expansion succeeded.
-  const hereString = [["! true <<< \"$HOME\"", "always fails"], ["true <<< \"$HOME\" && no-such-runner", "'no-such-runner'"]]
+  const hereString = [["true <<< \"$HOME\" && no-such-runner", "'no-such-runner'"]]
     .map(([s, want]) => ({ s, want, r: detectTest(s, {}, { shell: bashShell }) }));
   check(hereString.every(({ want, r }) => broken(r, want)),
     "outside a pipeline, a here-string's expansion that fails ends the script, so its command is read as succeeding", JSON.stringify(hereString));
 
-  // Where either shell may run the script, unset given -f and -v may fail, as
-  // bash refuses it, and with -f last it keeps PATH in both.
+  // Where either shell may run the script, unset given -f and -v with -f last
+  // keeps PATH in both: bash refuses it, and dash unsets a function. With -v
+  // last, dash unsets PATH.
   const eitherUnset = { ...dashShell, name: "dash or bash", unsetLastOptionWins: "maybe" };
   const unsetEither = [["unset -vf PATH; no-such-runner", "'no-such-runner'"], ["unset -v -f PATH; no-such-runner", "'no-such-runner'"],
-                       ["! unset -vf x", "present"], ["! unset -fv x", "present"], ["unset -fv PATH; jest --ci", "present"]]
+                       ["unset -fv PATH; jest --ci", "present"]]
     .map(([s, want]) => ({ s, want, r: detectTest(s, jest, { shell: eitherUnset }) }));
   check(unsetEither.every(({ want, r }) => (want === "present" ? r.state === "present" : broken(r, want))),
-    "where either shell may run the script, unset given -f and -v may fail, and with -f last keeps PATH", JSON.stringify(unsetEither));
+    "where either shell may run the script, unset given -f and -v keeps PATH with -f last, and may unset it with -v last", JSON.stringify(unsetEither));
 
   // What the shell does is asked of it.
   const asked216 = [scriptShell(which("bash")), dashPath ? scriptShell(dashPath) : null];

@@ -661,15 +661,16 @@ export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSp
     // And on Linux the bubblewrap and socat the CLI runs, as the worker's PATH
     // finds them: a pass under one build of them says nothing of the next (#156).
     const runtime = (ctx.sandboxRuntimeIdentity ?? sandboxRuntimeIdentity)(env.PATH, { platform: ctx.platform ?? process.platform });
+    // The Linux probes' targets, found before the cache is looked in: which of
+    // them the host lets the canary run is part of its id. Found before the
+    // listener opens, too, so a search that fails leaves none open (#156).
+    const linuxTargets = (ctx.platform ?? process.platform) === "linux" ? await (ctx.linuxProbeTargets ?? linuxProbeTargets)() : null;
     // The network positive control is a daemon-local listener the sandboxed curl
     // tries to reach. The daemon knows the listener is reachable (it self-pings),
     // so a sandboxed curl that cannot reach it proves a DENIAL — no external
     // dependency, no timing window, and a hit at any point in the run is a leak.
     // (Codex #4d-[12], #4c-[13].) Injectable for tests.
-    const netProbe = ctx.netProbe ?? netListener();
-    // The Linux probes' targets, found before the cache is looked in: which of
-    // them the host lets the canary run is part of its id (#156).
-    const linuxTargets = (ctx.platform ?? process.platform) === "linux" ? await (ctx.linuxProbeTargets ?? linuxProbeTargets)() : null;
+    const netProbe = ctx.netProbe ?? (ctx.netListener ?? netListener)();
     // Computed exactly as measureContainment computes it. A cache key that
     // drifts from the id is how every tick came to pay for a five-minute canary.
     const before = cache.get(canaryIdFor({ cliVersion: version, sandbox: policy.settings.sandbox, binaryId, worktree: canaryPaths.dir,

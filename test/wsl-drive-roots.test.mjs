@@ -125,3 +125,15 @@ test("a search of the drives that couldn't run isn't read as a drive with nothin
   assert.equal(t.mntFile, null);
   assert.match(t.skipped.mnt ?? "", /readable/);
 });
+
+test("the canary finds a readable file on a drive however deep it is", async () => {
+  // A data drive with nothing readable near its root, and a file five folders
+  // down. A search that stopped at three would read the drive as empty, and
+  // skip the probe of its deny.
+  const drive = realpathSync(tempDir("wd-deep-"));
+  const deep = join(drive, "a", "b", "c", "d", "e");
+  mkdirSync(deep, { recursive: true });
+  writeFileSync(join(deep, "notes.txt"), "readable\n");
+  const t = await linuxProbeTargets({ mounts: "", driveRoots: [drive], searchRoots: [drive], mntCandidates: [], uid: -1 });
+  assert.equal(t.mntFile, join(deep, "notes.txt"));
+});

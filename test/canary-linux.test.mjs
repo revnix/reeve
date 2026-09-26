@@ -15,7 +15,7 @@
 // runtime is measured by test/escape.test.mjs.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { canaryIdFor, canaryScript, instrumentHash, linuxProbeTargets, probeShapeOf, sandboxCanary } from "../src/canary.mjs";
@@ -120,6 +120,21 @@ test("a Linux canary whose Windows binary couldn't be planted fails: the interop
   writeFileSync(exe, "MZ not really a Windows binary\n");
   const ok = await run({}, { ...everything, windowsExe: exe });
   assert.equal(ok.ok, true, ok.why);
+});
+
+test("a Linux canary whose drive file is gone by the end of the run fails: the failed copy proves nothing", async () => {
+  // The file probed can go while the canary runs, a temporary one say. Its copy
+  // then fails whatever the deny does, which would read as the deny holding.
+  const file = join(root, "drive-file.txt");
+  writeFileSync(file, "readable\n");
+  const gone = await sandboxCanary({ ...base, linuxTargets: { ...everything, mntFile: file },
+    runner: async (args) => { rmSync(file, { force: true }); return worker()(args); } });
+  assert.equal(gone.ok, false, "a canary passed on the copy of a file that was gone");
+  assert.match(gone.why, /drive file/);
+  // The control: the file still there at the end, the copy refused, the canary passes.
+  writeFileSync(file, "readable\n");
+  const kept = await sandboxCanary({ ...base, linuxTargets: { ...everything, mntFile: file }, runner: worker() });
+  assert.equal(kept.ok, true, kept.why);
 });
 
 test("a worker that can create a Unix socket fails the Linux canary: the socket filter is not in force", async () => {

@@ -152,6 +152,25 @@ test("the canary's TMPDIR is removed when measuring fails before the canary is a
   assert.deepEqual(existsSync(t) ? readdirSync(t) : [], [], "a TMPDIR was left behind");
 });
 
+test("the canary's listener isn't left open when finding the Linux targets fails", async () => {
+  // Each tick would open another, and the one-shot command would stay alive on it.
+  // A real one left open keeps this file alive for ever: a timer that doesn't
+  // keep it alive itself ends it then, and fails it, rather than hanging.
+  setTimeout(() => { console.error("a listener kept the process alive"); process.exit(1); }, 20_000).unref();
+  const stateDir = tempDir("rc-");
+  let opened = 0, closed = 0;
+  const ctx = { logPath: join(stateDir, "reeve.log"), platform: "linux", isolationReady: () => true, mounts: "",
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "2.1.278 (Claude Code)",
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    netListener: () => { opened++; return { url: "http://127.0.0.1:1/canary", ready: Promise.resolve(), selfReachable: () => true, wasHit: () => false, close: () => { closed++; } }; },
+    linuxProbeTargets: async () => { throw new Error("the targets couldn't be found"); },
+    canary: async () => ({ ok: true, id: "t", why: null, evidence: {} }) };
+  const profile = { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: tempDir("rc-wt-") }, worker: { isolation: "scratch-home" }, units: [] };
+  const v = await daemon.measuredContainment(ctx, profile, "o/r", ctx.logPath);
+  assert.equal(v.credentialRead, "open", "control: the measurement failed");
+  assert.equal(opened - closed, 0, `a listener was left open (${opened} opened, ${closed} closed)`);
+});
+
 test("a TMPDIR with no room names the state folder it sits under, which --log can put outside REEVE_HOME", () => {
   const state = "/" + "s".repeat(70);
   const why = workerenv.tmpDirTooLong(join(state, "t", "0123456789ab"), "linux");

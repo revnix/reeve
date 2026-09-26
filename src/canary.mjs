@@ -371,7 +371,9 @@ export async function linuxProbeTargets({ uid = process.getuid?.(), node = proce
   // failed copy would read as a deny that held (#156).
   let mntFile = mntCandidates.find(readable) ?? null;
   if (!mntFile) {
-    const found = spawnSync(findBin, [...searchRoots, "-maxdepth", "3", "-type", "f", "-readable", "-print0", "-quit"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] });
+    // However deep: a drive whose readable files are all far down would
+    // otherwise read as empty, and its deny go unprobed (#156).
+    const found = spawnSync(findBin, [...searchRoots, "-type", "f", "-readable", "-print0", "-quit"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] });
     // A search that couldn't run, or ran out of time, answers nothing, and that
     // isn't proof nothing is readable: the probe would be skipped, and the canary
     // could pass with the deny open. Unreadable folders on the way are normal,
@@ -912,6 +914,8 @@ export async function sandboxCanary({
  * sockets it has (#156). Each other probe ran only where the daemon reached the
  * shape first, and a probe that should have run and didn't is a problem too.
  */
+const readableFile = f => { try { accessSync(f, constants.R_OK); return statSync(f).isFile(); } catch { return false; } };
+
 function linuxProblems(results, t, problems, evidence, dir, planted = {}) {
   evidence.linux = { targets: t ? { mntFile: t.mntFile, windowsExe: t.windowsExe, bus: t.bus } : null, skipped: t?.skipped ?? null, planted };
   // The login token in any process's environment the shell can read (#156).
@@ -931,7 +935,10 @@ function linuxProblems(results, t, problems, evidence, dir, planted = {}) {
     if (!(key in results)) problems.push(`the ${key} probe did not run, though the host has the shape it probes`);
     else if (results[key] === 0 || (copy && existsSync(join(dir, copy)))) problems.push(leak);
   };
-  probe(t.mntFile, "mnt_read", "read a file under /mnt, where WSL keeps the Windows drives", "mnt-copy");
+  // The drive file has to be there still: a copy of one that went during the
+  // run fails whatever the deny does, and would read as the deny holding (#156).
+  if (t.mntFile && results.mnt_read !== 0 && !readableFile(t.mntFile)) problems.push("the drive file probed was gone by the end of the run, so its failed copy proves nothing");
+  else probe(t.mntFile, "mnt_read", "read a file under /mnt, where WSL keeps the Windows drives", "mnt-copy");
   if (t.windowsExe && !planted.interop) problems.push("the Windows binary couldn't be planted in the canary's folder, so the interop probe proves nothing");
   else probe(t.windowsExe, "interop", "ran a Windows binary committed to the worktree, which WSL's interop runs outside the sandbox");
   probe(t.bus, "session_bus", "reached the session bus, and the Secret Service behind it");

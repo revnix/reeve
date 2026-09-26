@@ -211,7 +211,7 @@ if (!["darwin", "linux"].includes(process.platform)) {
   const mntFile = process.platform !== "linux" ? null
     : ["/mnt/c/Windows/System32/drivers/etc/hosts", "/mnt/reeve-escape-decoy.txt"].find(f => sh(root, "test", ["-r", f]).status === 0)
       // NUL-ended and whole, as the canary reads it: a name can hold a newline.
-      ?? (spawnSync("find", ["/mnt", "-maxdepth", "3", "-type", "f", "-readable", "-print0", "-quit"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).stdout?.split("\0")[0] || null);
+      ?? (spawnSync("find", ["/mnt", "-type", "f", "-readable", "-print0", "-quit"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).stdout?.split("\0")[0] || null);
   const ghDecoy = join(homedir(), ".config", "gh", `reeve-escape-decoy-${process.pid}`);
   mkdirInHome(dirname(ghDecoy)); writeFileSync(ghDecoy, "decoy\n");
   const windowsExe = "/mnt/c/Windows/System32/cmd.exe";

@@ -9,7 +9,7 @@
 // withdrawer, and a store of its own.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -346,6 +346,70 @@ test("a HALT that takes back a PASS this tick couldn't doesn't then announce it 
   assert.ok(withdrawn.some((w) => w.head === headOf(7)), "control: HALT took #7's PASS back");
   const stuck = ctx.db.prepare("SELECT why FROM escalation").all().map((r) => r.why).filter((w) => /may no longer hold/.test(w));
   assert.deepEqual(stuck, [], JSON.stringify(sent));
+});
+
+// #7 moved from its first head to another, still passing.
+const HEAD_B = "7b".padEnd(40, "b");
+const movedOn = (n) => (n === 7 ? { ...evaluation(7), head: HEAD_B, verdict: { ...evaluation(7).verdict, head: HEAD_B } } : evaluation(n));
+
+test("a PASS left at an earlier head is withdrawn once the pull request moves on, so a push back to it can't merge on it", async () => {
+  const { ctx, withdrawn } = setup();
+  await daemon.tick(ctx);
+  await daemon.tick({ ...ctx, evaluate: ({ pr: n }) => movedOn(n) });
+  assert.ok(withdrawn.some((w) => w.head === headOf(7)), JSON.stringify(withdrawn));
+  assert.ok(!withdrawn.some((w) => w.head === HEAD_B), "the PASS at the head it moved to was withdrawn");
+});
+
+test("a PASS at an earlier head that couldn't be withdrawn stays on record, and HALT takes it back", async () => {
+  const { ctx, withdrawn, halt } = setup();
+  await daemon.tick(ctx);
+  await daemon.tick({ ...ctx, evaluate: ({ pr: n }) => movedOn(n), withdraw: async () => ({ ok: false, why: "HTTP 502" }) });
+  assert.deepEqual(withdrawn, [], "control: nothing was withdrawn yet");
+  halt();
+  await daemon.tick({ ...ctx, evaluate: ({ pr: n }) => movedOn(n) });
+  assert.ok(withdrawn.some((w) => w.head === headOf(7)), JSON.stringify(withdrawn));
+});
+
+test("a pull request reeve can't re-check has its PASS withdrawn at every head it left one", async () => {
+  const { ctx, withdrawn } = setup();
+  await daemon.tick(ctx);
+  // Moved on, and the earlier head's PASS couldn't be withdrawn then.
+  await daemon.tick({ ...ctx, evaluate: ({ pr: n }) => movedOn(n), withdraw: async () => ({ ok: false, why: "HTTP 502" }) });
+  await daemon.tick({ ...ctx, evaluate: ({ pr: n }) => (n === 7 ? { ok: false, why: "GitHub answered 502" } : movedOn(n)) });
+  assert.deepEqual(withdrawn.filter((w) => w.pr === 7).map((w) => w.head).sort(), [headOf(7), HEAD_B].sort(), JSON.stringify(withdrawn));
+});
+
+test("a HALT that arrives while the last worker runs withdraws every PASS before the tick ends", async () => {
+  const { ctx, withdrawn, halt } = setup();
+  // A checkout of its own, apart from reeve's state, which workers are denied.
+  const dir = tempDir("reeve-withdraw-wt-"), clone = tempDir("reeve-withdraw-clone-");
+  execFileSync("git", ["-C", clone, "init", "-q"]);
+  execFileSync("git", ["-C", clone, "config", "user.name", "Founder"]);
+  execFileSync("git", ["-C", clone, "config", "user.email", "founder@example.invalid"]);
+  const red = { ...evaluation(42, "BLOCK", [{ id: "ci", state: "BLOCK", detail: "failing: CI Gate" }]),
+    checks: { verdict: "RED", caused: ["CI Gate"], failing: [{ name: "CI Gate", id: "99" }] } };
+  const spawned = [];
+  // #42's worker is the last thing the tick does, so no later step looks at HALT.
+  await daemon.tick({ ...ctx, execute: true, openPrs: () => [43, 42],
+    profile: { ...ctx.profile, identity: { ...ctx.profile.identity, worktreeRoot: dir, checkout: clone } },
+    evaluate: ({ pr: n }) => (n === 42 ? red : evaluation(n)),
+    resolveCause: () => ({ ok: true, job: "CI Gate", step: "Test", cause: [{ where: "src/x.ts:1", message: "boom" }] }),
+    containment: { credentialRead: "closed", why: "test" }, keychain: { measured: true, items: [], why: null },
+    claudeBin: "/bin/sh", cliVersion: "test",
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    // HALT arrives while the only worker runs: nothing is left to look at the marker.
+    spawnWorker: async (args) => { spawned.push(args); halt(); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s1" }; } });
+  assert.equal(spawned.length, 1, "control: the worker ran");
+  assert.ok(withdrawn.some((w) => w.head === headOf(43) && /halted/.test(w.why)), JSON.stringify(withdrawn));
+});
+
+test("a withdrawal the store couldn't record is reported, not taken as done", async () => {
+  const { ctx } = setup();
+  await daemon.tick(ctx);
+  const left = await daemon.withdrawStanding({ ...ctx, db: refusing(ctx.db, (op) => op === "pr.withdrawn") }, "the merge policy stopped");
+  assert.equal(left.length, 2, JSON.stringify(left));
 });
 
 test("a publish that throws doesn't end the tick: the pull requests after it are still published", async () => {

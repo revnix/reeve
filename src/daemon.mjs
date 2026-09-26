@@ -833,8 +833,9 @@ function record(db, { pr, head, verdict, decision, effects = [], retire = new Ma
 }
 
 // WHAT REEVE HAS STANDING at each pull request (#161): the newest of its
-// publications and withdrawals there under each check name, since a shadow
-// result and an enforcing one are separate checks and neither writes over the
+// publications and withdrawals there under each check name and at each head:
+// a shadow result and an enforcing one are separate checks, and a result stays
+// on its commit after the pull request moves on, so neither writes over the
 // other; a merge ends them all. A PASS stays on its commit for as long as
 // nothing writes over it, so one reeve can no longer re-check is withdrawn. A
 // publication is written down when it changes, not on every tick, and a PASS
@@ -849,15 +850,15 @@ const STANDING_UNREAD = "reeve couldn't read which PASSes it has standing, so it
 const isStuck = (why) => { const n = /^#(\d+): /.exec(why)?.[1]; return n != null && why === PASS_STUCK(Number(n)); };
 
 /**
- * What reeve last left at `pr` under each check name, as `{ op, head, state,
- * name, id }`. Empty where it left nothing, and after a merge. Throws when that
- * can't be read.
+ * What reeve last left at `pr` under each check name at each head, as `{ op,
+ * head, state, name, id }`. Empty where it left nothing, and after a merge.
+ * Throws when that can't be read.
  */
 function standingAt(db, pr) {
   const at = new Map();
   for (const r of db.prepare(`SELECT op, payload FROM event WHERE subject = ? AND ${STANDING} ORDER BY seq`).all(`pr:${pr}`)) {
     const s = { ...JSON.parse(r.payload), op: r.op };
-    if (r.op === "pr.merged") at.clear(); else at.set(s.name, s);
+    if (r.op === "pr.merged") at.clear(); else at.set(`${s.name}\n${s.head}`, s);
   }
   return [...at.values()];
 }
@@ -869,10 +870,11 @@ function standingAt(db, pr) {
  * stands in its place. Throws when the log can't be read at all.
  */
 export function standingPasses(db) {
-  const name = (t) => `CASE WHEN json_valid(${t}.payload) THEN json_extract(${t}.payload, '$.name') END`;
+  const field = (t, k) => `CASE WHEN json_valid(${t}.payload) THEN json_extract(${t}.payload, '$.${k}') END`;
   return db.prepare(`SELECT e.subject, e.payload FROM event e WHERE e.op = 'pr.published'
                        AND NOT EXISTS (SELECT 1 FROM event f WHERE f.subject = e.subject AND f.seq > e.seq AND ${STANDING}
-                         AND (f.op = 'pr.merged' OR NOT json_valid(e.payload) OR ${name("f")} IS ${name("e")}))`).all()
+                         AND (f.op = 'pr.merged' OR NOT json_valid(e.payload)
+                              OR (${field("f", "name")} IS ${field("e", "name")} AND ${field("f", "head")} IS ${field("e", "head")})))`).all()
     .map((r) => {
       const pr = Number(String(r.subject).slice(3));
       try { return { ...JSON.parse(r.payload), pr }; } catch (err) { return { pr, unread: err.message }; }
@@ -901,7 +903,12 @@ async function withdrawPass(ctx, pr, standing, why) {
     log(logPath, `  #${pr}: COULD NOT WITHDRAW the PASS at ${String(standing.head).slice(0, 8)} (${why}) — ${r?.why}`);
     return false;
   }
-  notePublication(db, pr, "pr.withdrawn", { head: standing.head, name: standing.name, id: r.id ?? standing.id ?? null, why });
+  // Withdrawn but not written down is not done: the log would go on saying the
+  // PASS stands, and a stop or reeve withdraw would report it withdrawn.
+  if (!notePublication(db, pr, "pr.withdrawn", { head: standing.head, name: standing.name, id: r.id ?? standing.id ?? null, why })) {
+    log(logPath, `  #${pr}: withdrew the PASS at ${String(standing.head).slice(0, 8)} (${why}), but COULDN'T RECORD it, so it still reads as standing`);
+    return false;
+  }
   log(logPath, `  #${pr}: withdrew the PASS at ${String(standing.head).slice(0, 8)} (${why})`);
   return true;
 }
@@ -1775,8 +1782,8 @@ export async function tick(ctx) {
 
   // A PASS may stand only where reeve keeps checking (#161). Withdrawing one
   // takes authority back rather than using it, so it happens halted too. With
-  // `head`, only a PASS at that head is taken back.
-  const takeBack = async (n, why, head = null) => {
+  // `which`, only the PASSes it picks are taken back.
+  const takeBack = async (n, why, which = () => true) => {
     let at;
     try { at = standingAt(db, n); }
     catch (err) {
@@ -1787,7 +1794,7 @@ export async function tick(ctx) {
     }
     let ok = true;
     for (const s of at)
-      if (s.op === "pr.published" && s.state === PASS && (!head || s.head === head) && !(await withdrawPass(ctx, n, s, why))) ok = false;
+      if (s.op === "pr.published" && s.state === PASS && which(s) && !(await withdrawPass(ctx, n, s, why))) ok = false;
     if (!ok) { raise(PASS_STUCK(n)); return false; }
     // Taken back, or nothing was left to take: an alert that it couldn't be is over.
     escalations.delete(PASS_STUCK(n));
@@ -2184,12 +2191,12 @@ export async function tick(ctx) {
     // read, and then written afresh.
     let at;
     try { at = standingAt(db, pr); } catch { at = null; }
-    const under = (n) => at?.find((x) => x.name === n) ?? null;
+    const under = (n, head = e.head) => at?.find((x) => x.name === n && x.head === head) ?? null;
     const note = (op, left) => {
-      const s = under(left.name);
+      const s = under(left.name, left.head);
       if (op === "pr.published" && s?.op === op && s.head === left.head && s.state === left.state && s.id === left.id) return true;
       if (!notePublication(db, pr, op, left)) return false;
-      at = [...(at ?? []).filter((x) => x.name !== left.name), { ...left, op }];
+      at = [...(at ?? []).filter((x) => x.name !== left.name || x.head !== left.head), { ...left, op }];
       return true;
     };
     const name = shadow ? shadowContextOf(POLICY_CONTEXT) : POLICY_CONTEXT;
@@ -2199,7 +2206,7 @@ export async function tick(ctx) {
     // that fails in between never leaves one standing that reeve doesn't know
     // of. One the store won't take isn't published: what stood before stays.
     if (e.verdict.state === PASS
-        && !note("pr.published", { head: e.head, state: PASS, name, id: was?.head === e.head ? was.id ?? null : null }))
+        && !note("pr.published", { head: e.head, state: PASS, name, id: was?.id ?? null }))
       pub = { ok: false, why: "its PASS couldn't be written down first, so it isn't published" };
     else {
       try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict: e.verdict, shadow, base: e.baseRef }); }
@@ -2225,8 +2232,14 @@ export async function tick(ctx) {
       if (failures.get(pr) >= 3) raise(`#${pr}: reeve couldn't publish its verdict on 3 ticks in a row`);
       // A PASS published at this head stands until something writes over it.
       if (e.verdict.state !== PASS)
-        await takeBack(pr, "the merge policy couldn't publish its new verdict here", e.head);
+        await takeBack(pr, "the merge policy couldn't publish its new verdict here", (x) => x.head === e.head);
     }
+    // A PASS left at an earlier head stays on that commit, and a push back to it
+    // makes it the pull request's again, to merge on a result nothing re-checked.
+    // So it's withdrawn once the pull request moves on, and again each tick until
+    // it is; a stop or HALT withdraws it too while it stands.
+    if ((at ?? []).some((x) => x.op === "pr.published" && x.state === PASS && x.head !== e.head))
+      await takeBack(pr, "this pull request has moved to a newer commit", (x) => x.head !== e.head);
     // A rule requires the enforcement check, which shadow mode never publishes,
     // so every pull request on that branch is blocked. A person has to choose:
     // enforce, or stop requiring the check. One escalation, not one per PR.
@@ -3637,6 +3650,11 @@ export async function tick(ctx) {
   // depend on it, and a queue that cannot move is a reason to say so rather than to
   // stop reading pull requests.
   await drainDueEffects([...finished]);
+
+  // HALT THAT ARRIVED after the last check: while the last worker ran, say
+  // (#161). Nothing after here looks at the marker before the tick returns and
+  // the daemon sleeps, so what this tick leaves passing is withdrawn now.
+  if (halted(ctx.haltMarker)) await takeBackAll("the merge policy is halted");
 
   const { fresh, cleared } = announce({ covered: evaluated, waiting, finished,
                                         complete: evaluated.size === prs.length });

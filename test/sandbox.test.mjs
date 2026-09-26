@@ -364,7 +364,8 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   check(JSON.stringify(fs.allowRead) === JSON.stringify([TMP]),
     "and the read grant is the tmp alone when no deny sits above the checkout", JSON.stringify(fs.allowRead));
   const deny = s.settings.permissions.deny;
-  check(credentialPaths().every(c => deny.includes(`Read(/${c}/**)`) || deny.includes(`Read(/${c})`)),
+  // The same paths as the OS layer: on Linux a linked one at its target only.
+  check(osCredentialPaths().every(c => deny.includes(`Read(/${c}/**)`) || deny.includes(`Read(/${c})`)),
     "and the Read tool, which the OS sandbox does not cover, is denied the same paths", deny.filter(d => d.startsWith("Read(")).slice(0, 2).join(" "));
   const v = validateSettings(s.settings, { tmpDir: TMP });
   check(v.ok === true, "control: generated settings validate", JSON.stringify(v.errors));
@@ -704,11 +705,13 @@ const linuxOnly = (name, run) => (process.platform === "linux" ? run() : console
     });
     // The Read tool runs outside the OS sandbox, so a committed symlink could
     // point it straight at the target: it is denied there too, a file as a file.
-    linuxOnly("the Read tool is denied a linked credential at its target too, a file as a file", () => {
+    // And not at the link: the CLI mounts its Read denies too, and bubblewrap
+    // can't mount over a link (measured 2026-09-26; test/sandbox-linked-read.test.mjs).
+    linuxOnly("the Read tool is denied a linked credential at its target, a file as a file, and not at the link", () => {
       const deny = sandboxFor({ profile, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: TMP }).settings.permissions.deny;
       check(deny.includes(`Read(/${join(home, "elsewhere", "aws")}/**)`) && deny.includes(`Read(/${join(home, "elsewhere", "npmrc")})`)
-        && deny.includes(`Read(/${join(home, ".aws")}/**)`),
-        "the Read tool is denied a linked credential at its target too, a file as a file", JSON.stringify(deny.filter(d => d.includes(home))));
+        && !deny.includes(`Read(/${join(home, ".aws")}/**)`),
+        "the Read tool is denied a linked credential at its target, a file as a file, and not at the link", JSON.stringify(deny.filter(d => d.includes(home))));
     });
   } finally {
     if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;

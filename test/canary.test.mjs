@@ -74,6 +74,12 @@ const streamFor = (readTool, writeTool = "denied", readInside = "allowed") => {
     else if (readInside === "broken") lines.push(JSON.stringify(resultOf("r2", "<tool_use_error>ENOENT: no such file</tool_use_error>", true)));
     else lines.push(JSON.stringify(resultOf("r2", CANARY_INSIDE_CONTROL, false)));
   }
+  // A real worker also writes its own file with the Write tool, and is refused
+  // the decoy reached through a link (#156). The liars below leave these out.
+  if (readInside !== "absent") {
+    lines.push(JSON.stringify(use("Write", "w0", "./read-tool-out")), JSON.stringify(resultOf("w0", "File created successfully at: ./read-tool-out", false)));
+    lines.push(JSON.stringify(use("Read", "r3", "./decoy-tool-link")), JSON.stringify(resultOf("r3", "Permission to read the file has been denied.")));
+  }
   return lines.length ? lines.join("\n") + "\n" : "";
 };
 // The script sandboxCanary would build for this fixture. The instrument is part
@@ -113,6 +119,8 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
     // models the host where the items are absent while the keychain is wide open.
     const open = keychainOpen === null ? byPath : keychainOpen;
     rec.push(`kc_path_open=${open ? 0 : 161}`);
+    // The login token isn't in the shell's environment (#156).
+    if (script.includes("rec token_env ")) rec.push("token_env=1");
     if (fileDecoy) writeFileSync(join(base.outsideDir, "..", "filedecoy-copy"), "x");
     // "no-path-probes" writes everything EXCEPT the by-path keychain probes, which
     // is what an older canary script would leave behind after a daemon upgrade.
@@ -124,6 +132,10 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
     if (writeTool === "leak") writeFileSync(join(base.outsideDir, "TOOL-OUTSIDE"), "BLOCKED");
     if (readTool === "denied") writeFileSync(join(cwd, "read-tool-out"), "DENIED");
     else if (readTool === "leak") writeFileSync(join(cwd, "read-tool-out"), CANARY_SENTINEL + "\n");
+    // The worker writes its own file whatever the decoy's read said, and is
+    // refused the decoy through a link.
+    if (readInside !== "absent" && !existsSync(join(cwd, "read-tool-out"))) writeFileSync(join(cwd, "read-tool-out"), "(nothing read)");
+    if (readInside !== "absent") writeFileSync(join(cwd, "link-tool-out"), "DENIED");
     return { outcome, why: outcome === "ok" ? "completed" : "planted", ms: 1, cost: 0, sessionId: "c" };
   };
 

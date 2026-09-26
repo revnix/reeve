@@ -26,7 +26,7 @@
 // was never offered. Any tool that can run a command is a write primitive, so the
 // grant is a CLOSED ALLOWLIST and the denies are belt-and-braces on top of it.
 
-import { writeFileSync, mkdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, writeFileSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { resolveHome, DEFAULT_HOME } from "./home.mjs";
@@ -299,8 +299,17 @@ const readRule = (p, file) => (file ? `Read(${ruleFor(p)})` : `Read(${ruleFor(p)
 // The Read tool runs outside the OS sandbox, and a committed symlink could point
 // it straight at a linked credential's target. So on Linux, where the sandbox is
 // given the targets, the Read tool is denied them too: a file as a file.
+//
+// And ONLY them on Linux (#156). The CLI mounts its Read denies in the sandbox
+// as well, and bubblewrap can't mount over a link: measured 2026-09-26 with CLI
+// 2.1.278 on WSL2, `Read(~/.aws/**)` with ~/.aws a link stopped the sandbox
+// from starting. The same day the Read tool refused a denied file reached
+// through a link, so the target covers the link. A path that isn't there is
+// kept as written, a directory's form or a file's as the list says.
 const isDir = p => { try { return statSync(p).isDirectory(); } catch { return false; } };
 const credentialReadDenies = () => {
+  if (process.platform === "linux")
+    return osCredentialPaths().map(p => readRule(p, existsSync(p) ? !isDir(p) : isCredentialFile(p)));
   const written = credentialPaths();
   const targets = osCredentialPaths().filter(p => !written.includes(p));
   return [...written.map(p => readRule(p, isCredentialFile(p))), ...targets.map(p => readRule(p, !isDir(p)))];

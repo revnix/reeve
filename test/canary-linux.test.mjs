@@ -49,15 +49,21 @@ const worker = ({ leak = [], absent = [], nodeRuns = true } = {}) => async ({ cw
     if (!script.includes(line) || absent.includes(key)) continue;
     rec[key] = key === "node_runs" ? (nodeRuns ? 0 : 127) : leak.includes(key) ? 0 : 1;
   }
+  // The login token isn't in the shell's environment, nor any it can read.
+  for (const [key, held] of [["token_env", 1], ["proc_control", 0], ["token_proc", 2]]) if (script.includes(`rec ${key} `)) rec[key] = held;
   writeFileSync(join(cwd, "canary-results.txt"), Object.entries(rec).map(([k, v]) => `${k}=${v}`).join("\n") + "\n");
   // The tool stream: the Read of the worker's own file returns it; the Read of
   // the decoy and the Write outside are refused.
   const use = (name, id, path) => JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name, id, input: { file_path: path } }] } });
   const result = (id, content, err) => JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content, is_error: err }] } });
+  // It writes its own file, and the decoy reached through a link is refused.
   writeFileSync(outPath, [use("Read", "r1", base.decoyPath), result("r1", "Permission to read the file was denied.", true),
+    use("Write", "w0", "./read-tool-out"), result("w0", "File created successfully at: ./read-tool-out", false),
     use("Write", "w1", join(base.outsideDir, "TOOL-OUTSIDE")), result("w1", "Permission to write outside the working directory was denied.", true),
-    use("Read", "r2", join(cwd, "inside-control.txt")), result("r2", readFileSync(join(cwd, "inside-control.txt"), "utf8"), false)].join("\n") + "\n");
+    use("Read", "r2", join(cwd, "inside-control.txt")), result("r2", readFileSync(join(cwd, "inside-control.txt"), "utf8"), false),
+    use("Read", "r3", "./decoy-tool-link"), result("r3", "Permission to read the file has been denied.", true)].join("\n") + "\n");
   writeFileSync(join(cwd, "read-tool-out"), "DENIED");
+  writeFileSync(join(cwd, "link-tool-out"), "DENIED");
   return { outcome: "ok", why: "completed", ms: 1, cost: 0, sessionId: "c" };
 };
 const run = (opts, targets = everything) => sandboxCanary({ ...base, linuxTargets: targets, runner: worker(opts) });

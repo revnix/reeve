@@ -23,7 +23,7 @@ import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGra
 import { verifyConfig, GIT_NEUTRALISE, gitEnv } from "./gitguard.mjs";
 import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor, commitRunWork, digestOf } from "./checkout.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
-import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor } from "./workerenv.mjs";
+import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor, workerTmpDir } from "./workerenv.mjs";
 import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
 import { canaryIdFor, netListener, instrumentHash } from "./canary.mjs";
 import { claimProvider, releaseProvider, bindProviderLease, noteRateLimit, heartbeatProvider,
@@ -590,7 +590,8 @@ export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSp
     const inv = `${nwo.replace("/", "-")}-${process.pid}-${Date.now()}`;
     const canaryRoot = join(root, ".reeve-canary", inv);
     const canaryPaths = {
-      dir: join(canaryRoot, "run"), outsideDir: join(canaryRoot, "outside"), tmpDir: join(canaryRoot, "tmp"),
+      // The TMPDIR is a production worker's, short, so the sandbox's sockets fit (#156).
+      dir: join(canaryRoot, "run"), outsideDir: join(canaryRoot, "outside"), tmpDir: workerTmpDir(stateDir),
       // Under the CONFIGURED state root (deny-read, so it is measurable), per
       // repository AND per invocation: two daemons sharing one decoy could delete
       // each other's and read the ENOENT as a denial. (Codex #4-[1], #4b-[11].)
@@ -670,7 +671,7 @@ export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSp
       // another directory behind, each with a git config and the shims in it. A
       // FAILED canary keeps its own directory for evidence, which is why this
       // removes the tree only when the canary did not run. (Codex #5-[6].)
-      if (c?.canary?.skipped || c?.canary?.cached) rmSync(canaryRoot, { recursive: true, force: true });
+      if (c?.canary?.skipped || c?.canary?.cached) { rmSync(canaryRoot, { recursive: true, force: true }); rmSync(canaryPaths.tmpDir, { recursive: true, force: true }); }
     }
     if (!before) log(logPath, `containment: canary ${c.canary?.id ?? "?"} ${c.canary?.ok ? "passed" : `FAILED: ${c.canary?.why}`}; keychain: ${c.keychain?.measured ? (c.keychain.items.length ? c.keychain.why : "no GitHub credential") : `unmeasured (${c.keychain?.why})`}`);
     return c;
@@ -2654,7 +2655,8 @@ export async function tick(ctx) {
       // write grant the OS sandbox carries beyond the worktree.
       const stateDir = dirname(logPathOf(ctx));
       const runDir = join(stateDir, "runs", nwo.replace("/", "-"), String(e.pr), run.runId);
-      const tmpDir = join(runDir, "tmp");
+      // Short, and outside the run's folder, so the sandbox's sockets fit (#156).
+      const tmpDir = workerTmpDir(stateDir);
       // Declared out here, not inside the try: the publish path below reads it,
       // and a const in the try block is a ReferenceError at that point -- the
       // exact shape that once threw on every FIX_CI with every unit test green.
@@ -2939,6 +2941,8 @@ export async function tick(ctx) {
                                     why: r?.why ?? "the worker threw before returning a result",
                                     ms: r?.ms, cost: r?.cost, sessionId: r?.sessionId });
         if (!prepFailed) PREP_BACKOFF.delete(prepKey);
+        // The run's TMPDIR is its own scratch, and nothing reads it once the worker stops.
+        try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* the next start's sweep finds it */ }
         if (fin?.applied === false) {
           // The store refused the outcome: the claim was gone or withdrawn by
           // the time the worker finished. Whatever it produced is not published.

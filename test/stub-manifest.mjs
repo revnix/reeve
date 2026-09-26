@@ -3800,7 +3800,7 @@ export const STUBS = [
     expectRed: "a failed publication still raises what it held, and logs the failure",
     edits: [{ file: "src/daemon.mjs",
               find: "    if (pub.held) {\n      log(logPath, `    shadow: ${pub.held}`);",
-              replace: "    else if (pub.held) {\n      log(logPath, `    shadow: ${pub.held}`);" }],
+              replace: "    if (pub.ok && pub.held) {\n      log(logPath, `    shadow: ${pub.held}`);" }],
   },
   {
     name: "shadow-held-unread-runs-may-pass",
@@ -7080,9 +7080,9 @@ export const STUBS = [
   },
   {
     name: "withdraw-alert-cleared",
-    why: "leave an alert that a PASS couldn't be withdrawn once a later withdrawal took it back. After a stop no tick clears it, and it goes on saying a PASS stands",
+    why: "leave an alert that a PASS couldn't be withdrawn once nothing stands at that pull request. After a stop no tick clears it, and it goes on saying a PASS stands",
     test: "test/pass-withdrawn.test.mjs",
-    expectRed: "an alert that a PASS couldn't be withdrawn clears once a later withdrawal takes it back",
+    expectRed: "reeve withdraw clears the alert a stop raised once nothing is left standing",
     edits: [{ file: "src/daemon.mjs",
               find: "        ctx.db.prepare(\"DELETE FROM escalation WHERE why = ?\").run(why);\n",
               replace: "" }],

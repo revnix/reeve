@@ -30,7 +30,11 @@ const baseFor = (platform) => {
     platform,
   };
 };
-const everything = { node: process.execPath, mntFile: "/mnt/c/Windows/System32/drivers/etc/hosts", windowsExe: null, bus: "/run/user/1000/bus", skipped: {} };
+// A readable file to stand for one on a Windows drive. A real one, so the check
+// after the run that it's still there holds on any host, WSL or not.
+const driveFile = join(tempDir("reeve-canary-live-drive-"), "hosts");
+writeFileSync(driveFile, "127.0.0.1 localhost\n");
+const everything = { node: process.execPath, mntFile: driveFile, windowsExe: null, bus: "/run/user/1000/bus", skipped: {} };
 
 // A worker whose sandbox held everywhere, but for what the options say.
 //   results:     script results to set, over the held defaults

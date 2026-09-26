@@ -26,9 +26,9 @@ const suite = (files) => {
   return dir;
 };
 // Each stand-in makes a folder under the temp directory, as a test does, and
-// says it ran.
-const test = (name, end = "") => `import { mkdtempSync } from "node:fs"; import { tmpdir } from "node:os"; import { join } from "node:path";
-  mkdtempSync(join(tmpdir(), "reeve-t-")); console.log(${JSON.stringify(`${name} ran`)}); ${end}`;
+// says it ran. `start` runs before it says so, and `end` after.
+const test = (name, end = "", start = "") => `import { mkdtempSync } from "node:fs"; import { tmpdir } from "node:os"; import { join } from "node:path";
+  ${start} mkdtempSync(join(tmpdir(), "reeve-t-")); console.log(${JSON.stringify(`${name} ran`)}); ${end}`;
 const env = (tmp) => ({ ...process.env, TMPDIR: tmp, TEMP: tmp, TMP: tmp });
 
 const dirs = [];
@@ -76,8 +76,10 @@ try {
     // A test that catches SIGTERM keeps running through the grace period. A
     // second SIGTERM then must not end the runner before it has cleaned up.
     // The grace is cut to 3 seconds here, and the stand-in ends itself after 8,
-    // so nothing outlives the case.
-    const stubborn = suite({ "stubborn.test.mjs": test("stubborn", "process.on('SIGTERM', () => {}); setTimeout(() => process.exit(0), 8_000);") });
+    // so nothing outlives the case. It catches SIGTERM before it says it ran,
+    // which is when the first is sent: the other way round, a signal could land
+    // first and end it at once.
+    const stubborn = suite({ "stubborn.test.mjs": test("stubborn", "setTimeout(() => process.exit(0), 8_000);", "process.on('SIGTERM', () => {});") });
     const tmp2 = mkdtempSync(join(tmpdir(), "reeve-runner-"));
     dirs.push(stubborn, tmp2);
     const twice = await new Promise((resolve) => {

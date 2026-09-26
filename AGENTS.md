@@ -102,6 +102,13 @@ next:
   than adding more tests.
 - **A fix needs a test that fails on the broken code first.** Never turn an
   absence into a pass.
+- **New tests use `node:test`,** with `node:assert/strict`, and each test is
+  named for the property it proves: a stub entry names the test that must fail.
+  The stub sweep runs every file with `scripts/test-reporter.mjs`, which prints
+  `PASS  name` and `FAIL  name`. A test that throws anything but an assertion
+  error died rather than failed, and never counts as catching a stub. The older
+  script-style files keep working: put a new case in a `node:test` file of its
+  own rather than into one of them, and move a file over when you rewrite it.
 - **Recovery checks what actually happened before it retries.** Promise safe
   retries and reconciliation, never "exactly once".
 - **Stop after two rounds of the same review disagreement** and ask the founder.

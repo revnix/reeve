@@ -1,3 +1,4 @@
+// @ts-check
 // review/shadow — is the derived view telling the same story as the live read?
 //
 // PR-5 lets the verdict consume projections instead of reading GitHub directly on

@@ -14,10 +14,14 @@
   "scripts": {
     "test": "node scripts/test.mjs",
     "lint": "eslint .",
-    "test:escape": "node test/escape.test.mjs"
+    "test:escape": "node test/escape.test.mjs",
+    "typecheck": "tsc -p ."
   },
   "devDependencies": {
     "@anthropic-ai/sandbox-runtime": "0.0.73",
-    "eslint": "^10.9.1"
+    "@types/node": "^24.13.6",
+    "eslint": "^10.9.1",
+    "globals": "^17.12.0",
+    "typescript": "^7.0.2"
   }
 }

@@ -26,9 +26,9 @@ const suite = (files) => {
   return dir;
 };
 // Each stand-in makes a folder under the temp directory, as a test does, and
-// says it ran.
-const test = (name, end = "") => `import { mkdtempSync } from "node:fs"; import { tmpdir } from "node:os"; import { join } from "node:path";
-  mkdtempSync(join(tmpdir(), "reeve-t-")); console.log(${JSON.stringify(`${name} ran`)}); ${end}`;
+// says it ran. `start` runs before it says so, and `end` after.
+const test = (name, end = "", start = "") => `import { mkdtempSync } from "node:fs"; import { tmpdir } from "node:os"; import { join } from "node:path";
+  ${start} mkdtempSync(join(tmpdir(), "reeve-t-")); console.log(${JSON.stringify(`${name} ran`)}); ${end}`;
 const env = (tmp) => ({ ...process.env, TMPDIR: tmp, TEMP: tmp, TMP: tmp });
 
 const dirs = [];
@@ -72,7 +72,39 @@ try {
     check(stopped.every(({ sig, signal, ms, left }) => signal === sig && ms !== null && ms < 5_000 && left.length === 0),
       "stopped by SIGTERM or SIGINT, the runner ends the busy test at once, removes the run's folder, and ends by that signal",
       JSON.stringify(stopped));
+
+    // A test that catches SIGTERM keeps running through the grace period. A
+    // second SIGTERM then must not end the runner before it has cleaned up.
+    // The grace is cut to 3 seconds here, and the stand-in ends itself after 8,
+    // so nothing outlives the case. It catches SIGTERM before it says it ran,
+    // which is when the first is sent: the other way round, a signal could land
+    // first and end it at once.
+    const stubborn = suite({ "stubborn.test.mjs": test("stubborn", "setTimeout(() => process.exit(0), 8_000);", "process.on('SIGTERM', () => {});") });
+    const tmp2 = mkdtempSync(join(tmpdir(), "reeve-runner-"));
+    dirs.push(stubborn, tmp2);
+    const twice = await new Promise((resolve) => {
+      const child = spawn(process.execPath, [runner, stubborn], { env: { ...env(tmp2), REEVE_TEST_GRACE_MS: "3000" }, stdio: ["ignore", "pipe", "ignore"] });
+      let sentAt = null;
+      child.stdout.on("data", (d) => {
+        if (sentAt !== null || !/stubborn ran/.test(String(d))) return;
+        sentAt = Date.now();
+        child.kill("SIGTERM");
+        setTimeout(() => child.kill("SIGTERM"), 500);
+      });
+      child.on("exit", (status, signal) => resolve({ status, signal, ms: sentAt === null ? null : Date.now() - sentAt, left: readdirSync(tmp2) }));
+    });
+    check(twice.signal === "SIGTERM" && twice.ms !== null && twice.ms >= 2_500 && twice.left.length === 0,
+      "a second SIGTERM while a test outlasts the first doesn't end the runner before it removes the run's folder",
+      JSON.stringify(twice));
   }
+
+  // A run with no test file in its folder ran nothing, and fails.
+  const empty = suite({ "notes.mjs": test("notes") });
+  const tmp3 = mkdtempSync(join(tmpdir(), "reeve-runner-"));
+  dirs.push(empty, tmp3);
+  const none = spawnSync(process.execPath, [runner, empty], { env: env(tmp3), encoding: "utf8", timeout: 60_000 });
+  check(none.status === 1 && readdirSync(tmp3).length === 0, "a run with no test file to run fails, rather than passing on nothing",
+    JSON.stringify({ status: none.status, err: none.stderr, left: readdirSync(tmp3) }));
 } finally {
   for (const d of dirs) rmSync(d, { recursive: true, force: true });
 }

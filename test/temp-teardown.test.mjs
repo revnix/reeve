@@ -45,27 +45,43 @@ check(failed.status === 1 && failed.left.length === 0 && threw.status !== 0 && t
 // A signal keeps its default action, which ends a test at once, even one busy
 // in synchronous code, where a JavaScript listener would never run: a listener
 // switches the default off, and Node runs it only between tasks, so a stopped
-// test ran on and then exited 0 (#220). Its folders are left; the suite's
-// runner, scripts/test.mjs, removes them. Windows has no signals to send:
-// there, process.kill ends a process outright.
-const stoppedWhileBusy = (sig) => new Promise((resolve) => {
+// test ran on and then exited 0 (#220). No exit listener runs then, or when a
+// test is killed outright, so the helper's watcher removes the folders once the
+// test is gone (#223). Windows has no signals to send: there, process.kill ends
+// a process outright.
+// `group` sends the signal to the test's whole process group, as Ctrl-C at a
+// terminal does.
+const stoppedWhileBusy = (sig, { group = false } = {}) => new Promise((resolve) => {
   const tmp = mkdtempSync(join(tmpdir(), "reeve-teardown-"));
   const script = `const { tempDir } = await import(${JSON.stringify(pathToFileURL(helper).href)});
     tempDir("reeve-a-"); process.stdout.write("ready\\n");
     const end = Date.now() + 20_000; while (Date.now() < end) {}`;
   const child = spawn(process.execPath, ["--input-type=module", "-e", script],
-    { env: { ...process.env, TMPDIR: tmp, TEMP: tmp, TMP: tmp }, stdio: ["ignore", "pipe", "ignore"] });
+    { env: { ...process.env, TMPDIR: tmp, TEMP: tmp, TMP: tmp }, stdio: ["ignore", "pipe", "ignore"], detached: group });
   let sentAt = null;
-  child.stdout.on("data", (d) => { if (sentAt === null && String(d).includes("ready")) { sentAt = Date.now(); child.kill(sig); } });
-  child.on("exit", (status, signal) => {
+  child.stdout.on("data", (d) => {
+    if (sentAt !== null || !String(d).includes("ready")) return;
+    sentAt = Date.now();
+    if (group) process.kill(-child.pid, sig); else child.kill(sig);
+  });
+  child.on("exit", async (status, signal) => {
+    const ms = sentAt === null ? null : Date.now() - sentAt;
+    // The watcher works once the test is gone, so give it a moment.
+    for (let n = 0; n < 30 && readdirSync(tmp).length; n++) await new Promise((r) => setTimeout(r, 100));
+    const left = readdirSync(tmp);
     rmSync(tmp, { recursive: true, force: true });
-    resolve({ sig, status, signal, ms: sentAt === null ? null : Date.now() - sentAt });
+    resolve({ sig, status, signal, ms, left });
   });
 });
 if (process.platform !== "win32") {
   const stopped = [await stoppedWhileBusy("SIGTERM"), await stoppedWhileBusy("SIGINT")];
   check(stopped.every(({ sig, signal, ms }) => signal === sig && ms !== null && ms < 5_000),
     "a test busy in synchronous code is ended at once by SIGTERM or SIGINT, and by that signal", JSON.stringify(stopped));
+  const killed = await stoppedWhileBusy("SIGKILL");
+  const interrupted = await stoppedWhileBusy("SIGINT", { group: true });
+  check([...stopped, killed, interrupted].every(({ left }) => left.length === 0),
+    "and its folders are gone once it has ended, by a signal, by Ctrl-C to its group, or killed outright, with no suite runner",
+    JSON.stringify([...stopped, killed, interrupted].map(({ sig, left }) => ({ sig, left }))));
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

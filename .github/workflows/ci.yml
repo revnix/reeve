@@ -83,6 +83,12 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      # Type checking, file by file: a file is checked once it starts with
+      # `// @ts-check` (#153). A missing import and a variable used before it
+      # is defined are both bugs this catches, and both have happened here.
+      - name: Type-check
+        run: npm run typecheck
+
       # Codex reads .agents/skills and Claude Code reads .claude/skills, so the
       # two copies must stay identical. A copy rather than a symlink, because Git
       # for Windows leaves symlinks off by default.

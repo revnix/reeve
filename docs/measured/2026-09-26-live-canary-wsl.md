@@ -61,9 +61,17 @@ The passing runs recorded:
 
 ## What changed because of this (#156)
 
-- A worker's TMPDIR, and the canary's, is `<reeve home>/t/<12 hex>`. It stays under reeve's home, which workers are denied, and each worker is granted only its own. It's removed when the run ends. `runWorker` refuses to start a worker whose TMPDIR is longer than 72 characters, and says why, so a deep `REEVE_HOME` fails before anything is spent rather than inside the sandbox.
+- A worker's TMPDIR, and the canary's, is `<reeve home>/t/<12 hex>`. It stays under reeve's home, which workers are denied, and each worker is granted only its own. It's removed when the run ends. `runWorker` refuses to start a worker whose TMPDIR is longer than 72 bytes, as the kernel counts a socket's path, and says why, so a deep `REEVE_HOME` fails before anything is spent rather than inside the sandbox.
 - On Linux the Read tool is denied a linked credential at its target only, as the OS sandbox already was.
 - The canary grants its own directory by `Edit`, and fails if its worker couldn't write its own file.
 - The canary records whether the worker's shell can see its login token, and on Linux whether any process environment it can read holds it, never the value. Either one fails the canary. So a CLI build that starts passing the token to shells is caught before a worker runs under it.
 - The canary asks the Read tool for the decoy through a link, and fails unless it's refused.
 - `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` stays unset on Linux: it stops the sandbox on WSL2, and the token is already out of reach without it.
+- `<reeve home>/t`, the folder of every worker's TMPDIR, is denied to workers wherever reeve's state lives, and each is carved back only its own. On Linux the state roots are given at their targets, as the credentials are.
+- A worktree root under `/mnt` is refused before a worker or the canary runs, and before anything is written there: the policy denies `/mnt`, so a checkout there would be denied its own files.
+
+## Again after the first review of these fixes
+
+The same host and CLI, 2026-09-26 at 17:20 UTC, on #202's head 0d64870, with the worktree root `/tmp/rw`. In this policy the worker's TMPDIR is carved back from two denied folders, reeve's home and `<reeve home>/t` inside it, rather than one.
+
+Canary `02f565bb4a4a980f` passed, with the same results as before: the worker wrote inside its own directory and its TMPDIR, and every way out was refused. The escape probe, run on the same commit on the same host, passed its 37 checks, and skipped the keychain's, which are measured on macOS only.

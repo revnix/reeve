@@ -795,6 +795,10 @@ export async function sandboxCanary({
   const scriptNow = (() => { try { return createHash("sha256").update(readFileSync(join(dir, "canary.sh"))).digest("hex"); } catch { return null; } })();
   evidence.scriptIntact = scriptNow === scriptHash;
   if (!evidence.scriptIntact) problems.push("the canary's probe script changed during the run, so nothing it recorded can be trusted");
+  // Nor can anything, where the worker did what it wasn't asked to: its shell
+  // writes the results, so it could write them itself (#156).
+  evidence.unexpectedTools = unexpectedTools(join(dir, "canary.out"), { dir, outsidePath: outsideToolPath });
+  if (evidence.unexpectedTools.length) problems.push(`the canary's worker did what it wasn't asked to (${evidence.unexpectedTools.join("; ")}), so its results can't be trusted`);
   if (decoyGone) problems.push("the decoy vanished during the probe; the read-denial result is unproven");
   if (!results || ["inside", "tmp", "outside", "curl", "decoy", "symlink"].some(k => !(k in results)))
     problems.push(`the canary script did not run to completion (worker: ${r?.outcome ?? "?"}: ${r?.why ?? "?"})`);
@@ -993,6 +997,37 @@ export function parseReadProbe(outPath, decoyPath, cwd = dirname(decoyPath), mar
  * for those tools would pass a Bash-only probe while a worker could still write
  * daemon state or another checkout. (Codex #4e-[6].)
  */
+/**
+ * What the canary's worker did beyond its five steps, from its own event stream:
+ * a shell command other than running the script, or a write anywhere but the
+ * three files it's asked to write. The results are the worker's shell's to
+ * write, so the worker could write them too, and turn a probe with no leak file
+ * of its own, the token's or the socket filter's, into a pass. Reads change
+ * nothing, and are left alone (#156).
+ */
+export function unexpectedTools(outPath, { dir, outsidePath }) {
+  if (!existsSync(outPath)) return [];
+  const writes = new Set([join(dir, "read-tool-out"), join(dir, "link-tool-out"), outsidePath]);
+  const script = new RegExp(`^(?:sh|bash) (?:\\./|${dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/)?canary\\.sh$`);
+  const extra = [];
+  for (const line of readFileSync(outPath, "utf8").split("\n")) {
+    let ev; try { ev = JSON.parse(line); } catch { continue; }
+    for (const b of ev?.message?.content ?? []) {
+      if (b?.type !== "tool_use") continue;
+      const input = b.input ?? {};
+      if (b.name === "Bash") {
+        const cmd = String(input.command ?? "").trim().replace(/\s+/g, " ");
+        if (!script.test(cmd)) extra.push(`ran \`${cmd.slice(0, 80)}\``);
+      } else if (["Write", "Edit", "MultiEdit", "NotebookEdit"].includes(b.name)) {
+        const p = input.file_path ?? input.notebook_path;
+        const target = typeof p === "string" ? resolve(dir, p) : null;
+        if (!writes.has(target)) extra.push(`${b.name} of ${target ?? "no path"}`);
+      }
+    }
+  }
+  return extra;
+}
+
 export function parseWriteProbe(outPath, targetPath, cwd = dirname(targetPath)) {
   const out = { attempted: false, denied: false };
   if (!existsSync(outPath)) return out;

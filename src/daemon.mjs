@@ -540,7 +540,10 @@ export function stateRootsFor(stateDir, logPath, worktree, dbPath = null) {
   // The database the daemon was pointed at, with its WAL and shared-memory
   // files: `--db` can name a path outside every other protected tree, and it
   // holds the event history, prompts and operational state. (Codex #4f-[7].)
-  const dbFiles = dbPath ? [dbPath, `${dbPath}-wal`, `${dbPath}-shm`] : [];
+  // Its sidecars beside the database's target, where SQLite makes them, if the
+  // path given is a link (#156).
+  const db = dbPath ? linkFree(dbPath) : null;
+  const dbFiles = db ? [db, `${db}-wal`, `${db}-shm`] : [];
   // `t` holds every worker's TMPDIR (#156); each is granted only its own.
   const cands = [logPath, ...dbFiles, join(stateDir, "runs"), join(stateDir, "canary"), join(stateDir, "backups"), join(stateDir, "t"), resolveHome()]
     .filter(p => p && isAbsolute(p));

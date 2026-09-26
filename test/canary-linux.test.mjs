@@ -15,7 +15,7 @@
 // runtime is measured by test/escape.test.mjs.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { canaryIdFor, canaryScript, instrumentHash, linuxProbeTargets, probeShapeOf, sandboxCanary } from "../src/canary.mjs";
@@ -140,6 +140,25 @@ test("a Linux canary whose drive file is gone by the end of the run fails: the f
   writeFileSync(file, "readable\n");
   const kept = await sandboxCanary({ ...base, linuxTargets: { ...everything, mntFile: file }, runner: worker() });
   assert.equal(kept.ok, true, kept.why);
+});
+
+test("a canary whose worker writes its results itself, or runs a command of its own, fails: its results can't be trusted", async () => {
+  // The results are the worker's shell's to write, so the worker could write
+  // them too, and turn a probe with no leak file of its own, the token's, the
+  // socket filter's, into a pass. Its own event stream says what it did.
+  const also = (block) => async (args) => {
+    const r = await worker()(args);
+    appendFileSync(args.outPath, "\n" + JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "x9", ...block(args) }] } }));
+    return r;
+  };
+  const wrote = await sandboxCanary({ ...base, linuxTargets: everything, runner: also(({ cwd }) => ({ name: "Write", input: { file_path: join(cwd, "canary-results.txt"), content: "token_env=1\n" } })) });
+  assert.equal(wrote.ok, false, "a canary passed whose worker wrote its own results");
+  assert.match(wrote.why, /wasn't asked to/);
+  const ran = await sandboxCanary({ ...base, linuxTargets: everything, runner: also(() => ({ name: "Bash", input: { command: "echo token_env=1 >> ./canary-results.txt" } })) });
+  assert.equal(ran.ok, false, "a canary passed whose worker ran a command of its own");
+  // The control: running the script, as it's asked to, is no deviation.
+  const script = await sandboxCanary({ ...base, linuxTargets: everything, runner: also(() => ({ name: "Bash", input: { command: "sh ./canary.sh" } })) });
+  assert.equal(script.ok, true, script.why);
 });
 
 test("a worker that can create a Unix socket fails the Linux canary: the socket filter is not in force", async () => {

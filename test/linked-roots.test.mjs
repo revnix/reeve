@@ -240,3 +240,15 @@ test("on Linux the layout check sees a credential directory at its target, where
     if (savedReeve !== undefined) process.env.REEVE_HOME = savedReeve;
   }
 });
+
+test("on Linux a database reached through a link has its sidecars denied beside its target, where SQLite makes them", linux, () => {
+  // --db /alias/e.db, a link to /state/e.db: SQLite writes e.db-wal and e.db-shm
+  // beside the target, so they're denied there, not beside the link.
+  const base = realpathSync(tempDir("rl-db-"));
+  mkdirSync(join(base, "alias")); mkdirSync(join(base, "state"));
+  writeFileSync(join(base, "state", "e.db"), "");
+  symlinkSync(join(base, "state", "e.db"), join(base, "alias", "e.db"));
+  const roots = daemon.stateRootsFor(join(base, "run"), join(base, "run", "reeve.log"), null, join(base, "alias", "e.db"));
+  const denyRead = sandboxFor({ profile: { identity: { key: "o/r", defaultBranch: "main" }, units: [] }, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: "/tmp/t", stateRoots: roots }).settings.sandbox.filesystem.denyRead;
+  for (const f of ["e.db", "e.db-wal", "e.db-shm"]) assert.ok(denyRead.includes(join(base, "state", f)), `${f}: ${JSON.stringify(denyRead.filter((d) => d.startsWith(base)))}`);
+});

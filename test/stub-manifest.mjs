@@ -8073,4 +8073,22 @@ export const STUBS = [
               find: "    const linuxTargets = (ctx.platform ?? process.platform) === \"linux\" ? await (ctx.linuxProbeTargets ?? linuxProbeTargets)() : null;\n",
               replace: "    const netProbe = ctx.netProbe ?? (ctx.netListener ?? netListener)();\n    const linuxTargets = (ctx.platform ?? process.platform) === \"linux\" ? await (ctx.linuxProbeTargets ?? linuxProbeTargets)() : null;\n" }],
   },
+  {
+    name: "canary-unexpected-tools",
+    why: "trust a canary whose worker wrote its own results, or ran a command of its own. A probe with no leak file of its own then passes on the worker's word",
+    test: "test/canary-linux.test.mjs",
+    expectRed: "a canary whose worker writes its results itself, or runs a command of its own, fails: its results can't be trusted",
+    edits: [{ file: "src/canary.mjs",
+              find: "  if (evidence.unexpectedTools.length) problems.push(",
+              replace: "  if (false) problems.push(" }],
+  },
+  {
+    name: "db-sidecars-at-target",
+    why: "deny a linked database's sidecars beside the link. SQLite makes them beside the target, where they're left readable",
+    test: "test/linked-roots.test.mjs",
+    expectRed: "on Linux a database reached through a link has its sidecars denied beside its target, where SQLite makes them",
+    edits: [{ file: "src/daemon.mjs",
+              find: "  const db = dbPath ? linkFree(dbPath) : null;",
+              replace: "  const db = dbPath;" }],
+  },
 ];

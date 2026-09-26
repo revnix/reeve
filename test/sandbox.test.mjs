@@ -27,7 +27,7 @@
 // was not in the allowlist at all. Any tool that can run a command is a write
 // primitive, so this must be a closed allowlist, never a denylist.
 import { sandboxFor, reviewDiff, validateSettings, validateToolGrant, scopeGrant, credentialPaths, osCredentialPaths, hostEscapePaths, quarantineOsDenies, siblingRootsOf, CREDENTIAL_PATHS } from "../src/sandbox.mjs";
-import { readFileSync, mkdtempSync, mkdirSync, rmSync, realpathSync, symlinkSync } from "node:fs";
+import { readFileSync, mkdtempSync, mkdirSync, rmSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { tempDir } from "./fixtures/temp.mjs";
@@ -686,6 +686,8 @@ const linuxOnly = (name, run) => (process.platform === "linux" ? run() : console
   const home = realpathSync(tempDir("reeve-linked-home-"));
   mkdirSync(join(home, "elsewhere", "aws"), { recursive: true });
   symlinkSync(join(home, "elsewhere", "aws"), join(home, ".aws"));
+  writeFileSync(join(home, "elsewhere", "npmrc"), "decoy\n");
+  symlinkSync(join(home, "elsewhere", "npmrc"), join(home, ".npmrc"));
   const savedHome = process.env.HOME, savedReeve = process.env.REEVE_HOME;
   process.env.HOME = home; delete process.env.REEVE_HOME;
   try {
@@ -699,6 +701,14 @@ const linuxOnly = (name, run) => (process.platform === "linux" ? run() : console
       const v = validateSettings(s.settings, { tmpDir: TMP });
       check(s.settings.sandbox.filesystem.denyRead.includes(join(home, "elsewhere", "aws")) && !s.settings.sandbox.filesystem.denyRead.includes(join(home, ".aws")) && v.ok,
         "the policy denies a linked credential at its target, and still validates", JSON.stringify({ errors: v.errors }));
+    });
+    // The Read tool runs outside the OS sandbox, so a committed symlink could
+    // point it straight at the target: it is denied there too, a file as a file.
+    linuxOnly("the Read tool is denied a linked credential at its target too, a file as a file", () => {
+      const deny = sandboxFor({ profile, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: TMP }).settings.permissions.deny;
+      check(deny.includes(`Read(/${join(home, "elsewhere", "aws")}/**)`) && deny.includes(`Read(/${join(home, "elsewhere", "npmrc")})`)
+        && deny.includes(`Read(/${join(home, ".aws")}/**)`),
+        "the Read tool is denied a linked credential at its target too, a file as a file", JSON.stringify(deny.filter(d => d.includes(home))));
     });
   } finally {
     if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;

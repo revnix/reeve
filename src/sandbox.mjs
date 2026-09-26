@@ -26,7 +26,7 @@
 // was never offered. Any tool that can run a command is a write primitive, so the
 // grant is a CLOSED ALLOWLIST and the denies are belt-and-braces on top of it.
 
-import { writeFileSync, mkdirSync, realpathSync } from "node:fs";
+import { writeFileSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { resolveHome, DEFAULT_HOME } from "./home.mjs";
@@ -295,7 +295,16 @@ export function credentialPaths() {
   // home these resolve against.
   return [...CREDENTIAL_PATHS.map(expandTilde), ...extra];
 }
-const credentialReadDenies = () => credentialPaths().map(p => (isCredentialFile(p) ? `Read(${ruleFor(p)})` : `Read(${ruleFor(p)}/**)`));
+const readRule = (p, file) => (file ? `Read(${ruleFor(p)})` : `Read(${ruleFor(p)}/**)`);
+// The Read tool runs outside the OS sandbox, and a committed symlink could point
+// it straight at a linked credential's target. So on Linux, where the sandbox is
+// given the targets, the Read tool is denied them too: a file as a file.
+const isDir = p => { try { return statSync(p).isDirectory(); } catch { return false; } };
+const credentialReadDenies = () => {
+  const written = credentialPaths();
+  const targets = osCredentialPaths().filter(p => !written.includes(p));
+  return [...written.map(p => readRule(p, isCredentialFile(p))), ...targets.map(p => readRule(p, !isDir(p)))];
+};
 
 /**
  * The credential paths as the OS sandbox is given them.

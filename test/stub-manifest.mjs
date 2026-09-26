@@ -6356,4 +6356,22 @@ export const STUBS = [
               find: "{ detached: true, stdio:",
               replace: "{ detached: false, stdio:" }],
   },
+  {
+    name: "sandbox-read-tool-linked-target",
+    why: "deny the Read tool a linked credential only as written. It runs outside the OS sandbox, and a committed symlink pointing at the target reads the credential",
+    test: "test/sandbox.test.mjs",
+    expectRed: "the Read tool is denied a linked credential at its target too, a file as a file",
+    edits: [{ file: "src/sandbox.mjs",
+              find: "  return [...written.map(p => readRule(p, isCredentialFile(p))), ...targets.map(p => readRule(p, !isDir(p)))];",
+              replace: "  return written.map(p => readRule(p, isCredentialFile(p)));" }],
+  },
+  {
+    name: "sandbox-read-tool-linked-file",
+    why: "deny a linked credential file's target as a directory. `Read(<file>/**)` matches only what is under it, and a file has nothing under it, so the file stays readable",
+    test: "test/sandbox.test.mjs",
+    expectRed: "the Read tool is denied a linked credential at its target too, a file as a file",
+    edits: [{ file: "src/sandbox.mjs",
+              find: "  return [...written.map(p => readRule(p, isCredentialFile(p))), ...targets.map(p => readRule(p, !isDir(p)))];",
+              replace: "  return [...written.map(p => readRule(p, isCredentialFile(p))), ...targets.map(p => readRule(p, false))];" }],
+  },
 ];

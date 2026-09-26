@@ -18,27 +18,39 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // A test that listens for the signal itself and keeps running is killed after
-// this long.
-const GRACE_MS = 10_000;
+// this long. REEVE_TEST_GRACE_MS shortens it for the runner's own test.
+const GRACE_MS = Number(process.env.REEVE_TEST_GRACE_MS) || 10_000;
 
 const dir = process.argv[2] ?? "test";
 const files = readdirSync(dir).filter((f) => f.endsWith(".test.mjs") && f !== "escape.test.mjs").sort();
+// A run that runs nothing proves nothing, and fails: the folder may be the
+// wrong one, or its tests renamed.
+if (!files.length) {
+  console.error(`test: no test files in ${dir}`);
+  process.exit(1);
+}
 const run = mkdtempSync(join(tmpdir(), "reeve-test-"));
 const env = { ...process.env, TMPDIR: run, TEMP: run, TMP: run };
 const remove = () => rmSync(run, { recursive: true, force: true });
 
-let current = null, stopping = null;
-// Ends the run by `signal`: this runner's own listener for it is gone by now,
-// so the signal's default action applies.
-const endBy = (signal) => { remove(); process.kill(process.pid, signal); };
-for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.once(signal, () => {
-    stopping ??= signal;
-    if (!current) return endBy(stopping);
-    current.kill(signal);
-    setTimeout(() => current?.kill("SIGKILL"), GRACE_MS).unref();
-  });
-}
+let current = null, stopping = null, grace = null;
+// The listeners stay until the folder is gone, so a second signal, while a
+// test that caught the first is still running, is passed on too rather than
+// ending the runner before it has cleaned up.
+const onSignal = (signal) => {
+  stopping ??= signal;
+  if (!current) return endBy(stopping);
+  current.kill(signal);
+  grace ??= setTimeout(() => current?.kill("SIGKILL"), GRACE_MS).unref();
+};
+// Ends the run by `signal`. Its listeners come off only now, so the signal's
+// default action applies.
+const endBy = (signal) => {
+  remove();
+  for (const s of ["SIGINT", "SIGTERM"]) process.removeListener(s, onSignal);
+  process.kill(process.pid, signal);
+};
+for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, onSignal);
 
 for (const file of files) {
   current = spawn(process.execPath, [join(dir, file)], { stdio: "inherit", env });

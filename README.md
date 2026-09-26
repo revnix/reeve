@@ -34,8 +34,9 @@ installation, which is not an org admin and therefore *cannot* bypass. This
 inverts the failure mode: a stale reeve fails to publish and the merge blocks,
 where the old design merged on stale logic. A PASS it has already published
 stays on its commit, so reeve withdraws it whenever it stops checking: on HALT,
-on a stop, for a pull request it couldn't re-check, and after a crash through
-`reeve withdraw`. A machine that is asleep or off can withdraw nothing.
+on a stop, for a pull request it couldn't re-check, and, under systemd, after a
+crash through `reeve withdraw`. A machine that is asleep or off can withdraw
+nothing.
 
 **A worker is contained by the tool layer, not by its prompt.** Risk paths,
 forbidden commands and territory are compiled into a scoped allowlist and a
@@ -105,7 +106,7 @@ reeve status [owner/repo]   what is happening     --health, --json
 reeve why <pr>              the decision trail, newest first, with the clauses
 reeve dash                  write the one-page view
 reeve run [owner/repo]      the daemon
-      --tick                  one pass and exit
+      --tick                  one pass and exit, in shadow mode only
       --execute               dispatch workers        (default: report only)
       --enforce               publish real conclusions (default: shadow/neutral)
 ```
@@ -123,6 +124,11 @@ sources a shell profile, so a bare `node` fails **exit 78 with an empty stderr
 log**. The plist names an absolute interpreter and an explicit repository for
 exactly that reason — passing no repository made it detect one from its working
 directory and spend every tick watching the wrong project.
+
+launchd has no step that runs after the daemon stops, as systemd's
+`ExecStopPost` does below. So under launchd, a crash or a kill leaves any PASS
+the daemon published standing until reeve publishes there again (#241). The
+plist runs in shadow mode, whose results can't pass the enforcement check.
 
 On Linux and WSL2 it runs as a systemd user service, `deploy/reeve.service`,
 which follows the same rules: an absolute interpreter and an explicit repository.

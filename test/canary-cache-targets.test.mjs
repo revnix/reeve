@@ -104,12 +104,14 @@ test("the sandbox runtime is the bwrap and socat the PATH would run: a file ther
   // A regular file named bwrap earlier on the PATH, not executable: the shell
   // passes over it, so the identity must too, or it tracks a file nothing runs.
   const inert = tempDir("cr-inert-"), real = tempDir("cr-real-");
-  for (const t of ["bwrap", "socat"]) {
+  for (const t of ["bwrap", "socat", "rg"]) {
     writeFileSync(join(inert, t), "not a program\n");
     chmodSync(join(inert, t), 0o644);
     writeFileSync(join(real, t), "#!/bin/sh\nexit 0\n");
     chmodSync(join(real, t), 0o755);
   }
   const id = sandboxRuntimeIdentity(`${inert}:${real}`, { platform: "linux", identity: (p) => p });
-  assert.equal(id, `bwrap=${join(real, "bwrap")} socat=${join(real, "socat")}`);
+  // ripgrep too: the runtime uses it to find the files it must protect
+  // (docs/measured/2026-09-25-linux-wsl-sandbox.md).
+  assert.equal(id, `bwrap=${join(real, "bwrap")} socat=${join(real, "socat")} rg=${join(real, "rg")}`);
 });

@@ -102,3 +102,13 @@ test("the daemon runs only the system drive's cmd.exe for its interop control, n
   assert.equal(tc.windowsExe, c.exe, "control: the system drive's cmd.exe is the interop control");
   assert.equal(existsSync(d.mark), false, "a cmd.exe on a secondary drive was run by the daemon");
 });
+
+test("the canary finds a drive file whose name holds a newline whole, never a prefix of it", async () => {
+  // Split at the newline, the probe would copy a prefix that isn't there, and
+  // the failed copy would read as a deny that held.
+  const drive = realpathSync(tempDir("wd-newline-"));
+  const name = "first line\nsecond line.txt";
+  writeFileSync(join(drive, name), "readable\n");
+  const t = await linuxProbeTargets({ mounts: "", driveRoots: [drive], searchRoots: [drive], mntCandidates: [], uid: -1 });
+  assert.equal(t.mntFile, join(drive, name));
+});

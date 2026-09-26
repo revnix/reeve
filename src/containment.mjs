@@ -44,8 +44,10 @@ export function isolationTopologyReady() { return true; }
  * under the old bytes is not credited to the new ones.
  */
 /**
- * What runs a Linux worker's boundary besides the CLI: bubblewrap and socat, as
- * the worker's PATH finds them, each by resolved path and modification time. A
+ * What runs a Linux worker's boundary besides the CLI: bubblewrap and socat, and
+ * ripgrep, which the runtime uses to find the files it must protect
+ * (docs/measured/2026-09-25-linux-wsl-sandbox.md). Each as the worker's PATH
+ * would run it, by resolved path and modification time. A
  * pass measured under one build of them says nothing of the next, so this is in
  * the canary's id and is checked again before a worker starts (#156). Null
  * elsewhere, where the OS itself supplies the sandbox.
@@ -55,7 +57,7 @@ export function sandboxRuntimeIdentity(pathVar, { platform = process.platform, i
   const onPath = name => String(pathVar ?? "").split(":").filter(Boolean).map(d => join(d, name))
     // As the PATH lookup does: the first that is a file and can be run.
     .find(f => { try { accessSync(f, constants.X_OK); return statSync(f).isFile(); } catch { return false; } }) ?? name;
-  return ["bwrap", "socat"].map(t => `${t}=${identity(onPath(t))}`).join(" ");
+  return ["bwrap", "socat", "rg"].map(t => `${t}=${identity(onPath(t))}`).join(" ");
 }
 
 export function binaryIdentity(bin) {

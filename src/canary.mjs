@@ -361,12 +361,16 @@ export async function linuxProbeTargets({ uid = process.getuid?.(), node = proce
                                           // drive's: another drive's Windows/System32 is anyone's (#156).
                                           systemDrive = windowsSystemDrive(mounts),
                                           windowsExe = systemDrive ? join(systemDrive, "Windows", "System32", "cmd.exe") : null,
+                                          // Where to look for a file when none of the usual ones is readable.
+                                          searchRoots = [...new Set(["/mnt", ...driveRoots])],
                                           connectTimeoutMs = 2_000 } = {}) {
   const readable = f => { try { accessSync(f, constants.R_OK); return statSync(f).isFile(); } catch { return false; } };
   const skipped = {};
-  const searched = [...new Set(["/mnt", ...driveRoots])];
+  // NUL-ended and untrimmed, as a filename can hold a newline or end in a
+  // space: cut short, the probe would copy a path that isn't there, and the
+  // failed copy would read as a deny that held (#156).
   const mntFile = mntCandidates.find(readable)
-    ?? (spawnSync("find", [...searched, "-maxdepth", "3", "-type", "f", "-readable", "-print", "-quit"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }).stdout?.trim().split("\n")[0] || null);
+    ?? (spawnSync("find", [...searchRoots, "-maxdepth", "3", "-type", "f", "-readable", "-print0", "-quit"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }).stdout?.split("\0")[0] || null);
   if (!mntFile) skipped.mnt = "nothing on a Windows drive or under /mnt is readable on this host";
   const exeRuns = !!windowsExe && existsSync(windowsExe) && spawnSync(windowsExe, ["/c", "exit 0"], { stdio: "ignore", timeout: 15_000 }).status === 0;
   if (!exeRuns) skipped.interop = windowsExe ? "no Windows interop on this host" : "no system drive (C:) is mounted, so no Windows binary the daemon trusts to run";

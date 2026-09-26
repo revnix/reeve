@@ -280,6 +280,74 @@ test("no alert is cleared when what stands couldn't be read: nothing is known to
   assert.equal(standing().length, 2, "an alert was cleared though nothing could be read");
 });
 
+test("an enforced PASS stays tracked when reeve goes back to shadow and the shadow publication fails", async () => {
+  const { ctx, withdrawn, halt } = setup();
+  await daemon.tick(ctx);
+  // In shadow again, and every shadow publication fails before it writes anything.
+  const shadowed = { ...ctx, shadow: true, publish: async () => ({ ok: false, why: "no App credentials" }) };
+  await daemon.tick(shadowed);
+  halt();
+  await daemon.tick(shadowed);
+  assert.deepEqual(prsOf(withdrawn.filter((w) => w.name === "ops/merge-policy")), [7, 8], JSON.stringify(withdrawn));
+
+  // And for a pull request reeve then can't re-check: both its results are taken back.
+  const unread = setup();
+  await daemon.tick(unread.ctx);
+  const back = { ...unread.ctx, shadow: true, publish: async () => ({ ok: false, why: "no App credentials" }) };
+  await daemon.tick(back);
+  await daemon.tick({ ...back, evaluate: ({ pr: n }) => (n === 7 ? { ok: false, why: "GitHub answered 502" } : evaluation(n)) });
+  assert.deepEqual(unread.withdrawn.filter((w) => w.head === headOf(7)).map((w) => w.name).sort(),
+    ["ops/merge-policy", "ops/merge-policy (shadow)"], JSON.stringify(unread.withdrawn));
+});
+
+test("an enforced PASS a shadow publication superseded is written down as withdrawn, so HALT doesn't cancel it again", async () => {
+  const { ctx, withdrawn, halt } = setup();
+  await daemon.tick(ctx);
+  const shadowed = { ...ctx, shadow: true,
+    publish: async () => ({ ok: true, id: 200, conclusion: "neutral", name: pr.shadowContextOf("ops/merge-policy"), superseded: true }) };
+  await daemon.tick(shadowed);
+  halt();
+  await daemon.tick(shadowed);
+  assert.deepEqual(withdrawn.filter((w) => w.name === "ops/merge-policy"), [], JSON.stringify(withdrawn));
+});
+
+test("an alert that a PASS couldn't be withdrawn clears when a later tick's retry takes it back, though it can't re-check the pull request", async () => {
+  const { ctx } = setup();
+  await daemon.tick(ctx);
+  const unread = ({ pr: n }) => (n === 7 ? { ok: false, why: "GitHub answered 502" } : evaluation(n));
+  await daemon.tick({ ...ctx, evaluate: unread, withdraw: async () => ({ ok: false, why: "HTTP 502" }), notify: () => ({ ok: true }) });
+  const standing = () => ctx.db.prepare("SELECT why FROM escalation").all().map((r) => r.why).filter((w) => /may no longer hold/.test(w));
+  assert.equal(standing().length, 1, "control: the failed withdrawal is on record");
+  // Still unreadable, and now the withdrawal succeeds.
+  await daemon.tick({ ...ctx, evaluate: unread, notify: () => ({ ok: true }) });
+  assert.deepEqual(standing(), [], "the alert still says #7's PASS couldn't be withdrawn");
+});
+
+test("an alert that a PASS couldn't be withdrawn on HALT clears when a later halted tick takes it back", async () => {
+  const { ctx, halt } = setup();
+  await daemon.tick(ctx);
+  halt();
+  await daemon.tick({ ...ctx, withdraw: async () => ({ ok: false, why: "HTTP 502" }), notify: () => ({ ok: true }) });
+  const standing = () => ctx.db.prepare("SELECT why FROM escalation").all().map((r) => r.why).filter((w) => /may no longer hold/.test(w));
+  assert.equal(standing().length, 2, "control: the failed withdrawals are on record");
+  await daemon.tick({ ...ctx, notify: () => ({ ok: true }) });
+  assert.deepEqual(standing(), [], "the alerts still say the PASSes couldn't be withdrawn");
+});
+
+test("a HALT that takes back a PASS this tick couldn't doesn't then announce it as stuck", async () => {
+  const { ctx, withdrawn, halt } = setup();
+  await daemon.tick(ctx);
+  // #7 can't be re-checked and its withdrawal fails once; then HALT arrives, and the next one succeeds.
+  let tries = 0;
+  const flaky = async (args) => (++tries === 1 ? { ok: false, why: "HTTP 502" } : (withdrawn.push(args), { ok: true }));
+  const sent = [];
+  await daemon.tick({ ...ctx, withdraw: flaky, notify: ({ alert }) => { sent.push(alert.message); return { ok: true }; },
+    evaluate: ({ pr: n }) => { if (n === 7) { halt(); return { ok: false, why: "GitHub answered 502" }; } return evaluation(n); } });
+  assert.ok(withdrawn.some((w) => w.head === headOf(7)), "control: HALT took #7's PASS back");
+  const stuck = ctx.db.prepare("SELECT why FROM escalation").all().map((r) => r.why).filter((w) => /may no longer hold/.test(w));
+  assert.deepEqual(stuck, [], JSON.stringify(sent));
+});
+
 test("a publish that throws doesn't end the tick: the pull requests after it are still published", async () => {
   const published = [];
   const { ctx } = setup({ publish: async (args) => {

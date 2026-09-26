@@ -16,9 +16,10 @@
 // "the script never ran".
 import { runWorker, workerArgs } from "./supervisor.mjs";
 import { validateSettings, ruleFor, scopedFileTools, carveOuts } from "./sandbox.mjs";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer, connect } from "node:net";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, constants, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -266,7 +267,8 @@ export const CANARY_SENTINEL = "REEVE-CANARY-SENTINEL-DO-NOT-LEAK";
  * what decides.
  */
 export function canaryScript({ tmpDir, outsideDir, decoyPath, netUrl = null, fileDecoyPath = null, fileControlPath = null,
-                               loginKeychain = join(homedir(), "Library", "Keychains", "login.keychain-db") }) {
+                               loginKeychain = join(homedir(), "Library", "Keychains", "login.keychain-db"),
+                               platform = process.platform, linux = null }) {
   return `#!/bin/sh
 # reeve sandbox canary: leaves files for the daemon to read; records exit codes beside them
 out="./canary-results.txt"; : > "$out" || exit 97
@@ -277,7 +279,7 @@ touch ${JSON.stringify(join(outsideDir, "OUTSIDE"))}; rec outside $?
 curl -sS -m 5 https://example.com -o ./curl-body 2>/dev/null; rec curl $?
 ${netUrl ? `curl -sS -m 5 ${JSON.stringify(netUrl)} -o ./probe-body 2>/dev/null; rec probe $?` : ""}
 cp ${JSON.stringify(decoyPath)} ./decoy-copy 2>/dev/null; rec decoy $?
-# The KEYCHAIN. Absolute paths on purpose, because the refusing shims on the
+${platform === "linux" ? linuxProbeLines(linux) : `# The KEYCHAIN. Absolute paths on purpose, because the refusing shims on the
 # worker's PATH are a layer, not a boundary.
 #
 # The first three ask the SEARCH LIST, which a scratch HOME empties. That is what
@@ -295,12 +297,69 @@ printf 'protocol=https\nhost=github.com\n\n' | git -c credential.helper=osxkeych
 # host without those exact records they would report a closure that does not
 # exist. show-keychain-info asks about the KEYCHAIN rather than an item, and
 # distinguishes them: measured 2026-08-22, 0 when reachable and 161 when denied.
-/usr/bin/security show-keychain-info ${JSON.stringify(loginKeychain)} >/dev/null 2>&1; rec kc_path_open $?
+/usr/bin/security show-keychain-info ${JSON.stringify(loginKeychain)} >/dev/null 2>&1; rec kc_path_open $?`}
 ${fileDecoyPath ? `cp ${JSON.stringify(fileDecoyPath)} ./filedecoy-copy 2>/dev/null; rec filedecoy $?` : ""}
 ${fileControlPath ? `cp ${JSON.stringify(fileControlPath)} ./filecontrol-copy 2>/dev/null; rec filecontrol $?` : ""}
 ln -sf ${JSON.stringify(decoyPath)} ./decoy-link 2>/dev/null; cp ./decoy-link ./decoy-copy2 2>/dev/null; rec symlink $?
 echo done
 `;
+}
+
+
+/**
+ * Linux's ways out of the sandbox that the canary probes, found on this host
+ * by the daemon before the run (#156). Each is a CONTROL as well as a target:
+ * a probe for a shape the host doesn't have would pass on an absence, so it is
+ * left out, and the evidence says why.
+ *
+ *   node          the daemon's own node, which the socket probes run on. A
+ *                 probe that runs `node -e 0` first proves node runs at all.
+ *   mntFile       a file the daemon can read under /mnt, where WSL keeps the
+ *                 Windows drives and a hosted runner its scratch disk.
+ *   windowsExe    a Windows binary the daemon can run through WSL's interop.
+ *                 The canary plants a copy in its own directory, as a
+ *                 repository could commit one, and interop would run it OUTSIDE
+ *                 the sandbox.
+ *   bus           the session bus, with the Secret Service behind it, when the
+ *                 daemon can connect to it.
+ */
+export async function linuxProbeTargets({ uid = process.getuid?.(), node = process.execPath,
+                                          mntCandidates = ["/mnt/c/Windows/System32/drivers/etc/hosts", "/mnt/reeve-escape-decoy.txt"],
+                                          windowsExe = "/mnt/c/Windows/System32/cmd.exe", connectTimeoutMs = 2_000 } = {}) {
+  const readable = f => { try { accessSync(f, constants.R_OK); return statSync(f).isFile(); } catch { return false; } };
+  const skipped = {};
+  const mntFile = mntCandidates.find(readable)
+    ?? (spawnSync("sh", ["-c", "find /mnt -maxdepth 3 -type f -readable -print -quit 2>/dev/null"], { encoding: "utf8", timeout: 10_000 }).stdout?.trim() || null);
+  if (!mntFile) skipped.mnt = "nothing under /mnt is readable on this host";
+  const exeRuns = existsSync(windowsExe) && spawnSync(windowsExe, ["/c", "exit 0"], { stdio: "ignore", timeout: 15_000 }).status === 0;
+  if (!exeRuns) skipped.interop = "no Windows interop on this host";
+  const busPath = Number.isInteger(uid) ? `/run/user/${uid}/bus` : null;
+  const busUp = busPath && existsSync(busPath) ? await new Promise(res => {
+    const c = connect(busPath);
+    const done = ok => { clearTimeout(t); c.destroy(); res(ok); };
+    const t = setTimeout(() => done(false), connectTimeoutMs);
+    c.once("connect", () => done(true)).once("error", () => done(false));
+  }) : false;
+  if (!busUp) skipped.bus = "no session bus the daemon can reach on this host";
+  return { node, mntFile, windowsExe: exeRuns ? windowsExe : null, bus: busUp ? busPath : null, skipped };
+}
+
+// The Linux probes, as lines of the canary script. The socket probes run on the
+// daemon's own node, because a probe that needs a tool the host may lack could
+// fail for want of it; `node_runs` proves node itself runs.
+function linuxProbeLines(t) {
+  if (!t) return "# no Linux targets were given, so the Linux probes did not run";
+  const node = JSON.stringify(t.node);
+  return [
+    "# LINUX: the host's own ways out. The runtime's seccomp filter, which blocks",
+    "# new Unix sockets, is what closes Windows interop, D-Bus and any socket the",
+    "# deny list doesn't name, Docker's among them; unix_socket proves it is on.",
+    `${node} -e 0 >/dev/null 2>&1; rec node_runs $?`,
+    `${node} -e 'require("net").createServer().on("error", () => process.exit(1)).listen("./canary.sock", function () { this.close(); })' >/dev/null 2>&1; rec unix_socket $?`,
+    t.mntFile ? `cp ${JSON.stringify(t.mntFile)} ./mnt-copy 2>/dev/null; rec mnt_read $?` : "",
+    t.windowsExe ? "./committed.exe /c exit 0 >/dev/null 2>&1 </dev/null; rec interop $?" : "",
+    t.bus ? `${node} -e 'const c = require("net").connect(${JSON.stringify(t.bus)}); c.on("connect", () => process.exit(0)); c.on("error", () => process.exit(1)); setTimeout(() => process.exit(1), 3000);' >/dev/null 2>&1; rec session_bus $?` : "",
+  ].filter(Boolean).join("\n");
 }
 
 /**
@@ -483,6 +542,10 @@ export async function sandboxCanary({
   // curl that could NOT reach it proves a denial, and a hit proves a leak. No
   // external endpoint, no timing window.
   netProbe = null,
+  // The host's platform decides which ways out are probed: the login keychain
+  // on macOS, the socket filter and the host's own paths on Linux (#156).
+  // `linuxTargets` is what linuxProbeTargets found, and is found here when not given.
+  platform = process.platform, linuxTargets = null,
 }) {
   const outsideToolPath = join(outsideDir, "TOOL-OUTSIDE");
   // Production denies whole DIRECTORIES (~/.ssh) and individual FILES (the log,
@@ -523,7 +586,8 @@ export async function sandboxCanary({
   // Built BEFORE the id, because the script is the instrument and its identity
   // belongs in the id: a record made before a probe existed describes a weaker
   // measurement than the one being asked for now.
-  const scriptText = canaryScript({ tmpDir, outsideDir, decoyPath, netUrl: netProbe?.url ?? null, fileDecoyPath, fileControlPath });
+  const linux = platform === "linux" ? (linuxTargets ?? await linuxProbeTargets()) : null;
+  const scriptText = canaryScript({ tmpDir, outsideDir, decoyPath, netUrl: netProbe?.url ?? null, fileDecoyPath, fileControlPath, platform, linux });
   // `!!netProbe`, not `!!netProbe.url`, so this is computable BEFORE the script
   // exists -- which is what lets `measureContainment` key its cache on the same
   // value. The two can only disagree when a listener was handed over and failed
@@ -557,6 +621,8 @@ export async function sandboxCanary({
   writeFileSync(fileControlPath, "reeve canary control: readable on purpose\n");
   writeFileSync(join(dir, "canary.sh"), scriptText);
   writeFileSync(join(dir, "inside-control.txt"), `${CANARY_INSIDE_CONTROL}\n`);
+  // A Windows binary in the canary's own directory, as a repository could commit one.
+  if (linux?.windowsExe) { try { copyFileSync(linux.windowsExe, join(dir, "committed.exe")); } catch { /* the interop probe then fails to run, and says so */ } }
   const scriptHash = createHash("sha256").update(scriptText).digest("hex");
 
   const settings = {
@@ -681,11 +747,14 @@ export async function sandboxCanary({
       if (results.filecontrol !== 0) problems.push("control: a file that is NOT denied was unreadable, so the exact-file result proves nothing");
     }
     if (existsSync(join(dir, "decoy-copy2")) || results.symlink === 0 || decoyContains(join(dir, "decoy-copy2"))) problems.push("read a deny-read file through a symlink");
+    if (platform === "linux") linuxProblems(results, linux, problems, evidence, dir);
     // The keychain is the boundary the OS sandbox cannot enforce, so it is the
     // one the canary must prove: with a scratch HOME the founder's login
     // keychain is not in the worker's search list and every probe fails. A
-    // SUCCESS here means a worker can read the founder's credentials.
-    if (!("kc_github" in results) || !("kc_claude" in results) || !("kc_helper" in results))
+    // SUCCESS here means a worker can read the founder's credentials. It is a
+    // macOS boundary: on Linux `security` isn't there, and its 127 would read
+    // as a closure that was never measured.
+    else if (!("kc_github" in results) || !("kc_claude" in results) || !("kc_helper" in results))
       problems.push("the keychain probes did not run, so credential reach is unproven");
     else {
       if (results.kc_github === 0) problems.push("read the founder's GitHub credential from the keychain");
@@ -696,7 +765,8 @@ export async function sandboxCanary({
     // three above measure; naming the keychain file walks around that entirely,
     // and did, until the path joined the deny list. Absent probes are a refusal:
     // a canary that did not run them proves nothing about the reach they cover.
-    if (!("kc_path_open" in results) || !("kc_path_github" in results) || !("kc_path_claude" in results))
+    if (platform === "linux") { /* judged above */ }
+    else if (!("kc_path_open" in results) || !("kc_path_github" in results) || !("kc_path_claude" in results))
       problems.push("the keychain was not probed by path, so the reach a scratch HOME does NOT close is unproven");
     else {
       // The deciding probe. The two item probes below corroborate it and cannot
@@ -744,6 +814,34 @@ export async function sandboxCanary({
   // A FAILED canary keeps its run directory for evidence; everything else goes.
   sweep({ keepRunDir: !(ok || !keepOnFailure) });
   return ok ? { ok: true, id, why: null, evidence } : { ok: false, id, why: problems.join("; "), evidence };
+}
+
+
+/**
+ * What the Linux probes say, as problems. The socket filter decides: it is what
+ * closes Windows interop, D-Bus and every socket the deny list can't name, so a
+ * worker that could create a Unix socket means the host is refused, whatever
+ * sockets it has (#156). Each other probe ran only where the daemon reached the
+ * shape first, and a probe that should have run and didn't is a problem too.
+ */
+function linuxProblems(results, t, problems, evidence, dir) {
+  evidence.linux = { targets: t ? { mntFile: t.mntFile, windowsExe: t.windowsExe, bus: t.bus } : null, skipped: t?.skipped ?? null };
+  if (!t) { problems.push("the Linux probes had no targets, so the host's ways out are unproven"); return; }
+  if (!("node_runs" in results) || !("unix_socket" in results)) {
+    problems.push("the Linux socket probe did not run, so the runtime's socket filter is unproven");
+  } else if (results.node_runs !== 0) {
+    problems.push("control: node could not run in the sandbox, so the socket probe proves nothing");
+  } else if (results.unix_socket === 0) {
+    problems.push("the worker created a Unix socket: the runtime's socket filter is not in force, so a socket the deny list does not name, Docker's among them, is reachable");
+  }
+  const probe = (target, key, leak, copy = null) => {
+    if (!target) return;
+    if (!(key in results)) problems.push(`the ${key} probe did not run, though the host has the shape it probes`);
+    else if (results[key] === 0 || (copy && existsSync(join(dir, copy)))) problems.push(leak);
+  };
+  probe(t.mntFile, "mnt_read", "read a file under /mnt, where WSL keeps the Windows drives", "mnt-copy");
+  probe(t.windowsExe, "interop", "ran a Windows binary committed to the worktree, which WSL's interop runs outside the sandbox");
+  probe(t.bus, "session_bus", "reached the session bus, and the Secret Service behind it");
 }
 
 /**

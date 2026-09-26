@@ -97,7 +97,10 @@ export function probeKeychain({ platform = process.platform, exec = spawnSync } 
  */
 export function cheapContainmentReasons({ platform = process.platform, isolated = false, keychain = null } = {}) {
   const reasons = [];
-  if (platform !== "darwin") reasons.push(`the OS sandbox is unmeasured on ${platform}; only macOS has been measured`);
+  // macOS and Linux are measured (docs/measured/2026-09-25-linux-wsl-sandbox.md).
+  // On Linux the canary decides as it does on macOS, with probes of its own: the
+  // runtime's socket filter must be in force, or the host is refused (#156).
+  if (platform !== "darwin" && platform !== "linux") reasons.push(`the OS sandbox is unmeasured on ${platform}; only macOS and Linux have been measured`);
   if (!isolated) reasons.push("no isolated worker environment declared (worker.isolation)");
   // The keychain is PROBED here for the record, and it is deliberately no longer
   // a gate. It used to be one because a worker ran with the founder's HOME and
@@ -162,7 +165,7 @@ export async function measureContainment({
   else if (!id) cn = { ok: false, id: null, why: "no CLI version or sandbox block to run a canary under" };
   else {
     const run = typeof canary === "function" ? canary : sandboxCanary;
-    cn = await run({ cliVersion, sandbox, permissionsDeny, allowedTools, binaryId, ...canaryPaths, bin, env, onSpawn, beforeSpawn, ...(netProbe ? { netProbe } : {}) });
+    cn = await run({ cliVersion, sandbox, permissionsDeny, allowedTools, binaryId, ...canaryPaths, bin, env, onSpawn, beforeSpawn, platform, ...(netProbe ? { netProbe } : {}) });
     cn = { ...cn, at: now() };
     cache.set(id, cn);
     if (stateDir && nwo) { try { writeCanaryState(stateDir, nwo, { id: cn.id, cliVersion, bin, binaryId, instrument: instrumentHash({ hasNet: !!netProbe }), policyHash: policyHashOf(sandbox, canaryPaths?.dir ?? null, { permissionsDeny, allowedTools }), stateRoots, allowedTools, canaryDir: canaryPaths?.dir ?? null, ok: cn.ok, why: cn.why, at: cn.at, evidence: cn.evidence ?? null }); } catch { /* the verdict stands without the doctor's copy */ } }

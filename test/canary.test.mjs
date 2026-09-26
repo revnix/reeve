@@ -34,6 +34,9 @@ const base = {
   // The network control is a daemon-local listener; injected so tests never
   // touch the network. selfReachable true, not hit = network denied.
   netProbe: { url: "http://127.0.0.1:59999/canary", selfReachable: () => true, wasHit: () => false },
+  // The fake worker below answers the macOS keychain probes; the Linux canary
+  // has probes of its own, in test/canary-linux.test.mjs.
+  platform: "darwin",
 };
 
 // A runner that behaves like a sandboxed script under the given boundary.
@@ -78,7 +81,7 @@ const streamFor = (readTool, writeTool = "denied", readInside = "allowed") => {
 const scriptOf = b => canaryScript({ tmpDir: b.tmpDir, outsideDir: b.outsideDir, decoyPath: b.decoyPath,
                                      netUrl: b.netProbe?.url ?? null,
                                      fileDecoyPath: join(b.outsideDir, "FILE-DECOY.txt"),
-                                     fileControlPath: join(b.outsideDir, "FILE-CONTROL.txt") });
+                                     fileControlPath: join(b.outsideDir, "FILE-CONTROL.txt"), platform: "darwin" });
 
 const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, decoy = false, symlink = false, results = true, outcome = "ok", readTool = "denied", writeTool = "denied", fileDecoy = false, fileControl = true, keychainReach = false, keychainByPath = null, keychainOpen = null, readInside = "allowed" } = {}) =>
   async ({ cwd, outPath }) => {

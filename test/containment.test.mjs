@@ -90,8 +90,8 @@ const base = { cliVersion: "2.1.237", sandbox, permissionsDeny: [], canaryPaths:
   check(r.credentialRead === "closed", "an unmeasurable host keychain no longer blocks either: the canary is what decides", r.why);
 }
 {
-  const r = await measureContainment({ ...base, canary: pass, keychain: clean, platform: "linux" });
-  check(r.credentialRead === "open" && /unmeasured on linux/.test(r.why), "an unmeasured platform is open even with both probes green", r.why);
+  const r = await measureContainment({ ...base, canary: pass, keychain: clean, platform: "win32" });
+  check(r.credentialRead === "open" && /unmeasured on win32/.test(r.why), "an unmeasured platform is open even with both probes green", r.why);
 }
 {
   const r = await measureContainment({ ...base, cliVersion: null, canary: null, keychain: clean });

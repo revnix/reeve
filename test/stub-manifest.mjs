@@ -6322,4 +6322,13 @@ export const STUBS = [
               find: "{ detached: true, stdio:",
               replace: "{ detached: false, stdio:" }],
   },
+  {
+    name: "sweep-runs-node-test-reporter",
+    why: "run each test file with node's own reporter. A node:test file then prints neither PASS nor FAIL, and every stub on it reads as CRASHED",
+    test: "test/stubsweep-node-test.test.mjs",
+    expectRed: "a node:test file's stub is caught by the test it names",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: "  const child = spawn(process.execPath, [`--test-reporter=${TEST_REPORTER}`, \"--test-reporter-destination=stdout\", join(ROOT, file)],",
+              replace: "  const child = spawn(process.execPath, [join(ROOT, file)]," }],
+  },
 ];

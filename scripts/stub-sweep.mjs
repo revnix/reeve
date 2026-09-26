@@ -480,7 +480,17 @@ const killTree = child => {
   }
 };
 
-const TEST_REPORTER = fileURLToPath(new URL("./test-reporter.mjs", import.meta.url));
+// THE REPORTER AS IT WAS WHEN THE SWEEP STARTED. It is part of how the sweep
+// reads a run, not of what a stub tests: a stub to it must change only the runs
+// it tests, never how the sweep reads the test that should catch it. Read through
+// the file on disk, a stub that stopped it printing PASS left the catching file
+// reporting one assertion where its control reported six, and the entry was
+// UNRUNNABLE. So every run is read through a copy taken before any stub lands,
+// and the copy goes when the sweep ends.
+const reporterDir = mkdtempSync(join(tmpdir(), "stub-sweep-reporter-"));
+const TEST_REPORTER = join(reporterDir, "test-reporter.mjs");
+copyFileSync(fileURLToPath(new URL("./test-reporter.mjs", import.meta.url)), TEST_REPORTER);
+process.on("exit", () => { try { rmSync(reporterDir, { recursive: true, force: true }); } catch { /* best effort: it holds no work */ } });
 const runTest = (file, expectRed = null) => new Promise(resolve => {
   // DETACHED, so the child leads its own process GROUP.
   //

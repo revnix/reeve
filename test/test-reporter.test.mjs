@@ -24,6 +24,7 @@ test("a parent", async (t) => {
   await t.test("child passes", () => {});
   await t.test("child fails", () => { assert.ok(false); });
 });
+test("a passing parent", async (t) => { await t.test("its child", () => {}); });
 test("fails on its own", async (t) => {
   await t.test("inner passes", () => {});
   assert.equal(1, 2);
@@ -64,7 +65,8 @@ test("a test inside another is named with the path to it, so the same name in tw
 });
 
 test("a test with subtests prints only a failure of its own: its subtests' failures are theirs", () => {
-  assert.ok(!lines.some((l) => / {2}a parent$/.test(l)), shown);
+  assert.ok(!lines.some((l) => /^[A-Z]+ {2}(a parent|a passing parent)(:|$)/.test(l)), shown);
+  assert.ok(lines.includes("PASS  a passing parent > its child"), shown);
   assert.ok(lines.includes("FAIL  fails on its own") && lines.includes("PASS  fails on its own > inner passes"), shown);
 });
 

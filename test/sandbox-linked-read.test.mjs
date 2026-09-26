@@ -48,3 +48,16 @@ test("on Linux no path the Read tool is denied runs through a link", { skip: pro
   const linked = readPaths(deny).filter((p) => existsSync(p) && realpathSync(p) !== p);
   assert.deepEqual(linked, []);
 });
+
+test("on Linux a state root reached through a link is denied at its target, to the OS sandbox and the Read tool, and the policy still validates", { skip: process.platform !== "linux" && "Linux only" }, async () => {
+  const { validateSettings } = await import("../src/sandbox.mjs");
+  const base = realpathSync(tempDir("reeve-linked-state-"));
+  mkdirSync(join(base, "real-state"));
+  symlinkSync(join(base, "real-state"), join(base, "state"));
+  const link = join(base, "state"), target = join(base, "real-state");
+  const s = sandboxFor({ profile, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: "/tmp/t", stateRoots: [link] }).settings;
+  assert.ok(s.sandbox.filesystem.denyRead.includes(target) && !s.sandbox.filesystem.denyRead.includes(link), JSON.stringify(s.sandbox.filesystem.denyRead.filter((p) => p.startsWith(base))));
+  assert.ok(s.permissions.deny.includes(`Read(/${target}/**)`) && !s.permissions.deny.some((d) => d.includes(link + ")") || d.includes(link + "/")), JSON.stringify(s.permissions.deny.filter((d) => d.includes(base))));
+  const v = validateSettings(s, { tmpDir: "/tmp/t", stateRoots: [link] });
+  assert.equal(v.ok, true, JSON.stringify(v.errors));
+});

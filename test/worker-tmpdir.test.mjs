@@ -87,7 +87,7 @@ test("a worker whose TMPDIR leaves no room for the sandbox's sockets isn't start
                                          outPath: join(dir, `out${n}`), errPath: join(dir, `err${n}`) });
   const r = await run("/" + "t".repeat(workerenv.TMPDIR_MAX), 1);
   assert.equal(r.outcome, "unbound", JSON.stringify(r));
-  assert.match(r.why, /TMPDIR[^\n]*characters/);
+  assert.match(r.why, /TMPDIR[^\n]*bytes/);
   assert.equal(existsSync(marker), false, "the worker started");
   // A TMPDIR within the room starts it.
   const ok = await run("/tmp", 2);
@@ -107,4 +107,29 @@ test("the canary's worker gets a short TMPDIR under reeve's home too", async () 
   await daemon.measuredContainment(ctx, profile, "o/r", ctx.logPath);
   assert.match(seen.tmpDir ?? "", underHome(stateDir));
   assert.equal(seen.TMPDIR, seen.tmpDir);
+});
+
+test("a TMPDIR's room is counted in bytes, as the kernel counts a socket's path", () => {
+  // 41 characters, 81 bytes: past the room, though not by a count of characters.
+  const wide = "/" + "é".repeat(40);
+  assert.ok(workerenv.tmpDirTooLong(wide, "linux"), "a TMPDIR over the room in bytes was let through");
+  assert.match(workerenv.tmpDirTooLong(wide, "linux"), /81 bytes/);
+  assert.equal(workerenv.tmpDirTooLong("/" + "e".repeat(40), "linux"), null, "control: the same length in plain characters fits");
+});
+
+test("a run's TMPDIR is removed even when the run can't be closed", async () => {
+  const stateDir = tempDir("rt-");
+  const { ctx, seen } = dispatch({ stateDir });
+  // Closing the run fails: its read of the run's lease throws, as a locked or broken store would.
+  const real = ctx.db;
+  ctx.db = new Proxy(real, { get: (t, k) => k !== "prepare" ? (typeof t[k] === "function" ? t[k].bind(t) : t[k])
+    : (sql) => { if (/COALESCE\(x\.cancel_requested, 0\) AS cancel_requested/.test(sql)) throw new Error("database is locked"); return t.prepare(sql); } });
+  try { await daemon.tick(ctx); } catch { /* the tick may throw with it */ }
+  assert.equal(seen.spawned.length, 1, "control: the worker ran");
+  assert.equal(existsSync(seen.spawned[0].TMPDIR), false, "the run's TMPDIR is left behind");
+});
+
+test("the shared TMPDIR root is denied to workers wherever reeve's state lives, not only under its home", () => {
+  const roots = daemon.stateRootsFor("/srv/reeve-state", "/srv/reeve-state/reeve.log", "/w/x");
+  assert.ok(roots.includes("/srv/reeve-state/t"), JSON.stringify(roots));
 });

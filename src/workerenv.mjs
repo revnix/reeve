@@ -186,10 +186,15 @@ export const TMPDIR_MAX = 107 - "/claude-socks-0123456789abcdef.sock".length;
 export function workerTmpDir(stateDir) {
   return join(stateDir, "t", randomBytes(6).toString("hex"));
 }
-/** Why `tmpDir` is too long for the sandbox's sockets on this platform, or null. */
+/**
+ * Why `tmpDir` is too long for the sandbox's sockets on this platform, or null.
+ * In bytes, as the kernel counts a socket's path: a name in another alphabet
+ * takes two or more bytes a character.
+ */
 export function tmpDirTooLong(tmpDir, platform = process.platform) {
-  if (platform !== "linux" || tmpDir.length <= TMPDIR_MAX) return null;
-  return `the worker's TMPDIR, ${tmpDir}, is ${tmpDir.length} characters, and the sandbox's sockets there need it at ${TMPDIR_MAX} or fewer; set REEVE_HOME to a shorter path`;
+  const bytes = Buffer.byteLength(tmpDir);
+  if (platform !== "linux" || bytes <= TMPDIR_MAX) return null;
+  return `the worker's TMPDIR, ${tmpDir}, is ${bytes} bytes, and the sandbox's sockets there need it at ${TMPDIR_MAX} or fewer; set REEVE_HOME to a shorter path`;
 }
 
 /**

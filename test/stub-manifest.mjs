@@ -7071,7 +7071,7 @@ export const STUBS = [
     test: "test/worker-tmpdir.test.mjs",
     expectRed: "a dispatched worker gets a short TMPDIR under reeve's home, not inside its run's folder, and it's gone once the run ends",
     edits: [{ file: "src/daemon.mjs",
-              find: "        try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* the next start's sweep finds it */ }\n",
+              find: "        try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* nothing more to do for it */ }\n",
               replace: "" }],
   },
   {

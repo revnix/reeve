@@ -533,7 +533,8 @@ export function stateRootsFor(stateDir, logPath, worktree, dbPath = null) {
   // files: `--db` can name a path outside every other protected tree, and it
   // holds the event history, prompts and operational state. (Codex #4f-[7].)
   const dbFiles = dbPath ? [dbPath, `${dbPath}-wal`, `${dbPath}-shm`] : [];
-  const cands = [logPath, ...dbFiles, join(stateDir, "runs"), join(stateDir, "canary"), join(stateDir, "backups"), resolveHome()]
+  // `t` holds every worker's TMPDIR (#156); each is granted only its own.
+  const cands = [logPath, ...dbFiles, join(stateDir, "runs"), join(stateDir, "canary"), join(stateDir, "backups"), join(stateDir, "t"), resolveHome()]
     .filter(p => p && isAbsolute(p));
   return [...new Set(cands)].filter(p => !(worktree && under(p, worktree)));
 }
@@ -2869,6 +2870,9 @@ export async function tick(ctx) {
         raise(`#${e.pr}: the worker could not be prepared; reeve is backing off`);
       } finally {
         clearInterval(beat);
+        // The run's TMPDIR is its own scratch, and nothing reads it once the worker
+        // stops. First, so nothing below that fails leaves it behind (#156).
+        try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* nothing more to do for it */ }
         // THE PROVIDER LEASE GOES BACK HERE, and this is the only place it does
         // for a dispatched run. Every exit from this block passes through --
         // success, worker failure, a throw during preparation -- so there is one
@@ -2941,8 +2945,6 @@ export async function tick(ctx) {
                                     why: r?.why ?? "the worker threw before returning a result",
                                     ms: r?.ms, cost: r?.cost, sessionId: r?.sessionId });
         if (!prepFailed) PREP_BACKOFF.delete(prepKey);
-        // The run's TMPDIR is its own scratch, and nothing reads it once the worker stops.
-        try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* the next start's sweep finds it */ }
         if (fin?.applied === false) {
           // The store refused the outcome: the claim was gone or withdrawn by
           // the time the worker finished. Whatever it produced is not published.

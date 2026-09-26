@@ -26,17 +26,17 @@
 // And a sixth, unprompted: denied twice, the model reached for a THIRD tool that
 // was not in the allowlist at all. Any tool that can run a command is a write
 // primitive, so this must be a closed allowlist, never a denylist.
+import test from "node:test";
+import assert from "node:assert/strict";
 import { sandboxFor, reviewDiff, validateSettings, validateToolGrant, scopeGrant, credentialPaths, osCredentialPaths, hostEscapePaths, quarantineOsDenies, siblingRootsOf, CREDENTIAL_PATHS } from "../src/sandbox.mjs";
 import { readFileSync, mkdtempSync, mkdirSync, rmSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { tempDir } from "./fixtures/temp.mjs";
 
-let fail = 0;
-const check = (ok, name, detail) => {
-  console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
-  if (!ok) { if (detail) console.log("        " + detail); fail++; }
-};
+// Each check is a node:test case, named for the property it proves, so the
+// stub sweep reads it through the repository's reporter like any other.
+const check = (ok, name, detail) => test(name, () => assert.ok(ok, detail || name));
 
 const profile = {
   identity: { key: "o/r", defaultBranch: "main" },
@@ -662,7 +662,7 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
 // sockets and the session bus. The runtime's seccomp filter, which blocks new
 // Unix sockets, was all that stopped Windows interop and D-Bus; with it off,
 // both worked, and only these paths closed them.
-const linuxOnly = (name, run) => (process.platform === "linux" ? run() : console.log(`SKIP  ${name} (Linux only; this is ${process.platform})`));
+const linuxOnly = (name, run) => (process.platform === "linux" ? run() : test(name, { skip: `Linux only; this is ${process.platform}` }, () => {}));
 {
   check(JSON.stringify(hostEscapePaths({ platform: "linux", uid: 1000 })) === JSON.stringify(["/mnt", "/run/WSL", "/run/user/1000", "/run/dbus"])
     && hostEscapePaths({ platform: "darwin", uid: 501 }).length === 0,
@@ -718,6 +718,3 @@ const linuxOnly = (name, run) => (process.platform === "linux" ? run() : console
     if (savedReeve !== undefined) process.env.REEVE_HOME = savedReeve;
   }
 }
-
-console.log(fail ? `\nfailed=${fail}` : "\nall green");
-process.exit(fail ? 1 : 0);

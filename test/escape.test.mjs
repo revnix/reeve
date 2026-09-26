@@ -20,6 +20,8 @@
 // proof under the runtime, and both read files, never a worker's word.
 //
 // Never print what a credential probe returns: presence is the only thing read.
+import test from "node:test";
+import assert from "node:assert/strict";
 import { REFUSING_HOOK } from "../src/gitguard.mjs";
 import { workerEnv, writeGitConfig, CONTAINMENT } from "../src/workerenv.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
@@ -40,12 +42,10 @@ const WORKER_HOME = tempDir("reeve-worker-home-");
 const LOGIN_KEYCHAIN = join(homedir(), "Library", "Keychains", "login.keychain-db");
 const FAKE_TOKEN = "sk-ant-oat01-test-token-not-a-real-credential-000000000000";
 
-let fail = 0, skipped = 0;
-const check = (ok, name, detail) => {
-  console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
-  if (!ok) { if (detail) console.log("        " + detail); fail++; }
-};
-const skip = (name, why) => { console.log(`SKIP  ${name} (${why})`); skipped++; };
+// Each check is a node:test case, named for the property it proves, so the
+// stub sweep reads it through the repository's reporter like any other.
+const check = (ok, name, detail) => test(name, () => assert.ok(ok, detail || name));
+const skip = (name, why) => test(name, { skip: why }, () => {});
 
 // ── fixture: origin, clone, a worker's worktree, a standalone clone, a destination
 //
@@ -395,5 +395,3 @@ ${JSON.stringify(process.execPath)} -e 'require("net").createServer().listen("./
 check(CONTAINMENT.credentialRead === "closed-by-home-and-path", "control: the module declares the closure this file just measured, and the canary re-proves it per CLI build", JSON.stringify(CONTAINMENT));
 
 rmSync(root, { recursive: true, force: true });
-console.log(`${fail ? `\nfailed=${fail}` : "\nall green"}${skipped ? ` (skipped ${skipped}: not measurable on this host)` : ""}`);
-process.exit(fail ? 1 : 0);

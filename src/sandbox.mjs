@@ -329,7 +329,12 @@ const credentialReadDenies = () => {
  */
 export function osCredentialPaths({ platform = process.platform } = {}) {
   if (platform !== "linux") return credentialPaths();
-  return [...new Set(credentialPaths().map(p => { try { return realpathSync(p); } catch { return p; } }))];
+  return [...new Set(credentialPaths().map(p => linkFree(p, platform)))];
+}
+/** A path as the Linux sandbox must be given it: at its target when it's a link. Elsewhere, and where nothing is there yet, as written. */
+export function linkFree(p, platform = process.platform) {
+  if (platform !== "linux") return p;
+  try { return realpathSync(p); } catch { return p; }
 }
 // The Read tool is outside the OS sandbox, and would follow a committed symlink
 // into /mnt/c as readily as into ~/.ssh, so the host's ways out are denied to it
@@ -535,7 +540,10 @@ const denyWriteVerbs = glob =>
  * with its worktree as the working directory, and adding anything to that widens
  * the only boundary keeping it inside its own checkout.
  */
-export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = null, stateRoots = [] }) {
+export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = null, stateRoots: givenRoots = [] }) {
+  // At their targets on Linux, as the credential paths are: bubblewrap can't
+  // mount over a link, and a REEVE_HOME that is one stopped every sandbox (#156).
+  const stateRoots = [...new Set(givenRoots.map(p => linkFree(p)))];
   const sourceCheckout = sourceCheckoutOf(profile);
   // The shared root, minus this run's own checkout. A worker reads its own
   // directory through the cwd grant and the allowRead carve-out below, so
@@ -793,8 +801,10 @@ export function validateToolGrant(allowedTools, { worktree = null } = {}) {
   return { ok: errors.length === 0, errors };
 }
 
-export function validateSettings(settings, { tmpDir = null, stateRoots = [], quarantineDenies = [], extraDenies = [], sourceCheckout = [],
+export function validateSettings(settings, { tmpDir = null, stateRoots: givenRoots = [], quarantineDenies = [], extraDenies = [], sourceCheckout = [],
                                             siblingRoots = [], worktree = null, readCarveOuts = [] } = {}) {
+  // Judged as the generator writes them: at their targets on Linux (#156).
+  const stateRoots = [...new Set(givenRoots.map(p => linkFree(p)))];
   const errors = [];
   if (!tmpDir) return { ok: false, errors: ["validator needs the run's tmpDir to judge the write grant"] };
   if (!settings || typeof settings !== "object" || Array.isArray(settings)) return { ok: false, errors: ["settings absent"] };

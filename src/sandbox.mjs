@@ -350,8 +350,12 @@ const readRule = (p, file) => (file ? `Read(${ruleFor(p)})` : `Read(${ruleFor(p)
 // kept as written, a directory's form or a file's as the list says.
 const isDir = p => { try { return statSync(p).isDirectory(); } catch { return false; } };
 const credentialReadDenies = () => {
+  // At the target on Linux, but a file named as a file and a folder as a folder,
+  // judged by what's there or, where nothing is yet, by the entry itself: a
+  // dangling link's target named as a folder leaves the file readable to the
+  // Read tool once it appears (#156).
   if (process.platform === "linux")
-    return osCredentialPaths().map(p => readRule(p, existsSync(p) ? !isDir(p) : isCredentialFile(p)));
+    return [...new Set(credentialPaths().map(c => { const p = linkFree(c); return readRule(p, existsSync(p) ? !isDir(p) : isCredentialFile(c)); }))];
   const written = credentialPaths();
   const targets = osCredentialPaths().filter(p => !written.includes(p));
   return [...written.map(p => readRule(p, isCredentialFile(p))), ...targets.map(p => readRule(p, !isDir(p)))];
@@ -405,7 +409,8 @@ export function linkFree(p, platform = process.platform, hops = 0) {
  * checkout (#156).
  */
 export function layoutDeniesAbove(path, { profile = null, stateRoots = [], mounts } = {}) {
-  const denied = [...credentialPaths().map(expandTilde), ...hostEscapePaths({ mounts }), ...sourceCheckoutOf(profile), ...stateRoots.map(p => linkFree(p))];
+  // The credentials as the policy denies them: at their targets on Linux.
+  const denied = [...osCredentialPaths(), ...hostEscapePaths({ mounts }), ...sourceCheckoutOf(profile), ...stateRoots.map(p => linkFree(p))];
   return denied.filter(d => d.startsWith("/") && (path === d || path.startsWith(d.endsWith("/") ? d : d + "/")));
 }
 

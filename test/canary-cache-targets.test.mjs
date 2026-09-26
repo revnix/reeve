@@ -8,9 +8,10 @@
 // what was found is part of the canary's id.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { chmodSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as daemon from "../src/daemon.mjs";
-import { measureContainment, revalidateContainment } from "../src/containment.mjs";
+import { measureContainment, revalidateContainment, sandboxRuntimeIdentity } from "../src/containment.mjs";
 import { canaryIdFor } from "../src/canary.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 
@@ -97,4 +98,18 @@ test("the check before a worker starts refuses a verdict measured under another 
   const moved = await at("bwrap=/usr/bin/bwrap@2 socat=/usr/bin/socat@1");
   assert.equal(moved.ok, false, "a worker started under a bubblewrap the canary never ran under");
   assert.match(moved.why, /sandbox runtime changed/);
+});
+
+test("the sandbox runtime is the bwrap and socat the PATH would run: a file there that can't be run is passed over", () => {
+  // A regular file named bwrap earlier on the PATH, not executable: the shell
+  // passes over it, so the identity must too, or it tracks a file nothing runs.
+  const inert = tempDir("cr-inert-"), real = tempDir("cr-real-");
+  for (const t of ["bwrap", "socat"]) {
+    writeFileSync(join(inert, t), "not a program\n");
+    chmodSync(join(inert, t), 0o644);
+    writeFileSync(join(real, t), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(real, t), 0o755);
+  }
+  const id = sandboxRuntimeIdentity(`${inert}:${real}`, { platform: "linux", identity: (p) => p });
+  assert.equal(id, `bwrap=${join(real, "bwrap")} socat=${join(real, "socat")}`);
 });

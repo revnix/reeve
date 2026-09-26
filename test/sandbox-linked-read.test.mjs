@@ -61,3 +61,16 @@ test("on Linux a state root reached through a link is denied at its target, to t
   const v = validateSettings(s, { tmpDir: "/tmp/t", stateRoots: [link] });
   assert.equal(v.ok, true, JSON.stringify(v.errors));
 });
+
+test("on Linux a credential file that is a link to what isn't there yet is denied to the Read tool as a file, at its target", { skip: process.platform !== "linux" && "Linux only" }, () => {
+  // ~/.npmrc a link whose target isn't there yet. Named as a folder, its rule
+  // matches only what's under it, and once the file appears the Read tool,
+  // outside the OS sandbox, could read it.
+  const home = realpathSync(tempDir("reeve-dangling-cred-"));
+  mkdirSync(join(home, "elsewhere"));
+  symlinkSync(join(home, "elsewhere", "npmrc"), join(home, ".npmrc"));
+  const deny = withHome(home, () => sandboxFor({ profile, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: "/tmp/t" }).settings.permissions.deny);
+  const target = join(home, "elsewhere", "npmrc");
+  assert.ok(deny.includes(`Read(/${target})`), JSON.stringify(deny.filter((d) => d.includes(home))));
+  assert.ok(!deny.includes(`Read(/${target}/**)`), "the file is named as a folder");
+});

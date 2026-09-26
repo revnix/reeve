@@ -9,7 +9,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import * as daemon from "../src/daemon.mjs";
 import * as workerenv from "../src/workerenv.mjs";
@@ -133,6 +133,23 @@ test("the canary's TMPDIR is removed whatever the canary's outcome, a failure in
   await daemon.measuredContainment(ctx, profile, "o/r", ctx.logPath);
   assert.equal(seen.existed, true, "control: it existed while the canary ran");
   assert.equal(existsSync(seen.tmpDir), false, "a failed canary's TMPDIR is left behind");
+});
+
+test("the canary's TMPDIR is removed when measuring fails before the canary is asked", async () => {
+  // Anything that throws after the TMPDIR is made, finding the Linux targets
+  // here, leaves the verdict open, and the next tick makes another.
+  const stateDir = tempDir("rc-");
+  const ctx = { logPath: join(stateDir, "reeve.log"), platform: "linux", isolationReady: () => true, mounts: "",
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "2.1.278 (Claude Code)",
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    netProbe: { url: "http://127.0.0.1:1/canary", selfReachable: () => true, wasHit: () => false },
+    linuxProbeTargets: async () => { throw new Error("the targets couldn't be found"); },
+    canary: async () => ({ ok: true, id: "t", why: null, evidence: {} }) };
+  const profile = { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: tempDir("rc-wt-") }, worker: { isolation: "scratch-home" }, units: [] };
+  const v = await daemon.measuredContainment(ctx, profile, "o/r", ctx.logPath);
+  assert.equal(v.credentialRead, "open", "control: the measurement failed");
+  const t = join(stateDir, "t");
+  assert.deepEqual(existsSync(t) ? readdirSync(t) : [], [], "a TMPDIR was left behind");
 });
 
 test("a TMPDIR with no room names the state folder it sits under, which --log can put outside REEVE_HOME", () => {

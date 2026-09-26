@@ -19,7 +19,7 @@
 // Anything unmeasured is open. A platform whose sandbox was never measured is
 // open. A probe that cannot run is open. Closed is a conclusion, never a default.
 import { spawnSync } from "node:child_process";
-import { realpathSync, statSync } from "node:fs";
+import { accessSync, constants, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { sandboxCanary, canaryIdFor, instrumentHash, policyHashOf, readCanaryState, writeCanaryState, linuxProbeTargets, probeShapeOf } from "./canary.mjs";
 import { windowsDriveRoots } from "./sandbox.mjs";
@@ -53,7 +53,8 @@ export function isolationTopologyReady() { return true; }
 export function sandboxRuntimeIdentity(pathVar, { platform = process.platform, identity = binaryIdentity } = {}) {
   if (platform !== "linux") return null;
   const onPath = name => String(pathVar ?? "").split(":").filter(Boolean).map(d => join(d, name))
-    .find(f => { try { return statSync(f).isFile(); } catch { return false; } }) ?? name;
+    // As the PATH lookup does: the first that is a file and can be run.
+    .find(f => { try { accessSync(f, constants.X_OK); return statSync(f).isFile(); } catch { return false; } }) ?? name;
   return ["bwrap", "socat"].map(t => `${t}=${identity(onPath(t))}`).join(" ");
 }
 

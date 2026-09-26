@@ -11,7 +11,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as daemon from "../src/daemon.mjs";
-import { linkFree, notifyCredOf, sandboxFor, siblingRootsOf, sourceCheckoutOf, validateSettings } from "../src/sandbox.mjs";
+import { layoutDeniesAbove, linkFree, notifyCredOf, sandboxFor, siblingRootsOf, sourceCheckoutOf, validateSettings } from "../src/sandbox.mjs";
 import { open } from "../src/db/ops.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 
@@ -221,4 +221,22 @@ test("on Linux a protected path that is a link to what isn't there yet is named 
   symlinkSync(join(base, "loop-b"), join(base, "loop-a"));
   symlinkSync(join(base, "loop-a"), join(base, "loop-b"));
   assert.ok(typeof linkFree(join(base, "loop-a"), "linux") === "string", "control: a loop of links ends");
+});
+
+test("on Linux the layout check sees a credential directory at its target, where the policy denies it", linux, () => {
+  // ~/.aws a link to a folder the worktree root is under: the policy denies the
+  // folder, so a checkout there would be denied its own files, and the check
+  // before a checkout is made has to say so.
+  const home = realpathSync(tempDir("rl-cred-home-"));
+  mkdirSync(join(home, "data", "wt"), { recursive: true });
+  symlinkSync(join(home, "data"), join(home, ".aws"));
+  const saved = process.env.HOME, savedReeve = process.env.REEVE_HOME;
+  process.env.HOME = home; delete process.env.REEVE_HOME;
+  try {
+    const denied = layoutDeniesAbove(join(home, "data", "wt"), { profile: { identity: { key: "o/r" } } });
+    assert.ok(denied.includes(join(home, "data")), JSON.stringify(denied));
+  } finally {
+    if (saved === undefined) delete process.env.HOME; else process.env.HOME = saved;
+    if (savedReeve !== undefined) process.env.REEVE_HOME = savedReeve;
+  }
 });

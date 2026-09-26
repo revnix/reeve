@@ -578,6 +578,11 @@ export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSp
   // the mechanism intact: the next field a callee lazily attaches to `ctx` is the
   // same defect again. Removing the copy removes the class.
   const cache = (ctx.containmentCache ??= new Map());
+  // The canary's TMPDIR, once one is named. It's outside the folder a failed
+  // canary keeps as evidence, under <state>/t, and holds nothing that evidence
+  // needs, so it goes whatever happened: a failed canary is retried, and so is
+  // a measurement that threw, each making another (#156).
+  let tmpDir = null;
   try {
     if (!profile.identity?.worktreeRoot || !isAbsolute(profile.identity.worktreeRoot)) return { credentialRead: "open", why: "no absolute identity.worktreeRoot to run the canary under" };
     // At its target on Linux, as every root the sandbox is given (#156).
@@ -624,6 +629,7 @@ export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSp
       // under the link's spelling is under no deny, and the canary can't run (#156).
       decoyPath: join(linkFree(resolveHome()), "canary", nwo.replace("/", "-"), `decoy-${process.pid}-${Date.now()}.txt`),
     };
+    tmpDir = canaryPaths.tmpDir;
     // The block every worker gets; the canary's id covers it, so a block that
     // changes (a new deny, a new domain) is measured again before it is trusted.
     // The reeve-owned trees are denied to workers too; the canary proves the
@@ -707,15 +713,13 @@ export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSp
       // FAILED canary keeps its own directory for evidence, which is why this
       // removes the tree only when the canary did not run. (Codex #5-[6].)
       if (c?.canary?.skipped || c?.canary?.cached) rmSync(canaryRoot, { recursive: true, force: true });
-      // The TMPDIR is outside that tree, under <state>/t, and a failed canary's
-      // evidence needs nothing in it, so it goes whatever happened: a failed
-      // canary is retried, and each would leave another one behind (#156).
-      rmSync(canaryPaths.tmpDir, { recursive: true, force: true });
     }
     if (!before) log(logPath, `containment: canary ${c.canary?.id ?? "?"} ${c.canary?.ok ? "passed" : `FAILED: ${c.canary?.why}`}; keychain: ${c.keychain?.measured ? (c.keychain.items.length ? c.keychain.why : "no GitHub credential") : `unmeasured (${c.keychain?.why})`}`);
     return c;
   } catch (err) {
     return { credentialRead: "open", why: `containment could not be measured: ${err.message}` };
+  } finally {
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 

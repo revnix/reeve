@@ -11,7 +11,7 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { detectCommands } from "../src/profile/detect.mjs";
 import { npmScriptShells, runnerShells, scriptShell, scriptShells } from "../src/profile/shellscript.mjs";
 
@@ -433,11 +433,13 @@ try {
                     "command", "exec", ":", ".", "test", "["];
   const NO_SYNTAX = { "|&": false, "<<<": false, "&>": false, "&>>": false, ">&": false };
   const dashShell = { name: "dash", paths: [], execOptions: false, execEndsOptions: false, appendAssign: false, pipefail: true,
-                      badOptionEnds: true, syntax: NO_SYNTAX, builtins: new Set(BUILTINS),
+                      badOptionEnds: true, syntax: NO_SYNTAX, unsetLastOptionWins: true, pTakesOperands: false,
+                      readonlyAssignEnds: true, builtins: new Set(BUILTINS),
                       keywords: new Set(["if", "for", "while", "until", "case", "!", "{", "}"]) };
   // dash before Debian's 0.5.12-7, as Debian 12 and Ubuntu 24.04 have it.
   const oldDashShell = { ...dashShell, pipefail: false };
   const bashShell = { ...dashShell, name: "bash", execOptions: true, execEndsOptions: true, appendAssign: true, badOptionEnds: false,
+                      unsetLastOptionWins: false, pTakesOperands: true,
                       syntax: Object.fromEntries(Object.keys(NO_SYNTAX).map((op) => [op, true])),
                       builtins: new Set([...BUILTINS, "source", "declare"]),
                       keywords: new Set([...dashShell.keywords, "[[", "function", "select", "time"]) };
@@ -570,6 +572,101 @@ try {
   check(!dashPath || (eitherAsked?.syntax?.["|&"] === "maybe" && eitherAsked.badOptionEnds === "maybe"),
     "shells that may run a script, asked together, differ where one has an operator or ends on a bad option and another doesn't",
     JSON.stringify(eitherAsked));
+
+  // ── four more shapes from #215's review, and one beside them (#216) ───────
+  //
+  // Each made a broken script read as present, except `export -p` under dash,
+  // which made a working one read as broken.
+
+  // unset's -f and -v: dash takes the last of them, and bash refuses both at
+  // once, and unsets neither.
+  // bash keeps PATH, so a program it doesn't have is still missing.
+  const unsetBoth = [["unset -fv PATH; jest --ci", dashShell, "'jest'"], ["unset -f -v PATH; jest --ci", dashShell, "'jest'"],
+                     ["unset -vf PATH; jest --ci", dashShell, "present"], ["unset -fv PATH; jest --ci", bashShell, "present"],
+                     ["unset -fv PATH; no-such-runner", bashShell, "'no-such-runner'"]]
+    .map(([s, sh, want]) => ({ s, sh: sh.name, want, r: detectTest(s, jest, { shell: sh }) }));
+  check(unsetBoth.every(({ want, r }) => (want === "present" ? r.state === "present" : broken(r, want))),
+    "unset reads -f and -v as the shell does: dash takes the last, and bash refuses both at once", JSON.stringify(unsetBoth));
+
+  // -p with readonly or export: dash lists, and takes no operand at all, where
+  // bash takes them as it would without -p.
+  const withP = [["readonly -p PATH; PATH=/nowhere; sh -c true", dashShell, "broken"], ["readonly -p PATH; PATH=/nowhere; sh -c true", bashShell, "broken"],
+                 ["export -p PATH=/nowhere; sh -c true", dashShell, "present"], ["export -p PATH=/nowhere; sh -c true", bashShell, "broken"]]
+    .map(([s, sh, want]) => ({ s, sh: sh.name, want, r: detectTest(s, {}, { shell: sh }) }));
+  // Where the shells that may run the script differ, what -p did is unknown,
+  // but a bare name gives PATH no value in either.
+  const maybeP = { ...dashShell, pTakesOperands: "maybe" };
+  const eitherP = detectTest("export -p PATH=/nowhere; sh -c true", {}, { shell: maybeP });
+  const bareP = detectTest("export -p PATH; no-such-runner", {}, { shell: maybeP });
+  check(withP.every(({ want, r }) => (want === "present" ? r.state === "present" : broken(r))) && eitherP.state === "present"
+    && broken(bareP, "'no-such-runner'"),
+    "readonly and export with -p take their operands only in a shell that does: dash only lists", JSON.stringify({ withP, eitherP, bareP }));
+
+  // A bare assignment to a read-only PATH ends both shells. Before a command, or
+  // through export, readonly or unset, bash goes on.
+  const bare = detectTest("readonly PATH; PATH=/nowhere; true", {}, { shell: bashShell });
+  const prefix = detectTest("readonly PATH; PATH=/nowhere true", {}, { shell: bashShell });
+  check(broken(bare, "read-only") && prefix.state === "present",
+    "a bare assignment to a read-only PATH ends the shell, where one before a command may not", JSON.stringify({ bare, prefix }));
+
+  // Under pipefail, a command that writes nothing can't be stopped by the pipe
+  // closing, so it surely succeeds as the last one does.
+  const quiet = ["set -o pipefail; ! true | true", "set -o pipefail; ! : | true"]
+    .map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
+  check(quiet.every(({ r }) => broken(r, "always fails")),
+    "under pipefail, a command before the last that writes nothing surely succeeds", JSON.stringify(quiet));
+
+  // An assignment to a read-only variable fails, and in a pipeline's subshell
+  // it fails only that command. bash has read-only variables of its own, EUID
+  // and UID among them, so a command in a pipeline with an assignment never
+  // surely succeeds, first or last: each of these passes in bash.
+  const assigning = ["readonly x; set -o pipefail; ! x=1 | true", "set -o pipefail; ! EUID=1 | true", "readonly x; ! true | x=1",
+                     "readonly x; set -o pipefail; ! x=1 true | true"]
+    .map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
+  check(assigning.every(({ r }) => r.state === "present"),
+    "a command in a pipeline with an assignment never surely succeeds: a read-only variable fails it", JSON.stringify(assigning));
+
+  // Each command of a pipeline runs in a subshell of its own, where an expansion
+  // that fails, $((1/0)) or ${x:?}, fails that command rather than ending the
+  // script. So a command with an expansion there, in a word or in a
+  // here-string, never surely succeeds, first or last: all of these pass in
+  // bash, and the first two in dash.
+  const expanding = ["set -o pipefail; ! true $((1/0)) | true", "! true | true $((1/0))",
+                     "set -o pipefail; ! true <<< $((1/0)) | true", "! true | true <<< $((1/0))"]
+    .map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
+  check(expanding.every(({ r }) => r.state === "present"),
+    "a command in a pipeline with an expansion that may fail never surely succeeds", JSON.stringify(expanding));
+
+  // Outside a pipeline, a here-string whose expansion fails ends the script, as
+  // one in a word does. Either way it fails, so its command is read as though
+  // the expansion succeeded.
+  const hereString = [["! true <<< \"$HOME\"", "always fails"], ["true <<< \"$HOME\" && no-such-runner", "'no-such-runner'"]]
+    .map(([s, want]) => ({ s, want, r: detectTest(s, {}, { shell: bashShell }) }));
+  check(hereString.every(({ want, r }) => broken(r, want)),
+    "outside a pipeline, a here-string's expansion that fails ends the script, so its command is read as succeeding", JSON.stringify(hereString));
+
+  // Where either shell may run the script, unset given -f and -v may fail, as
+  // bash refuses it, and with -f last it keeps PATH in both.
+  const eitherUnset = { ...dashShell, name: "dash or bash", unsetLastOptionWins: "maybe" };
+  const unsetEither = [["unset -vf PATH; no-such-runner", "'no-such-runner'"], ["unset -v -f PATH; no-such-runner", "'no-such-runner'"],
+                       ["! unset -vf x", "present"], ["! unset -fv x", "present"], ["unset -fv PATH; jest --ci", "present"]]
+    .map(([s, want]) => ({ s, want, r: detectTest(s, jest, { shell: eitherUnset }) }));
+  check(unsetEither.every(({ want, r }) => (want === "present" ? r.state === "present" : broken(r, want))),
+    "where either shell may run the script, unset given -f and -v may fail, and with -f last keeps PATH", JSON.stringify(unsetEither));
+
+  // What the shell does is asked of it.
+  const asked216 = [scriptShell(which("bash")), dashPath ? scriptShell(dashPath) : null];
+  // The -p probe assigns x through readonly -p, which dash ignores. An x the
+  // environment already holds must not read as that assignment having taken.
+  const reader = pathToFileURL(join(ROOT, "src", "profile", "shellscript.mjs")).href;
+  const withX = dashPath ? spawnSync(process.execPath, ["--input-type=module", "-e",
+    `import { scriptShell } from ${JSON.stringify(reader)}; console.log(JSON.stringify(scriptShell(${JSON.stringify(dashPath)})?.pTakesOperands));`],
+    { env: { ...process.env, x: "1" }, encoding: "utf8" }).stdout.trim() : "false";
+  check(withX === "false", "whether -p takes operands is asked with a variable of the probe's own, whatever the environment holds", withX);
+  check(asked216[0]?.unsetLastOptionWins === false && asked216[0]?.pTakesOperands === true && asked216[0]?.readonlyAssignEnds === true
+    && (!dashPath || (asked216[1]?.unsetLastOptionWins === true && asked216[1]?.pTakesOperands === false && asked216[1]?.readonlyAssignEnds === true)),
+    "the shell is asked how unset reads -f and -v, whether -p takes operands, and whether assigning a read-only variable ends it",
+    JSON.stringify(asked216.map((sh) => sh && { name: sh.name, unset: sh.unsetLastOptionWins, p: sh.pTakesOperands, ends: sh.readonlyAssignEnds })));
 } finally {
   rmSync(root, { recursive: true, force: true });
 }

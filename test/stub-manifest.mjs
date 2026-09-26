@@ -7070,15 +7070,6 @@ export const STUBS = [
               replace: "    return haltStop(\"HALTED after the pull requests were checked\");" }],
   },
   {
-    name: "withdraw-before-dispatch",
-    why: "only stop workers starting on a HALT seen before dispatch. The tick ends with its PASSes standing, while nothing checks",
-    test: "test/pass-withdrawn.test.mjs",
-    expectRed: "a HALT that arrives just before a worker would start withdraws every PASS too",
-    edits: [{ file: "src/daemon.mjs",
-              find: "        await takeBackAll(\"the merge policy is halted\");\n        break;",
-              replace: "        break;" }],
-  },
-  {
     name: "withdraw-alert-cleared",
     why: "leave an alert that a PASS couldn't be withdrawn once nothing stands at that pull request. After a stop no tick clears it, and it goes on saying a PASS stands",
     test: "test/pass-withdrawn.test.mjs",

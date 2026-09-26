@@ -2665,8 +2665,8 @@ export async function tick(ctx) {
       if (started >= cap.canStart) { log(logPath, `  capacity reached; ${decisions.length - started} decision(s) deferred to the next tick`); break; }
       if (halted(ctx.haltMarker)) {
         log(logPath, "HALTED before dispatch");
-        // The rest of this tick is still said; what it leaves passing isn't left.
-        await takeBackAll("the merge policy is halted");
+        // The rest of this tick is still said. What it leaves passing is withdrawn
+        // as the tick ends, where the marker is looked for once more (#161).
         break;
       }
 

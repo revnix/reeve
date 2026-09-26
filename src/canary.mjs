@@ -38,7 +38,7 @@ const canonical = v => {
  * every run and says nothing about what the sandbox denies.
  */
 export function canaryIdFor({ cliVersion, sandbox, binaryId = null, worktree = null, permissionsDeny = null, allowedTools = null,
-                              instrument = null, probes = null }) {
+                              instrument = null, probes = null, runtime = null }) {
   if (!cliVersion || !sandbox) throw new Error("canaryIdFor: cliVersion and the sandbox block are required");
   // The INSTRUMENT is part of the identity too. A record made before a probe
   // existed describes a weaker measurement than the one being asked for now, and
@@ -57,7 +57,9 @@ export function canaryIdFor({ cliVersion, sandbox, binaryId = null, worktree = n
     `${cliVersion}\n${binaryId ?? "?"}\n${canonical(normalisePolicy(sandbox, worktree))}\n${canonical(normaliseRules(permissionsDeny, worktree))}\n${canonical(normaliseRules(allowedTools, worktree))}\n${instrument ?? "?"}` +
     // Which of the Linux probes the host let the canary run (#156). Appended only
     // when given, so an id without them is unchanged.
-    (probes ? `\n${canonical(probes)}` : ""),
+    (probes ? `\n${canonical(probes)}` : "") +
+    // What runs the boundary besides the CLI, on Linux: bubblewrap and socat.
+    (runtime ? `\nruntime:${runtime}` : ""),
   ).digest("hex").slice(0, 16);
 }
 
@@ -282,6 +284,13 @@ const tokenProcLines = [
  * daemon can stat afterwards; exit codes are recorded as well but are not
  * what decides.
  */
+// A path as one POSIX shell word, whatever it holds. Double quotes still expand
+// `$(...)`, backticks and `$VAR`, so a path holding one probed somewhere else,
+// and a copy that failed there read as a deny that held. Single quotes keep
+// all of it literal; a single quote inside is closed, escaped and reopened. The
+// drive file is found by `find`, so its name is anyone's (#156).
+export const shq = s => `'${String(s).replace(/'/g, "'\\''")}'`;
+
 export function canaryScript({ tmpDir, outsideDir, decoyPath, netUrl = null, fileDecoyPath = null, fileControlPath = null,
                                loginKeychain = join(homedir(), "Library", "Keychains", "login.keychain-db"),
                                platform = process.platform, linux = null }) {
@@ -290,11 +299,11 @@ export function canaryScript({ tmpDir, outsideDir, decoyPath, netUrl = null, fil
 out="./canary-results.txt"; : > "$out" || exit 97
 rec() { echo "$1=$2" >> "$out"; }
 touch ./INSIDE; rec inside $?
-touch ${JSON.stringify(join(tmpDir, "TMP"))}; rec tmp $?
-touch ${JSON.stringify(join(outsideDir, "OUTSIDE"))}; rec outside $?
+touch ${shq(join(tmpDir, "TMP"))}; rec tmp $?
+touch ${shq(join(outsideDir, "OUTSIDE"))}; rec outside $?
 curl -sS -m 5 https://example.com -o ./curl-body 2>/dev/null; rec curl $?
-${netUrl ? `curl -sS -m 5 ${JSON.stringify(netUrl)} -o ./probe-body 2>/dev/null; rec probe $?` : ""}
-cp ${JSON.stringify(decoyPath)} ./decoy-copy 2>/dev/null; rec decoy $?
+${netUrl ? `curl -sS -m 5 ${shq(netUrl)} -o ./probe-body 2>/dev/null; rec probe $?` : ""}
+cp ${shq(decoyPath)} ./decoy-copy 2>/dev/null; rec decoy $?
 ${platform === "linux" ? linuxProbeLines(linux) : `# The KEYCHAIN. Absolute paths on purpose, because the refusing shims on the
 # worker's PATH are a layer, not a boundary.
 #
@@ -306,17 +315,17 @@ ${platform === "linux" ? linuxProbeLines(linux) : `# The KEYCHAIN. Absolute path
 /usr/bin/security find-internet-password -s github.com >/dev/null 2>&1; rec kc_github $?
 /usr/bin/security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1; rec kc_claude $?
 printf 'protocol=https\nhost=github.com\n\n' | git -c credential.helper=osxkeychain credential fill 2>/dev/null | grep -q '^password='; rec kc_helper $?
-/usr/bin/security find-internet-password -s github.com ${JSON.stringify(loginKeychain)} >/dev/null 2>&1; rec kc_path_github $?
-/usr/bin/security find-generic-password -s "Claude Code-credentials" ${JSON.stringify(loginKeychain)} >/dev/null 2>&1; rec kc_path_claude $?
+/usr/bin/security find-internet-password -s github.com ${shq(loginKeychain)} >/dev/null 2>&1; rec kc_path_github $?
+/usr/bin/security find-generic-password -s "Claude Code-credentials" ${shq(loginKeychain)} >/dev/null 2>&1; rec kc_path_claude $?
 # The probe that DECIDES, because the two above cannot: find-*-password answers
 # 44 both when access is denied and when the item simply is not there, so on a
 # host without those exact records they would report a closure that does not
 # exist. show-keychain-info asks about the KEYCHAIN rather than an item, and
 # distinguishes them: measured 2026-08-22, 0 when reachable and 161 when denied.
-/usr/bin/security show-keychain-info ${JSON.stringify(loginKeychain)} >/dev/null 2>&1; rec kc_path_open $?`}
-${fileDecoyPath ? `cp ${JSON.stringify(fileDecoyPath)} ./filedecoy-copy 2>/dev/null; rec filedecoy $?` : ""}
-${fileControlPath ? `cp ${JSON.stringify(fileControlPath)} ./filecontrol-copy 2>/dev/null; rec filecontrol $?` : ""}
-ln -sf ${JSON.stringify(decoyPath)} ./decoy-link 2>/dev/null; cp ./decoy-link ./decoy-copy2 2>/dev/null; rec symlink $?
+/usr/bin/security show-keychain-info ${shq(loginKeychain)} >/dev/null 2>&1; rec kc_path_open $?`}
+${fileDecoyPath ? `cp ${shq(fileDecoyPath)} ./filedecoy-copy 2>/dev/null; rec filedecoy $?` : ""}
+${fileControlPath ? `cp ${shq(fileControlPath)} ./filecontrol-copy 2>/dev/null; rec filecontrol $?` : ""}
+ln -sf ${shq(decoyPath)} ./decoy-link 2>/dev/null; cp ./decoy-link ./decoy-copy2 2>/dev/null; rec symlink $?
 # THE WORKER'S OWN LOGIN (#156). The CLI authenticates from a token in its
 # environment, and a shell that could read it could write it into a file a pull
 # request carries. Only whether it is there is recorded, never its value.
@@ -377,16 +386,17 @@ export async function linuxProbeTargets({ uid = process.getuid?.(), node = proce
 // fail for want of it; `node_runs` proves node itself runs.
 function linuxProbeLines(t) {
   if (!t) return "# no Linux targets were given, so the Linux probes did not run";
-  const node = JSON.stringify(t.node);
+  const node = shq(t.node);
   return [
     "# LINUX: the host's own ways out. The runtime's seccomp filter, which blocks",
     "# new Unix sockets, is what closes Windows interop, D-Bus and any socket the",
     "# deny list doesn't name, Docker's among them; unix_socket proves it is on.",
     `${node} -e 0 >/dev/null 2>&1; rec node_runs $?`,
     `${node} -e 'require("net").createServer().on("error", () => process.exit(1)).listen("./canary.sock", function () { this.close(); })' >/dev/null 2>&1; rec unix_socket $?`,
-    t.mntFile ? `cp ${JSON.stringify(t.mntFile)} ./mnt-copy 2>/dev/null; rec mnt_read $?` : "",
+    t.mntFile ? `cp ${shq(t.mntFile)} ./mnt-copy 2>/dev/null; rec mnt_read $?` : "",
     t.windowsExe ? "./committed.exe /c exit 0 >/dev/null 2>&1 </dev/null; rec interop $?" : "",
-    t.bus ? `${node} -e 'const c = require("net").connect(${JSON.stringify(t.bus)}); c.on("connect", () => process.exit(0)); c.on("error", () => process.exit(1)); setTimeout(() => process.exit(1), 3000);' >/dev/null 2>&1; rec session_bus $?` : "",
+    // The bus's path goes to node as an argument, not inside its code.
+    t.bus ? `${node} -e 'const c = require("net").connect(process.argv[1]); c.on("connect", () => process.exit(0)); c.on("error", () => process.exit(1)); setTimeout(() => process.exit(1), 3000);' ${shq(t.bus)} >/dev/null 2>&1; rec session_bus $?` : "",
   ].filter(Boolean).join("\n");
 }
 
@@ -549,7 +559,7 @@ function canaryGrant(dir, decoyPath) {
 }
 
 export async function sandboxCanary({
-  cliVersion, sandbox, permissionsDeny = [], allowedTools = null, binaryId = null,
+  cliVersion, sandbox, permissionsDeny = [], allowedTools = null, binaryId = null, runtime = null,
   dir, outsideDir, tmpDir, decoyPath,
   bin, env,
   runner = runWorker, budgetMs = 5 * 60_000, maxOutputBytes = 8 * 1024 * 1024,
@@ -626,7 +636,7 @@ export async function sandboxCanary({
   // value. The two can only disagree when a listener was handed over and failed
   // to bind, and a canary whose network control is missing fails on that alone.
   const id = canaryIdFor({ cliVersion, sandbox, binaryId, worktree: dir, permissionsDeny, allowedTools,
-                           instrument: instrumentHash({ hasNet: !!netProbe }), probes: probeShapeOf(linux) });
+                           instrument: instrumentHash({ hasNet: !!netProbe }), probes: probeShapeOf(linux), runtime });
   const evidence = { id, cliVersion, dir, outcome: null, why: null, results: null, readTool: null, writeTool: null, network: null };
   const fail = why => ({ ok: false, id, why, evidence });
 

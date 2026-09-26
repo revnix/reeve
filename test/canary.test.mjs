@@ -155,7 +155,7 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
 // ── the script leaves files for every probe ──────────────────────────────────
 {
   const s = canaryScript({ tmpDir: "/t", outsideDir: "/o", decoyPath: "/Users/x/.reeve/d.txt" });
-  check(/touch \.\/INSIDE/.test(s) && /"\/t\/TMP"/.test(s) && /"\/o\/OUTSIDE"/.test(s) && /curl .* -o \.\/curl-body/.test(s) && /cp "\/Users\/x\/.reeve\/d.txt" \.\/decoy-copy/.test(s) && /decoy-copy2/.test(s),
+  check(/touch \.\/INSIDE/.test(s) && /'\/t\/TMP'/.test(s) && /'\/o\/OUTSIDE'/.test(s) && /curl .* -o \.\/curl-body/.test(s) && /cp '\/Users\/x\/.reeve\/d.txt' \.\/decoy-copy/.test(s) && /decoy-copy2/.test(s),
     "every probe writes a file the daemon can stat", s);
   check(!/cat /.test(s), "and none of them prints a file's contents", s);
 }

@@ -206,3 +206,19 @@ test("on Linux a protected path that isn't there yet is named under its parent's
   assert.ok(s.permissions.deny.includes(`Read(/${join(target, "token")})`), JSON.stringify(s.permissions.deny.filter((d) => d.includes("rl-absent-"))));
   assert.equal(linkFree("/nowhere/at/all", "linux"), "/nowhere/at/all", "control: a path with no link on the way is as written");
 });
+
+test("on Linux a protected path that is a link to what isn't there yet is named where the link points", linux, () => {
+  // A credential rotated by swapping a link, say, whose target isn't in place
+  // yet. Named at the link, neither layer would name where the file appears.
+  const base = realpathSync(tempDir("rl-dangling-"));
+  mkdirSync(join(base, "secrets"));
+  symlinkSync(join(base, "secrets", "token"), join(base, "cred"));
+  assert.equal(linkFree(join(base, "cred"), "linux"), join(base, "secrets", "token"));
+  symlinkSync("secrets/token", join(base, "rel"));
+  assert.equal(linkFree(join(base, "rel"), "linux"), join(base, "secrets", "token"), "a relative link");
+  symlinkSync(join(base, "missing"), join(base, "dl"));
+  assert.equal(linkFree(join(base, "dl", "token"), "linux"), join(base, "missing", "token"), "a dangling link on the way");
+  symlinkSync(join(base, "loop-b"), join(base, "loop-a"));
+  symlinkSync(join(base, "loop-a"), join(base, "loop-b"));
+  assert.ok(typeof linkFree(join(base, "loop-a"), "linux") === "string", "control: a loop of links ends");
+});

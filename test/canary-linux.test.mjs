@@ -73,7 +73,7 @@ test("on Linux the canary script probes the socket filter and the host's own pat
   assert.match(s, /rec node_runs/);
   assert.match(s, /listen\("\.\/canary\.sock"/);
   assert.match(s, /rec unix_socket/);
-  assert.match(s, /cp "\/mnt\/c\/Windows\/System32\/drivers\/etc\/hosts" \.\/mnt-copy/);
+  assert.match(s, /cp '\/mnt\/c\/Windows\/System32\/drivers\/etc\/hosts' \.\/mnt-copy/);
   assert.match(s, /\.\/committed\.exe \/c exit 0/);
   assert.match(s, /rec session_bus/);
   assert.doesNotMatch(s, /\/usr\/bin\/security/);
@@ -101,6 +101,12 @@ test("a Linux canary records the id its cache is looked in under, with the probe
   const key = canaryIdFor({ cliVersion: base.cliVersion, sandbox: base.sandbox, worktree: base.dir, permissionsDeny: base.permissionsDeny,
                             instrument: instrumentHash({ hasNet: true }), probes: probeShapeOf(everything) });
   assert.equal(r.id, key);
+  // And under the sandbox runtime it was measured with, which the key has too.
+  const runtime = "bwrap=/usr/bin/bwrap@1 socat=/usr/bin/socat@1";
+  const rr = await sandboxCanary({ ...base, linuxTargets: everything, runner: worker(), runtime });
+  assert.equal(rr.ok, true, rr.why);
+  assert.equal(rr.id, canaryIdFor({ cliVersion: base.cliVersion, sandbox: base.sandbox, worktree: base.dir, permissionsDeny: base.permissionsDeny,
+                                    instrument: instrumentHash({ hasNet: true }), probes: probeShapeOf(everything), runtime }));
 });
 
 test("a worker that can create a Unix socket fails the Linux canary: the socket filter is not in force", async () => {

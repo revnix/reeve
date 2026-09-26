@@ -20,12 +20,12 @@ import { nextAction, describe, ACTIONS, ESCALATIONS } from "./watcher.mjs";
 import { POLICY_CONTEXT, reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, isSameProcess, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
-import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf, siblingRootsOf, hostEscapePaths, worktreeRootOf, linkFree, notifyCredOf } from "./sandbox.mjs";
+import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf, siblingRootsOf, hostEscapePaths, worktreeRootOf, linkFree, notifyCredOf, layoutDeniesAbove } from "./sandbox.mjs";
 import { verifyConfig, GIT_NEUTRALISE, gitEnv } from "./gitguard.mjs";
 import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor, commitRunWork, digestOf } from "./checkout.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor, workerTmpDir } from "./workerenv.mjs";
-import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
+import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity, sandboxRuntimeIdentity } from "./containment.mjs";
 import { canaryIdFor, netListener, instrumentHash, linuxProbeTargets, probeShapeOf } from "./canary.mjs";
 import { claimProvider, releaseProvider, bindProviderLease, noteRateLimit, heartbeatProvider,
          reapProviderLeases, cancelQueued, queuedGuardianRequests } from "./provider.mjs";
@@ -652,6 +652,9 @@ export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSp
     // The resolved binary's identity is part of the canary id, so a swapped
     // executable that prints the same --version is re-measured. (Codex #4-[3].)
     const binaryId = binaryIdentity(claudeBin);
+    // And on Linux the bubblewrap and socat the CLI runs, as the worker's PATH
+    // finds them: a pass under one build of them says nothing of the next (#156).
+    const runtime = (ctx.sandboxRuntimeIdentity ?? sandboxRuntimeIdentity)(env.PATH, { platform: ctx.platform ?? process.platform });
     // The network positive control is a daemon-local listener the sandboxed curl
     // tries to reach. The daemon knows the listener is reachable (it self-pings),
     // so a sandboxed curl that cannot reach it proves a DENIAL — no external
@@ -665,7 +668,7 @@ export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSp
     // drifts from the id is how every tick came to pay for a five-minute canary.
     const before = cache.get(canaryIdFor({ cliVersion: version, sandbox: policy.settings.sandbox, binaryId, worktree: canaryPaths.dir,
                                            permissionsDeny: policy.settings.permissions.deny, allowedTools: policy.allowedTools,
-                                           instrument: instrumentHash({ hasNet: !!netProbe }), probes: probeShapeOf(linuxTargets) }))?.ok === true;
+                                           instrument: instrumentHash({ hasNet: !!netProbe }), probes: probeShapeOf(linuxTargets), runtime }))?.ok === true;
     if (!before) log(logPath, `containment: running the sandbox canary under ${version}`);
     let c;
     try {
@@ -691,7 +694,7 @@ export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSp
       // seam because the next topology will not be. (Codex #4c-[9].)
       isolated,
       canary: ctx.canary ?? null, keychain: cheap.keychain,
-      mounts: ctx.mounts, linuxTargets,
+      mounts: ctx.mounts, linuxTargets, runtime,
       });
     } finally {
       // The listener is torn down whatever happened, so a canary run never
@@ -2760,6 +2763,17 @@ export async function tick(ctx) {
         log(logPath, `  #${e.pr}: NOT dispatching — ${why}`);
         continue;
       }
+      // A root the policy denies, /mnt or reeve's own state, denies every
+      // checkout under it its own files. Refused here, before a run exists or a
+      // checkout is written there: on WSL /mnt/c is the Windows drive (#156).
+      const rootDenied = layoutDeniesAbove(checkoutRoot, { profile, mounts: ctx.mounts,
+        stateRoots: stateRootsFor(dirname(logPathOf(ctx)), logPathOf(ctx), null, ctx.dbPath ?? null) });
+      if (rootDenied.length) {
+        const why = layoutRefusal(rootDenied, checkoutRoot);
+        raise(`#${e.pr}: cannot dispatch — ${why}`);
+        log(logPath, `  #${e.pr}: NOT dispatching — ${why}`);
+        continue;
+      }
 
       // A PROVIDER LEASE BEFORE A DURABLE RUN, in that order and not the other
       // way round. `startRun` spends a fixer's attempt two lines below it, so a
@@ -3118,7 +3132,7 @@ export async function tick(ctx) {
         // credential during preparation reopens the gate. (Codex #4c-[11],[12],
         // #4d-[13].)
         const reval = await revalidateContainment(containment, {
-          bin: claudeBin, binaryIdentity, keychain: ctx.keychain ?? null, platform: ctx.platform ?? undefined,
+          bin: claudeBin, binaryIdentity, keychain: ctx.keychain ?? null, platform: ctx.platform ?? undefined, pathVar: env.PATH,
         });
         if (!reval.ok) {
           log(logPath, `  #${e.pr}: NOT dispatching — ${reval.why}`);

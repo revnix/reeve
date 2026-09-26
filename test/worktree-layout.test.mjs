@@ -52,7 +52,7 @@ test("a worker whose checkout is under /mnt isn't started, and the refusal says 
     rounds: { n: 1, softCap: 5, hardCap: 10, unspilledCritical: 0 },
     checks: { verdict: "RED", caused: ["CI Gate"], failing: [{ name: "CI Gate", id: "99" }] },
     reviewers: [], threads: {}, settled: { settled: true } };
-  let spawned = 0;
+  let spawned = 0, prepared = 0;
   mkdirSync(stateDir, { recursive: true });
   const ctx = {
     nwo: "o/r", db: open(join(stateDir, "e.db")), logPath: join(stateDir, "reeve.log"), dbPath: join(stateDir, "e.db"),
@@ -67,11 +67,14 @@ test("a worker whose checkout is under /mnt isn't started, and the refusal says 
     resolveCause: () => ({ ok: true, job: "CI Gate", step: "Test", cause: [{ where: "src/x.ts:1", message: "boom" }] }),
     observe: () => ({ ok: false, observations: [], incomplete: true, threads: { readable: false, total: null, unresolved: 0, seen: 0 } }),
     oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
-    prepareCheckout: () => ({ ok: true, path: join(UNDER_MNT, "o-r-42"), why: null, deps: { ok: true, cow: false } }),
+    prepareCheckout: () => { prepared++; return { ok: true, path: join(UNDER_MNT, "o-r-42"), why: null, deps: { ok: true, cow: false } }; },
     spawnWorker: async () => { spawned++; return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s1" }; },
   };
   await daemon.tick(ctx);
   const logged = readFileSync(ctx.logPath, "utf8");
   assert.equal(spawned, 0, "the worker started");
+  // Refused before a checkout is made there: on WSL /mnt/c is the Windows drive,
+  // and the repository would be written onto it first.
+  assert.equal(prepared, 0, "a checkout was prepared under the denied root");
   assert.match(logged, /a denied path \(\/mnt\) contains the checkout[^\n]*out of \/mnt/, logged.slice(-1500));
 });

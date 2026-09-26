@@ -10,7 +10,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import * as daemon from "../src/daemon.mjs";
-import { measureContainment } from "../src/containment.mjs";
+import { measureContainment, revalidateContainment } from "../src/containment.mjs";
 import { canaryIdFor } from "../src/canary.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 
@@ -59,4 +59,42 @@ test("the daemon finds the Linux targets before it looks for a cached pass, and 
   } finally { if (saved === undefined) delete process.env.REEVE_HOME; else process.env.REEVE_HOME = saved; }
   assert.equal(seen.length, 2, "the second measurement reused a pass taken without the /mnt probe");
   assert.deepEqual(seen.map((t) => t?.mntFile ?? null), [null, withMnt.mntFile]);
+});
+
+test("on Linux the canary's id follows the sandbox runtime, bubblewrap and socat, as well as the CLI", () => {
+  const base = { cliVersion: "2.1.278", sandbox: { enabled: true, filesystem: { denyRead: ["/mnt"] } } };
+  const a = canaryIdFor({ ...base, runtime: "bwrap=/usr/bin/bwrap@1 socat=/usr/bin/socat@1" });
+  const b = canaryIdFor({ ...base, runtime: "bwrap=/usr/bin/bwrap@2 socat=/usr/bin/socat@1" });
+  assert.notEqual(a, b, "a pass under one bubblewrap has the id of one under the next");
+  assert.equal(canaryIdFor({ ...base, runtime: "bwrap=/usr/bin/bwrap@1 socat=/usr/bin/socat@1" }), a, "control: the same runtime gives the same id");
+});
+
+test("a pass taken under one bubblewrap isn't reused once the host has another", async () => {
+  const stateDir = tempDir("cr-");
+  const runtimes = ["bwrap=/usr/bin/bwrap@1 socat=/usr/bin/socat@1", "bwrap=/usr/bin/bwrap@1 socat=/usr/bin/socat@1", "bwrap=/usr/bin/bwrap@2 socat=/usr/bin/socat@1"];
+  let runs = 0;
+  const ctx = { logPath: join(stateDir, "reeve.log"), platform: "linux", isolationReady: () => true, mounts: "",
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "2.1.278 (Claude Code)",
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    netProbe: { url: "http://127.0.0.1:1/canary", selfReachable: () => true, wasHit: () => false },
+    linuxProbeTargets: async () => without,
+    sandboxRuntimeIdentity: () => runtimes.shift(),
+    canary: async () => { runs++; return { ok: true, id: `c${runs}`, why: null, evidence: {} }; } };
+  const profile = { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: tempDir("cr-wt-") }, worker: { isolation: "scratch-home" }, units: [] };
+  const saved = process.env.REEVE_HOME;
+  process.env.REEVE_HOME = stateDir;
+  try {
+    for (let i = 0; i < 3; i++) await daemon.measuredContainment(ctx, profile, "o/r", ctx.logPath);
+  } finally { if (saved === undefined) delete process.env.REEVE_HOME; else process.env.REEVE_HOME = saved; }
+  assert.equal(runs, 2, "the same runtime reused the pass once, and a new bubblewrap measured again");
+});
+
+test("the check before a worker starts refuses a verdict measured under another sandbox runtime", async () => {
+  const verdict = { credentialRead: "closed", binaryId: "/cli@1", runtime: "bwrap=/usr/bin/bwrap@1 socat=/usr/bin/socat@1" };
+  const at = (now) => revalidateContainment(verdict, { bin: "/cli", binaryIdentity: () => "/cli@1", platform: "linux", pathVar: "/usr/bin",
+                                                       runtimeIdentity: () => now });
+  assert.equal((await at("bwrap=/usr/bin/bwrap@1 socat=/usr/bin/socat@1")).ok, true, "control: the same runtime starts the worker");
+  const moved = await at("bwrap=/usr/bin/bwrap@2 socat=/usr/bin/socat@1");
+  assert.equal(moved.ok, false, "a worker started under a bubblewrap the canary never ran under");
+  assert.match(moved.why, /sandbox runtime changed/);
 });

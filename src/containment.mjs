@@ -20,6 +20,7 @@
 // open. A probe that cannot run is open. Closed is a conclusion, never a default.
 import { spawnSync } from "node:child_process";
 import { realpathSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { sandboxCanary, canaryIdFor, instrumentHash, policyHashOf, readCanaryState, writeCanaryState, linuxProbeTargets, probeShapeOf } from "./canary.mjs";
 import { windowsDriveRoots } from "./sandbox.mjs";
 
@@ -42,6 +43,20 @@ export function isolationTopologyReady() { return true; }
  * replaced in place keeps its path but not its mtime, so a canary that passed
  * under the old bytes is not credited to the new ones.
  */
+/**
+ * What runs a Linux worker's boundary besides the CLI: bubblewrap and socat, as
+ * the worker's PATH finds them, each by resolved path and modification time. A
+ * pass measured under one build of them says nothing of the next, so this is in
+ * the canary's id and is checked again before a worker starts (#156). Null
+ * elsewhere, where the OS itself supplies the sandbox.
+ */
+export function sandboxRuntimeIdentity(pathVar, { platform = process.platform, identity = binaryIdentity } = {}) {
+  if (platform !== "linux") return null;
+  const onPath = name => String(pathVar ?? "").split(":").filter(Boolean).map(d => join(d, name))
+    .find(f => { try { return statSync(f).isFile(); } catch { return false; } }) ?? name;
+  return ["bwrap", "socat"].map(t => `${t}=${identity(onPath(t))}`).join(" ");
+}
+
 export function binaryIdentity(bin) {
   try { const real = realpathSync(bin); const st = statSync(real); return `${real}@${st.mtimeMs}`; }
   catch { return bin; }
@@ -134,6 +149,8 @@ export async function measureContainment({
   mounts,
   // The Linux probes' targets, when the caller has found them already.
   linuxTargets = null,
+  // What runs the boundary besides the CLI, on Linux (sandboxRuntimeIdentity).
+  runtime = null,
   // Handed to the canary runner so its detached child can be bound before it
   // runs. Only used on the paid path: a cached or injected verdict spawns
   // nothing, so there is nothing to bind.
@@ -176,7 +193,7 @@ export async function measureContainment({
   // it once the host has one (#156).
   const targets = platform === "linux" && cliVersion && sandbox ? (linuxTargets ?? await linuxProbeTargets()) : null;
   const id = cliVersion && sandbox ? canaryIdFor({ cliVersion, sandbox, binaryId, worktree: canaryPaths?.dir ?? null, permissionsDeny, allowedTools,
-                                                   instrument: instrumentHash({ hasNet: !!netProbe }), probes: probeShapeOf(targets) }) : null;
+                                                   instrument: instrumentHash({ hasNet: !!netProbe }), probes: probeShapeOf(targets), runtime }) : null;
   const cheapReasons = reasons.length > 0;
   if (canary && typeof canary !== "function") cn = canary;
   else if (cheapReasons) cn = { ok: false, id, why: "not run: containment is already open for a cheaper reason", skipped: true };
@@ -186,7 +203,7 @@ export async function measureContainment({
   else if (!id) cn = { ok: false, id: null, why: "no CLI version or sandbox block to run a canary under" };
   else {
     const run = typeof canary === "function" ? canary : sandboxCanary;
-    cn = await run({ cliVersion, sandbox, permissionsDeny, allowedTools, binaryId, ...canaryPaths, bin, env, onSpawn, beforeSpawn, platform, ...(netProbe ? { netProbe } : {}), ...(targets ? { linuxTargets: targets } : {}) });
+    cn = await run({ cliVersion, sandbox, permissionsDeny, allowedTools, binaryId, ...canaryPaths, bin, env, onSpawn, beforeSpawn, platform, ...(netProbe ? { netProbe } : {}), ...(targets ? { linuxTargets: targets } : {}), ...(runtime ? { runtime } : {}) });
     cn = { ...cn, at: now() };
     cache.set(id, cn);
     if (stateDir && nwo) { try { writeCanaryState(stateDir, nwo, { id: cn.id, cliVersion, bin, binaryId, instrument: instrumentHash({ hasNet: !!netProbe }), policyHash: policyHashOf(sandbox, canaryPaths?.dir ?? null, { permissionsDeny, allowedTools }), stateRoots, allowedTools, canaryDir: canaryPaths?.dir ?? null, ok: cn.ok, why: cn.why, at: cn.at, evidence: cn.evidence ?? null }); } catch { /* the verdict stands without the doctor's copy */ } }
@@ -198,7 +215,7 @@ export async function measureContainment({
   return {
     credentialRead: reasons.length ? "open" : "closed",
     why: reasons.length ? reasons.join("; ") : `canary ${cn.id} passed and an isolated worker is declared${keychainNote(kc)}`,
-    canary: cn, keychain: kc, platform, isolated, binaryId, at: now(),
+    canary: cn, keychain: kc, platform, isolated, binaryId, runtime, at: now(),
   };
 }
 
@@ -210,11 +227,19 @@ export async function measureContainment({
  * next worker, not after the tick. (Codex #4c-[11], #4c-[12].) Cheap: no model
  * call, just a stat and two metadata reads.
  */
-export async function revalidateContainment(verdict, { bin, binaryIdentity, keychain = null, platform = process.platform } = {}) {
+export async function revalidateContainment(verdict, { bin, binaryIdentity, keychain = null, platform = process.platform,
+                                                        pathVar = process.env.PATH, runtimeIdentity = sandboxRuntimeIdentity } = {}) {
   if (!verdict || verdict.credentialRead !== "closed") return { ok: false, why: "containment was not closed" };
   const nowId = binaryIdentity(bin);
   if (verdict.binaryId && nowId !== verdict.binaryId)
     return { ok: false, why: `the CLI binary changed since containment was measured (${verdict.binaryId} -> ${nowId}); re-measuring before dispatch` };
+  // And on Linux the bubblewrap and socat it runs, as the worker's PATH finds
+  // them: a worker mustn't start under a build of them the canary never ran (#156).
+  if (verdict.runtime) {
+    const nowRuntime = runtimeIdentity(pathVar, { platform, identity: binaryIdentity });
+    if (nowRuntime !== verdict.runtime)
+      return { ok: false, why: `the sandbox runtime changed since containment was measured (${verdict.runtime} -> ${nowRuntime}); re-measuring before dispatch` };
+  }
   // The keychain is deliberately NOT re-checked here any more. It was, when a
   // worker ran with the founder's HOME and could ask the keychain directly, so a
   // credential appearing mid-tick genuinely changed what a worker could reach.

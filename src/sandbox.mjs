@@ -26,8 +26,8 @@
 // was never offered. Any tool that can run a command is a write primitive, so the
 // grant is a CLOSED ALLOWLIST and the denies are belt-and-braces on top of it.
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync, statSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { existsSync, lstatSync, readFileSync, readlinkSync, writeFileSync, mkdirSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { homedir } from "node:os";
 import { resolveHome, DEFAULT_HOME } from "./home.mjs";
 import { ARTIFACT_FILE } from "./paths.mjs";
@@ -373,18 +373,40 @@ export function osCredentialPaths({ platform = process.platform } = {}) {
   return [...new Set(credentialPaths().map(p => linkFree(p, platform)))];
 }
 /** A path as the Linux sandbox must be given it: at its target when it's a link. Elsewhere, and where nothing is there yet, as written. */
-export function linkFree(p, platform = process.platform) {
+export function linkFree(p, platform = process.platform, hops = 0) {
   if (platform !== "linux") return p;
   try { return realpathSync(p); } catch { /* not there yet */ }
   // Its nearest ancestor that is there, at its target, and the rest as written:
   // a file that appears later, a rotated credential or a store's sidecar, is
-  // then named where it will appear, not through a link on the way (#156).
+  // then named where it will appear, not through a link on the way. A link on
+  // the way whose target isn't there yet is followed, a credential rotated by
+  // swapping a link among them (#156). Forty hops end a loop of links, as the
+  // kernel's own limit does.
   const rest = [];
   for (let d = p; dirname(d) !== d; d = dirname(d)) {
+    let link = null;
+    try { if (hops < 40 && lstatSync(d).isSymbolicLink()) link = readlinkSync(d); } catch { /* not there */ }
+    if (link !== null) return linkFree(join(resolvePath(dirname(d), link), ...rest), platform, hops + 1);
     rest.unshift(basename(d));
     try { return join(realpathSync(dirname(d)), ...rest); } catch { /* keep climbing */ }
   }
   return p;
+}
+
+/**
+ * The denied paths a checkout at `path` would sit under: the credentials, the
+ * host's ways out, the source checkout and reeve's own state. One that contains
+ * the checkout denies the worker its own code, so containment could never close
+ * and the reason would look like a sandbox failure. A layout such as
+ * REEVE_HOME=/srv/reeve with worktreeRoot=/srv/reeve/worktrees is a
+ * configuration error, and it is named as one; so is a worktree root under /mnt
+ * on Linux, where WSL mounts the Windows drives. The dispatch asks this of the
+ * worktree root before a checkout is made there, and the policy asks it of the
+ * checkout (#156).
+ */
+export function layoutDeniesAbove(path, { profile = null, stateRoots = [], mounts } = {}) {
+  const denied = [...credentialPaths().map(expandTilde), ...hostEscapePaths({ mounts }), ...sourceCheckoutOf(profile), ...stateRoots.map(p => linkFree(p))];
+  return denied.filter(d => d.startsWith("/") && (path === d || path.startsWith(d.endsWith("/") ? d : d + "/")));
 }
 
 /**
@@ -806,15 +828,8 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
     // the caller must refuse the dispatch rather than run with a hole.
     unrepresentableQuarantine: quarantine.unrepresentable,
     // A denied path that CONTAINS the worktree denies the worker its own code
-    // (and the canary its own script), so containment could never close and the
-    // reason would look like a sandbox failure. A layout such as
-    // REEVE_HOME=/srv/reeve with worktreeRoot=/srv/reeve/worktrees is a
-    // configuration error, and it is named as one. So is a
-    // worktree root under /mnt on Linux, where WSL mounts the Windows drives:
-    // the policy closes /mnt to every worker (#156).
-    stateHomeContainsWorktree: worktree
-      ? [...credentialPaths().map(expandTilde), ...hostEscapes, ...sourceCheckout, ...stateRoots].filter(d => d.startsWith("/") && (worktree === d || worktree.startsWith(d.endsWith("/") ? d : d + "/")))
-      : [],
+    // (and the canary its own script); see layoutDeniesAbove.
+    stateHomeContainsWorktree: worktree ? layoutDeniesAbove(worktree, { profile, stateRoots: givenRoots, mounts }) : [],
   };
 }
 

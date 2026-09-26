@@ -15,7 +15,7 @@
 // a write to the run's own tmp), so an absent file means "denied", not
 // "the script never ran".
 import { runWorker, workerArgs } from "./supervisor.mjs";
-import { validateSettings, ruleFor, scopedFileTools, carveOuts, windowsDriveRoots } from "./sandbox.mjs";
+import { validateSettings, ruleFor, scopedFileTools, carveOuts, windowsDriveRoots, windowsSystemDrive } from "./sandbox.mjs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer, connect } from "node:net";
@@ -344,11 +344,14 @@ echo done
  *   bus           the session bus, with the Secret Service behind it, when the
  *                 daemon can connect to it.
  */
-export async function linuxProbeTargets({ uid = process.getuid?.(), node = process.execPath,
+export async function linuxProbeTargets({ uid = process.getuid?.(), node = process.execPath, mounts,
                                           // Every Windows drive, wherever it's mounted, as the policy denies them (#156).
-                                          driveRoots = windowsDriveRoots() ?? [],
+                                          driveRoots = windowsDriveRoots(mounts) ?? [],
                                           mntCandidates = [...driveRoots.map(r => join(r, "Windows", "System32", "drivers", "etc", "hosts")), "/mnt/reeve-escape-decoy.txt"],
-                                          windowsExe = driveRoots.map(r => join(r, "Windows", "System32", "cmd.exe")).find(f => existsSync(f)) ?? "/mnt/c/Windows/System32/cmd.exe",
+                                          // The daemon runs this itself, outside any sandbox, so only the system
+                                          // drive's: another drive's Windows/System32 is anyone's (#156).
+                                          systemDrive = windowsSystemDrive(mounts),
+                                          windowsExe = systemDrive ? join(systemDrive, "Windows", "System32", "cmd.exe") : null,
                                           connectTimeoutMs = 2_000 } = {}) {
   const readable = f => { try { accessSync(f, constants.R_OK); return statSync(f).isFile(); } catch { return false; } };
   const skipped = {};
@@ -356,8 +359,8 @@ export async function linuxProbeTargets({ uid = process.getuid?.(), node = proce
   const mntFile = mntCandidates.find(readable)
     ?? (spawnSync("find", [...searched, "-maxdepth", "3", "-type", "f", "-readable", "-print", "-quit"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }).stdout?.trim().split("\n")[0] || null);
   if (!mntFile) skipped.mnt = "nothing on a Windows drive or under /mnt is readable on this host";
-  const exeRuns = existsSync(windowsExe) && spawnSync(windowsExe, ["/c", "exit 0"], { stdio: "ignore", timeout: 15_000 }).status === 0;
-  if (!exeRuns) skipped.interop = "no Windows interop on this host";
+  const exeRuns = !!windowsExe && existsSync(windowsExe) && spawnSync(windowsExe, ["/c", "exit 0"], { stdio: "ignore", timeout: 15_000 }).status === 0;
+  if (!exeRuns) skipped.interop = windowsExe ? "no Windows interop on this host" : "no system drive (C:) is mounted, so no Windows binary the daemon trusts to run";
   const busPath = Number.isInteger(uid) ? `/run/user/${uid}/bus` : null;
   const busUp = busPath && existsSync(busPath) ? await new Promise(res => {
     const c = connect(busPath);

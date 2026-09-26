@@ -27,7 +27,7 @@
 // grant is a CLOSED ALLOWLIST and the denies are belt-and-braces on top of it.
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { resolveHome, DEFAULT_HOME } from "./home.mjs";
 import { ARTIFACT_FILE } from "./paths.mjs";
@@ -294,6 +294,20 @@ export function windowsDriveRoots(mounts = readMounts()) {
   }
   return [...new Set(roots)];
 }
+/**
+ * Where the system drive, C:, is mounted, or null. It's the one drive whose
+ * Windows/System32 a Windows user can't change, so it's the only one the daemon
+ * runs a Windows binary from, for its interop control, outside any sandbox. A
+ * secondary or removable drive's is anyone's (#156).
+ */
+export function windowsSystemDrive(mounts = readMounts()) {
+  if (mounts == null) return null;
+  for (const line of mounts.split("\n")) {
+    const [source = "", target] = line.split(" ");
+    if (target && /^[Cc]:\\?$/.test(unescapeMount(source))) return unescapeMount(target);
+  }
+  return null;
+}
 const readMounts = () => { try { return readFileSync("/proc/mounts", "utf8"); } catch { return null; } };
 // The mount table writes a space, a tab, a newline and a backslash as octal.
 const unescapeMount = s => s.replace(/\\([0-7]{3})/g, (_, o) => String.fromCharCode(parseInt(o, 8)));
@@ -361,7 +375,16 @@ export function osCredentialPaths({ platform = process.platform } = {}) {
 /** A path as the Linux sandbox must be given it: at its target when it's a link. Elsewhere, and where nothing is there yet, as written. */
 export function linkFree(p, platform = process.platform) {
   if (platform !== "linux") return p;
-  try { return realpathSync(p); } catch { return p; }
+  try { return realpathSync(p); } catch { /* not there yet */ }
+  // Its nearest ancestor that is there, at its target, and the rest as written:
+  // a file that appears later, a rotated credential or a store's sidecar, is
+  // then named where it will appear, not through a link on the way (#156).
+  const rest = [];
+  for (let d = p; dirname(d) !== d; d = dirname(d)) {
+    rest.unshift(basename(d));
+    try { return join(realpathSync(dirname(d)), ...rest); } catch { /* keep climbing */ }
+  }
+  return p;
 }
 
 /**

@@ -8,7 +8,7 @@
 // filter doesn't stop a file read.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { hostEscapePaths, sandboxFor, validateSettings, windowsDriveRoots } from "../src/sandbox.mjs";
 import { linuxProbeTargets } from "../src/canary.mjs";
@@ -73,4 +73,32 @@ test("on Linux a host path the distro makes a link is denied at its target, as F
   const atTarget = (p) => (p === "/mnt" ? "/var/mnt" : p);
   const paths = hostEscapePaths({ platform: "linux", uid: 1000, mounts: "", atTarget });
   assert.ok(paths.includes("/var/mnt") && !paths.includes("/mnt"), JSON.stringify(paths));
+});
+
+// A drive with a planted Windows/System32/cmd.exe: a script that leaves a mark
+// if anything runs it.
+const plantedDrive = (prefix) => {
+  const drive = realpathSync(tempDir(prefix));
+  const sys = join(drive, "Windows", "System32");
+  mkdirSync(sys, { recursive: true });
+  const mark = join(drive, "ran");
+  writeFileSync(join(sys, "cmd.exe"), `#!/bin/sh\ntouch ${JSON.stringify(mark)}\nexit 0\n`, { mode: 0o755 });
+  return { drive, exe: join(sys, "cmd.exe"), mark };
+};
+
+test("the daemon runs only the system drive's cmd.exe for its interop control, never one on another drive", async () => {
+  // D: is a secondary or removable volume. What's on it is anyone's, and the
+  // daemon runs its control outside any sandbox.
+  const d = plantedDrive("wd-planted-d-");
+  const onlyD = `D:\\134 ${d.drive} 9p rw,noatime,aname=drvfs;path=D:\;uid=1000 0 0\n`;
+  const t = await linuxProbeTargets({ mounts: onlyD, driveRoots: [d.drive], uid: -1 });
+  assert.equal(existsSync(d.mark), false, "a cmd.exe on a secondary drive was run by the daemon");
+  assert.equal(t.windowsExe, null);
+  assert.match(t.skipped.interop ?? "", /system drive/);
+  // The control: the system drive's own is the one it runs.
+  const c = plantedDrive("wd-planted-c-");
+  const withC = `C:\\134 ${c.drive} 9p rw,noatime,aname=drvfs;path=C:\;uid=1000 0 0\n` + onlyD;
+  const tc = await linuxProbeTargets({ mounts: withC, driveRoots: [c.drive, d.drive], uid: -1 });
+  assert.equal(tc.windowsExe, c.exe, "control: the system drive's cmd.exe is the interop control");
+  assert.equal(existsSync(d.mark), false, "a cmd.exe on a secondary drive was run by the daemon");
 });

@@ -11,7 +11,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as daemon from "../src/daemon.mjs";
-import { notifyCredOf, sandboxFor, siblingRootsOf, sourceCheckoutOf, validateSettings } from "../src/sandbox.mjs";
+import { linkFree, notifyCredOf, sandboxFor, siblingRootsOf, sourceCheckoutOf, validateSettings } from "../src/sandbox.mjs";
 import { open } from "../src/db/ops.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 
@@ -192,4 +192,17 @@ test("a worker whose source checkout and notify credential are reached through l
   await daemon.tick(ctx);
   const { readFileSync } = await import("node:fs");
   assert.equal(spawned, 1, readFileSync(ctx.logPath, "utf8").split("\n").filter((l) => /#42/.test(l)).slice(-4).join("\n"));
+});
+
+test("on Linux a protected path that isn't there yet is named under its parent's target, where it will appear", linux, () => {
+  // A credential rotated into place later, say, under a folder reached through
+  // a link. Named as spelled, neither layer would name the path it appears at.
+  const { link, target } = linked("rl-absent-");
+  assert.equal(linkFree(join(link, "token"), "linux"), join(target, "token"));
+  assert.equal(linkFree(join(link, "sub", "token"), "linux"), join(target, "sub", "token"), "more than one level that isn't there yet");
+  const profile = { identity: { key: "o/r", defaultBranch: "main" }, notify: { credentialFile: join(link, "token") }, units: [] };
+  const s = sandboxFor({ profile, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: "/tmp/t" }).settings;
+  assert.ok(s.sandbox.filesystem.denyRead.includes(join(target, "token")), JSON.stringify(s.sandbox.filesystem.denyRead.filter((d) => d.includes("rl-absent-"))));
+  assert.ok(s.permissions.deny.includes(`Read(/${join(target, "token")})`), JSON.stringify(s.permissions.deny.filter((d) => d.includes("rl-absent-"))));
+  assert.equal(linkFree("/nowhere/at/all", "linux"), "/nowhere/at/all", "control: a path with no link on the way is as written");
 });

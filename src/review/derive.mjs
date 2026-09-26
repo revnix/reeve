@@ -1,3 +1,4 @@
+// @ts-check
 // review/derive — the pure fold from raw observations to what the gate reads.
 //
 // Nothing here talks to GitHub. It reads inbox rows that ingest already landed

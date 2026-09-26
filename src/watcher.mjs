@@ -1,3 +1,4 @@
+// @ts-check
 // watcher — given a verdict, decide the single next action for a PR.
 //
 // Pure and total: every reachable state maps to exactly one action, and there is

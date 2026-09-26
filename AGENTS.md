@@ -108,6 +108,26 @@ next:
 - **Everything you allocate ships its teardown in the same change.** That
   includes worktrees, containers and temporary directories.
 
+## Code Review Rules
+
+For a reviewer of a pull request here, a person or a review bot.
+
+- **Judge a commit's authorship from GitHub's record, not from your checkout.**
+  Every commit in this repository is authored and committed by its maintainer.
+  Before reporting AI attribution in a commit, read its author and committer
+  from GitHub: the pull request's Commits tab, or
+  `GET /repos/revnix/reeve/pulls/<number>/commits`. The environment a review
+  runs in may make commits under its own identity, such as
+  `Codex <codex@openai.com>`. That identity belongs to the review, not to the
+  commit, and is never a finding.
+- **AI attribution means one of these:**
+  - an author, committer or `Co-Authored-By` trailer that names an AI tool;
+  - text that credits an AI tool with the change, or with finding what it
+    fixes, in a commit message, a pull request, a comment or a document.
+
+  Report it with the commit's SHA, or the file and line, and the words that name
+  the tool.
+
 ## Commands
 
 | Task | Command |

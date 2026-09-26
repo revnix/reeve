@@ -16,7 +16,7 @@
 // "the script never ran".
 import { runWorker, workerArgs } from "./supervisor.mjs";
 import { validateSettings, ruleFor, scopedFileTools, carveOuts, windowsDriveRoots, windowsSystemDrive } from "./sandbox.mjs";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer, connect } from "node:net";
 import { accessSync, constants, copyFileSync, symlinkSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -353,6 +353,24 @@ echo done
  *   bus           the session bus, with the Secret Service behind it, when the
  *                 daemon can connect to it.
  */
+/**
+ * A command run without blocking the daemon, with a timeout. Its output is
+ * read as text, and its errors only as far as the first 64 KiB.
+ */
+function runQuiet(bin, args, { timeoutMs, env }) {
+  return new Promise(res => {
+    let stdout = "", stderr = "", errBytes = 0, done = false, timer = null;
+    const finish = r => { if (!done) { done = true; clearTimeout(timer); res(r); } };
+    let child;
+    try { child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"], env }); } catch (error) { finish({ error }); return; }
+    timer = setTimeout(() => { child.kill("SIGKILL"); finish({ error: new Error(`timed out after ${timeoutMs} ms`) }); }, timeoutMs);
+    child.stdout.setEncoding("utf8").on("data", d => { stdout += d; });
+    child.stderr.setEncoding("utf8").on("data", d => { errBytes += Buffer.byteLength(d); if (errBytes <= 65_536) stderr += d; });
+    child.on("error", error => finish({ error }));
+    child.on("close", (status, signal) => finish({ stdout, stderr, status, signal, truncated: errBytes > 65_536 }));
+  });
+}
+
 export async function linuxProbeTargets({ uid = process.getuid?.(), node = process.execPath, mounts,
                                           // Every Windows drive, wherever it's mounted, as the policy denies them (#156).
                                           driveRoots = windowsDriveRoots(mounts) ?? [],
@@ -363,6 +381,8 @@ export async function linuxProbeTargets({ uid = process.getuid?.(), node = proce
                                           windowsExe = systemDrive ? join(systemDrive, "Windows", "System32", "cmd.exe") : null,
                                           // Where to look for a file when none of the usual ones is readable.
                                           searchRoots = [...new Set(["/mnt", ...driveRoots])], findBin = "find",
+                                          // The worker's environment, which the interop control runs with.
+                                          env = process.env,
                                           connectTimeoutMs = 2_000 } = {}) {
   const readable = f => { try { accessSync(f, constants.R_OK); return statSync(f).isFile(); } catch { return false; } };
   const skipped = {};
@@ -372,18 +392,31 @@ export async function linuxProbeTargets({ uid = process.getuid?.(), node = proce
   let mntFile = mntCandidates.find(readable) ?? null;
   if (!mntFile) {
     // However deep: a drive whose readable files are all far down would
-    // otherwise read as empty, and its deny go unprobed (#156).
-    const found = spawnSync(findBin, [...searchRoots, "-type", "f", "-readable", "-print0", "-quit"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] });
+    // otherwise read as empty, and its deny go unprobed. Without blocking the
+    // daemon, as a slow drive can take the whole timeout (#156).
+    const roots = searchRoots.filter(r => existsSync(r));
+    const found = roots.length ? await runQuiet(findBin, [...roots, "-type", "f", "-readable", "-print0", "-quit"], { timeoutMs: 10_000, env: { ...process.env, LC_ALL: "C" } })
+      : { stdout: "", stderr: "", status: 0 };
     // A search that couldn't run, or ran out of time, answers nothing, and that
     // isn't proof nothing is readable: the probe would be skipped, and the canary
-    // could pass with the deny open. Unreadable folders on the way are normal,
-    // and find passes over them (#156).
+    // could pass with the deny open (#156).
     if (found.error || found.signal) throw new Error(`the drives couldn't be searched for a file to probe: ${found.error?.code ?? found.error?.message ?? found.signal}`);
-    mntFile = found.stdout?.split("\0")[0] || null;
+    mntFile = found.stdout.split("\0")[0] || null;
+    // Nor is one that ended in an error. find exits 1 for a folder it can't
+    // read as for an I/O error, and only the first leaves the drive measured:
+    // the worker can't read that folder either (#156).
+    const complaints = found.stderr.split("\n").filter(Boolean);
+    const other = complaints.find(l => !/: Permission denied$/.test(l));
+    if (!mntFile && found.status !== 0 && (found.truncated || !complaints.length || other))
+      throw new Error(`the drives couldn't be searched for a file to probe: ${other ?? (found.truncated ? "more errors than were read" : `find exited ${found.status}`)}`);
   }
   if (!mntFile) skipped.mnt = "nothing on a Windows drive or under /mnt is readable on this host";
-  const exeRuns = !!windowsExe && existsSync(windowsExe) && spawnSync(windowsExe, ["/c", "exit 0"], { stdio: "ignore", timeout: 15_000 }).status === 0;
-  if (!exeRuns) skipped.interop = windowsExe ? "no Windows interop on this host" : "no system drive (C:) is mounted, so no Windows binary the daemon trusts to run";
+  // Run with the worker's own environment: where launching a Windows binary
+  // needs something it lacks, WSL_INTEROP say, the sandboxed probe fails for
+  // want of it, and so must this control, or that failure reads as the sandbox
+  // holding (#156).
+  const exeRuns = !!windowsExe && existsSync(windowsExe) && (await runQuiet(windowsExe, ["/c", "exit 0"], { timeoutMs: 15_000, env })).status === 0;
+  if (!exeRuns) skipped.interop = windowsExe ? "a Windows binary doesn't run with a worker's environment on this host" : "no system drive (C:) is mounted, so no Windows binary the daemon trusts to run";
   const busPath = Number.isInteger(uid) ? `/run/user/${uid}/bus` : null;
   const busUp = busPath && existsSync(busPath) ? await new Promise(res => {
     const c = connect(busPath);
@@ -643,7 +676,7 @@ export async function sandboxCanary({
   // Built BEFORE the id, because the script is the instrument and its identity
   // belongs in the id: a record made before a probe existed describes a weaker
   // measurement than the one being asked for now.
-  const linux = platform === "linux" ? (linuxTargets ?? await linuxProbeTargets()) : null;
+  const linux = platform === "linux" ? (linuxTargets ?? await linuxProbeTargets({ env })) : null;
   const scriptText = canaryScript({ tmpDir, outsideDir, decoyPath, netUrl: netProbe?.url ?? null, fileDecoyPath, fileControlPath, platform, linux });
   // `!!netProbe`, not `!!netProbe.url`, so this is computable BEFORE the script
   // exists -- which is what lets `measureContainment` key its cache on the same

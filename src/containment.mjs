@@ -194,7 +194,7 @@ export async function measureContainment({
   // in, and they're part of the id: a pass taken when the host had no target for
   // a probe is a weaker measurement than one with it, and mustn't stand in for
   // it once the host has one (#156).
-  const targets = platform === "linux" && cliVersion && sandbox ? (linuxTargets ?? await linuxProbeTargets()) : null;
+  const targets = platform === "linux" && cliVersion && sandbox ? (linuxTargets ?? await linuxProbeTargets({ env })) : null;
   const id = cliVersion && sandbox ? canaryIdFor({ cliVersion, sandbox, binaryId, worktree: canaryPaths?.dir ?? null, permissionsDeny, allowedTools,
                                                    instrument: instrumentHash({ hasNet: !!netProbe }), probes: probeShapeOf(targets), runtime }) : null;
   const cheapReasons = reasons.length > 0;

@@ -137,3 +137,57 @@ test("the canary finds a readable file on a drive however deep it is", async () 
   const t = await linuxProbeTargets({ mounts: "", driveRoots: [drive], searchRoots: [drive], mntCandidates: [], uid: -1 });
   assert.equal(t.mntFile, join(deep, "notes.txt"));
 });
+
+// A find that answers as a real one would in trouble: what it prints, and how it exits.
+// A path found is printed NUL-ended, as -print0 does.
+const fakeFind = (prefix, { stderr = "", found = null, status = 1, sleep = 0 } = {}) => {
+  const dir = tempDir(prefix);
+  const bin = join(dir, "find");
+  const q = (x) => `'${String(x).replace(/'/g, "'\\''")}'`;
+  writeFileSync(bin, `#!/bin/sh\n${sleep ? `sleep ${sleep}\n` : ""}${found ? `printf '%s\\0' ${q(found)}\n` : ""}${stderr ? `printf '%s\\n' ${q(stderr)} >&2\n` : ""}exit ${status}\n`, { mode: 0o755 });
+  return bin;
+};
+
+test("a search that ends in an error other than a folder it can't read isn't read as an empty drive", async () => {
+  // GNU find exits 1 for an I/O error as for a folder it can't read, with no
+  // error for Node to see. Only the second leaves the drive measured as empty:
+  // the worker can't read that folder either.
+  const empty = realpathSync(tempDir("wd-ioerr-"));
+  const at = (findBin) => linuxProbeTargets({ mounts: "", driveRoots: [empty], searchRoots: [empty], mntCandidates: [], uid: -1, findBin });
+  await assert.rejects(at(fakeFind("wd-find-io-", { stderr: `find: '${empty}/x': Input/output error` })), /couldn't be searched/);
+  const t = await at(fakeFind("wd-find-perm-", { stderr: `find: '${empty}/x': Permission denied` }));
+  assert.equal(t.mntFile, null, "control: a folder it can't read leaves the drive measured, and empty");
+});
+
+test("the search of the drives doesn't hold up the daemon while it runs", async () => {
+  // A slow drive can take the whole timeout, and the daemon's timers wait on it.
+  const drive = realpathSync(tempDir("wd-slow-"));
+  writeFileSync(join(drive, "f.txt"), "readable\n");
+  let ticks = 0;
+  const timer = setInterval(() => { ticks++; }, 50);
+  try {
+    const t = await linuxProbeTargets({ mounts: "", driveRoots: [drive], searchRoots: [drive], mntCandidates: [], uid: -1,
+                                        findBin: fakeFind("wd-find-slow-", { found: join(drive, "f.txt"), status: 0, sleep: 1 }) });
+    assert.equal(t.mntFile, join(drive, "f.txt"), "control: it found the file");
+  } finally { clearInterval(timer); }
+  assert.ok(ticks >= 5, `the daemon's timers ran ${ticks} times in a one-second search`);
+});
+
+test("the interop control runs with the worker's environment, so a binary that won't launch there is skipped, not read as held", async () => {
+  // Where launching a Windows binary needs WSL_INTEROP and a worker's
+  // environment lacks it, the sandboxed probe fails for want of it. The control
+  // must fail the same way, or that failure reads as the sandbox holding.
+  const c = realpathSync(tempDir("wd-env-c-"));
+  const sys = join(c, "Windows", "System32");
+  mkdirSync(sys, { recursive: true });
+  writeFileSync(join(sys, "cmd.exe"), "#!/bin/sh\n[ -n \"$REEVE_TEST_INTEROP\" ] && exit 0\nexit 1\n", { mode: 0o755 });
+  const mounts = `C:\\134 ${c} 9p rw,noatime,aname=drvfs;path=C:\;uid=1000 0 0\n`;
+  const saved = process.env.REEVE_TEST_INTEROP;
+  process.env.REEVE_TEST_INTEROP = "1";
+  try {
+    const without = await linuxProbeTargets({ mounts, driveRoots: [c], uid: -1, env: { PATH: "/usr/bin:/bin" } });
+    assert.equal(without.windowsExe, null, "the control ran with the daemon's environment, not the worker's");
+    const withIt = await linuxProbeTargets({ mounts, driveRoots: [c], uid: -1, env: { PATH: "/usr/bin:/bin", REEVE_TEST_INTEROP: "1" } });
+    assert.equal(withIt.windowsExe, join(sys, "cmd.exe"), "control: with it in the worker's environment, the binary is the probe");
+  } finally { if (saved === undefined) delete process.env.REEVE_TEST_INTEROP; else process.env.REEVE_TEST_INTEROP = saved; }
+});

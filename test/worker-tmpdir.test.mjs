@@ -117,6 +117,24 @@ test("a TMPDIR's room is counted in bytes, as the kernel counts a socket's path"
   assert.equal(workerenv.tmpDirTooLong("/" + "e".repeat(40), "linux"), null, "control: the same length in plain characters fits");
 });
 
+test("the canary's TMPDIR is removed whatever the canary's outcome, a failure included", async () => {
+  // It sits under <state>/t, outside the canary's own folder, which a failed
+  // canary keeps as evidence. Nothing in the TMPDIR is evidence, and a failed
+  // canary is retried, so each failure left another one behind.
+  const stateDir = tempDir("rc-");
+  const seen = {};
+  const ctx = { logPath: join(stateDir, "reeve.log"), platform: "linux", isolationReady: () => true, mounts: "",
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "2.1.278 (Claude Code)",
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    netProbe: { url: "http://127.0.0.1:1/canary", selfReachable: () => true, wasHit: () => false },
+    linuxProbeTargets: async () => ({ node: process.execPath, mntFile: null, windowsExe: null, bus: null, skipped: {} }),
+    canary: async (args) => { seen.tmpDir = args.tmpDir; seen.existed = existsSync(args.tmpDir); return { ok: false, id: "t", why: "a probe leaked", evidence: {} }; } };
+  const profile = { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: tempDir("rc-wt-") }, worker: { isolation: "scratch-home" }, units: [] };
+  await daemon.measuredContainment(ctx, profile, "o/r", ctx.logPath);
+  assert.equal(seen.existed, true, "control: it existed while the canary ran");
+  assert.equal(existsSync(seen.tmpDir), false, "a failed canary's TMPDIR is left behind");
+});
+
 test("a TMPDIR with no room names the state folder it sits under, which --log can put outside REEVE_HOME", () => {
   const state = "/" + "s".repeat(70);
   const why = workerenv.tmpDirTooLong(join(state, "t", "0123456789ab"), "linux");

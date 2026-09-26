@@ -627,7 +627,7 @@ export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSp
     // The block every worker gets; the canary's id covers it, so a block that
     // changes (a new deny, a new domain) is measured again before it is trusted.
     // The reeve-owned trees are denied to workers too; the canary proves the
-    // block that includes them. (Codex #4d-[15], #4e-[5].)
+    // block that includes them.
     const stateRoots = stateRootsFor(stateDir, logPathOf(ctx), canaryPaths.dir, ctx.dbPath ?? null);
     const policy = sandboxFor({ profile, action: "FIX_CI", worktree: canaryPaths.dir, tmpDir: canaryPaths.tmpDir, stateRoots, mounts: ctx.mounts });
     // A root the policy denies would deny the canary its own script, so it could
@@ -703,7 +703,11 @@ export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSp
       // another directory behind, each with a git config and the shims in it. A
       // FAILED canary keeps its own directory for evidence, which is why this
       // removes the tree only when the canary did not run. (Codex #5-[6].)
-      if (c?.canary?.skipped || c?.canary?.cached) { rmSync(canaryRoot, { recursive: true, force: true }); rmSync(canaryPaths.tmpDir, { recursive: true, force: true }); }
+      if (c?.canary?.skipped || c?.canary?.cached) rmSync(canaryRoot, { recursive: true, force: true });
+      // The TMPDIR is outside that tree, under <state>/t, and a failed canary's
+      // evidence needs nothing in it, so it goes whatever happened: a failed
+      // canary is retried, and each would leave another one behind (#156).
+      rmSync(canaryPaths.tmpDir, { recursive: true, force: true });
     }
     if (!before) log(logPath, `containment: canary ${c.canary?.id ?? "?"} ${c.canary?.ok ? "passed" : `FAILED: ${c.canary?.why}`}; keychain: ${c.keychain?.measured ? (c.keychain.items.length ? c.keychain.why : "no GitHub credential") : `unmeasured (${c.keychain?.why})`}`);
     return c;
@@ -3035,7 +3039,7 @@ export async function tick(ctx) {
         const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane, tmpDir, stateRoots: dStateRoots, mounts: ctx.mounts });
         // A denied path that CONTAINS the worktree would deny the worker its own
         // code, and the failure would read as a broken sandbox rather than the
-        // configuration error it is. (Codex #4g-[4].) Refused before anything is
+        // configuration error it is. Refused before anything is
         // written under the root, the worker's home included (#156).
         if (sandbox.stateHomeContainsWorktree?.length)
           throw new Error(layoutRefusal(sandbox.stateHomeContainsWorktree, worktree));

@@ -7878,4 +7878,13 @@ export const STUBS = [
               find: "    why: reasons.length ? reasons.join(\"; \") : `canary ${cn.id} passed and an isolated worker is declared${keychainNote(kc)}`,",
               replace: "    why: reasons.length ? reasons.join(\"; \") : `canary ${cn.id} passed, an isolated worker is declared, and the keychain holds no GitHub credential`," }],
   },
+  {
+    name: "canary-tmpdir-removed-always",
+    why: "remove the canary's TMPDIR only when the canary didn't run. It's outside the folder a failed canary keeps, so each failure leaves one behind for good",
+    test: "test/worker-tmpdir.test.mjs",
+    expectRed: "the canary's TMPDIR is removed whatever the canary's outcome, a failure included",
+    edits: [{ file: "src/daemon.mjs",
+              find: "      rmSync(canaryPaths.tmpDir, { recursive: true, force: true });\n",
+              replace: "" }],
+  },
 ];

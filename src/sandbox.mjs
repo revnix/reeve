@@ -786,7 +786,7 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
     // (and the canary its own script), so containment could never close and the
     // reason would look like a sandbox failure. A layout such as
     // REEVE_HOME=/srv/reeve with worktreeRoot=/srv/reeve/worktrees is a
-    // configuration error, and it is named as one. (Codex #4g-[4].) So is a
+    // configuration error, and it is named as one. So is a
     // worktree root under /mnt on Linux, where WSL mounts the Windows drives:
     // the policy closes /mnt to every worker (#156).
     stateHomeContainsWorktree: worktree

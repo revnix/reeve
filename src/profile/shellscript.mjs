@@ -274,7 +274,7 @@ export function scriptShell(path = "sh") {
     'if ! (set -o reeve-no-such-option; exit 0) >/dev/null 2>&1; then printf "bad-option-ends\\tyes\\n"; fi; ' +
     'if (x=1; unset -fv x; test -z "${x+set}") >/dev/null 2>&1 && (x=1; unset -vf x; test -n "${x+set}") >/dev/null 2>&1; ' +
     'then printf "unset-last-option-wins\\tyes\\n"; fi; ' +
-    'if (readonly -p x=1 >/dev/null; test "${x-}" = 1) >/dev/null 2>&1; then printf "p-takes-operands\\tyes\\n"; fi; ' +
+    'if (unset x; readonly -p x=1 >/dev/null; test "${x-}" = 1) >/dev/null 2>&1; then printf "p-takes-operands\\tyes\\n"; fi; ' +
     'if ! (readonly x=1; x=2; exit 0) >/dev/null 2>&1; then printf "readonly-assign-ends\\tyes\\n"; fi; ' +
     // Each operator in a shell of its own, since a syntax error ends the shell
     // it's read in. dash reads `&>` as `&` and a redirection, which leaves the
@@ -1011,7 +1011,8 @@ const inverted = (r) => {
 };
 
 // A command that writes nothing, which the next closing the pipe can't stop:
-// `true` or `:`, the shell's or the program, or assignments alone.
+// `true` or `:`, the shell's or the program, or assignments alone, though a
+// pipeline doubts any command with an assignment for its own reason.
 const writesNothing = (cmd, shell) => {
   const word = cmd.words.find((w) => !assignment(w, shell));
   return !word || (!word.expansion && (word.text === "true" || word.text === ":"));
@@ -1055,10 +1056,11 @@ function pipeline(list, i, state, ctx) {
   // status is the pipeline's.
   const run = (k) => redirected(list[k], simple(list[k].words, { ...state, mutated: state.mutated || list[k].subst }, ctx));
   // Each runs in a subshell of its own, where an expansion that fails, $((1/0))
-  // or ${x:?}, fails that command rather than ending the script. So one with an
-  // expansion, in a word or in a redirection such as a here-string, never
-  // surely succeeds.
-  const sure = (k, e) => (e.o === "ok" && list[k].expansion ? UNKNOWN : e);
+  // or ${x:?}, fails that command rather than ending the script, and so does an
+  // assignment to a read-only variable, as bash's own EUID and UID are. So one
+  // with an expansion, in a word or in a redirection such as a here-string, or
+  // with an assignment, never surely succeeds.
+  const sure = (k, e) => (e.o === "ok" && (list[k].expansion || list[k].words.some((w) => assignment(w, ctx.shell))) ? UNKNOWN : e);
   const r = sure(j, run(j));
   // Under pipefail it fails when any of them fails. One before the last that
   // writes may be stopped by the next closing the pipe, so it never surely

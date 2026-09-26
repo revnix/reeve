@@ -11,7 +11,7 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { detectCommands } from "../src/profile/detect.mjs";
 import { npmScriptShells, runnerShells, scriptShell, scriptShells } from "../src/profile/shellscript.mjs";
 
@@ -611,10 +611,20 @@ try {
 
   // Under pipefail, a command that writes nothing can't be stopped by the pipe
   // closing, so it surely succeeds as the last one does.
-  const quiet = ["set -o pipefail; ! true | true", "set -o pipefail; ! : | true", "set -o pipefail; ! x=1 | true"]
+  const quiet = ["set -o pipefail; ! true | true", "set -o pipefail; ! : | true"]
     .map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
   check(quiet.every(({ r }) => broken(r, "always fails")),
     "under pipefail, a command before the last that writes nothing surely succeeds", JSON.stringify(quiet));
+
+  // An assignment to a read-only variable fails, and in a pipeline's subshell
+  // it fails only that command. bash has read-only variables of its own, EUID
+  // and UID among them, so a command in a pipeline with an assignment never
+  // surely succeeds, first or last: each of these passes in bash.
+  const assigning = ["readonly x; set -o pipefail; ! x=1 | true", "set -o pipefail; ! EUID=1 | true", "readonly x; ! true | x=1",
+                     "readonly x; set -o pipefail; ! x=1 true | true"]
+    .map((s) => ({ s, r: detectTest(s, {}, { shell: bashShell }) }));
+  check(assigning.every(({ r }) => r.state === "present"),
+    "a command in a pipeline with an assignment never surely succeeds: a read-only variable fails it", JSON.stringify(assigning));
 
   // Each command of a pipeline runs in a subshell of its own, where an expansion
   // that fails, $((1/0)) or ${x:?}, fails that command rather than ending the
@@ -646,6 +656,13 @@ try {
 
   // What the shell does is asked of it.
   const asked216 = [scriptShell(which("bash")), dashPath ? scriptShell(dashPath) : null];
+  // The -p probe assigns x through readonly -p, which dash ignores. An x the
+  // environment already holds must not read as that assignment having taken.
+  const reader = pathToFileURL(join(ROOT, "src", "profile", "shellscript.mjs")).href;
+  const withX = dashPath ? spawnSync(process.execPath, ["--input-type=module", "-e",
+    `import { scriptShell } from ${JSON.stringify(reader)}; console.log(JSON.stringify(scriptShell(${JSON.stringify(dashPath)})?.pTakesOperands));`],
+    { env: { ...process.env, x: "1" }, encoding: "utf8" }).stdout.trim() : "false";
+  check(withX === "false", "whether -p takes operands is asked with a variable of the probe's own, whatever the environment holds", withX);
   check(asked216[0]?.unsetLastOptionWins === false && asked216[0]?.pTakesOperands === true && asked216[0]?.readonlyAssignEnds === true
     && (!dashPath || (asked216[1]?.unsetLastOptionWins === true && asked216[1]?.pTakesOperands === false && asked216[1]?.readonlyAssignEnds === true)),
     "the shell is asked how unset reads -f and -v, whether -p takes operands, and whether assigning a read-only variable ends it",

@@ -6301,7 +6301,7 @@ export const STUBS = [
     test: "test/detect-shell-scripts.test.mjs",
     expectRed: "the shell is asked how unset reads -f and -v, whether -p takes operands, and whether assigning a read-only variable ends it",
     edits: [{ file: "src/profile/shellscript.mjs",
-              find: "    'if (readonly -p x=1 >/dev/null; test \"${x-}\" = 1) >/dev/null 2>&1; then printf \"p-takes-operands\\\\tyes\\\\n\"; fi; ' +\n",
+              find: "    'if (unset x; readonly -p x=1 >/dev/null; test \"${x-}\" = 1) >/dev/null 2>&1; then printf \"p-takes-operands\\\\tyes\\\\n\"; fi; ' +\n",
               replace: "" }],
   },
   {
@@ -6319,7 +6319,7 @@ export const STUBS = [
     test: "test/detect-shell-scripts.test.mjs",
     expectRed: "a command in a pipeline with an expansion that may fail never surely succeeds",
     edits: [{ file: "src/profile/shellscript.mjs",
-              find: "  const sure = (k, e) => (e.o === \"ok\" && list[k].expansion ? UNKNOWN : e);",
+              find: "  const sure = (k, e) => (e.o === \"ok\" && (list[k].expansion || list[k].words.some((w) => assignment(w, ctx.shell))) ? UNKNOWN : e);",
               replace: "  const sure = (k, e) => e;" }],
   },
   {
@@ -6366,5 +6366,23 @@ export const STUBS = [
     edits: [{ file: "src/profile/shellscript.mjs",
               find: "      const outcome = unsure ? UNKNOWN : OK;",
               replace: "      const outcome = OK;" }],
+  },
+  {
+    name: "detect-pipeline-assignments-unsure",
+    why: "take a command in a pipeline with an assignment to succeed. An assignment to a read-only variable fails it in its subshell, bash's own EUID among them, and `set -o pipefail; ! EUID=1 | true` passes in bash",
+    test: "test/detect-shell-scripts.test.mjs",
+    expectRed: "a command in a pipeline with an assignment never surely succeeds: a read-only variable fails it",
+    edits: [{ file: "src/profile/shellscript.mjs",
+              find: "  const sure = (k, e) => (e.o === \"ok\" && (list[k].expansion || list[k].words.some((w) => assignment(w, ctx.shell))) ? UNKNOWN : e);",
+              replace: "  const sure = (k, e) => (e.o === \"ok\" && list[k].expansion ? UNKNOWN : e);" }],
+  },
+  {
+    name: "detect-p-probe-own-variable",
+    why: "probe -p with whatever x the environment holds. With x=1 there, dash reads as taking -p's operands, and a script it passes reads as broken",
+    test: "test/detect-shell-scripts.test.mjs",
+    expectRed: "whether -p takes operands is asked with a variable of the probe's own, whatever the environment holds",
+    edits: [{ file: "src/profile/shellscript.mjs",
+              find: "    'if (unset x; readonly -p x=1 >/dev/null; test \"${x-}\" = 1) >/dev/null 2>&1; then printf \"p-takes-operands\\\\tyes\\\\n\"; fi; ' +\n",
+              replace: "    'if (readonly -p x=1 >/dev/null; test \"${x-}\" = 1) >/dev/null 2>&1; then printf \"p-takes-operands\\\\tyes\\\\n\"; fi; ' +\n" }],
   },
 ];

@@ -26,8 +26,8 @@
 // was never offered. Any tool that can run a command is a write primitive, so the
 // grant is a CLOSED ALLOWLIST and the denies are belt-and-braces on top of it.
 
-import { writeFileSync, mkdirSync, realpathSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, lstatSync, readFileSync, readlinkSync, writeFileSync, mkdirSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { homedir } from "node:os";
 import { resolveHome, DEFAULT_HOME } from "./home.mjs";
 import { ARTIFACT_FILE } from "./paths.mjs";
@@ -245,7 +245,72 @@ export const CREDENTIAL_PATHS = [
   // be denied by path like every other credential file. (Codex #4e-[3].)
   "~/.git-credentials", "~/.config/git", "~/.netrc", "~/.npmrc", "~/.aws", "~/.azure",
   "~/.config/gcloud", "~/.kube", "~/.docker", "~/.gnupg",
+  // GNOME Keyring's files, where the Secret Service keeps secrets on Linux.
+  "~/.local/share/keyrings",
 ];
+
+/**
+ * The host's own ways out of the sandbox on Linux, denied by path. The seccomp
+ * filter that blocks Unix sockets closes the socket ones too, where the runtime
+ * can apply it; naming them keeps them closed where it can't, and closes the
+ * file reads no socket filter sees.
+ *
+ *   /mnt              WSL mounts the Windows drives here by default: every
+ *                     Windows user's files, and the Windows binaries interop runs.
+ *   each drive        wherever else the mount table puts one: `[automount] root`
+ *                     in /etc/wsl.conf moves them all, and `mount -t drvfs` puts
+ *                     one anywhere (#156).
+ *   /run/WSL          WSL's interop sockets. A Windows executable started inside
+ *                     the sandbox runs through one, OUTSIDE it, wherever the .exe
+ *                     came from, one committed to the repository included.
+ *   /run/user/<uid>   the session bus and the Secret Service behind it, keyring
+ *                     sockets, and the systemd user manager, which starts a
+ *                     command outside the sandbox on request.
+ *   /run/dbus         the system bus.
+ */
+export function hostEscapePaths({ platform = process.platform, uid = process.getuid?.(), mounts, atTarget = linkFree } = {}) {
+  if (platform !== "linux") return [];
+  const drives = (windowsDriveRoots(mounts) ?? []).filter(d => d !== "/mnt" && !d.startsWith("/mnt/"));
+  // Each at its target where the host makes one a link, as Fedora's ostree
+  // variants make /mnt one to /var/mnt: bubblewrap can't mount over a link (#156).
+  return ["/mnt", ...drives, "/run/WSL", ...(Number.isInteger(uid) ? [`/run/user/${uid}`] : []), "/run/dbus"].map(p => atTarget(p, platform));
+}
+
+/**
+ * Where the Windows drives are mounted, from the mount table, or null when it
+ * can't be read. A drive shows as drvfs, as 9p with `aname=drvfs` on WSL2
+ * (measured on this host: `C:\134 /mnt/c 9p rw,...,aname=drvfs;path=C:\;...`),
+ * or under any type with a drive letter for its source. WSL's own 9p mounts,
+ * such as its driver store, aren't drives.
+ */
+export function windowsDriveRoots(mounts = readMounts()) {
+  if (mounts == null) return null;
+  const roots = [];
+  for (const line of mounts.split("\n")) {
+    const [source = "", target, type = "", options = ""] = line.split(" ");
+    if (!target) continue;
+    const drvfs = type === "drvfs" || /(^|[,;])aname=drvfs([,;]|$)/.test(options) || /^[A-Za-z]:\\/.test(unescapeMount(source));
+    if (drvfs) roots.push(unescapeMount(target));
+  }
+  return [...new Set(roots)];
+}
+/**
+ * Where the system drive, C:, is mounted, or null. It's the one drive whose
+ * Windows/System32 a Windows user can't change, so it's the only one the daemon
+ * runs a Windows binary from, for its interop control, outside any sandbox. A
+ * secondary or removable drive's is anyone's (#156).
+ */
+export function windowsSystemDrive(mounts = readMounts()) {
+  if (mounts == null) return null;
+  for (const line of mounts.split("\n")) {
+    const [source = "", target] = line.split(" ");
+    if (target && /^[Cc]:\\?$/.test(unescapeMount(source))) return unescapeMount(target);
+  }
+  return null;
+}
+const readMounts = () => { try { return readFileSync("/proc/mounts", "utf8"); } catch { return null; } };
+// The mount table writes a space, a tab, a newline and a backslash as octal.
+const unescapeMount = s => s.replace(/\\([0-7]{3})/g, (_, o) => String.fromCharCode(parseInt(o, 8)));
 // The same list as Read-tool rules: a file is named, a directory gets `/**`.
 const CREDENTIAL_FILE_NAMES = ["~/.claude.json", "~/.gitconfig", "~/.git-credentials", "~/.netrc", "~/.npmrc"];
 const isCredentialFile = p => CREDENTIAL_FILE_NAMES.map(expandTilde).includes(p);
@@ -272,7 +337,77 @@ export function credentialPaths() {
   // home these resolve against.
   return [...CREDENTIAL_PATHS.map(expandTilde), ...extra];
 }
-const credentialReadDenies = () => credentialPaths().map(p => (isCredentialFile(p) ? `Read(${ruleFor(p)})` : `Read(${ruleFor(p)}/**)`));
+const readRule = (p, file) => (file ? `Read(${ruleFor(p)})` : `Read(${ruleFor(p)}/**)`);
+// The Read tool runs outside the OS sandbox, and a committed symlink could point
+// it straight at a linked credential's target. So on Linux, where the sandbox is
+// given the targets, the Read tool is denied them too: a file as a file.
+//
+// And ONLY them on Linux (#156). The CLI mounts its Read denies in the sandbox
+// as well, and bubblewrap can't mount over a link: measured 2026-09-26 with CLI
+// 2.1.278 on WSL2, `Read(~/.aws/**)` with ~/.aws a link stopped the sandbox
+// from starting. The same day the Read tool refused a denied file reached
+// through a link, so the target covers the link. A path that isn't there is
+// kept as written, a directory's form or a file's as the list says.
+const isDir = p => { try { return statSync(p).isDirectory(); } catch { return false; } };
+const credentialReadDenies = () => {
+  if (process.platform === "linux")
+    return osCredentialPaths().map(p => readRule(p, existsSync(p) ? !isDir(p) : isCredentialFile(p)));
+  const written = credentialPaths();
+  const targets = osCredentialPaths().filter(p => !written.includes(p));
+  return [...written.map(p => readRule(p, isCredentialFile(p))), ...targets.map(p => readRule(p, !isDir(p)))];
+};
+
+/**
+ * The credential paths as the OS sandbox is given them.
+ *
+ * On Linux the runtime hides a denied directory by mounting over it, and
+ * bubblewrap refuses to start when it reaches that directory through a symlink.
+ * Measured on WSL2 with srt 0.0.73, where ~/.aws and ~/.azure link to
+ * /mnt/c/Users/<you>: "Can't mount tmpfs on .../.aws", and nothing ran. So on
+ * Linux a path that resolves elsewhere is denied at its target, which covers
+ * every way of reaching it. A path that isn't there yet is kept as written, and
+ * the runtime passes over it. Elsewhere the paths are given as written, as they
+ * were measured.
+ */
+export function osCredentialPaths({ platform = process.platform } = {}) {
+  return [...new Set(credentialPaths().map(p => linkFree(p, platform)))];
+}
+/** A path as the Linux sandbox must be given it: at its target when it's a link. Elsewhere, and where nothing is there yet, as written. */
+export function linkFree(p, platform = process.platform, hops = 0) {
+  if (platform !== "linux") return p;
+  try { return realpathSync(p); } catch { /* not there yet */ }
+  // Its nearest ancestor that is there, at its target, and the rest as written:
+  // a file that appears later, a rotated credential or a store's sidecar, is
+  // then named where it will appear, not through a link on the way. A link on
+  // the way whose target isn't there yet is followed, a credential rotated by
+  // swapping a link among them (#156). Forty hops end a loop of links, as the
+  // kernel's own limit does.
+  const rest = [];
+  for (let d = p; dirname(d) !== d; d = dirname(d)) {
+    let link = null;
+    try { if (hops < 40 && lstatSync(d).isSymbolicLink()) link = readlinkSync(d); } catch { /* not there */ }
+    if (link !== null) return linkFree(join(resolvePath(dirname(d), link), ...rest), platform, hops + 1);
+    rest.unshift(basename(d));
+    try { return join(realpathSync(dirname(d)), ...rest); } catch { /* keep climbing */ }
+  }
+  return p;
+}
+
+/**
+ * The denied paths a checkout at `path` would sit under: the credentials, the
+ * host's ways out, the source checkout and reeve's own state. One that contains
+ * the checkout denies the worker its own code, so containment could never close
+ * and the reason would look like a sandbox failure. A layout such as
+ * REEVE_HOME=/srv/reeve with worktreeRoot=/srv/reeve/worktrees is a
+ * configuration error, and it is named as one; so is a worktree root under /mnt
+ * on Linux, where WSL mounts the Windows drives. The dispatch asks this of the
+ * worktree root before a checkout is made there, and the policy asks it of the
+ * checkout (#156).
+ */
+export function layoutDeniesAbove(path, { profile = null, stateRoots = [], mounts } = {}) {
+  const denied = [...credentialPaths().map(expandTilde), ...hostEscapePaths({ mounts }), ...sourceCheckoutOf(profile), ...stateRoots.map(p => linkFree(p))];
+  return denied.filter(d => d.startsWith("/") && (path === d || path.startsWith(d.endsWith("/") ? d : d + "/")));
+}
 
 /**
  * The clone a worker's checkout was made FROM.
@@ -286,9 +421,20 @@ const credentialReadDenies = () => credentialPaths().map(p => (isCredentialFile(
  * has its own clone and its dependencies were copied in before it started — so
  * it is denied like any other credential path.
  */
-export function sourceCheckoutOf(profile) {
+export function sourceCheckoutOf(profile, platform = process.platform) {
   const c = profile?.identity?.checkout;
-  return typeof c === "string" && c.startsWith("/") ? [c.replace(/\/+$/, "")] : [];
+  // At its target on Linux, as every path the sandbox is given (#156).
+  return typeof c === "string" && c.startsWith("/") ? [linkFree(c.replace(/\/+$/, "") || "/", platform)] : [];
+}
+
+/**
+ * The publishing credential the profile names by absolute path, as the sandbox
+ * must be given it: at its target on Linux. The policy and the check of it both
+ * read it here, so the two name the same path (#156).
+ */
+export function notifyCredOf(profile, platform = process.platform) {
+  const c = profile?.notify?.credentialFile;
+  return typeof c === "string" && c.startsWith("/") ? [linkFree(c, platform)] : [];
 }
 
 /**
@@ -306,8 +452,20 @@ export function sourceCheckoutOf(profile) {
  * enumeration of the siblings that existed at policy time would not.
  */
 export function siblingRootsOf(profile) {
+  const root = worktreeRootOf(profile);
+  return root?.startsWith("/") ? [root] : [];
+}
+
+/**
+ * `identity.worktreeRoot` as reeve uses it. On Linux an absolute root is taken at
+ * its target, so every path built under it is the target's too: the sibling
+ * deny, a checkout, the canary's folders. Bubblewrap can't mount a deny over a
+ * link, and a grant made through one names a path the deny doesn't (#156).
+ */
+export function worktreeRootOf(profile, platform = process.platform) {
   const root = profile?.identity?.worktreeRoot;
-  return typeof root === "string" && root.startsWith("/") ? [root.replace(/\/+$/, "")] : [];
+  if (typeof root !== "string" || !root) return null;
+  return root.startsWith("/") ? linkFree(root.replace(/\/+$/, "") || "/", platform) : root;
 }
 
 /**
@@ -473,7 +631,10 @@ const denyWriteVerbs = glob =>
  * with its worktree as the working directory, and adding anything to that widens
  * the only boundary keeping it inside its own checkout.
  */
-export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = null, stateRoots = [] }) {
+export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = null, stateRoots: givenRoots = [], mounts }) {
+  // At their targets on Linux, as the credential paths are: bubblewrap can't
+  // mount over a link, and a REEVE_HOME that is one stopped every sandbox (#156).
+  const stateRoots = [...new Set(givenRoots.map(p => linkFree(p)))];
   const sourceCheckout = sourceCheckoutOf(profile);
   // The shared root, minus this run's own checkout. A worker reads its own
   // directory through the cwd grant and the allowRead carve-out below, so
@@ -482,7 +643,7 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
   // The publishing credential the profile names by absolute path: outside every
   // hard-coded credential directory, so it must be denied explicitly or a worker
   // could copy the token into a source file. (Codex #4f-[8].)
-  const notifyCred = typeof profile?.notify?.credentialFile === "string" && profile.notify.credentialFile.startsWith("/") ? [profile.notify.credentialFile] : [];
+  const notifyCred = notifyCredOf(profile);
   const risk = profile?.risk ?? {};
   const units = profile?.units ?? [];
 
@@ -572,12 +733,16 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
 
   // The OS deny list, built once: the read grant above is derived from it.
 
-  const osDenyRead = [...credentialPaths(), ...notifyCred, ...sourceCheckout, ...siblingRoots, ...stateRoots, ...quarantine.paths];
+  // The mount table is read once, so every list below names the same drives.
+  const hostEscapes = hostEscapePaths({ mounts });
+  const osDenyRead = [...osCredentialPaths(), ...hostEscapes, ...notifyCred, ...sourceCheckout, ...siblingRoots, ...stateRoots, ...quarantine.paths];
 
   // The Read tool is not under the OS sandbox, so the credential paths are
   // denied to it here as well; measured to hold for an absolute path and for a
-  // symlink inside the worktree that points at one.
-  deny.push(...credentialReadDenies());
+  // symlink inside the worktree that points at one. So are the host's ways out,
+  // each a directory: it would follow a committed symlink into /mnt/c as readily
+  // as into ~/.ssh.
+  deny.push(...credentialReadDenies(), ...hostEscapes.map(p => `Read(${ruleFor(p)}/**)`));
   // reeve's own state is denied too: with a --log or --db outside ~/.reeve it is
   // not otherwise covered, and a worker could copy another run's output, the
   // event store, or the log into its worktree for reeve to publish.
@@ -663,13 +828,8 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
     // the caller must refuse the dispatch rather than run with a hole.
     unrepresentableQuarantine: quarantine.unrepresentable,
     // A denied path that CONTAINS the worktree denies the worker its own code
-    // (and the canary its own script), so containment could never close and the
-    // reason would look like a sandbox failure. A layout such as
-    // REEVE_HOME=/srv/reeve with worktreeRoot=/srv/reeve/worktrees is a
-    // configuration error, and it is named as one. (Codex #4g-[4].)
-    stateHomeContainsWorktree: worktree
-      ? [...credentialPaths().map(expandTilde), ...sourceCheckout, ...stateRoots].filter(d => d.startsWith("/") && (worktree === d || worktree.startsWith(d.endsWith("/") ? d : d + "/")))
-      : [],
+    // (and the canary its own script); see layoutDeniesAbove.
+    stateHomeContainsWorktree: worktree ? layoutDeniesAbove(worktree, { profile, stateRoots: givenRoots, mounts }) : [],
   };
 }
 
@@ -731,8 +891,10 @@ export function validateToolGrant(allowedTools, { worktree = null } = {}) {
   return { ok: errors.length === 0, errors };
 }
 
-export function validateSettings(settings, { tmpDir = null, stateRoots = [], quarantineDenies = [], extraDenies = [], sourceCheckout = [],
-                                            siblingRoots = [], worktree = null, readCarveOuts = [] } = {}) {
+export function validateSettings(settings, { tmpDir = null, stateRoots: givenRoots = [], quarantineDenies = [], extraDenies = [], sourceCheckout = [],
+                                            siblingRoots = [], worktree = null, readCarveOuts = [], mounts } = {}) {
+  // Judged as the generator writes them: at their targets on Linux (#156).
+  const stateRoots = [...new Set(givenRoots.map(p => linkFree(p)))];
   const errors = [];
   if (!tmpDir) return { ok: false, errors: ["validator needs the run's tmpDir to judge the write grant"] };
   if (!settings || typeof settings !== "object" || Array.isArray(settings)) return { ok: false, errors: ["settings absent"] };
@@ -797,7 +959,7 @@ export function validateSettings(settings, { tmpDir = null, stateRoots = [], qua
         if (JSON.stringify(fs.allowRead) !== JSON.stringify(want))
           errors.push(`sandbox.filesystem.allowRead must be exactly ${want.join(", ")}`);
       }
-      if (strs(fs.denyRead)) for (const c of [...credentialPaths(), ...extraDenies, ...sourceCheckout, ...siblingRoots, ...stateRoots, ...quarantineDenies]) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
+      if (strs(fs.denyRead)) for (const c of [...osCredentialPaths(), ...hostEscapePaths({ mounts }), ...extraDenies, ...sourceCheckout, ...siblingRoots, ...stateRoots, ...quarantineDenies]) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
     }
     const net = sb.network;
     if (!isObj(net)) errors.push("sandbox.network must be an object");

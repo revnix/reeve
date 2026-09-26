@@ -34,6 +34,9 @@ const base = {
   // The network control is a daemon-local listener; injected so tests never
   // touch the network. selfReachable true, not hit = network denied.
   netProbe: { url: "http://127.0.0.1:59999/canary", selfReachable: () => true, wasHit: () => false },
+  // The fake worker below answers the macOS keychain probes; the Linux canary
+  // has probes of its own, in test/canary-linux.test.mjs.
+  platform: "darwin",
 };
 
 // A runner that behaves like a sandboxed script under the given boundary.
@@ -71,6 +74,12 @@ const streamFor = (readTool, writeTool = "denied", readInside = "allowed") => {
     else if (readInside === "broken") lines.push(JSON.stringify(resultOf("r2", "<tool_use_error>ENOENT: no such file</tool_use_error>", true)));
     else lines.push(JSON.stringify(resultOf("r2", CANARY_INSIDE_CONTROL, false)));
   }
+  // A real worker also writes its own file with the Write tool, and is refused
+  // the decoy reached through a link (#156). The liars below leave these out.
+  if (readInside !== "absent") {
+    lines.push(JSON.stringify(use("Write", "w0", "./read-tool-out")), JSON.stringify(resultOf("w0", "File created successfully at: ./read-tool-out", false)));
+    lines.push(JSON.stringify(use("Read", "r3", "./decoy-tool-link")), JSON.stringify(resultOf("r3", "Permission to read the file has been denied.")));
+  }
   return lines.length ? lines.join("\n") + "\n" : "";
 };
 // The script sandboxCanary would build for this fixture. The instrument is part
@@ -78,7 +87,7 @@ const streamFor = (readTool, writeTool = "denied", readInside = "allowed") => {
 const scriptOf = b => canaryScript({ tmpDir: b.tmpDir, outsideDir: b.outsideDir, decoyPath: b.decoyPath,
                                      netUrl: b.netProbe?.url ?? null,
                                      fileDecoyPath: join(b.outsideDir, "FILE-DECOY.txt"),
-                                     fileControlPath: join(b.outsideDir, "FILE-CONTROL.txt") });
+                                     fileControlPath: join(b.outsideDir, "FILE-CONTROL.txt"), platform: "darwin" });
 
 const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, decoy = false, symlink = false, results = true, outcome = "ok", readTool = "denied", writeTool = "denied", fileDecoy = false, fileControl = true, keychainReach = false, keychainByPath = null, keychainOpen = null, readInside = "allowed" } = {}) =>
   async ({ cwd, outPath }) => {
@@ -110,6 +119,8 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
     // models the host where the items are absent while the keychain is wide open.
     const open = keychainOpen === null ? byPath : keychainOpen;
     rec.push(`kc_path_open=${open ? 0 : 161}`);
+    // The login token isn't in the shell's environment (#156).
+    if (script.includes("rec token_env ")) rec.push("token_env=1");
     if (fileDecoy) writeFileSync(join(base.outsideDir, "..", "filedecoy-copy"), "x");
     // "no-path-probes" writes everything EXCEPT the by-path keychain probes, which
     // is what an older canary script would leave behind after a daemon upgrade.
@@ -121,6 +132,10 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
     if (writeTool === "leak") writeFileSync(join(base.outsideDir, "TOOL-OUTSIDE"), "BLOCKED");
     if (readTool === "denied") writeFileSync(join(cwd, "read-tool-out"), "DENIED");
     else if (readTool === "leak") writeFileSync(join(cwd, "read-tool-out"), CANARY_SENTINEL + "\n");
+    // The worker writes its own file whatever the decoy's read said, and is
+    // refused the decoy through a link.
+    if (readInside !== "absent" && !existsSync(join(cwd, "read-tool-out"))) writeFileSync(join(cwd, "read-tool-out"), "(nothing read)");
+    if (readInside !== "absent") writeFileSync(join(cwd, "link-tool-out"), "DENIED");
     return { outcome, why: outcome === "ok" ? "completed" : "planted", ms: 1, cost: 0, sessionId: "c" };
   };
 
@@ -140,7 +155,7 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
 // ── the script leaves files for every probe ──────────────────────────────────
 {
   const s = canaryScript({ tmpDir: "/t", outsideDir: "/o", decoyPath: "/Users/x/.reeve/d.txt" });
-  check(/touch \.\/INSIDE/.test(s) && /"\/t\/TMP"/.test(s) && /"\/o\/OUTSIDE"/.test(s) && /curl .* -o \.\/curl-body/.test(s) && /cp "\/Users\/x\/.reeve\/d.txt" \.\/decoy-copy/.test(s) && /decoy-copy2/.test(s),
+  check(/touch \.\/INSIDE/.test(s) && /'\/t\/TMP'/.test(s) && /'\/o\/OUTSIDE'/.test(s) && /curl .* -o \.\/curl-body/.test(s) && /cp '\/Users\/x\/.reeve\/d.txt' \.\/decoy-copy/.test(s) && /decoy-copy2/.test(s),
     "every probe writes a file the daemon can stat", s);
   check(!/cat /.test(s), "and none of them prints a file's contents", s);
 }

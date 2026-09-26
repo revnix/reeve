@@ -24,6 +24,7 @@ import { spawn, execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, openSync, writeSync, closeSync, readSync, fstatSync } from "node:fs";
 import { dirname } from "node:path";
 import { platform } from "./platform.mjs";
+import { tmpDirTooLong } from "./workerenv.mjs";
 
 export const OUTCOMES = {
   OK: "ok",
@@ -291,6 +292,12 @@ export function runWorker({
   // handed every worker the founder's tokens and the ssh agent; see workerenv.mjs.
   if (!env || typeof env !== "object") throw new Error("runWorker: env is required; a worker never inherits the supervisor's environment");
   if (!outPath || !errPath) throw new Error("runWorker: outPath and errPath are required; a worker's output must survive the supervisor");
+  // A TMPDIR with no room for the sandbox's sockets (#156): the CLI's sandbox
+  // couldn't start, and every command the worker ran would be refused. Nothing
+  // is spawned, so it's a pre-execution outcome: refunded, backed off, and said.
+  // Here, where every real worker and the canary's start, and nothing else.
+  const tooLong = tmpDirTooLong(String(env.TMPDIR ?? ""));
+  if (tooLong) return Promise.resolve({ outcome: OUTCOMES.UNBOUND, why: tooLong, pid: null, lstart: null, ms: 0, stderr: "", outPath, errPath, truncated: false });
   return new Promise(resolve => {
     // Output goes to durable files, not memory: a restart reads the report from
     // the file, and a worker that prints without end cannot take the supervisor

@@ -843,6 +843,8 @@ const STANDING = `op IN ('pr.published', 'pr.withdrawn', 'pr.merged')`;
 /** The words for a PASS reeve couldn't take back, the same from every place that tries. */
 const PASS_STUCK = (n) => `#${n}: a PASS reeve published may no longer hold, and reeve couldn't withdraw it`;
 const STANDING_UNREAD = "reeve couldn't read which PASSes it has standing, so it couldn't withdraw them";
+/** Whether `why` is PASS_STUCK's words, for some pull request. */
+const isStuck = (why) => { const n = /^#(\d+): /.exec(why)?.[1]; return n != null && why === PASS_STUCK(Number(n)); };
 
 /**
  * What reeve last left at `pr`, as `{ op, head, state, name, id }`, or null
@@ -938,16 +940,27 @@ function say({ db, nwo, profile, logPath, notify: send = notify }, fresh, cleare
 /**
  * Tell a person now what a withdrawal outside a tick couldn't do: the daemon's
  * stop, and `reeve withdraw` after it. It goes through the same record as a
- * tick's announcement, so between them the two push it once, and it clears
- * once a tick re-checks the pull request.
+ * tick's announcement, so between them the two push it once. `stuck` is all
+ * that couldn't be withdrawn, so an earlier alert it no longer names is cleared
+ * here: after a stop no tick comes to clear it. Unless what stands couldn't be
+ * read, when nothing is known to have cleared.
  */
 export function tellStuck(ctx, stuck) {
-  if (!stuck.length) return;
-  let fresh;
-  try { ({ fresh } = announceable(ctx.db, new Map(stuck.map((why) => [why, 1])), { covered: new Set(), complete: false })); }
+  let fresh = [], cleared = [];
+  try {
+    ({ fresh } = announceable(ctx.db, new Map(stuck.map((why) => [why, 1])), { covered: new Set(), complete: false }));
+    if (!stuck.includes(STANDING_UNREAD)) {
+      const now = new Set(stuck);
+      for (const { why } of ctx.db.prepare("SELECT why FROM escalation").all()) {
+        if (now.has(why) || !(isStuck(why) || why === STANDING_UNREAD)) continue;
+        ctx.db.prepare("DELETE FROM escalation WHERE why = ?").run(why);
+        cleared.push(why);
+      }
+    }
+  }
   // A store that can't record it is no reason to stay silent.
   catch { fresh = stuck.map((why) => ({ why, count: 1 })); }
-  say(ctx, fresh);
+  say(ctx, fresh, cleared);
 }
 
 /**
@@ -2209,6 +2222,16 @@ export async function tick(ctx) {
     }
   }
 
+  // HALT THAT ARRIVED while the last pull request was being checked (#161). No
+  // pull request is left in the loop to see it, and the check before dispatch
+  // only stops workers starting, so the PASSes this tick published would stand
+  // until the next tick while reeve checks nothing.
+  if (halted(ctx.haltMarker)) {
+    await takeBackAll("the merge policy is halted");
+    announce();
+    return haltStop("HALTED after the pull requests were checked");
+  }
+
   // A PASS left at a pull request this tick didn't list (#161), asked of GitHub
   // rather than read from the absence. One that merged under it keeps it: it's
   // the record of why, and a merged pull request can't reopen. Any other is
@@ -2582,7 +2605,12 @@ export async function tick(ctx) {
         continue;
       }
       if (started >= cap.canStart) { log(logPath, `  capacity reached; ${decisions.length - started} decision(s) deferred to the next tick`); break; }
-      if (halted(ctx.haltMarker)) { log(logPath, "HALTED before dispatch"); break; }
+      if (halted(ctx.haltMarker)) {
+        log(logPath, "HALTED before dispatch");
+        // The rest of this tick is still said; what it leaves passing isn't left.
+        await takeBackAll("the merge policy is halted");
+        break;
+      }
 
       // Only some decisions are worker tasks. WAIT, PARK, MERGE and ESCALATE are
       // not: two of them are for a human and one is the gate's own job.

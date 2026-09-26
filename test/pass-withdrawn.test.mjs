@@ -10,7 +10,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as daemon from "../src/daemon.mjs";
@@ -224,6 +224,62 @@ test("a PASS reeve couldn't withdraw on HALT is pushed to a person, at the top o
   assert.ok(told.some((a) => /#8: [^\n]*PASS[^\n]*couldn't withdraw/.test(a.message)), JSON.stringify(told));
 });
 
+test("a HALT that arrives while the last pull request is checked withdraws every PASS in that tick", async () => {
+  const { ctx, withdrawn, halt } = setup();
+  // HALT arrives while #8, the last, is being checked: no pull request is left to see it.
+  const t = await daemon.tick({ ...ctx, evaluate: ({ pr: n }) => { if (n === 8) halt(); return evaluation(n); } });
+  assert.equal(t.halted, true);
+  assert.deepEqual(prsOf(withdrawn), [7, 8], JSON.stringify(withdrawn));
+  assert.ok(withdrawn.every((w) => /halted/.test(w.why)), JSON.stringify(withdrawn));
+});
+
+test("a HALT that arrives just before a worker would start withdraws every PASS too", async () => {
+  const { dir, ctx, withdrawn, halt } = setup();
+  // #42's CI is red, so a fixer is wanted; #43 passes. HALT arrives as capacity
+  // is weighed, the step before a worker would start.
+  const red = { ...evaluation(42, "BLOCK", [{ id: "ci", state: "BLOCK", detail: "failing: CI Gate" }]),
+    checks: { verdict: "RED", caused: ["CI Gate"], failing: [{ name: "CI Gate", id: "99" }] } };
+  const spawned = [];
+  await daemon.tick({ ...ctx, execute: true, openPrs: () => [42, 43],
+    profile: { ...ctx.profile, identity: { ...ctx.profile.identity, worktreeRoot: dir, checkout: dir } },
+    evaluate: ({ pr: n }) => (n === 42 ? red : evaluation(n)),
+    resolveCause: () => ({ ok: true, job: "CI Gate", step: "Test", cause: [{ where: "src/x.ts:1", message: "boom" }] }),
+    containment: { credentialRead: "closed", why: "test" }, keychain: { measured: true, items: [], why: null },
+    claudeBin: "/bin/sh", cliVersion: "test",
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+    spawnWorker: async (args) => { spawned.push(args); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s1" }; },
+    capacity: () => { halt(); return { allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }; } });
+  assert.ok(existsSync(ctx.haltMarker), "control: the tick reached the step before a worker would start");
+  assert.equal(spawned.length, 0, "a worker started after HALT");
+  assert.ok(withdrawn.some((w) => w.head === headOf(43) && /halted/.test(w.why)), JSON.stringify(withdrawn));
+});
+
+test("an alert that a PASS couldn't be withdrawn clears once a later withdrawal takes it back", async () => {
+  const { ctx } = setup();
+  await daemon.tick(ctx);
+  const fail = { ...ctx, withdraw: async () => ({ ok: false, why: "HTTP 502" }), notify: () => ({ ok: true }) };
+  daemon.tellStuck(fail, await daemon.withdrawStanding(fail, "the merge policy stopped"));
+  const standing = () => ctx.db.prepare("SELECT why FROM escalation").all().map((r) => r.why).filter((w) => /may no longer hold/.test(w));
+  assert.equal(standing().length, 2, "control: the failed withdrawals are on record");
+  // systemd's reeve withdraw, straight after, succeeds.
+  daemon.tellStuck(ctx, await daemon.withdrawStanding(ctx, "the merge policy stopped"));
+  assert.deepEqual(standing(), [], "the alert still says the PASS couldn't be withdrawn");
+  assert.match(readFileSync(ctx.logPath, "utf8"), /CLEARED: #7: /);
+});
+
+test("no alert is cleared when what stands couldn't be read: nothing is known to have been withdrawn", async () => {
+  const { ctx } = setup();
+  await daemon.tick(ctx);
+  const fail = { ...ctx, withdraw: async () => ({ ok: false, why: "HTTP 502" }), notify: () => ({ ok: true }) };
+  daemon.tellStuck(fail, await daemon.withdrawStanding(fail, "the merge policy stopped"));
+  const standing = () => ctx.db.prepare("SELECT why FROM escalation").all().map((r) => r.why).filter((w) => /may no longer hold/.test(w));
+  assert.equal(standing().length, 2, "control: the failed withdrawals are on record");
+  const blind = await daemon.withdrawStanding({ ...ctx, db: unreadable(ctx.db) }, "the merge policy stopped");
+  daemon.tellStuck({ ...ctx, notify: () => ({ ok: true }) }, blind);
+  assert.equal(standing().length, 2, "an alert was cleared though nothing could be read");
+});
+
 test("a publish that throws doesn't end the tick: the pull requests after it are still published", async () => {
   const published = [];
   const { ctx } = setup({ publish: async (args) => {
@@ -405,6 +461,24 @@ test("reeve withdraw tells a person about a PASS it couldn't withdraw, not only 
   let log = "";
   try { log = readFileSync(join(home, "reeve.log"), "utf8"); } catch { /* none written */ }
   assert.match(`${r.stdout}${r.stderr}${log}`, /NEEDS YOU: #7: [^\n]*PASS[^\n]*couldn't withdraw/, `${r.stdout}${r.stderr}${log}`);
+});
+
+test("reeve withdraw clears the alert a stop raised once nothing is left standing", () => {
+  const home = scratchHome();
+  const store = open(statePathFor(home, NWO));
+  const at = Math.floor(Date.now() / 1000);
+  // The stop couldn't withdraw #7's PASS and said so; since then it was withdrawn.
+  store.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
+    .run(at, "daemon", "pr.withdrawn", "pr:7", JSON.stringify({ head: headOf(7), name: "ops/merge-policy", id: 55, why: "the merge policy stopped" }));
+  const stuck = "#7: a PASS reeve published may no longer hold, and reeve couldn't withdraw it";
+  store.prepare("INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count) VALUES(?,?,?,?,?)").run(stuck, 1, at, at, 1);
+  store.close?.();
+  const r = spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), "withdraw", NWO],
+    { cwd: home, env: { ...process.env, REEVE_HOME: home }, encoding: "utf8", timeout: 60_000 });
+  assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+  const after = open(statePathFor(home, NWO));
+  assert.deepEqual(after.prepare("SELECT why FROM escalation").all().map((x) => x.why), [], "the alert still stands");
+  after.close?.();
 });
 
 test("a one-shot tick refuses --enforce: once it exits, nothing re-checks its PASS or takes it back", () => {

@@ -871,11 +871,12 @@ switch (cmd) {
     const logPath = resolve(opt("log") ?? join(HOME, "reeve.log"));
     const ctx = { nwo, db: open(dbPath), logPath, profile: null };
     const stuck = await withdrawStanding(ctx, "the merge policy stopped");
+    // The profile says where a person is told. It's read after withdrawing, and
+    // one that won't load leaves the telling to the log, so it costs nothing.
+    if (stuck.length) ctx.profile = loadProfile(nwo, { orNull: true });
+    // Also when all were withdrawn: an alert the stop raised then clears.
+    tellStuck(ctx, stuck);
     if (stuck.length) {
-      // The profile says where a person is told. It's read after withdrawing, and
-      // one that won't load leaves the telling to the log, so it costs nothing.
-      ctx.profile = loadProfile(nwo, { orNull: true });
-      tellStuck(ctx, stuck);
       console.error(`reeve withdraw: ${stuck.join("; ")}. Each stands until reeve publishes there again.`);
       process.exit(1);
     }

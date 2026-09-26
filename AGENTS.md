@@ -107,7 +107,8 @@ next:
   The stub sweep runs every file with `scripts/test-reporter.mjs`, which prints
   `PASS  name` and `FAIL  name`. A test that throws anything but an assertion
   error died rather than failed, and never counts as catching a stub. The older
-  script-style tests keep working, and move over only when they're changed.
+  script-style files keep working: put a new case in a `node:test` file of its
+  own rather than into one of them, and move a file over when you rewrite it.
 - **Recovery checks what actually happened before it retries.** Promise safe
   retries and reconciliation, never "exactly once".
 - **Stop after two rounds of the same review disagreement** and ask the founder.

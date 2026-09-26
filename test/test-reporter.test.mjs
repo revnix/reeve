@@ -24,7 +24,13 @@ test("a parent", async (t) => {
   await t.test("child passes", () => {});
   await t.test("child fails", () => { assert.ok(false); });
 });
-describe("a group", () => { it("in a group", () => {}); });
+test("fails on its own", async (t) => {
+  await t.test("inner passes", () => {});
+  assert.equal(1, 2);
+});
+describe("group one", () => { it("same name", () => {}); });
+describe("group two", () => { it("same name", () => { assert.ok(false); }); });
+describe("an empty group", () => {});
 test("skipped", { skip: true }, () => {});
 test("todo", { todo: true }, () => {});
 test("two\\nlines", () => {});
@@ -32,39 +38,46 @@ test("two\\nlines", () => {});
 const run = spawnSync(process.execPath, [`--test-reporter=${REPORTER}`, "--test-reporter-destination=stdout", shapes],
   { encoding: "utf8", timeout: 60_000 });
 const lines = (run.stdout ?? "").split("\n").filter(Boolean);
+const shown = lines.join("\n");
 
 test("a passing test prints PASS and its name", () => {
-  assert.ok(lines.includes("PASS  passes"), lines.join("\n"));
+  assert.ok(lines.includes("PASS  passes"), shown);
 });
 
 test("a failed assertion prints FAIL and its name", () => {
-  assert.ok(lines.includes("FAIL  fails an assertion"), lines.join("\n"));
+  assert.ok(lines.includes("FAIL  fails an assertion"), shown);
 });
 
 test("a test that throws anything but an assertion error prints ERROR, never PASS or FAIL", () => {
-  assert.ok(lines.some((l) => l.startsWith("ERROR  throws a TypeError: ")), lines.join("\n"));
-  assert.ok(!lines.some((l) => /^(PASS|FAIL) {2}throws a TypeError/.test(l)), lines.join("\n"));
+  assert.ok(lines.some((l) => l.startsWith("ERROR  throws a TypeError: ")), shown);
+  assert.ok(!lines.some((l) => /^(PASS|FAIL) {2}throws a TypeError/.test(l)), shown);
 });
 
 test("a test that times out prints ERROR", () => {
-  assert.ok(lines.some((l) => l.startsWith("ERROR  times out: ")), lines.join("\n"));
+  assert.ok(lines.some((l) => l.startsWith("ERROR  times out: ")), shown);
 });
 
-test("subtests print each, and their parent fails with them", () => {
-  assert.deepEqual(lines.filter((l) => /child|a parent/.test(l)), ["PASS  child passes", "FAIL  child fails", "FAIL  a parent"]);
+test("a test inside another is named with the path to it, so the same name in two places reads as two tests", () => {
+  assert.ok(lines.includes("PASS  group one > same name") && lines.includes("FAIL  group two > same name")
+    && lines.includes("PASS  a parent > child passes") && lines.includes("FAIL  a parent > child fails"), shown);
+  assert.ok(!lines.some((l) => / {2}same name$/.test(l)), shown);
+});
+
+test("a test with subtests prints only a failure of its own: its subtests' failures are theirs", () => {
+  assert.ok(!lines.some((l) => / {2}a parent$/.test(l)), shown);
+  assert.ok(lines.includes("FAIL  fails on its own") && lines.includes("PASS  fails on its own > inner passes"), shown);
 });
 
 test("a describe block prints nothing, and the tests in it print", () => {
-  assert.ok(lines.includes("PASS  in a group"), lines.join("\n"));
-  assert.ok(!lines.some((l) => / {2}a group$/.test(l)), lines.join("\n"));
+  assert.ok(!lines.some((l) => / {2}(group one|group two|an empty group)$/.test(l)), shown);
 });
 
 test("a skipped or todo test prints nothing", () => {
-  assert.ok(!lines.some((l) => /skipped|todo/.test(l)), lines.join("\n"));
+  assert.ok(!lines.some((l) => /skipped|todo/.test(l)), shown);
 });
 
 test("a name on several lines prints on one", () => {
-  assert.ok(lines.includes("PASS  two lines"), lines.join("\n"));
+  assert.ok(lines.includes("PASS  two lines"), shown);
 });
 
 test("the file exits as node decides: non-zero when a test failed", () => {

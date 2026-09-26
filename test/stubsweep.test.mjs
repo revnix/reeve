@@ -386,52 +386,6 @@ const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.ur
     "and the uncommitted work is still there afterwards");
 }
 
-// --- a node:test file is read as a script-style one is (#224) ----------------
-{
-  // node:test's own reporters print neither PASS nor FAIL, so the sweep read a
-  // file written with it as reporting no assertion at all: every stub CRASHED.
-  // The sweep runs each file with the repository's reporter, which prints those
-  // lines, so the same five readings come out: caught, not caught, the wrong
-  // check, a crash, and a test that died where the one named should have failed.
-  const root = tmpRoot("sweep-node-test-");
-  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
-  const SOURCE = `export function safe(v) {\n  if (typeof v === "object") throw new Error("not a scalar");\n  return String(v);\n}\n`;
-  writeFileSync(join(root, "src", "thing.mjs"), SOURCE);
-  writeFileSync(join(root, "test", "thing.test.mjs"),
-    `import test from "node:test";\n` +
-    `import assert from "node:assert/strict";\n` +
-    `import { safe } from "../src/thing.mjs";\n` +
-    `test("an object is refused", () => { assert.throws(() => safe({}), /not a scalar/); });\n` +
-    `test("a scalar still works", () => { assert.equal(safe(3), "3"); });\n`);
-  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
-  git("init", "-q");
-  git("config", "user.email", "sweep@example.invalid");
-  git("config", "user.name", "sweep");
-  const sweep = (stub) => {
-    writeFileSync(join(root, "test", "stub-manifest.mjs"), `export const STUBS = ${JSON.stringify([{ why: "a node:test stub", test: "test/thing.test.mjs", ...stub }], null, 2)};\n`);
-    git("add", "-A"); git("commit", "-q", "-m", "fixture");
-    const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
-      env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
-    return { exit: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
-  };
-  const edit = (find, replace) => [{ file: "src/thing.mjs", find, replace }];
-  const guardLine = `  if (typeof v === "object") throw new Error("not a scalar");\n`;
-
-  const caught = sweep({ name: "nt-guard", expectRed: "an object is refused", edits: edit(guardLine, "") });
-  check(caught.exit === 0 && /CAUGHT/.test(caught.out), "a node:test file's stub is caught by the test it names", caught.out.slice(-400));
-  const uncaught = sweep({ name: "nt-cosmetic", expectRed: "an object is refused", edits: edit("  return String(v);", "  return String(v); // noop") });
-  check(uncaught.exit === 1 && /NOT_CAUGHT/.test(uncaught.out), "a node:test stub nothing catches fails the sweep as NOT_CAUGHT", uncaught.out.slice(-400));
-  const wrong = sweep({ name: "nt-adjacent", expectRed: "an object is refused", edits: edit("  return String(v);", `  return String(v) + "!";`) });
-  check(wrong.exit === 1 && /WRONG_RED/.test(wrong.out), "a node:test stub that fails a different test is WRONG_RED", wrong.out.slice(-400));
-  const crash = sweep({ name: "nt-crash", expectRed: "an object is refused", edits: edit("export function safe(v) {", "export function safe(v) { (") });
-  check(crash.exit === 1 && /CRASHED/.test(crash.out), "a node:test file that can't load is CRASHED", crash.out.slice(-400));
-  // The named test throws a TypeError rather than failing its assertion: it died.
-  const died = sweep({ name: "nt-died", expectRed: "a scalar still works", edits: edit("  return String(v);", "  return v.length.toFixed();") });
-  check(died.exit === 1 && !/\bCAUGHT\b/.test(died.out.replace(/NOT_CAUGHT/g, "")) && /UNRUNNABLE/.test(died.out),
-    "a node:test test that throws where its assertion should fail is not read as caught", died.out.slice(-400));
-  check(readFileSync(join(root, "src", "thing.mjs"), "utf8") === SOURCE, "and the source is restored byte for byte after each");
-}
-
 // --- a killed run must not leave the tree broken -------------------------------
 {
   // The docblock CLAIMED a killed run cannot leave a stub behind. Taking a

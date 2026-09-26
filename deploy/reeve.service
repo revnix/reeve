@@ -2,8 +2,8 @@
 # equivalent is com.revnix.reeve.plist, and this file follows the same rules.
 #
 # Before installing, edit ExecStart: `run nextlyhq/nextly` names the repository
-# the daemon watches, so change it to yours. Change the node and checkout paths
-# too if they live elsewhere.
+# the daemon watches, so change it to yours, and ExecStopPost's to the same one.
+# Change the node and checkout paths too if they live elsewhere.
 #
 # Install (README, "Running it unattended"):
 #   mkdir -p ~/.config/systemd/user
@@ -39,6 +39,11 @@ StartLimitIntervalSec=0
 # appears: the shadow period publishes neutral conclusions and dispatches
 # nothing, and both flags are opt-in.
 ExecStart=%h/.nvm/versions/node/v24.21.0/bin/node %h/code/nextly-workspace/reeve/bin/reeve run nextlyhq/nextly
+# After the daemon stops, however it stopped, withdraw every PASS it left
+# standing: a crash or a kill runs nothing of the daemon's own, and a PASS stays
+# on its commit until something writes over it. After a normal stop the daemon
+# has withdrawn them itself, and this finds none. The next start publishes again.
+ExecStopPost=%h/.nvm/versions/node/v24.21.0/bin/node %h/code/nextly-workspace/reeve/bin/reeve withdraw nextlyhq/nextly
 WorkingDirectory=%h/code/nextly-workspace/reeve
 
 # ~/.local/bin holds the claude binary the workers are spawned from.

@@ -13,7 +13,7 @@ import { loadRegistry } from "../src/build/registryio.mjs";
 import { snapshot, restore, latestSnapshot, exportEvents,
          snapshotAll, restoreHub, validateSnapshot } from "../src/backup.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
-import { run, tick, measuredContainment } from "../src/daemon.mjs";
+import { run, tick, measuredContainment, withdrawStanding } from "../src/daemon.mjs";
 import { readState, render as renderStatus, statusline, why, cleanMergeRate } from "../src/status.mjs";
 import { init } from "../src/init.mjs";
 import { writeDash } from "../src/dash.mjs";
@@ -852,6 +852,26 @@ switch (cmd) {
     //
     // Old divergences stay listed above. They are history to read, not a veto.
     process.exit(sk.days >= need ? 0 : 3);
+  }
+
+  // AFTER THE DAEMON, however it stopped (#161). A PASS stays on its commit until
+  // something writes over it, so one a crashed or killed daemon left would stand
+  // while nothing checks. systemd runs this as ExecStopPost, and it withdraws
+  // every PASS the store says reeve has standing on the repository. After a stop
+  // the daemon withdrew them itself, and this finds none.
+  case "withdraw": {
+    const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
+    if (!nwo) { console.error("reeve withdraw: no repo. Pass owner/repo or run inside a git checkout."); process.exit(1); }
+    // Same resolution as the daemon, or the two would read different stores.
+    const dbPath = resolve(opt("db") ?? stateFor(nwo));
+    if (!existsSync(dbPath)) { console.error(`reeve withdraw: ${missingStoreMessage(dbPath, { initCreatesIt: !opt("db"), nwo })}`); process.exit(1); }
+    const logPath = resolve(opt("log") ?? join(HOME, "reeve.log"));
+    const failed = await withdrawStanding({ nwo, db: open(dbPath), logPath }, "the merge policy stopped");
+    if (failed.length) {
+      console.error(`reeve withdraw: could not withdraw the PASS on ${failed.map((n) => `#${n}`).join(", ")}: it stands until reeve publishes there again`);
+      process.exit(1);
+    }
+    process.exit(0);
   }
 
   // These four share one body below. A new subcommand must get its OWN block
@@ -2484,6 +2504,8 @@ function usage() {
       --enforce             publish real conclusions (default: shadow/neutral)
       --interval <seconds>  default 90
       --halt <path>         marker file that stops everything (default ~/.reeve/HALT)
+  withdraw [owner/repo] withdraw every PASS reeve left standing there; systemd runs it
+                        after the daemon stops, however it stopped
 
   everywhere:
       --home <dir>          the reeve home to operate on (default $REEVE_HOME, else ~/.reeve)

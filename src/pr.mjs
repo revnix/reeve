@@ -1069,3 +1069,34 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = "o
              id, conclusion, name, wouldBe: real, shadow, updated: Boolean(existing), superseded, held };
   return { ok: true, id, conclusion, name, wouldBe: real, shadow, updated: Boolean(existing), superseded, held };
 }
+
+/**
+ * Take a PASS back (#161). reeve's own run under `name` at `head` is marked
+ * cancelled, which a required check reads as not passed, until the next publish
+ * writes over it. Cancelled rather than in progress: GitHub takes it on a
+ * completed run, as the shadow supersede above does, and the run keeps its
+ * identity, so the next publish finds it again. A second run left in progress
+ * might not be the one that publish updates, and would hold the check for ever.
+ * With no `id`, reeve's own latest run under the name at the head is looked up.
+ *
+ * The run's text shows on the watched repository's pull requests, so it names
+ * the merge policy, never reeve.
+ */
+export async function withdrawVerdict({ nwo, head, name, id = null, why,
+                                        auth: authenticateAs = authenticate, api = apiAsInstallation }) {
+  const auth = await authenticateAs(nwo);
+  if (!auth.ok) return { ok: false, why: auth.why };
+  let run = id;
+  if (run == null) {
+    const runs = existingRuns(auth.token, nwo, head, [name], api);
+    if (!runs) return { ok: false, why: `the check runs at ${head.slice(0, 8)} couldn't be read` };
+    run = runs.mine[name]?.id ?? null;
+    // Nothing of reeve's stands there, so there is nothing to take back.
+    if (run == null) return { ok: true, id: null };
+  }
+  const res = api(auth.token, ["-X", "PATCH", `repos/${nwo}/check-runs/${run}`, "-f", "status=completed", "-f", "conclusion=cancelled",
+    "-f", `output[title]=${`Withdrawn: ${why}`.slice(0, 250)}`,
+    "-f", `output[summary]=The merge policy withdrew its result here: ${why}. A withdrawn result doesn't pass. It publishes a new one once it can check this pull request again.`]);
+  if (!res.ok) return { ok: false, why: String(res.err ?? "").split("\n")[0] };
+  return { ok: true, id: run };
+}

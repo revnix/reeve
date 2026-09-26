@@ -13,7 +13,7 @@ import { loadRegistry } from "../src/build/registryio.mjs";
 import { snapshot, restore, latestSnapshot, exportEvents,
          snapshotAll, restoreHub, validateSnapshot } from "../src/backup.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
-import { run, tick, measuredContainment } from "../src/daemon.mjs";
+import { run, tick, measuredContainment, withdrawStanding, tellStuck } from "../src/daemon.mjs";
 import { readState, render as renderStatus, statusline, why, cleanMergeRate } from "../src/status.mjs";
 import { init } from "../src/init.mjs";
 import { writeDash } from "../src/dash.mjs";
@@ -492,14 +492,16 @@ function detectNwo() {
   } catch { return null; }
 }
 
-function loadProfile(nwo) {
+// With `orNull`, a profile that won't load is said and read as none, for a
+// command that must go on without one.
+function loadProfile(nwo, { orNull = false } = {}) {
   const sidecar = join(HOME, "profiles", `${nwo}.json`);
   const inRepo = join(process.cwd(), ".ops", "profile.json");
   for (const p of [inRepo, sidecar]) {
     if (!existsSync(p)) continue;
     let raw;
     try { raw = JSON.parse(readFileSync(p, "utf8")); }
-    catch (e) { console.error(`reeve: ${p} is not valid JSON — ${e.message}`); process.exit(1); }
+    catch (e) { console.error(`reeve: ${p} is not valid JSON — ${e.message}`); if (orNull) return null; process.exit(1); }
     const profile = withDefaults(raw);
     const r = validate(profile);
     if (!r.ok) {
@@ -507,6 +509,7 @@ function loadProfile(nwo) {
       // half-loaded profile is how a gate ends up judging the wrong check name.
       console.error(`reeve: ${p} is invalid`);
       for (const e of r.errors) console.error("  error:", e);
+      if (orNull) return null;
       process.exit(1);
     }
     for (const w of r.warnings) console.error("  warn:", w);
@@ -852,6 +855,32 @@ switch (cmd) {
     //
     // Old divergences stay listed above. They are history to read, not a veto.
     process.exit(sk.days >= need ? 0 : 3);
+  }
+
+  // AFTER THE DAEMON, however it stopped (#161). A PASS stays on its commit until
+  // something writes over it, so one a crashed or killed daemon left would stand
+  // while nothing checks. systemd runs this as ExecStopPost, and it withdraws
+  // every PASS the store says reeve has standing on the repository. After a stop
+  // the daemon withdrew them itself, and this finds none.
+  case "withdraw": {
+    const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
+    if (!nwo) { console.error("reeve withdraw: no repo. Pass owner/repo or run inside a git checkout."); process.exit(1); }
+    // Same resolution as the daemon, or the two would read different stores.
+    const dbPath = resolve(opt("db") ?? stateFor(nwo));
+    if (!existsSync(dbPath)) { console.error(`reeve withdraw: ${missingStoreMessage(dbPath, { initCreatesIt: !opt("db"), nwo })}`); process.exit(1); }
+    const logPath = resolve(opt("log") ?? join(HOME, "reeve.log"));
+    const ctx = { nwo, db: open(dbPath), logPath, profile: null };
+    const stuck = await withdrawStanding(ctx, "the merge policy stopped");
+    // The profile says where a person is told. It's read after withdrawing, and
+    // one that won't load leaves the telling to the log, so it costs nothing.
+    if (stuck.length) ctx.profile = loadProfile(nwo, { orNull: true });
+    // Also when all were withdrawn: an alert the stop raised then clears.
+    tellStuck(ctx, stuck);
+    if (stuck.length) {
+      console.error(`reeve withdraw: ${stuck.join("; ")}. Each stands until reeve publishes there again.`);
+      process.exit(1);
+    }
+    process.exit(0);
   }
 
   // These four share one body below. A new subcommand must get its OWN block
@@ -2281,6 +2310,14 @@ switch (cmd) {
 
   case "run":
   case "tick": {
+    // A ONE-SHOT TICK DOESN'T ENFORCE (#161). A PASS stays on its commit until
+    // something writes over it, and once this pass exits nothing re-checks it
+    // or takes it back. The daemon does both, so enforcing is left to it.
+    if ((cmd === "tick" || flag("tick")) && flag("enforce")) {
+      console.error(`reeve ${cmd}: --enforce needs the daemon. A one-shot tick would leave the PASS it publishes standing, ` +
+                    "with nothing to re-check it or take it back. Run `reeve run --enforce`, or tick without --enforce, in shadow mode.");
+      process.exit(1);
+    }
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
     if (!nwo) { console.error("reeve run: no repo. Pass owner/repo or run inside a git checkout."); process.exit(1); }
     const profile = loadProfile(nwo);
@@ -2479,11 +2516,13 @@ function usage() {
   build status          who holds the builder lease, and since when
 
   run [owner/repo]      the daemon: watch, publish, decide, on a loop
-      --tick                one pass and exit
+      --tick                one pass and exit, in shadow mode only
       --execute             dispatch workers (default: report only)
       --enforce             publish real conclusions (default: shadow/neutral)
       --interval <seconds>  default 90
       --halt <path>         marker file that stops everything (default ~/.reeve/HALT)
+  withdraw [owner/repo] withdraw every PASS reeve left standing there; systemd runs it
+                        after the daemon stops, however it stopped
 
   everywhere:
       --home <dir>          the reeve home to operate on (default $REEVE_HOME, else ~/.reeve)

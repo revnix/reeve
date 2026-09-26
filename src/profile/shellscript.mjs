@@ -336,6 +336,8 @@ export function scriptShells(paths) {
   if (shells.length === 1) return shells[0];
   return { name: [...new Set(shells.map((s) => s.name))].join(" or "), paths: shells.flatMap((s) => s.paths),
            builtins: new Set(shells.flatMap((s) => [...s.builtins])), keywords: new Set(shells.flatMap((s) => [...s.keywords])),
+           // The keywords every one of them has: `time` is bash's alone, and a program in dash.
+           allKeywords: new Set([...shells[0].keywords].filter((k) => shells.every((s) => s.keywords.has(k)))),
            execOptions: shells.some((s) => s.execOptions), execEndsOptions: shells.some((s) => s.execEndsOptions),
            appendAssign: shells.some((s) => s.appendAssign), pipefail: allHave(shells.map((s) => s.pipefail)),
            badOptionEnds: allHave(shells.map((s) => s.badOptionEnds)),
@@ -780,11 +782,17 @@ function builtin(name, args, path, state, ctx) {
       if (listing && ctx.shell?.pTakesOperands !== true) {
         // Whether PATH took a value, or was made read-only, depends on the
         // shell. A bare name gives it no value in either.
+        // A read-only PATH keeps its own in both: dash lists, and bash's
+        // assignment fails.
         const operands = args.slice(k);
-        if (operands.some((w) => assignment(w, ctx.shell)?.name === "PATH" || w.expansion)) state.path = null;
+        if (state.pathReadonly !== true && operands.some((w) => assignment(w, ctx.shell)?.name === "PATH" || w.expansion)) state.path = null;
         if (name === "readonly" && state.pathReadonly === false
             && operands.some((w) => (assignment(w, ctx.shell)?.name ?? w.text) === "PATH" || w.expansion)) state.pathReadonly = "maybe";
-        return UNKNOWN;
+        // It succeeds in both when it assigns nothing but a writable PATH: bash
+        // assigns, and dash lists. Another name may be read-only, as bash's EUID
+        // is, and then bash fails where dash doesn't.
+        const onlyPath = operands.every((w) => !w.expansion && (assignment(w, ctx.shell)?.name ?? "PATH") === "PATH");
+        return onlyPath && state.pathReadonly === false ? OK : UNKNOWN;
       }
       for (const w of args.slice(k)) {
         const a = assignment(w, ctx.shell);
@@ -811,6 +819,10 @@ function builtin(name, args, path, state, ctx) {
       const outcome = unsure ? UNKNOWN : OK;
       if (fn && (!vars || last === "f")) return outcome;
       for (const w of args.slice(k)) {
+        // -v last, and PATH read-only: bash refuses the command, and dash fails
+        // to unset it. It fails in both, and ends dash.
+        if (unsure && !w.expansion && !w.glob && w.text === "PATH" && state.pathReadonly === true)
+          return { ...failing("unsets PATH after making it read-only, which fails in every shell that may run it"), stop: "maybe" };
         if (w.expansion || w.glob || (unsure && w.text === "PATH")) {
           if (state.pathReadonly !== false) return { o: "?", stop: "maybe" };
           state.path = null;
@@ -894,7 +906,15 @@ function command(words, path, state, ctx, named = false) {
     let k = 0;
     while (args[k]?.text === "-p") k++;
     if (args[k]?.text === "--") k++;
-    return args.length > k ? simple(args.slice(k), state, ctx) : OK;
+    const timed = args.length > k ? simple(args.slice(k), state, ctx) : OK;
+    // Where only some of the shells that may run the script have `time` as a
+    // keyword, it is a program in the others, which a local one may shadow:
+    // read it both ways, and take what both say (#228).
+    if (shell.allKeywords && !shell.allKeywords.has("time")) {
+      const asProgram = program(words, path, { ...state }, ctx);
+      return { ...either(timed, asProgram), mutates: Boolean(timed.mutates || asProgram.mutates) };
+    }
+    return timed;
   }
   if (shell?.builtins.has(name.text)) {
     const r = builtin(name.text, args, path, state, ctx);
@@ -1011,11 +1031,23 @@ const inverted = (r) => {
 };
 
 // A command that writes nothing, which the next closing the pipe can't stop:
-// `true` or `:`, the shell's or the program, or assignments alone, though a
-// pipeline doubts any command with an assignment for its own reason.
+// `true`, `:` or `exit`, or assignments alone, though a pipeline doubts an
+// assignment for its own reason.
 const writesNothing = (cmd, shell) => {
   const word = cmd.words.find((w) => !assignment(w, shell));
-  return !word || (!word.expansion && (word.text === "true" || word.text === ":"));
+  return !word || (!word.expansion && ["true", ":", "exit"].includes(word.text));
+};
+
+// Builtins whose operands the shell assigns, as it does a leading assignment.
+const ASSIGNING = new Set(["export", "readonly", "declare", "typeset", "local"]);
+// Whether a command assigns: a word shaped like an assignment before its name,
+// or an operand of one of those builtins. After any other name, `X=1` is an
+// argument, and `true X=1` assigns nothing.
+const assigns = (cmd, shell) => {
+  const k = cmd.words.findIndex((w) => !assignment(w, shell));
+  if (k > 0 || (k < 0 && cmd.words.length)) return true;
+  const name = cmd.words[0];
+  return Boolean(name && !name.quoted && ASSIGNING.has(name.text) && cmd.words.slice(1).some((w) => assignment(w, shell)));
 };
 
 // A command whose redirection may fail: then it doesn't run, and fails. So it
@@ -1060,7 +1092,7 @@ function pipeline(list, i, state, ctx) {
   // assignment to a read-only variable, as bash's own EUID and UID are. So one
   // with an expansion, in a word or in a redirection such as a here-string, or
   // with an assignment, never surely succeeds.
-  const sure = (k, e) => (e.o === "ok" && (list[k].expansion || list[k].words.some((w) => assignment(w, ctx.shell))) ? UNKNOWN : e);
+  const sure = (k, e) => (e.o === "ok" && (list[k].expansion || assigns(list[k], ctx.shell)) ? UNKNOWN : e);
   const r = sure(j, run(j));
   // Under pipefail it fails when any of them fails. One before the last that
   // writes may be stopped by the next closing the pipe, so it never surely

@@ -268,10 +268,12 @@ export const CREDENTIAL_PATHS = [
  *                     command outside the sandbox on request.
  *   /run/dbus         the system bus.
  */
-export function hostEscapePaths({ platform = process.platform, uid = process.getuid?.(), mounts } = {}) {
+export function hostEscapePaths({ platform = process.platform, uid = process.getuid?.(), mounts, atTarget = linkFree } = {}) {
   if (platform !== "linux") return [];
   const drives = (windowsDriveRoots(mounts) ?? []).filter(d => d !== "/mnt" && !d.startsWith("/mnt/"));
-  return ["/mnt", ...drives, "/run/WSL", ...(Number.isInteger(uid) ? [`/run/user/${uid}`] : []), "/run/dbus"];
+  // Each at its target where the host makes one a link, as Fedora's ostree
+  // variants make /mnt one to /var/mnt: bubblewrap can't mount over a link (#156).
+  return ["/mnt", ...drives, "/run/WSL", ...(Number.isInteger(uid) ? [`/run/user/${uid}`] : []), "/run/dbus"].map(p => atTarget(p, platform));
 }
 
 /**
@@ -374,9 +376,20 @@ export function linkFree(p, platform = process.platform) {
  * has its own clone and its dependencies were copied in before it started — so
  * it is denied like any other credential path.
  */
-export function sourceCheckoutOf(profile) {
+export function sourceCheckoutOf(profile, platform = process.platform) {
   const c = profile?.identity?.checkout;
-  return typeof c === "string" && c.startsWith("/") ? [c.replace(/\/+$/, "")] : [];
+  // At its target on Linux, as every path the sandbox is given (#156).
+  return typeof c === "string" && c.startsWith("/") ? [linkFree(c.replace(/\/+$/, "") || "/", platform)] : [];
+}
+
+/**
+ * The publishing credential the profile names by absolute path, as the sandbox
+ * must be given it: at its target on Linux. The policy and the check of it both
+ * read it here, so the two name the same path (#156).
+ */
+export function notifyCredOf(profile, platform = process.platform) {
+  const c = profile?.notify?.credentialFile;
+  return typeof c === "string" && c.startsWith("/") ? [linkFree(c, platform)] : [];
 }
 
 /**
@@ -585,7 +598,7 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
   // The publishing credential the profile names by absolute path: outside every
   // hard-coded credential directory, so it must be denied explicitly or a worker
   // could copy the token into a source file. (Codex #4f-[8].)
-  const notifyCred = typeof profile?.notify?.credentialFile === "string" && profile.notify.credentialFile.startsWith("/") ? [profile.notify.credentialFile] : [];
+  const notifyCred = notifyCredOf(profile);
   const risk = profile?.risk ?? {};
   const units = profile?.units ?? [];
 

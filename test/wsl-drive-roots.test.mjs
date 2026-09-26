@@ -68,3 +68,9 @@ test("containment stays open on Linux when the mount table can't be read, since 
   const ok = cheapContainmentReasons({ platform: "linux", isolated: true, keychain: kc, mounts: MOUNTS });
   assert.deepEqual(ok.reasons, [], "control: a readable table adds no reason");
 });
+
+test("on Linux a host path the distro makes a link is denied at its target, as Fedora's ostree variants make /mnt a link to /var/mnt", () => {
+  const atTarget = (p) => (p === "/mnt" ? "/var/mnt" : p);
+  const paths = hostEscapePaths({ platform: "linux", uid: 1000, mounts: "", atTarget });
+  assert.ok(paths.includes("/var/mnt") && !paths.includes("/mnt"), JSON.stringify(paths));
+});

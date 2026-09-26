@@ -20,7 +20,7 @@ import { nextAction, describe, ACTIONS, ESCALATIONS } from "./watcher.mjs";
 import { POLICY_CONTEXT, reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, isSameProcess, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
-import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf, siblingRootsOf, hostEscapePaths, worktreeRootOf, linkFree } from "./sandbox.mjs";
+import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf, siblingRootsOf, hostEscapePaths, worktreeRootOf, linkFree, notifyCredOf } from "./sandbox.mjs";
 import { verifyConfig, GIT_NEUTRALISE, gitEnv } from "./gitguard.mjs";
 import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor, commitRunWork, digestOf } from "./checkout.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
@@ -3063,7 +3063,7 @@ export async function tick(ctx) {
         if (sandbox.unrepresentableQuarantine?.length)
           throw new Error(`quarantined path(s) cannot be enforced by the OS sandbox: ${sandbox.unrepresentableQuarantine.join(", ")}`);
         const qDenies = quarantineOsDenies(worktree, profile.risk?.quarantinePaths ?? []).paths;
-        const notifyCred = typeof profile.notify?.credentialFile === "string" && isAbsolute(profile.notify.credentialFile) ? [profile.notify.credentialFile] : [];
+        const notifyCred = notifyCredOf(profile);
         const sv = (ctx.settingsValidator ?? validateSettings)(sandbox.settings, { tmpDir, stateRoots: dStateRoots, quarantineDenies: qDenies,
                                                                                   extraDenies: notifyCred, sourceCheckout: sourceCheckoutOf(profile),
                                                                                   siblingRoots: siblingRootsOf(profile).filter(r => worktree !== r && !r.startsWith(worktree + "/")),

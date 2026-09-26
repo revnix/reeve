@@ -19,7 +19,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { canaryIdFor, canaryScript, instrumentHash, linuxProbeTargets, probeShapeOf, sandboxCanary } from "../src/canary.mjs";
-import { cheapContainmentReasons } from "../src/containment.mjs";
+import { cheapContainmentReasons, measureContainment } from "../src/containment.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 
@@ -153,6 +153,21 @@ test("the gate accepts Linux as it does macOS, and still refuses a platform neve
   assert.deepEqual(reasons("linux"), []);
   assert.deepEqual(reasons("darwin"), []);
   assert.match(reasons("win32").join(" "), /unmeasured on win32/);
+});
+
+test("a closed Linux verdict doesn't claim a keychain it never measured", async () => {
+  // The keychain probe is macOS only, so on Linux it answers unmeasured. A
+  // verdict that says the keychain holds no GitHub credential would be stating
+  // evidence nobody gathered.
+  const ask = (platform, keychain) => measureContainment({ cliVersion: base.cliVersion, sandbox: base.sandbox, permissionsDeny: base.permissionsDeny,
+    canaryPaths: { dir: base.dir }, bin: base.bin, env: base.env, platform, isolated: true, keychain, mounts: "", linuxTargets: everything,
+    canary: { ok: true, id: "c1", why: null } });
+  const linuxV = await ask("linux", { measured: false, items: [], why: "keychain probe is only measured on macOS (this is linux)" });
+  assert.equal(linuxV.credentialRead, "closed", linuxV.why);
+  assert.doesNotMatch(linuxV.why, /holds no GitHub credential/);
+  assert.match(linuxV.why, /keychain wasn't measured/);
+  const macV = await ask("darwin", { measured: true, items: [], why: null });
+  assert.match(macV.why, /holds no GitHub credential/, "control: a measured, empty keychain is still reported so");
 });
 
 test("the daemon finds the Linux targets it can reach itself, and names the ones it can't", { skip: process.platform !== "linux" && "Linux only" }, async () => {

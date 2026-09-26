@@ -29,7 +29,7 @@ import { probeKeychain } from "../src/containment.mjs";
 import { netListener } from "../src/canary.mjs";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { tempDir } from "./fixtures/temp.mjs";
@@ -52,7 +52,14 @@ const skip = (name, why) => test(name, { skip: why }, () => {});
 // Under the founder's HOME, not the system tmp: the sandbox's own write scope
 // includes temp areas, and a fixture placed there measured nothing (same doc).
 const root = join(homedir(), ".cache", "reeve-tests", `escape-${process.pid}`);
-rmSync(root, { recursive: true, force: true }); mkdirSync(root, { recursive: true });
+// Folders the probe makes in that home, for its fixture and its decoys, so the
+// teardown leaves the home as it found it: each is removed once it's empty.
+const madeInHome = [];
+const mkdirInHome = (dir) => {
+  for (let d = dir; !existsSync(d); d = dirname(d)) madeInHome.push(d);
+  mkdirSync(dir, { recursive: true });
+};
+rmSync(root, { recursive: true, force: true }); mkdirInHome(root);
 const sh = (cwd, cmd, args, env = process.env, input) => spawnSync(cmd, args, { cwd, env, encoding: "utf8", input });
 const git = (cwd, ...args) => { const r = sh(cwd, "git", args); if (r.status !== 0) throw new Error(r.stderr); return r.stdout.trim(); };
 
@@ -168,7 +175,7 @@ if (!["darwin", "linux"].includes(process.platform)) {
   // A decoy under a deny-read path stands in for every file credential; its
   // content is not a secret and is never printed.
   const decoy = join(homedir(), ".reeve", "canary", `escape-decoy-${process.pid}.txt`);
-  mkdirSync(dirname(decoy), { recursive: true }); writeFileSync(decoy, "decoy\n");
+  mkdirInHome(dirname(decoy)); writeFileSync(decoy, "decoy\n");
   const outside = join(root, "outside"); mkdirSync(outside, { recursive: true });
   // Production denies whole directories AND individual files (the log, the
   // database, ~/.gitconfig, notify.credentialFile). This pair proves the second
@@ -182,7 +189,7 @@ if (!["darwin", "linux"].includes(process.platform)) {
   // Git's `store` helper writes tokens here under the XDG layout; the deny must
   // cover it, so a decoy of our own goes there and is removed afterwards.
   const xdgDecoy = join(homedir(), ".config", "git", `reeve-escape-probe-${process.pid}`);
-  mkdirSync(dirname(xdgDecoy), { recursive: true }); writeFileSync(xdgDecoy, "decoy\n");
+  mkdirInHome(dirname(xdgDecoy)); writeFileSync(xdgDecoy, "decoy\n");
   const deniedCfg = join(homedir(), ".reeve", "canary", `escape-cfg-${process.pid}`);
   writeFileSync(deniedCfg, "[user]\n\temail = x@x\n");
   writeFileSync(join(tmpDir, "gitconfig"), "[user]\n\temail = x@x\n");
@@ -205,7 +212,7 @@ if (!["darwin", "linux"].includes(process.platform)) {
     : ["/mnt/c/Windows/System32/drivers/etc/hosts", "/mnt/reeve-escape-decoy.txt"].find(f => sh(root, "test", ["-r", f]).status === 0)
       ?? (sh(root, "sh", ["-c", "find /mnt -maxdepth 3 -type f -readable -print -quit 2>/dev/null"]).stdout.trim() || null);
   const ghDecoy = join(homedir(), ".config", "gh", `reeve-escape-decoy-${process.pid}`);
-  mkdirSync(dirname(ghDecoy), { recursive: true }); writeFileSync(ghDecoy, "decoy\n");
+  mkdirInHome(dirname(ghDecoy)); writeFileSync(ghDecoy, "decoy\n");
   const windowsExe = "/mnt/c/Windows/System32/cmd.exe";
   // Once per folder: the copy keeps the Windows file's read-only mode.
   const plant = (cwd) => { if (process.platform === "linux" && existsSync(windowsExe) && !existsSync(join(cwd, "committed.exe"))) copyFileSync(windowsExe, join(cwd, "committed.exe")); };
@@ -395,3 +402,5 @@ ${JSON.stringify(process.execPath)} -e 'require("net").createServer().listen("./
 check(CONTAINMENT.credentialRead === "closed-by-home-and-path", "control: the module declares the closure this file just measured, and the canary re-proves it per CLI build", JSON.stringify(CONTAINMENT));
 
 rmSync(root, { recursive: true, force: true });
+// Deepest first, and only what's empty: a folder the founder had keeps what's in it.
+for (const d of [...madeInHome].sort((a, b) => b.length - a.length)) { try { rmdirSync(d); } catch { /* not empty, or gone */ } }

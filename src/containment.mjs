@@ -119,6 +119,13 @@ export function cheapContainmentReasons({ platform = process.platform, isolated 
   return { reasons, keychain: kc };
 }
 
+// What the verdict says of the keychain: only what was measured. It's reported,
+// not a gate, and its probe is macOS only, so a closed verdict on Linux never
+// looked, and one on macOS can stand with items in it (#156).
+const keychainNote = kc => !kc?.measured ? `; the keychain wasn't measured (${kc?.why ?? "no probe ran"})`
+  : kc.items?.length ? `; the keychain holds ${kc.items.length} GitHub item(s), reported rather than gated: ${kc.why ?? "see the probe"}`
+  : ", and the keychain holds no GitHub credential";
+
 export async function measureContainment({
   cliVersion, sandbox, permissionsDeny, allowedTools = null, canaryPaths, bin, env, binaryId = null, stateRoots = null,
   stateDir, nwo, platform = process.platform, isolated = false, netProbe = null,
@@ -190,7 +197,7 @@ export async function measureContainment({
 
   return {
     credentialRead: reasons.length ? "open" : "closed",
-    why: reasons.length ? reasons.join("; ") : `canary ${cn.id} passed, an isolated worker is declared, and the keychain holds no GitHub credential`,
+    why: reasons.length ? reasons.join("; ") : `canary ${cn.id} passed and an isolated worker is declared${keychainNote(kc)}`,
     canary: cn, keychain: kc, platform, isolated, binaryId, at: now(),
   };
 }

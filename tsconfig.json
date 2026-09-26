@@ -4,6 +4,10 @@
     "checkJs": false,
     "noEmit": true,
     "target": "es2024",
+    "lib": [
+      "es2024"
+    ],
+    "erasableSyntaxOnly": true,
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "types": [

@@ -162,4 +162,9 @@ CI runs the tests twice: under `TZ=UTC` and under `TZ=Asia/Karachi`.
   inferred type is wrong, give the right one in a JSDoc comment rather than
   turning the check off.
 - A new module may be `.ts`, using only syntax Node can strip, so no `enum` or
-  `namespace`. Lint doesn't read `.ts` files yet.
+  `namespace`. `erasableSyntaxOnly` holds the type check to that. Lint doesn't
+  read `.ts` files yet.
+- The type check knows Node's globals and no browser's: `document` is an error.
+- Imports go first in a module. Lint flags an import read above its
+  declaration, though it runs, and CommonJS's names, which throw in an ES
+  module.

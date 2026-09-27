@@ -59,8 +59,15 @@ export const APPLIES = Object.freeze({
   project: Object.freeze(["task file", "task list"]),
 
   // `--since` is the cursor a previous digest handed back, and only the digest
-  // answers "what moved since then".
-  since: Object.freeze(["task dash"]),
+  // answers "what moved since then". `replay` reads it as the date from which
+  // recorded decisions are replayed (#165).
+  since: Object.freeze(["task dash", "replay"]),
+
+  // The decision records' own flags (#165): which pull request's, or which
+  // record, to replay, and which commit `why` explains.
+  pr: Object.freeze(["replay"]),
+  record: Object.freeze(["replay"]),
+  head: Object.freeze(["why"]),
 
   // `--test` is the whole of `reeve notify`: there is no other thing that
   // command does. It is listed rather than left unconstrained so that typing it

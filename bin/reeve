@@ -13,7 +13,9 @@ import { loadRegistry } from "../src/build/registryio.mjs";
 import { snapshot, restore, latestSnapshot, exportEvents,
          snapshotAll, restoreHub, validateSnapshot } from "../src/backup.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
-import { run, tick, measuredContainment, withdrawStanding, tellStuck } from "../src/daemon.mjs";
+import { run, tick, measuredContainment, withdrawStanding, tellStuck, runningCode } from "../src/daemon.mjs";
+import { replayDecisions, renderReplay } from "../src/decisions.mjs";
+import { policyOf } from "../src/evidence.mjs";
 import { readState, render as renderStatus, statusline, why, cleanMergeRate } from "../src/status.mjs";
 import { init } from "../src/init.mjs";
 import { writeDash } from "../src/dash.mjs";
@@ -219,7 +221,10 @@ const FLAGS = {
   priority:           { value: true,  what: "p1 or p2" },
   "idempotency-key":  { value: true,  what: "a key that makes a re-run of this command inert" },
   "pin-territory":    { value: true,  what: "keep the territory while held, for a duration like 48h" },
-  since:              { value: true,  what: "a cursor from a digest's next_cursor: what moved since" },
+  since:              { value: true,  what: "a cursor from a digest's next_cursor: what moved since; for replay, a date" },
+  pr:                 { value: true,  what: "a pull request number" },
+  head:               { value: true,  what: "a commit, or the start of one" },
+  record:             { value: true,  what: "a decision record's digest, or the start of one" },
 
   hub:            { value: false, what: "operate on the builder hub rather than a repository" },
   anyway:         { value: false, what: "file a near-twin of an existing task anyway" },
@@ -883,6 +888,28 @@ switch (cmd) {
     process.exit(0);
   }
 
+  // RECOMPUTE RECORDED VERDICTS (#165), with this code, from the evidence and
+  // policy each decision recorded. The current profile's hash only says whether
+  // the policy has changed since. Nothing to replay is not a pass: it exits 3.
+  case "replay": {
+    const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
+    const dbPath = opt("db") ?? (nwo ? stateFor(nwo) : null);
+    if (!dbPath || !existsSync(dbPath)) {
+      console.error(dbPath ? `reeve replay: ${missingStoreMessage(dbPath, { initCreatesIt: !opt("db"), nwo })}` : "reeve replay: no state database");
+      process.exit(1);
+    }
+    const pr = opt("pr"), since = opt("since");
+    const sinceAt = since == null ? null : Math.floor(Date.parse(since) / 1000);
+    if (pr != null && !/^\d+$/.test(pr)) { console.error(`reeve replay: --pr takes a pull request number, got ${JSON.stringify(pr)}`); process.exit(1); }
+    if (since != null && !Number.isFinite(sinceAt)) { console.error(`reeve replay: --since takes a date, got ${JSON.stringify(since)}`); process.exit(1); }
+    const profile = nwo ? loadProfile(nwo, { orNull: true }) : null;
+    const results = replayDecisions(open(dbPath), { pr: pr == null ? null : Number(pr), since: sinceAt, digest: opt("record") ?? null },
+                                    { code: runningCode(), policyHash: profile ? policyOf(profile).hash : null });
+    if (!results.length) { console.log("no decision records match, so nothing was replayed"); process.exit(3); }
+    console.log(renderReplay(results));
+    process.exit(results.every(r => r.outcome === "same") ? 0 : 1);
+  }
+
   // These four share one body below. A new subcommand must get its OWN block
   // above -- inserted between these labels and the body, its unconditional exit
   // captures all of them, which is how `shadow` silently broke `status` for a day.
@@ -918,7 +945,7 @@ switch (cmd) {
     if (cmd === "why") {
       const target = positionals.find(a => /^#?\d+$/.test(a) || a.startsWith("pr:"));
       if (!target) { console.error("reeve why <pr-number>"); process.exit(1); }
-      console.log(why(db, target));
+      console.log(why(db, target, { head: opt("head") ?? null }));
       process.exit(0);
     }
 
@@ -2477,7 +2504,11 @@ function usage() {
                         (0 all accepted · 3 a channel is unreachable)
 
   status [owner/repo]   what is happening now  (--health measures clean-merge, --json)
-  why <pr>              why reeve decided what it decided, newest first
+  why <pr>              why reeve decided what it decided: the latest decision and the
+                        evidence it was judged from, then the trail  (--head <sha>)
+  replay [owner/repo]   recompute recorded verdicts with this code and compare them
+                        (--pr <n>, --since <date>, --record <digest>;
+                         0 all the same · 1 one differs or can't be replayed · 3 none)
   statusline            one line for the terminal statusline; reads state only
   dash                  write the one-page view  (--health, --out <path>, --open)
   shadow [owner/repo]   compare what reeve would have decided against what happened

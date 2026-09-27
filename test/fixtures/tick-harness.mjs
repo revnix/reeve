@@ -87,7 +87,7 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
                     queuedRequests, cancelQueued, measureContainment, noteRateLimit,
                     carriedReleases, carriedCooldowns, providerBind,
                     resolveRepoIdFn, project, keepDir = false, seams = null,
-                    haltMarker, openPrs, containment, ticks = 1, dbPath, evaluate } = {}) => {
+                    haltMarker, openPrs, containment, ticks = 1, dbPath, evaluate, treeOf, code } = {}) => {
   const dir = tempDir("reeve-prov-");
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
@@ -181,6 +181,11 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     // fixture could produce an INCOMPLETE tick at all, so the whole branch that
     // decides whether absence may be read as repair was unreachable.
     evaluate: evaluate ?? (() => EVAL),
+    // The head's tree and the running code, which a verdict's records carry
+    // (#165). Unset, the tree is the offline read's null and the code is what
+    // this checkout runs.
+    ...(treeOf ? { treeOf } : {}),
+    ...(code ? { code } : {}),
     publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
     spawnWorker: spawnWorker ?? (async a => { spawned.push(a); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }; }),
     ...(heartbeatMs != null ? { heartbeatMs } : {}),

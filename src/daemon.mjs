@@ -14,7 +14,7 @@
 //     it WOULD do. Shipping a loop that acts before its decisions have been
 //     watched is how an unattended run becomes an incident.
 
-import { evaluatePr, publishVerdict, withdrawVerdict, prAnchor, isBuilderPr, clearRequirements, shadowContextOf } from "./pr.mjs";
+import { evaluatePr, publishVerdict, withdrawVerdict, prAnchor, isBuilderPr, clearRequirements, shadowContextOf, treeOf } from "./pr.mjs";
 import { PASS } from "./verdict.mjs";
 import { nextAction, describe, ACTIONS, ESCALATIONS } from "./watcher.mjs";
 import { POLICY_CONTEXT, reconcilePr } from "./github/reconciler.mjs";
@@ -51,8 +51,23 @@ import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { resolveHome } from "./home.mjs";
+import { codeVersion, policyOf, recordsFor } from "./evidence.mjs";
+import { saveDecision } from "./db/records.mjs";
 
 const now = () => Math.floor(Date.now() / 1000);
+
+// The code this process runs, read once: a record carries the version loaded at
+// startup, whatever the checkout says later (#165).
+let RUNNING_CODE = null;
+export const runningCode = () => (RUNNING_CODE ??= codeVersion(join(dirname(fileURLToPath(import.meta.url)), "..")));
+// The policy each profile applies, hashed once per profile object.
+const POLICIES = new WeakMap();
+const policyFor = profile => {
+  if (!profile || typeof profile !== "object") return policyOf({});
+  let p = POLICIES.get(profile);
+  if (!p) POLICIES.set(profile, p = policyOf(profile));
+  return p;
+};
 
 // Read once per binary: the CLI version is part of every worker's contract,
 // and asking on every dispatch would be a subprocess per tick for an answer
@@ -829,7 +844,7 @@ function openPrs(nwo, limit = 20) {   // bounded; the caller LOGS when the bound
  * Record what a tick decided, so the dashboard and `reeve why` can answer without
  * re-deriving anything, and so a restart knows how long a clause has been UNKNOWN.
  */
-function record(db, { pr, head, verdict, decision, effects = [], retire = new Map() }) {
+function record(db, { pr, head, verdict, decision, effects = [], retire = new Map(), kept = null }) {
   try {
     // ONE transaction, and that is the outbox's whole reason for existing. The
     // decision and the side effect it implies have to become durable together or
@@ -839,11 +854,15 @@ function record(db, { pr, head, verdict, decision, effects = [], retire = new Ma
     // UNKNOWN timeout can all have moved, so the next tick may legitimately decide
     // something else and the effect is simply lost.
     return tx(db, () => {
+      // What the verdict was judged from, in the same transaction as the event
+      // that names it, so neither stands without the other (#165).
+      if (kept) saveDecision(db, { at: now(), pr, head, ...kept });
       db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
         .run(now(), "daemon", "pr.decided", `pr:${pr}`, JSON.stringify({
           head, state: verdict.state, summary: verdict.summary,
           action: decision.action, why: decision.why,
           clauses: verdict.clauses.map(c => ({ id: c.id, state: c.state })),
+          ...(kept ? { record: kept.decision.digest } : {}),
         }));
       // `enqueue` returns null for a key it already holds, which is success: the
       // effect is durable, it was simply made durable by an earlier tick.
@@ -2258,7 +2277,20 @@ export async function tick(ctx) {
       // how many were affected, and it never re-announced when that number grew.
       raise(`${login} blocks merges but declares no trigger comment, so reeve cannot request their review`);
     }
-    const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire });
+    // What the verdict was judged from, kept as evidence with the decision it
+    // explains (#165). A verdict whose records can't be built still stands; it
+    // can't be replayed, and the log says why.
+    let kept = null;
+    if (e.input) {
+      try {
+        kept = recordsFor({ nwo, pr, head: e.head, tree: (ctx.treeOf ?? treeOf)(nwo, e.head), input: e.input,
+                            verdict: e.verdict, policy: policyFor(profile), code: ctx.code ?? runningCode(),
+                            observedAt: new Date(now() * 1000).toISOString() });
+      } catch (err) {
+        log(logPath, `  #${pr}: what this verdict was judged from could not be recorded — ${err.message}`);
+      }
+    }
+    const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire, kept });
     if (effects.length && !decided.ok) {
       log(logPath, `  #${pr}: REQUEST_REVIEW — the decision and its ${effects.length} effect(s) could NOT be recorded: ${decided.why}`);
       // Escalated, not merely logged. Nothing else covers this: no worker is
@@ -3925,6 +3957,12 @@ export async function run(ctx) {
   // A commit that cannot be read is recorded as unreadable, never guessed. An
   // invented value here would be worse than the checkout it replaces.
   log(logPath, `reeve daemon starting — node ${process.version}, pid ${process.pid}, running commit ${runningCommit()}`);
+  // The whole version every decision record carries (#165): the commit, its tree,
+  // and whether the checkout differs from them, with a digest of the difference.
+  const code = runningCode();
+  log(logPath, `  code: commit ${code.commit ?? "unreadable"}, tree ${code.tree ?? "unreadable"}, ` +
+               (code.dirty === null ? "whether the checkout differs is unreadable"
+                : code.dirty ? `the checkout differs from it (${String(code.diff).slice(0, 12)})` : "the checkout matches it"));
 
   // Assert the floor rather than trusting the environment: node on this machine's
   // PATH is v22, and launchd never sources a shell profile.

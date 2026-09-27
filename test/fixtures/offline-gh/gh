@@ -8,10 +8,12 @@
 # the record separator, and fails as a gh with no login fails. The runner then
 # fails the test file that made it.
 #
-# A version check is answered here, and isn't written down: it never leaves
-# the machine, and a test may use it as a command that only prints.
-case "$#:$1:${2-}" in
-  "1:--version:"|"1:version:"|"2:api:--version")
+# gh's own version check, `gh --version` or `gh version`, is answered here,
+# and isn't written down: it never leaves the machine, and a test may use it as
+# a command that only prints. A subcommand's `--version` isn't one: the real gh
+# rejects `gh api --version` as an unknown flag, so it's a call like any other.
+case "$#:$1" in
+  "1:--version"|"1:version")
     echo "gh version 0.0.0 (the tests' offline stand-in)"
     exit 0 ;;
 esac

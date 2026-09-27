@@ -366,19 +366,19 @@ export function checkBaseHealth(nwo, workflow = "ci.yml", branch = "main", io = 
  * reports success and an uninstalled one reports nothing, and both are
  * byte-identical to "found no problems" unless something counts.
  */
-function checkReviewerSupply(nwo, reviewers) {
+function checkReviewerSupply(nwo, reviewers, { api = gh, sh: run = sh } = {}) {
   const lines = [];
   let level = OK;
-  const prs = sh("gh", ["pr", "list", "--repo", nwo, "--state", "merged", "--limit", "40", "--json", "number", "--jq", ".[].number"]);
+  const prs = run("gh", ["pr", "list", "--repo", nwo, "--state", "merged", "--limit", "40", "--json", "number", "--jq", ".[].number"]);
   if (!prs.ok) return { id: "R-05", level: UNKNOWN, title: "reviewer supply", lines: ["could not list merged PRs"] };
   const numbers = prs.out.split("\n").filter(Boolean).slice(0, 20);
 
   for (const rev of reviewers) {
     let seen = 0, refused = 0, real = 0;
     for (const n of numbers) {
-      const c = gh(`repos/${nwo}/issues/${n}/comments`,
+      const c = api(`repos/${nwo}/issues/${n}/comments`,
         `[.[]|select(.user.login|test("${rev.login}";"i"))]|length`);
-      const rl = gh(`repos/${nwo}/issues/${n}/comments`,
+      const rl = api(`repos/${nwo}/issues/${n}/comments`,
         `[.[]|select((.user.login|test("${rev.login}";"i")) and (.body|test("${rev.refusal}";"i")))]|length`);
       if (c.ok) seen += Number(c.out || 0);
       if (rl.ok) refused += Number(rl.out || 0);
@@ -1125,7 +1125,7 @@ export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null
     checkMergeShape(nwo, profile.merge?.method ?? null, githubIo),
     checkBaseHealth(nwo, profile.ci?.workflow ?? "ci.yml",
                     profile.identity?.baseBranch ?? profile.identity?.defaultBranch ?? "main", githubIo),
-    profile.reviewers?.length ? checkReviewerSupply(nwo, profile.reviewers) : null,
+    profile.reviewers?.length ? checkReviewerSupply(nwo, profile.reviewers, githubIo) : null,
     checkLeases(db),
     profile.reviewers?.length ? checkDetectors(db, profile) : null,
     appCheck,

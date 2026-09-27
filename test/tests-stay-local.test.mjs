@@ -66,12 +66,20 @@ test("the offline gh fails a call as a gh with no login does, and writes it down
 
 test("the offline gh answers a version check itself, and writes nothing down", () => {
   const log = join(tempDir("og-"), "calls");
-  for (const args of [["--version"], ["version"], ["api", "--version"]]) {
+  for (const args of [["--version"], ["version"]]) {
     const r = offlineGh(args, log);
     assert.equal(r.status, 0, args.join(" "));
     assert.match(r.stdout, /^gh version /, args.join(" "));
   }
   assert.deepEqual(callsIn(log), []);
+});
+
+test("the offline gh treats a subcommand's --version as the call it is, which the real gh rejects", () => {
+  // Measured with gh 2.46.0: `gh api --version` exits 1 with "unknown flag".
+  const log = join(tempDir("og-"), "calls");
+  const r = offlineGh(["api", "--version"], log);
+  assert.equal(r.status, 1);
+  assert.deepEqual(callsIn(log), [["api", "--version"]]);
 });
 
 test("a process started with offlineEnv meets the offline gh, and its calls aren't written down for the runner", () => {
@@ -141,6 +149,28 @@ test("the doctor reads GitHub through githubIo, and so calls no gh", async () =>
     // through `sh`.
     assert.ok(["R-01", "R-03"].every((id) => r.checks.some((c) => c.id === id)), r.checks.map((c) => c.id).join(","));
     assert.deepEqual([...reached].sort(), ["api", "sh"], "the doctor didn't read through githubIo");
+    assert.deepEqual(callsIn(log), [], "the doctor called gh");
+  });
+});
+
+test("the doctor reads reviewer supply through githubIo too, when the profile names reviewers", async () => {
+  const dir = tempDir("doctor-rev-");
+  const log = join(dir, "gh-calls");
+  await withOfflineGh(log, () => {
+    const reached = new Set();
+    // Two merged pull requests, so the check goes on to read their comments.
+    const githubIo = {
+      api: (...a) => { reached.add("api"); return OFFLINE_IO.api(...a); },
+      sh: (cmd, args) => {
+        if (args?.[0] === "pr" && args?.[1] === "list") { reached.add("pr list"); return { ok: true, out: "5\n6" }; }
+        return OFFLINE_IO.sh(cmd, args);
+      },
+    };
+    const r = runDoctor({ nwo: "o/r", profile: { reviewers: [{ login: "someone", refusal: "can't review" }] }, stateDir: dir, githubIo,
+                          keychainIo: { probe: () => ({ measured: true, items: [], why: null }), token: () => ({ ok: true, token: "sk-ant-oat01-test", why: null }) },
+                          baselineIo: { fixturePath: join(dir, "none.json") } });
+    assert.ok(r.checks.some((c) => c.id === "R-05"), r.checks.map((c) => c.id).join(","));
+    assert.ok(reached.has("pr list"), "the reviewer check didn't list merged pull requests through githubIo");
     assert.deepEqual(callsIn(log), [], "the doctor called gh");
   });
 });

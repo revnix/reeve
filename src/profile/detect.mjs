@@ -6,7 +6,7 @@
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, matchesGlob } from "node:path";
 import { runnerShells, scriptOutcome, scriptShells } from "./shellscript.mjs";
 
 function sh(cmd, args, cwd) {
@@ -48,6 +48,72 @@ export function detectPackageManager(dir) {
       options: locks.map(([m]) => m),
     },
   };
+}
+
+/**
+ * The member globs of the workspace the root declares, for the manager that owns
+ * it: pnpm keeps them in pnpm-workspace.yaml; npm, yarn and bun in package.json's
+ * `workspaces`, as a list or as `{ packages: [...] }`.
+ */
+export function workspaceGlobs(root, manager) {
+  if (manager === "pnpm") {
+    let text;
+    try { text = readFileSync(join(root, "pnpm-workspace.yaml"), "utf8"); } catch { return []; }
+    return yamlList(text, "packages");
+  }
+  if (manager === "npm" || manager === "yarn" || manager === "bun") {
+    const ws = readJson(join(root, "package.json"))?.workspaces;
+    const list = Array.isArray(ws) ? ws : Array.isArray(ws?.packages) ? ws.packages : [];
+    return list.filter(g => typeof g === "string");
+  }
+  return [];
+}
+
+/** Whether a folder the root holds is a member of its workspace. A `!` glob excludes. */
+function isMember(rel, globs) {
+  const hit = g => matchesGlob(rel, g.replace(/^\.\//, "").replace(/\/+$/, ""));
+  return globs.some(g => !g.startsWith("!") && hit(g)) && !globs.some(g => g.startsWith("!") && hit(g.slice(1)));
+}
+
+/**
+ * A YAML flow list's items, split at the commas outside quotes: `'{foo,bar}'` is
+ * one glob, not two.
+ * @param {string} body
+ */
+function flowItems(body) {
+  const out = [];
+  let item = "", quote = null;
+  for (const ch of body) {
+    if (quote) { item += ch; if (ch === quote) quote = null; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; item += ch; continue; }
+    if (ch === ",") { out.push(item); item = ""; continue; }
+    item += ch;
+  }
+  out.push(item);
+  return out;
+}
+
+/**
+ * The string items of a top-level list, in YAML as pnpm-workspace.yaml writes it:
+ * a block list under the key, with comments and blank lines among the items, or a
+ * flow list on the key's own line. Anything else reads as no list.
+ */
+function yamlList(text, key) {
+  const lines = text.split(/\r?\n/);
+  const at = lines.findIndex(l => l.startsWith(`${key}:`));
+  if (at < 0) return [];
+  const unquote = s => s.trim().replace(/^(['"])(.*)\1$/, "$2");
+  const rest = lines[at].slice(key.length + 1).replace(/\s#.*$/, "").trim();
+  if (rest.startsWith("[")) return flowItems(rest.slice(1, rest.lastIndexOf("]"))).map(unquote).filter(Boolean);
+  const out = [];
+  for (const line of lines.slice(at + 1)) {
+    if (/^\s*(#.*)?$/.test(line)) continue;
+    const m = /^\s*-\s+(.*)$/.exec(line);
+    if (!m) break;
+    const item = /^['"]/.test(m[1]) ? m[1].replace(/^(['"])(.*?)\1.*$/, "$2") : m[1].replace(/\s#.*$/, "").trim();
+    if (item) out.push(item);
+  }
+  return out;
 }
 
 /** Language from manifests present, not from file extensions. */
@@ -242,6 +308,44 @@ export function detectReviewers(root, nwo) {
   }));
 }
 
+/**
+ * Units: the repo root, plus any directory holding its own manifest. Reads the
+ * checkout alone, never the network. Returns {units, questions, notes}.
+ */
+export function detectUnits(root) {
+  const questions = [];
+  const notes = [];
+  const roots = new Set(["."]);
+  for (const d of readdirSync(root)) {
+    const p = join(root, d);
+    if (!statSync(p).isDirectory() || d.startsWith(".") || d === "node_modules") continue;
+    if (existsSync(join(p, "package.json")) || existsSync(join(p, "pyproject.toml"))) roots.add(d);
+  }
+  // A workspace keeps one lockfile, at its root, so a member without one of its
+  // own uses the root's package manager. A folder the workspace doesn't list
+  // stays unsettled, as before, and so does one that isn't a JavaScript package:
+  // those managers know only packages, whatever a broad glob matches.
+  const rootPm = detectPackageManager(root);
+  const globs = rootPm.value ? workspaceGlobs(root, rootPm.value) : [];
+  const units = [];
+  for (const rel of roots) {
+    const dir = rel === "." ? root : join(root, rel);
+    const language = detectLanguage(dir);
+    if (!language) continue;
+    let pm = rel === "." ? rootPm : detectPackageManager(dir);
+    if (rel !== "." && pm.value === null && !pm.question && language === "typescript" && isMember(rel, globs)) {
+      pm = { value: rootPm.value, question: null };
+      notes.push(`unit ${rel}: no lockfile of its own, and a member of the root's ${rootPm.value} workspace, so it uses ${rootPm.value}`);
+    }
+    if (pm.question) questions.push({ ...pm.question, unit: rel });
+    const { commands, questions: cq } = detectCommands(dir, language, pm.value);
+    for (const q of cq) questions.push({ ...q, unit: rel });
+    units.push({ id: rel === "." ? "root" : rel, root: rel, language, packageManager: pm.value, commands });
+  }
+  if (units.length === 0) notes.push("no recognised manifest: this repo has no buildable unit");
+  return { units, questions, notes };
+}
+
 /** Full detection pass. Returns {proposal, questions, notes}. */
 export function detect(root) {
   const questions = [];
@@ -254,25 +358,10 @@ export function detect(root) {
   const perms = permRes.ok ? permRes.out.split(",") : [];
   const permission = perms.includes("admin") ? "admin" : perms.includes("push") ? "write" : perms.includes("triage") ? "triage" : "read";
 
-  // Units: the repo root, plus any directory holding its own manifest.
-  const roots = new Set(["."]);
-  for (const d of readdirSync(root)) {
-    const p = join(root, d);
-    if (!statSync(p).isDirectory() || d.startsWith(".") || d === "node_modules") continue;
-    if (existsSync(join(p, "package.json")) || existsSync(join(p, "pyproject.toml"))) roots.add(d);
-  }
-  const units = [];
-  for (const rel of roots) {
-    const dir = rel === "." ? root : join(root, rel);
-    const language = detectLanguage(dir);
-    if (!language) continue;
-    const pm = detectPackageManager(dir);
-    if (pm.question) questions.push({ ...pm.question, unit: rel });
-    const { commands, questions: cq } = detectCommands(dir, language, pm.value);
-    for (const q of cq) questions.push({ ...q, unit: rel });
-    units.push({ id: rel === "." ? "root" : rel, root: rel, language, packageManager: pm.value, commands });
-  }
-  if (units.length === 0) notes.push("no recognised manifest: this repo has no buildable unit");
+  const found = detectUnits(root);
+  const units = found.units;
+  questions.push(...found.questions);
+  notes.push(...found.notes);
 
   const ci = detectCi(root);
   notes.push(...ci.notes);

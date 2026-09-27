@@ -406,7 +406,12 @@ function checkLeases(db) {
   for (const r of expired.slice(0, 5)) {
     lines.push(`  ${r.task_id} (${r.lane}) expired ${Math.round((now - r.lease_expires_at) / 60)}m ago`);
   }
-  if (expired.length) { lines.push("-> reeve lane reap --dry-run"); return { id: "R-06", level: DEGRADED, title: "leases", lines }; }
+  // Reaped by the daemon itself, each tick (#162). A `reeve lane reap` was
+  // recommended here and never built.
+  if (expired.length) {
+    lines.push("-> a running daemon reaps these on its next tick, or extends the lease of one whose worker is still alive. If they stay, no daemon is running for this repository");
+    return { id: "R-06", level: DEGRADED, title: "leases", lines };
+  }
   return { id: "R-06", level: OK, title: "leases", lines };
 }
 

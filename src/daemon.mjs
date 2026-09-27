@@ -34,7 +34,7 @@ import { hubSession, NO_HUB } from "./build/hubsession.mjs";
 import { resolveRepoId } from "./build/repoid.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify, printable } from "./notify.mjs";
-import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects } from "./db/ops.mjs";
+import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects, reap } from "./db/ops.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
 import { drainOutbox } from "./outbox/drain.mjs";
 import { HANDLERS, permittedHandlers } from "./outbox/effects.mjs";
@@ -1765,6 +1765,24 @@ export async function tick(ctx) {
         raise("the provider scheduler is unreadable; dispatching unscheduled");
       }
     }
+  }
+
+  // AND THE RUNS A DEAD DAEMON LEFT (#162). A run holds its pull request
+  // exclusively, and only the daemon that started it finishes it. One that died
+  // with its worker -- a crash, a reboot, a service restart that took both --
+  // left the run live, and `startRun` refused that pull request until it
+  // merged. Its lease lapses within LEASE_SECONDS of the last heartbeat. A run
+  // past it whose worker isn't the same live process on this host is
+  // abandoned, and its pull request is free again this tick; one whose worker
+  // is still running is a long job, and keeps it. Ungated, as the reap above
+  // is, and for the same reasons.
+  try {
+    for (const r of (ctx.reapRuns ?? reap)(db, { actor: "daemon", isAlive: isSameProcess }))
+      if (r.action === "reaped") log(logPath, `run ${r.run} reaped: its lease had lapsed and its worker is gone`);
+  } catch (err) {
+    // Housekeeping must never take the tick with it.
+    log(logPath, `could not reap runs whose worker is gone — ${err.message}`);
+    raise("reeve could not reap the runs whose worker is gone");
   }
 
   // ONE READER for this guardian's queued rows. Two callers need them now -- the

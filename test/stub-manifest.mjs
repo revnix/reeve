@@ -364,8 +364,8 @@ export const STUBS = [
     expectRed: "the helper the STUBBED test spawned was killed with it",
     edits: [
       { file: "scripts/stub-sweep.mjs",
-        find: "  const child = spawn(process.execPath, [`--test-reporter=${TEST_REPORTER}`, \"--test-reporter-destination=stdout\", join(ROOT, file)],\n    { cwd: ROOT, detached: true });",
-        replace: "  const child = spawn(process.execPath, [`--test-reporter=${TEST_REPORTER}`, \"--test-reporter-destination=stdout\", join(ROOT, file)],\n    { cwd: ROOT });" },
+        find: "  const child = spawn(process.execPath, [`--test-reporter=${TEST_REPORTER}`, \"--test-reporter-destination=stdout\", join(ROOT, file)],\n    { cwd: ROOT, detached: true, env: childEnv(file) });",
+        replace: "  const child = spawn(process.execPath, [`--test-reporter=${TEST_REPORTER}`, \"--test-reporter-destination=stdout\", join(ROOT, file)],\n    { cwd: ROOT, env: childEnv(file) });" },
       { file: "scripts/stub-sweep.mjs",
         find: "  for (const pid of stragglers) {\n    try { process.kill(pid, \"SIGKILL\"); } catch { /* already gone, or not ours */ }\n  }",
         replace: "" },

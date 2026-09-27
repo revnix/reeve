@@ -115,7 +115,7 @@ test("the queue's commit is judged by its own checks: failing there blocks, thou
 test("a queue commit is judged only with the pull request's facts from this tick", () => {
   let r;
   assert.doesNotThrow(() => {
-    r = evaluateQueueEntry({ nwo: "o/r", entry: { pr: 7, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS" }, input: undefined,
+    r = evaluateQueueEntry({ nwo: "o/r", entry: { pr: 7, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS", prHead: HEAD }, input: undefined,
                              baseRef: "main", profile: { ci: { requiredChecks: [] } }, db: null,
                              read: () => ({ ok: true, rows: [checkRow("test", "success")], impostors: [] }),
                              requirements: () => ({ required: [], known: true, shadowRequired: false }) });

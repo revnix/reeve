@@ -158,8 +158,8 @@ clean runner.
 
 CI runs the tests twice: under `TZ=UTC` and under `TZ=Asia/Karachi`.
 
-To run one file as `npm test` does, offline and with a home of its own:
-`h="$(mktemp -d)"; PATH="$PWD/test/fixtures/offline-gh:$PATH" HOME="$h" env -u REEVE_HOME node test/<file>.test.mjs; rm -rf "$h"`.
+To run one file as `npm test` runs each of them, offline, with a home of its
+own, and failed for calling `gh`: `node scripts/test.mjs test/<file>.test.mjs`.
 
 ## Types
 

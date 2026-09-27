@@ -298,7 +298,9 @@ export function runExecutedSteps(nwo, runId, io = null) {
  */
 export function checkBaseHealth(nwo, workflow = "ci.yml", branch = "main", io = null) {
   const run = io?.sh ?? sh;
-  const steps = io?.steps ?? runExecutedSteps;
+  // The default step reader reads through the same io, so a failed run's jobs
+  // are read as its list was (#243).
+  const steps = io?.steps ?? ((n, id) => runExecutedSteps(n, id, io));
   // COMPLETED RUNS ONLY, because a run that has not finished cannot answer the
   // question and was still counting toward the denominator.
   //

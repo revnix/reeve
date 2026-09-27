@@ -175,6 +175,28 @@ test("the doctor reads reviewer supply through githubIo too, when the profile na
   });
 });
 
+test("the doctor reads a failed base run's jobs through githubIo too", async () => {
+  const dir = tempDir("doctor-base-");
+  const log = join(dir, "gh-calls");
+  await withOfflineGh(log, () => {
+    const asked = [];
+    // A completed run that failed, so the check goes on to read its jobs.
+    const githubIo = {
+      api: OFFLINE_IO.api,
+      sh: (cmd, args) => {
+        asked.push((args ?? []).slice(0, 2).join(" "));
+        if (args?.[0] === "run" && args?.[1] === "list") return { ok: true, out: "failure\t123" };
+        return OFFLINE_IO.sh(cmd, args);
+      },
+    };
+    runDoctor({ nwo: "o/r", profile: {}, stateDir: dir, githubIo,
+                keychainIo: { probe: () => ({ measured: true, items: [], why: null }), token: () => ({ ok: true, token: "sk-ant-oat01-test", why: null }) },
+                baselineIo: { fixturePath: join(dir, "none.json") } });
+    assert.ok(asked.some((a) => a.startsWith("api ")), `the failed run's jobs weren't read through githubIo: ${asked.join("; ")}`);
+    assert.deepEqual(callsIn(log), [], "the doctor called gh");
+  });
+});
+
 // A folder of test files for the runner, each written from its source.
 const suite = (files) => {
   const dir = tempDir("suite-");
@@ -190,6 +212,22 @@ test("the runner fails a test file that called gh, and names the call", () => {
   assert.notEqual(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stderr, /a\.test\.mjs called gh/, r.stderr);
   assert.match(r.stderr, /gh api repos\/o\/r\/pulls\/7/, r.stderr);
+});
+
+test("the runner runs one test file as it runs each of the suite's, and fails it for calling gh", () => {
+  // A test that ignores gh's failure passes on its own; the runner is what
+  // notices the call.
+  const dir = suite({ "a.test.mjs": `import { spawnSync } from "node:child_process";\nspawnSync("gh", ["api", "repos/o/r/pulls/7"]);\n` });
+  const r = spawnSync(process.execPath, [join(ROOT, "scripts", "test.mjs"), join(dir, "a.test.mjs")], { encoding: "utf8" });
+  assert.notEqual(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stderr, /a\.test\.mjs called gh/, r.stderr);
+});
+
+test("the runner won't run the escape probe on its own, which needs the real gh and home", () => {
+  const r = spawnSync(process.execPath, [join(ROOT, "scripts", "test.mjs"), join(ROOT, "test", "escape.test.mjs")], { encoding: "utf8" });
+  assert.notEqual(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stderr, /npm run test:escape/, r.stderr);
+  assert.doesNotMatch(r.stdout, /UNDER THE SANDBOX|under the OS sandbox/, "the escape probe ran");
 });
 
 test("the runner lets a test file ask gh for its version", () => {

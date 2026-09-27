@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // The suite, as `npm test` runs it: every test file but the escape probe, in
 // order, stopping at the first that fails. `node scripts/test.mjs [folder]`
-// runs another folder's instead of test/.
+// runs another folder's instead of test/, and `node scripts/test.mjs
+// <file>.test.mjs` runs that one file, as it runs each of the suite's.
 //
 // Each test runs with TMPDIR, TEMP and TMP set to a folder of this run's own,
 // which is removed however the run ends: finished, failed, or stopped by SIGINT
@@ -25,15 +26,23 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // A test that listens for the signal itself and keeps running is killed after
 // this long. REEVE_TEST_GRACE_MS shortens it for the runner's own test.
 const GRACE_MS = Number(process.env.REEVE_TEST_GRACE_MS) || 10_000;
 
-const dir = process.argv[2] ?? "test";
-const files = readdirSync(dir).filter((f) => f.endsWith(".test.mjs") && f !== "escape.test.mjs").sort();
+const arg = process.argv[2] ?? "test";
+const single = arg.endsWith(".test.mjs");
+// The escape probe measures the sandbox against the real home and a real gh,
+// which this runner takes away. It has a command of its own.
+if (single && basename(arg) === "escape.test.mjs") {
+  console.error("test: the escape probe runs against the real home and gh; run it with `npm run test:escape`");
+  process.exit(1);
+}
+const dir = single ? dirname(arg) : arg;
+const files = single ? [basename(arg)] : readdirSync(dir).filter((f) => f.endsWith(".test.mjs") && f !== "escape.test.mjs").sort();
 // A run that runs nothing proves nothing, and fails: the folder may be the
 // wrong one, or its tests renamed.
 if (!files.length) {

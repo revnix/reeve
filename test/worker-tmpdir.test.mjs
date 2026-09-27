@@ -16,6 +16,7 @@ import * as workerenv from "../src/workerenv.mjs";
 import { runWorker } from "../src/supervisor.mjs";
 import { open } from "../src/db/ops.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
+import { OFFLINE_READS } from "./fixtures/offline-github.mjs";
 
 // reeve's home, then t/<12 hex>: its shape, whatever this host's temp paths.
 const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -48,6 +49,7 @@ const dispatch = ({ stateDir }) => {
   const seen = { spawned: [] };
   mkdirSync(stateDir, { recursive: true });
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(stateDir, "e.db")), logPath: join(stateDir, "reeve.log"), dbPath: join(stateDir, "e.db"),
     profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: clone },
                authority: { policy: "propose_and_merge" }, rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },

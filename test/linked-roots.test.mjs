@@ -14,6 +14,7 @@ import * as daemon from "../src/daemon.mjs";
 import { layoutDeniesAbove, linkFree, notifyCredOf, sandboxFor, siblingRootsOf, sourceCheckoutOf, validateSettings } from "../src/sandbox.mjs";
 import { open } from "../src/db/ops.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
+import { OFFLINE_READS } from "./fixtures/offline-github.mjs";
 
 const linux = { skip: process.platform !== "linux" && "Linux only" };
 const under = (p, d) => p === d || p.startsWith(d + "/");
@@ -76,6 +77,7 @@ test("a dispatched checkout under a linked worktree root is made at its target",
     reviewers: [], threads: {}, settled: { settled: true } };
   const seen = {};
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(stateDir, "e.db")), logPath: join(stateDir, "reeve.log"), dbPath: join(stateDir, "e.db"),
     profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: link, checkout: clone },
                authority: { policy: "propose_and_merge" }, rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
@@ -174,6 +176,7 @@ test("a worker whose source checkout and notify credential are reached through l
     reviewers: [], threads: {}, settled: { settled: true } };
   let spawned = 0;
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(stateDir, "e.db")), logPath: join(stateDir, "reeve.log"), dbPath: join(stateDir, "e.db"),
     profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: root, checkout: src.link }, notify: { credentialFile: cred.link },
                authority: { policy: "propose_and_merge" }, rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },

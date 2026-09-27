@@ -10,8 +10,9 @@ import { measureContainment } from "../src/containment.mjs";
 import { currentInstrument, assemblySource, instrumentSourceHash, INSTRUMENT_SOURCES, INSTRUMENT_LOCAL_SOURCES, INSTRUMENT_CALLER_SOURCES, INSTRUMENT_NOT_SOURCES } from "../src/canary.mjs";
 import { createHash } from "node:crypto";
 import { sandboxFor } from "../src/sandbox.mjs";
+import { resolveHome } from "../src/home.mjs";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
-import { tmpdir, homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { connect } from "node:net";
 import { join } from "node:path";
 
@@ -22,14 +23,19 @@ const check = (ok, name, detail) => {
 };
 
 const root = mkdtempSync(join(tmpdir(), "reeve-canary-"));
+// Reeve's home is deny-read, so the decoy must sit under it to be measurable.
+// The test gives reeve a home of its own for it, inside its temp folder, so
+// the decoy never lands in the real one, where a running daemon keeps its
+// canary's results (#245). Set before the policy is built, which denies it.
+process.env.REEVE_HOME = join(root, "reeve-home");
 const profile = { identity: { key: "o/r", defaultBranch: "main" }, units: [] };
 const block = sandboxFor({ profile, action: "FIX_CI", worktree: "/w", tmpDir: "/t" }).settings;
 const base = {
   cliVersion: "2.1.237 (Claude Code)", sandbox: block.sandbox, permissionsDeny: block.permissions.deny,
   dir: join(root, "canary"), outsideDir: join(root, "outside"), tmpDir: join(root, "tmp"),
-  // ~/.reeve is deny-read; the decoy must sit under it to be measurable. The
-  // path is never written to in these tests except by the canary itself.
-  decoyPath: join(homedir(), ".reeve", "canary", "test-decoy-" + process.pid + ".txt"),
+  // Under the test's own reeve home, above. The path is never written to in
+  // these tests except by the canary itself.
+  decoyPath: join(resolveHome(), "canary", "test-decoy-" + process.pid + ".txt"),
   bin: "/bin/sh", env: { PATH: "/usr/bin:/bin" },
   // The network control is a daemon-local listener; injected so tests never
   // touch the network. selfReachable true, not hit = network denied.

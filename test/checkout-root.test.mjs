@@ -20,6 +20,7 @@ import { open } from "../src/db/ops.mjs";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { OFFLINE_READS } from "./fixtures/offline-github.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -87,6 +88,7 @@ const dispatchProfile = over => ({
 
 let spawned = [];
 const ctxFor = (dir, identity, extra = {}) => ({
+  ...OFFLINE_READS,
   nwo: "o/r", profile: dispatchProfile(identity), db: open(join(dir, "d.db")), logPath: join(dir, "log.txt"),
   execute: true, shadow: true, running: 0,
   // The real capacity() backs off on the host's load average, so a busy machine

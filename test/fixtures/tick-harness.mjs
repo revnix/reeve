@@ -39,6 +39,7 @@ import { queuedGuardianRequests } from "../../src/build/providerdb.mjs";
 import { rmSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CLAUSE_IDS } from "../../src/verdict.mjs";
+import { OFFLINE_READS } from "./offline-github.mjs";
 import { tempDir } from "./temp.mjs";
 
 // The fixture's evaluation payload. It lives HERE because run() closes over it;
@@ -93,6 +94,8 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
   const guest = hub === undefined ? openHubAsGuest(hubPath) : hub;
   const claims = [], releases = [], spawned = [];
   const ctx = {
+    // GitHub out of reach, for the reads nothing below answers (#243).
+    ...OFFLINE_READS,
     // A STORE THIS RUN DID NOT CREATE, when the caller names one. `bin/reeve`
     // builds a fresh context per process, so "the daemon restarted" means a new
     // ctx over an EXISTING store -- and a fixture that always makes its own store

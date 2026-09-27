@@ -9,6 +9,7 @@ import { writeCanaryState } from "../src/canary.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { OFFLINE_IO } from "./fixtures/offline-github.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -686,7 +687,7 @@ const HELD_KC = () => ({ measured: true, items: ["generic password gh:github.com
 // ── in the driver ────────────────────────────────────────────────────────────
 {
   const r = runDoctor({ nwo: "o/r", profile: {}, stateDir: root, keychainIo: { probe: EMPTY_KC, token: HAS_TOKEN },
-                        baselineIo: { fixturePath: join(root, "none.json") } });
+                        baselineIo: { fixturePath: join(root, "none.json") }, githubIo: OFFLINE_IO });
   const ids = r.checks.map(c => c.id);
   check(ids.includes("R-14") && ids.includes("R-15"), "both checks run in the driver", ids.join(","));
   check(r.verdict === "BROKEN" && r.checks.find(c => c.id === "R-14").level === "BROKEN", "and a failed canary makes the verdict BROKEN", r.verdict);

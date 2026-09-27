@@ -2140,9 +2140,10 @@ export async function tick(ctx) {
     }
 
     // GitHub is authoritative for PR facts; this is also what releases a lease
-    // when a PR merges.
+    // when a PR merges. Injectable like `evaluate`, so a test's tick never reads
+    // GitHub for a repository that doesn't exist (#243).
     evaluated.add(pr);
-    const rec = reconcilePr(db, { nwo, pr, profile });
+    const rec = (ctx.reconcile ?? reconcilePr)(db, { nwo, pr, profile });
     if (rec.ok && rec.released) log(logPath, `  #${pr}: released ${rec.released} lease(s) — PR merged`);
 
     // Review ingest, in SHADOW: it writes and nothing reads. Landing raw
@@ -3598,7 +3599,8 @@ export async function tick(ctx) {
     // have happened and the rate can have moved -- a per-tick recount would spend
     // API calls to learn nothing.
     if (ctx.lastOpenCount == null || prs.length < ctx.lastOpenCount) {
-      const clean = cleanMergeRate(nwo, 20, null, { required: profile.ci?.requiredChecks ?? [] });
+      // Injectable, as the tick's other GitHub reads are (#243).
+      const clean = (ctx.mergeRate ?? cleanMergeRate)(nwo, 20, null, { required: profile.ci?.requiredChecks ?? [] });
       ctx.health = { clean };
       log(logPath, `health: clean-merge ${clean.ok ? Math.round(clean.rate * 100) + "% over " + clean.judged + " judged" : clean.why}` +
                    (clean.unjudged ? `, ${clean.unjudged} unjudged` : ""));

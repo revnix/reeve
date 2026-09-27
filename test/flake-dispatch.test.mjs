@@ -13,6 +13,7 @@ import { open, countFixAttempts } from "../src/db/ops.mjs";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { tempDir } from "./fixtures/temp.mjs";
+import { OFFLINE_READS } from "./fixtures/offline-github.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -68,6 +69,7 @@ const scenario = async ({ failing, probe }) => {
   const dir = tempDir("reeve-flake-");
   const spawned = [];
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0, containment: { credentialRead: "closed", why: "test" }, keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
     // Deterministic: the real capacity() backs off on the host's load average, so

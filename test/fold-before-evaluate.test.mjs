@@ -18,6 +18,7 @@ import { open } from "../src/db/ops.mjs";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { OFFLINE_READS } from "./fixtures/offline-github.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -50,6 +51,7 @@ const evaluation = {
 };
 
 const ctx = {
+  ...OFFLINE_READS,
   nwo: "o/r", profile, db, dbPath: join(dir, "s.db"), logPath,
   haltMarker: join(dir, "HALT"), execute: false, shadow: true,
   dashPath: join(dir, "dash.md"), canaryStateDir: dir,

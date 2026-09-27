@@ -115,6 +115,13 @@ jobs:
       # Every test file removes what it makes under the temp directory (#204).
       # Each one runs with TMPDIR set to an empty folder of its own, and a file
       # that leaves anything there fails the step, named with what it left.
+      #
+      # And each stays on this machine, as `npm test` runs it (#243, #245): the
+      # tests' offline gh first on its PATH, which fails every call and writes
+      # it down, and a home of its own, with no REEVE_HOME. A file that called
+      # gh, or wrote a .reeve into its home, fails the step. The escape probe is
+      # the exception: it measures the sandbox against the host's real home and
+      # a real gh, and removes what it plants.
       - name: Run the suite
         env:
           TZ: UTC
@@ -122,15 +129,25 @@ jobs:
           set -euo pipefail
           fail=0
           base="$(mktemp -d)"
+          own="$(mktemp -d)"
           for f in test/*.test.mjs; do
             echo "── $f"
-            export TMPDIR="$base/$(basename "$f" .test.mjs)"
+            name="$(basename "$f" .test.mjs)"
+            export TMPDIR="$base/$name"
             mkdir "$TMPDIR"
-            node "$f" || fail=1
+            if [ "$name" = escape ]; then
+              node "$f" || fail=1
+            else
+              mkdir "$own/$name"
+              HOME="$own/$name" REEVE_TEST_GH_LOG="$own/$name.gh" PATH="$PWD/test/fixtures/offline-gh:$PATH" \
+                env -u REEVE_HOME node "$f" || fail=1
+              if [ -s "$own/$name.gh" ]; then echo "CALLED GH: $f"; head -c 1500 "$own/$name.gh" | tr '\037\036' ' \n'; echo; fail=1; fi
+              if [ -e "$own/$name/.reeve" ]; then echo "WROTE INTO ITS HOME'S .reeve: $f"; fail=1; fi
+            fi
             left="$(ls -A "$TMPDIR")"
             if [ -n "$left" ]; then echo "LEFT BEHIND by $f:"; echo "$left" | head -20; fail=1; fi
           done
-          rm -rf "$base"
+          rm -rf "$base" "$own"
           exit $fail
 
       # The runner is UTC, where a timestamp parsed without its trailing Z is
@@ -144,14 +161,24 @@ jobs:
           set -euo pipefail
           fail=0
           base="$(mktemp -d)"
+          own="$(mktemp -d)"
           for f in test/*.test.mjs; do
-            export TMPDIR="$base/$(basename "$f" .test.mjs)"
+            name="$(basename "$f" .test.mjs)"
+            export TMPDIR="$base/$name"
             mkdir "$TMPDIR"
-            node "$f" >/dev/null || { echo "FAILED under TZ=$TZ: $f"; fail=1; }
+            if [ "$name" = escape ]; then
+              node "$f" >/dev/null || { echo "FAILED under TZ=$TZ: $f"; fail=1; }
+            else
+              mkdir "$own/$name"
+              HOME="$own/$name" REEVE_TEST_GH_LOG="$own/$name.gh" PATH="$PWD/test/fixtures/offline-gh:$PATH" \
+                env -u REEVE_HOME node "$f" >/dev/null || { echo "FAILED under TZ=$TZ: $f"; fail=1; }
+              if [ -s "$own/$name.gh" ]; then echo "CALLED GH under TZ=$TZ: $f"; head -c 1500 "$own/$name.gh" | tr '\037\036' ' \n'; echo; fail=1; fi
+              if [ -e "$own/$name/.reeve" ]; then echo "WROTE INTO ITS HOME'S .reeve under TZ=$TZ: $f"; fail=1; fi
+            fi
             left="$(ls -A "$TMPDIR")"
             if [ -n "$left" ]; then echo "LEFT BEHIND under TZ=$TZ by $f:"; echo "$left" | head -20; fail=1; fi
           done
-          rm -rf "$base"
+          rm -rf "$base" "$own"
           exit $fail
 
   gate:

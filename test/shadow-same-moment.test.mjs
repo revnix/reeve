@@ -17,6 +17,7 @@ import { divergences } from "../src/review/shadow.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { OFFLINE_READS } from "./fixtures/offline-github.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -56,6 +57,7 @@ const THREAD_OBS = { source: "codexbot", kind: "review_thread", external_id: "t1
                      payload: { thread_id: "t11", is_resolved: false, body: "x" }, event_at: 1 };
 
 const ctxFor = (dir, extra = {}) => ({
+  ...OFFLINE_READS,
   nwo: NWO, profile, db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
   execute: false, shadow: true, running: 0,
   openPrs: () => [7],

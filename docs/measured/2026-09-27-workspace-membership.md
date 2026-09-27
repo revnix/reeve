@@ -78,6 +78,46 @@ So:
 - An extglob is read by npm, pnpm 10 and yarn, refused by pnpm 12, and matched by no bun.
 - A backslash is an escape to npm, pnpm 10 and yarn 3 and 4, where Node's matcher (`path.matchesGlob`) reads it as a separator.
 
+## A trailing globstar, a leading `!(`, and a negated class
+
+Run later the same day (about 23:45 UTC), after #266's post-ready review, with
+the same method and versions, and yarn 2.4.3 as well. Folders foo and bar:
+
+| Patterns | npm | pnpm 10 | pnpm 12 | yarn 1 | yarn 2, 3 | yarn 4 | bun 1.2 | bun 1.4.2 |
+|---|---|---|---|---|---|---|---|---|
+| `["*/**"]` | bar, foo | bar, foo | bar, foo | bar, foo | none | bar, foo | bar, foo | bar, foo |
+| `["b*/**"]` | bar | bar | bar | bar | none | bar | bar | bar |
+| `["**"]` | bar, foo | bar, foo | bar, foo | bar, foo, and the root | bar, foo | bar, foo | bar, foo | bar, foo |
+| `["!(foo)"]` | none | bar | refused | none | none | bar | bar, foo | bar, foo |
+| `["*", "!(foo)"]` | bar, foo | bar, foo | refused | bar, foo | bar | bar, foo | bar, foo | bar, foo |
+| `["b[!x]r"]` | bar | none | bar | bar | bar | bar | bar | bar |
+| `["b[^x]r"]` | bar | bar | none | bar | bar | bar | bar | bar |
+| `["b[ax]r"]` | bar | bar | bar | bar | bar | bar | bar | bar |
+| `["*", "!b[!x]r"]` | foo | bar, foo | foo | bar, foo | foo | foo | bar, foo | foo |
+
+Yarn alone, with packages at packages/a, packages/a/b and foo:
+
+| Patterns | yarn 1 | yarn 2, 3 | yarn 4 |
+|---|---|---|---|
+| `["packages/*/**"]` | packages/a, packages/a/b | packages/a/b | packages/a, packages/a/b |
+| `["packages/**"]` | packages/a, packages/a/b | packages/a, packages/a/b | packages/a, packages/a/b |
+| `["p*/**"]` | packages/a, packages/a/b | packages/a, packages/a/b | packages/a, packages/a/b |
+| `["packages/a/**"]` | packages/a, packages/a/b | packages/a/b | packages/a/b |
+| `["*/a/**"]` | packages/a, packages/a/b | packages/a, packages/a/b | packages/a, packages/a/b |
+
+So:
+- For yarn 4, a trailing `/**` reaches the folder itself, as Node's matcher
+  reads the folder's path with its slash, unless the folder is the pattern's
+  literal base: the leading part with no glob in it, which the glob walks from
+  and never lists. `bar/**` doesn't list bar, and `*/**` does.
+- Yarn 2 and 3 read that form by some other rule: `*/**` lists no top-level
+  folder, and `*/a/**` lists packages/a. Six runs don't settle it.
+- A leading `!(` is a negated extglob to yarn 4 and pnpm 10, and pnpm 12
+  refuses it. Yarn 2 and 3 read it as an exclusion of a group, `(foo)`, which
+  Node's matcher reads as literal text. Yarn 1 reads no `!` pattern.
+- pnpm 10 doesn't read `[!x]` as a negated class, and pnpm 12 doesn't read
+  `[^x]` as one. Every other manager reads both as Node's matcher does.
+
 ## pnpm-workspace.yaml: a flow list with a comment line
 
 | File | pnpm 10.28.1 | pnpm 12.5.1 |
@@ -111,6 +151,7 @@ With no dependency and no member, none of them wrote a lockfile.
     exclusion does, as glob's `ignore` reads one. That takes the folder's path
     with its slash too, so `!bar/**` excludes bar.
 - **pnpm 10 and 12, and yarn 4:** an exclusion wins, wherever it stands.
+  Yarn 4 reads a leading `!(` as a pattern, not an exclusion.
 - **yarn 2 and 3:** the last pattern that matches decides.
 - **yarn 1** reads no exclusion: a `!` pattern lists nothing and excludes
   nothing.
@@ -147,3 +188,12 @@ With no dependency and no member, none of them wrote a lockfile.
   unknown.
 - `bun.lock` names bun, as `bun.lockb` does, and the two together are one
   package manager, not a question.
+- From the later runs:
+  - For yarn 4, a trailing `/**` reaches the folder unless it's the pattern's
+    literal base, and a leading `!(` is a pattern. Where either could decide,
+    yarn 2 and 3 leave the answer unknown.
+  - A negated character class leaves pnpm's answer unknown, as does a leading
+    `!(`, which is an extglob to pnpm.
+  - A `.yarnrc.yml` says yarn 2 or later only by a setting, so one of only
+    comments says nothing. One with a setting, beside yarn 1's lockfile,
+    leaves yarn 1 to 4 open.

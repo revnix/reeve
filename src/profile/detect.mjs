@@ -78,8 +78,10 @@ export function workspaceGlobs(root, manager) {
  * The majors of yarn that may own a root, among those measured (1 to 4):
  *   - each one `packageManager` or `.yarnrc.yml`'s `yarnPath` setting names,
  *     since a yarnPath runs in place of the version packageManager names;
- *   - 2 to 4 for a `.yarnrc.yml`, or a lockfile that yarn 2 or later wrote;
- *   - 1 for yarn 1's lockfile;
+ *   - 2 to 4 for a lockfile that yarn 2 or later wrote, or a `.yarnrc.yml` with
+ *     a setting in it;
+ *   - 1 for yarn 1's lockfile, and all four where it and such a `.yarnrc.yml`
+ *     disagree;
  *   - all four when nothing says.
  */
 function yarnMajors(root) {
@@ -95,8 +97,12 @@ function yarnMajors(root) {
   const berry = [2, 3, 4];
   const named = [byManager, byPath].filter(v => v !== undefined).map(Number);
   if (named.length) return [...new Set(named.flatMap(m => (m >= 1 && m <= 4 ? [m] : berry)))];
-  if (rc || /^__metadata:/m.test(lock)) return berry;
-  return /yarn lockfile v1/.test(lock) ? [1] : [1, ...berry];
+  if (/^__metadata:/m.test(lock)) return berry;
+  // Only a setting says yarn 2 or later, so a file of comments says nothing.
+  const settings = rc.split(/\r?\n/).some(l => !/^\s*(#.*)?$/.test(l));
+  const v1 = /yarn lockfile v1/.test(lock);
+  if (settings) return v1 ? [1, ...berry] : berry;
+  return v1 ? [1] : [1, ...berry];
 }
 
 /**
@@ -109,6 +115,9 @@ function yarnMajors(root) {
  *   yarn 1         it's no pattern at all;
  *   bun            differently from one version to the next.
  * Only npm drops a leading slash; the others keep it, so it matches no folder.
+ * A leading `!(` is a negated extglob to yarn 4, and an exclusion of a group to
+ * yarn 2 and 3. A trailing `/**` reaches the folder itself for yarn 4, unless
+ * the folder is the pattern's literal base, which its glob walks from.
  * True, false, or null when it can't be told: a list the manager's versions
  * read differently, a yarn whose possible versions disagree, or bun where an
  * exclusion or an extglob could matter.
@@ -117,16 +126,20 @@ function isMember(rel, globs, manager, root) {
   if (manager === "npm") return listed(globs, rel);
   if (globs === null) return null;
   try {
-    const hit = g => matchesGlob(rel, g.replace(/^!/, "").replace(/^\.\//, "").replace(/\/+$/, ""));
+    const clean = g => g.replace(/^!/, "").replace(/^\.\//, "").replace(/\/+$/, "");
+    const hit = g => matchesGlob(rel, clean(g));
     // The folder's path with its slash too, which `bar/**` reaches.
-    const asFolder = g => hit(g) || matchesGlob(`${rel}/`, g.replace(/^!/, "").replace(/^\.\//, "").replace(/\/+$/, ""));
-    const extglob = g => /[?*+@!]\(/.test(g.replace(/^!/, ""));
+    const asFolder = g => hit(g) || matchesGlob(`${rel}/`, clean(g));
+    const negated = g => g.startsWith("!(");
+    const extglob = g => /[?*+@!]\(/.test(g.replace(/^!(?!\()/, ""));
     // What a manager reads unlike Node's matcher leaves its answer unknown: a
     // backslash, an escape to each manager and a separator to the matcher; an
     // extglob, which pnpm 12 refuses and pnpm 10 reads; a leading slash, for
     // which bun refuses the whole list.
     if (globs.some(g => g.includes("\\"))) return null;
     if (manager === "pnpm" && globs.some(extglob)) return null;
+    // A negated class, which pnpm 10 reads only as `[^…]` and pnpm 12 only as `[!…]`.
+    if (manager === "pnpm" && globs.some(g => /\[[!^]/.test(g))) return null;
     if (manager === "bun" && globs.some(g => /^!?\//.test(g))) return null;
     // Repeated bangs, which yarn 3 and 4 read their own ways.
     if (manager === "yarn" && globs.some(g => g.startsWith("!!"))) return null;
@@ -143,10 +156,16 @@ function isMember(rel, globs, manager, root) {
       return exclusions.length || included ? null : false;
     }
     if (manager !== "yarn") return false;
-    const berryIncluded = globs.some(g => !g.startsWith("!") && hit(g));
+    // Where only a trailing `/**` reaches the folder itself, short of the base
+    // the pattern's glob walks from.
+    const base = g => { const at = clean(g).split("/"); const n = at.findIndex(s => /[*?[\]{}()!+@]/.test(s)); return at.slice(0, n < 0 ? at.length : n).join("/"); };
+    const onlyAsFolder = g => !g.startsWith("!") && !hit(g) && asFolder(g) && rel !== base(g);
+    const berryIncluded = globs.some(g => (!g.startsWith("!") && (hit(g) || onlyAsFolder(g))) || (negated(g) && matchesGlob(rel, g)));
     const lastWins = globs.reduce((member, g) => (g.startsWith("!") ? (asFolder(g) ? false : member) : hit(g) || member), false);
     const berryExclusionWins = berryIncluded && !exclusions.some(asFolder);
-    const reading = { 1: included, 2: lastWins, 3: lastWins, 4: berryExclusionWins };
+    // Yarn 2 and 3 read either form in a way not measured.
+    const twoAndThree = globs.some(negated) || globs.some(onlyAsFolder) ? null : lastWins;
+    const reading = { 1: included, 2: twoAndThree, 3: twoAndThree, 4: berryExclusionWins };
     const readings = new Set(yarnMajors(root).map(m => reading[m]));
     return readings.size === 1 ? [...readings][0] : null;
   } catch { return null; }

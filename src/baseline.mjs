@@ -23,13 +23,15 @@ export function baselinePathFor(nwo) {
   return join(PKG_ROOT, "deploy", "baselines", owner, `${repo}.json`);
 }
 
-// Every list endpoint is paginated and slurped, so a repository with more
-// rulesets than one page does not lose the later ones from its baseline;
-// `--slurp` wraps the pages in one outer array, which is flattened here.
-const ghApi = (path, { list = false } = {}) => {
-  const args = list ? ["api", "--paginate", "--slurp", path] : ["api", path];
-  const out = JSON.parse(execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 60000 }));
-  return list ? out.flat() : out;
+// Every list endpoint is paginated, so a repository with more rulesets than one
+// page does not lose the later ones from its baseline. `--jq` hands back each
+// item of every page as one line of JSON. `--slurp` would wrap the pages in one
+// array instead, but the gh in Ubuntu's own archive (2.46) doesn't have it and
+// answers "unknown flag: --slurp" (docs/measured/2026-09-27-gh-2.46-has-no-slurp.md).
+export const ghApi = (path, { list = false, exec = execFileSync } = {}) => {
+  const read = args => exec("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 60000 });
+  if (!list) return JSON.parse(read(["api", path]));
+  return read(["api", "--paginate", "--jq", ".[] | tojson", path]).split("\n").filter(Boolean).map(line => JSON.parse(line));
 };
 
 /**

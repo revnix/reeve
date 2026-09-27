@@ -401,7 +401,7 @@ function checkLeases(db) {
     `SELECT id, task_id, lane, status, lease_expires_at, heartbeat_at FROM run
      WHERE status IN ('leased','running','blocked_on_ci','blocked_on_review','awaiting_founder')`
   ).all();
-  const expired = rows.filter(r => r.lease_expires_at < now);
+  const expired = rows.filter(r => r.lease_expires_at <= now);
   const lines = [`${rows.length} live run(s); ${expired.length} past lease expiry`];
   for (const r of expired.slice(0, 5)) {
     lines.push(`  ${r.task_id} (${r.lane}) expired ${Math.round((now - r.lease_expires_at) / 60)}m ago`);
@@ -409,7 +409,7 @@ function checkLeases(db) {
   // Reaped by the daemon itself, each tick (#162). A `reeve lane reap` was
   // recommended here and never built.
   if (expired.length) {
-    lines.push("-> a running daemon reaps these on its next tick, or extends the lease of one whose worker is still alive. If they stay, no daemon is running for this repository");
+    lines.push("-> a running daemon reaps these on its next tick, first stopping a worker still running on one. If they stay, no daemon is running for this repository");
     return { id: "R-06", level: DEGRADED, title: "leases", lines };
   }
   return { id: "R-06", level: OK, title: "leases", lines };

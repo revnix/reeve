@@ -1776,26 +1776,42 @@ export async function tick(ctx) {
   // abandoned, and its pull request is free again. Ungated, as the reap above
   // is, and for the same reasons, the halt among them.
   try {
-    for (const r of (ctx.reapRuns ?? reap)(db, { actor: "daemon", isAlive: isSameProcess })) {
-      if (r.action === "reaped") {
-        log(logPath, `run ${r.run} reaped: its lease had lapsed and its worker is gone`);
-        // Its checkout, preserved as a failed run's is, since whatever the
-        // worker committed was never fetched. Left where it was, each crash
-        // would leave a whole repository and its dependencies behind.
-        const pr = /^pr:(\d+)$/.exec(r.task ?? "")?.[1];
-        if (pr) {
-          const kept = releaseRunCheckout(runPathFor(worktreeRootOf(profile), pr, r.run), { workFetched: false });
-          if (!kept.ok) log(logPath, `  run ${r.run}: could not preserve its checkout — ${kept.why}`);
+    // One pass reaps each run whose worker is gone, and stops each worker still
+    // running on a lapsed lease. It answers the runs whose workers it stopped.
+    const pass = () => {
+      const stopped = [];
+      for (const r of (ctx.reapRuns ?? reap)(db, { actor: "daemon", isAlive: isSameProcess })) {
+        if (r.action === "reaped") {
+          log(logPath, `run ${r.run} reaped: its lease had lapsed and its worker is gone`);
+          // Its checkout, preserved as a failed run's is, since whatever the
+          // worker committed was never fetched. Left where it was, each crash
+          // would leave a whole repository and its dependencies behind.
+          const pr = /^pr:(\d+)$/.exec(r.task ?? "")?.[1];
+          if (pr) {
+            const kept = releaseRunCheckout(runPathFor(worktreeRootOf(profile), pr, r.run), { workFetched: false });
+            if (!kept.ok) log(logPath, `  run ${r.run}: could not preserve its checkout — ${kept.why}`);
+          }
+        } else if (r.action === "spared") {
+          // A worker still running on a lapsed lease holds a claim nothing will
+          // renew: its supervisor is gone, or stalled past its lease. Nothing
+          // records its work, keeps its budget, or stops it at a halt. So it's
+          // stopped, as the supervisor stops a worker whose lease it can no
+          // longer prove.
+          const stoppedIt = (ctx.stopWorker ?? stopWorkerGroup)(r.pid, r.boot);
+          log(logPath, `run ${r.run}: its lease lapsed while its worker ran on; ${stoppedIt ? "the worker was stopped" : "the process is no longer the worker, so it was left alone"}`);
+          if (stoppedIt) stopped.push(r);
         }
-      } else if (r.action === "spared") {
-        // A worker still running on a lapsed lease holds a claim nothing will
-        // renew: its supervisor is gone, or stalled past its lease. Nothing
-        // records its work, keeps its budget, or stops it at a halt. So it's
-        // stopped, as the supervisor stops a worker whose lease it can no
-        // longer prove, and its run is reaped once it's gone.
-        const stopped = (ctx.stopWorker ?? stopWorkerGroup)(r.pid, r.boot);
-        log(logPath, `run ${r.run}: its lease lapsed while its worker ran on; ${stopped ? "the worker was stopped" : "the process is no longer the worker, so it was left alone"}`);
       }
+      return stopped;
+    };
+    const stopped = pass();
+    // And reaped in this same pass once they've gone, known gone by pid and
+    // start time together, so the tick doesn't go on to report a run past its
+    // lease that nothing is working, which it has just handled.
+    if (stopped.length) {
+      for (let i = 0; i < 20 && stopped.some((r) => isSameProcess(r.pid, r.boot)); i++)
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      pass();
     }
   } catch (err) {
     // Housekeeping must never take the tick with it.

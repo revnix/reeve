@@ -19,7 +19,7 @@ import { once } from "node:events";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { open, startRun, bindRun } from "../src/db/ops.mjs";
+import { open, startRun, bindRun, reap } from "../src/db/ops.mjs";
 import { readStart } from "../src/supervisor.mjs";
 import { statePathFor } from "../src/paths.mjs";
 import { runPathFor } from "../src/checkout.mjs";
@@ -66,29 +66,30 @@ test("a run whose worker died is reaped on the next tick, and its pull request i
   assert.equal(out.spawned.length, 1, `no worker was dispatched for the pull request:\n${out.log.slice(-1500)}`);
 });
 
-test("a worker still running on a lapsed lease is stopped, its claim isn't renewed, and its run is reaped on the next tick", async () => {
+test("a worker still running on a lapsed lease is stopped and its run reaped in the same tick, its claim never renewed", async () => {
   const { dbPath, runId, worker } = await leftBehind({ killWorker: false });
   try {
-    const first = await run({ dbPath });
-    assert.equal(first.spawned.length, 0, "a second worker was dispatched beside the live one");
-    assert.ok(runRow(dbPath, runId).lease_expires_at < now(), "the lapsed claim was renewed");
-    assert.ok(await exits(worker), `the worker wasn't stopped:\n${first.log.slice(-1500)}`);
-    const second = await run({ dbPath });
-    assert.equal(runRow(dbPath, runId).status, "abandoned", second.log.slice(-1500));
-    assert.equal(second.spawned.length, 1, `the pull request wasn't worked again:\n${second.log.slice(-1500)}`);
+    const out = await run({ dbPath });
+    assert.ok(await exits(worker), `the worker wasn't stopped:\n${out.log.slice(-1500)}`);
+    const row = runRow(dbPath, runId);
+    assert.equal(row.status, "abandoned", out.log.slice(-1500));
+    assert.ok(row.lease_expires_at < now(), "the lapsed claim was renewed");
+    // Handled in this pass, so nothing tells a person it's unworked.
+    assert.doesNotMatch(out.esc, /past its lease/, "the tick paged about a run it had just handled");
   } finally {
     try { process.kill(-worker.pid, "SIGKILL"); } catch { /* stopped */ }
   }
 });
 
 test("a halted tick stops a worker left running on a lapsed lease", async () => {
-  const { dbPath, worker } = await leftBehind({ killWorker: false });
+  const { dbPath, runId, worker } = await leftBehind({ killWorker: false });
   const haltMarker = join(tempDir("reap-halt-"), "HALT");
   writeFileSync(haltMarker, "");
   try {
     const out = await run({ dbPath, haltMarker });
     assert.equal(out.spawned.length, 0);
     assert.ok(await exits(worker), `a halted tick left the orphaned worker running:\n${out.log.slice(-1500)}`);
+    assert.equal(runRow(dbPath, runId).status, "abandoned", out.log.slice(-1500));
   } finally {
     try { process.kill(-worker.pid, "SIGKILL"); } catch { /* stopped */ }
   }
@@ -104,6 +105,19 @@ test("a pid now held by another process is never signalled: its run is reaped as
     assert.equal(alive(worker.pid), true, "a process that isn't the worker was signalled");
   } finally {
     try { process.kill(-worker.pid, "SIGKILL"); } catch { /* gone */ }
+  }
+});
+
+test("a run whose lease lapses this very second is reaped, as heartbeat already treats it as lost", () => {
+  const db = open(join(tempDir("reap-edge-"), "s.db"));
+  try {
+    const started = startRun(db, { nwo: "o/r", pr: 42, action: "FIX_CI", head: HEAD });
+    // The lease ends at the second the reaper reads as now.
+    const at = now() + 60;
+    db.prepare("UPDATE run SET lease_expires_at = ? WHERE id = ?").run(at, started.runId);
+    assert.deepEqual(reap(db, { isAlive: () => false, now: at }).map((r) => r.action), ["reaped"]);
+  } finally {
+    db.close();
   }
 });
 
@@ -155,4 +169,6 @@ test("the doctor's advice for a run past its lease is the daemon's next tick, no
   assert.ok(leases.lines.some((l) => /past lease expiry/.test(l)), "control: the run wasn't read as past its lease");
   assert.ok(leases.lines.some((l) => /reaps these on its next tick/.test(l)), JSON.stringify(leases.lines));
   assert.ok(!leases.lines.some((l) => /lane reap/.test(l)), JSON.stringify(leases.lines));
+  // The reaper stops a worker still running on a lapsed lease; it renews nothing.
+  assert.ok(!leases.lines.some((l) => /extends the lease/.test(l)), JSON.stringify(leases.lines));
 });

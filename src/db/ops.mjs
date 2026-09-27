@@ -379,11 +379,14 @@ export function backoffSeconds(attempt, base = 30, cap = 3600) {
   return Math.floor(exp / 2 + Math.random() * (exp / 2));
 }
 
-export function reap(db, { actor = "daemon", isAlive = () => false } = {}) {
+export function reap(db, { actor = "daemon", isAlive = () => false, now = Math.floor(Date.now() / 1000) } = {}) {
+  // From the second the lease names, as heartbeat() and finishRun() already
+  // treat it as lost: a claim nothing can use shouldn't hold its task a tick
+  // longer (#162).
   const expired = db.prepare(`
     SELECT id, task_id, attempt, owner_pid, owner_boot, owner_host FROM run
-    WHERE lease_expires_at < unixepoch()
-      AND status IN ('leased','running','blocked_on_ci','blocked_on_review','awaiting_founder')`).all();
+    WHERE lease_expires_at <= ?
+      AND status IN ('leased','running','blocked_on_ci','blocked_on_review','awaiting_founder')`).all(now);
   const out = [];
   for (const r of expired) {
     // Grace: a run whose process is demonstrably alive on this host is spared,

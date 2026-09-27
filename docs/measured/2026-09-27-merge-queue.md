@@ -23,6 +23,17 @@ was published by hand as the app, as an enforcing reeve would publish it.
 | Queued again. `ops/merge-policy` passed on the new queue commit, 56e3345, at 15:06:53 | Merged at 15:07:27, 34 seconds later. `main`'s head became 56e3345, the queue's commit itself. |
 | A second pull request queued. `ops/merge-policy` failed on its queue commit, 6ff3054, at 15:08:17 | Removed at 15:08:49, with the reason `failed_checks`. The pull request stayed open. |
 
+## With reeve publishing, enforcing, from #163's branch
+
+`reeve run nextlyhq/merge-queue-sandbox --enforce --interval 60`, with the queue's
+check timeout raised to 30 minutes.
+
+| Step | What happened |
+|---|---|
+| Queued at 22:19:04 UTC, while reeve published a settling UNKNOWN on the queue's commit as `action_required` | Removed at 22:20:50, with the reason `failed_checks`, 31 seconds after that publication. A queue reads any settled result that isn't success as a failure. |
+| After the fix, queued at 22:23:37. On the queue's commit, 9bf42da, reeve published its settling UNKNOWN as in progress, at 22:26:54 and 22:28:12 | The queue waited. |
+| reeve's verdict on 9bf42da was PASS, published at 22:29:29 | Merged at 22:29:43, 14 seconds later. `main`'s head became 9bf42da. |
+
 ## What followed
 
 - **The queue commit is what merges.** A required check has to pass on it, and a
@@ -38,6 +49,10 @@ was published by hand as the app, as an enforcing reeve would publish it.
   GitHub reports a pull request whose required checks pass as CLEAN under a
   required queue. So when such a base reports BLOCKED, the queue isn't the
   reason, and reeve counts `merge_queue` among the rules that can't stop a merge.
+- **What a queue reads as a failure.** Any settled result on the queue's commit
+  that isn't success removes the entry. So there, an UNKNOWN that waiting or
+  reading again settles is published as in progress. A block, a pass, and an
+  UNKNOWN only a person can settle are settled there as anywhere.
 - **Timing.** Nextly's queue waits 60 minutes for checks. A daemon that polls every
   5 minutes, and settles CI over three readings, answers within about 15 minutes of
   the queue's own checks finishing. The sandbox's 10 minutes is too short for that,

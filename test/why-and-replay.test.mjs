@@ -11,9 +11,9 @@ import { fileURLToPath } from "node:url";
 import { open } from "../src/db/ops.mjs";
 import { computeVerdict } from "../src/verdict.mjs";
 import { why } from "../src/status.mjs";
-import { replayDecisions } from "../src/decisions.mjs";
+import { replayDecisions, policyHashFor } from "../src/decisions.mjs";
 import { latestDecision, policyBody, saveDecision } from "../src/db/records.mjs";
-import { recordsFor } from "../src/evidence.mjs";
+import { recordsFor, policyOf } from "../src/evidence.mjs";
 import { run, EVAL, HEAD } from "./fixtures/tick-harness.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 import { offlineEnv } from "./fixtures/offline-github.mjs";
@@ -223,4 +223,36 @@ test("a start that more than one commit or record shares is refused as ambiguous
       .run(digest, 43, HEAD, JSON.stringify(d.record), 1, 1, ++seq, seq);
   assert.throws(() => replayDecisions(db, { digest: "abcd" }), /abcd is ambiguous: it starts 2 records/);
   assert.throws(() => replayDecisions(db, { digest: "0" }), /must be 4 to 64 hexadecimal characters/);
+});
+
+// ── from the review after #261 was marked ready ───────────────────────────────
+
+test("the policy is compared only with the selected repository's own profile", () => {
+  const profile = { schemaVersion: 1, identity: { key: "o/r" }, project: { kind: "product" } };
+  assert.equal(policyHashFor({ ...profile, identity: { key: "x/y" } }, "o/r"), null, "another repository's profile");
+  assert.equal(policyHashFor({ schemaVersion: 1 }, "o/r"), null, "a profile that names no repository");
+  assert.equal(policyHashFor(profile, "o/r"), policyOf(profile).hash);
+});
+
+test("a decision row whose pull request or commit no longer matches its record can't be trusted", async () => {
+  const { db } = await recorded();
+  const d = latestDecision(db, 42);
+  db.prepare(`UPDATE decision SET pr = 99 WHERE digest = ?`).run(d.digest);
+  assert.match(why(db, "99"), /names pull request 99, but its record 42/);
+  const [r] = replayDecisions(db, { pr: 99 });
+  assert.equal(r.outcome, "unreplayable");
+  assert.match(String(r.why), /names pull request 99, but its record 42/);
+  db.prepare(`UPDATE decision SET pr = 42, head = ? WHERE digest = ?`).run("f".repeat(40), d.digest);
+  assert.match(String(replayDecisions(db, { pr: 42 })[0].why), /names commit ffffffff/);
+});
+
+test("a code version git couldn't read makes the comparison unknown, never unchanged", async () => {
+  const unreadable = { commit: null, tree: null, dirty: null, diff: null };
+  const { db } = await recorded();
+  assert.equal(replayDecisions(db, {}, { code: unreadable })[0].codeChanged, null, "the replaying code unreadable");
+  const dbPath = join(tempDir("reeve-why-"), "s.db");
+  await run({ evaluate, dbPath, code: unreadable, treeOf: () => "c".repeat(40) });
+  const both = open(dbPath);
+  assert.equal(replayDecisions(both, {}, { code: unreadable })[0].codeChanged, null, "both unreadable");
+  assert.equal(replayDecisions(both, {}, { code: CODE })[0].codeChanged, null, "the recorded code unreadable");
 });

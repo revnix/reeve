@@ -100,7 +100,7 @@ function braces(glob) {
 // pattern overrides an earlier one, and `!` excludes. `*`, `**`, `?` and braces
 // are read; null when a pattern holds more, a class or an extended glob, which
 // leaves the answer unknown.
-function listed(patterns, rel) {
+export function listed(patterns, rel) {
   const path = rel.split(sep).join("/");
   let hit = false, unsure = false;
   for (const pattern of patterns) {

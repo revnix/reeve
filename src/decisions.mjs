@@ -8,7 +8,7 @@
 // that agreed.
 
 import { computeVerdict } from "./verdict.mjs";
-import { joinEvidence, asJson } from "./evidence.mjs";
+import { joinEvidence, asJson, policyOf } from "./evidence.mjs";
 import { canonical } from "./db/ops.mjs";
 import { latestDecision, decisionsFor, evidenceBy, policyRecord } from "./db/records.mjs";
 
@@ -37,7 +37,7 @@ export function explainDecision(db, pr, { head = null } = {}) {
   /** @type {{ id: string, state: string, detail?: string }[]} */
   const clauses = r.verdict.clauses ?? [];
   const out = [];
-  if (d.corrupt) out.push(`  this record doesn't match its digest ${short(d.digest)}: it was changed after it was kept, so what follows can't be trusted`);
+  if (d.corrupt) out.push(`  this record can't be trusted: ${d.corrupt} (record ${short(d.digest)}); it was changed after it was kept`);
   out.push(`${r.verdict.state} at ${short(r.subject.head)}, tree ${short(r.subject.tree)}, judged ${span(d.first_at, d.last_at)} (record ${short(d.digest)})`);
   if (r.verdict.summary) out.push(`  ${r.verdict.summary}`);
   const w = Math.max(0, ...clauses.map(c => c.id.length));
@@ -61,8 +61,28 @@ export function explainDecision(db, pr, { head = null } = {}) {
  *             codeChanged: boolean | null, policyChanged: boolean | null }} Replayed
  */
 
-/** @param {any} a @param {any} b */
-const sameCode = (a, b) => a?.commit === b?.commit && a?.tree === b?.tree && a?.dirty === b?.dirty && a?.diff === b?.diff;
+/**
+ * Whether two code versions are the same: null when either can't say, because
+ * git couldn't read its commit, or whether it differed from it, or by how much.
+ * @param {any} a @param {any} b
+ */
+const sameCode = (a, b) => {
+  const readable = v => Boolean(v?.commit) && typeof v.dirty === "boolean" && (!v.dirty || Boolean(v.diff));
+  if (!readable(a) || !readable(b)) return null;
+  return a.commit === b.commit && a.tree === b.tree && a.dirty === b.dirty && a.diff === b.diff;
+};
+
+/**
+ * The hash of the policy a repository applies now, which says whether a replayed
+ * decision's policy has changed since. It comes only from a profile that names
+ * that repository: a checkout's own profile may be another repository's. Null
+ * otherwise, which leaves the question unanswered rather than answered wrongly.
+ * @param {Record<string, any> | null | undefined} profile
+ * @param {string | null | undefined} nwo
+ */
+export function policyHashFor(profile, nwo) {
+  return profile && nwo && profile.identity?.key === nwo ? policyOf(profile).hash : null;
+}
 
 /**
  * What changed between two verdicts, clause by clause.
@@ -97,11 +117,11 @@ export function replayDecisions(db, which = {}, { code = null, policyHash = null
   for (const d of decisionsFor(db, which)) {
     const r = d.record;
     const base = { digest: d.digest, pr: d.pr, head: d.head, recorded: r.verdict.state,
-                   codeChanged: code ? !sameCode(r.code, code) : null,
+                   codeChanged: code ? ((same) => (same === null ? null : !same))(sameCode(r.code, code)) : null,
                    policyChanged: policyHash ? r.policy !== policyHash : null };
     // A record, evidence or policy that doesn't match its digest is not the one
     // its key names, so what it would replay to proves nothing either way.
-    if (d.corrupt) { results.push({ ...base, outcome: "unreplayable", why: "its record doesn't match its digest" }); continue; }
+    if (d.corrupt) { results.push({ ...base, outcome: "unreplayable", why: d.corrupt }); continue; }
     const { found, missing, corrupt } = evidenceBy(db, Object.values(r.evidence));
     const policy = policyRecord(db, r.policy);
     const why = missing.length ? `${missing.length} piece(s) of its evidence are missing`

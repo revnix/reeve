@@ -1,5 +1,5 @@
 {
-  "capturedAt": "2026-08-21T22:33:40.617Z",
+  "capturedAt": "2026-09-27T13:02:21.554Z",
   "nwo": "nextlyhq/nextly",
   "branch": "main",
   "liveDefaultBranch": "main",
@@ -7,31 +7,41 @@
     "protect-main"
   ],
   "rulesetSnapshot": [
-    "protect-main|bypass:[\"OrganizationAdmin::always\"]|rules:[\"deletion:{}\",\"non_fast_forward:{}\",\"pull_request:{\\\"allowed_merge_methods\\\":[\\\"merge\\\",\\\"rebase\\\",\\\"squash\\\"],\\\"dismiss_stale_reviews_on_push\\\":false,\\\"dismissal_restriction\\\":{\\\"allowed_actors\\\":[],\\\"enabled\\\":false},\\\"require_code_owner_review\\\":true,\\\"require_extra_approval_for_unattributed_changes\\\":true,\\\"require_last_push_approval\\\":false,\\\"required_approving_review_count\\\":1,\\\"required_review_thread_resolution\\\":false,\\\"required_reviewers\\\":[]}\"]"
+    "protect-main|bypass:[\"Team:19697326:pull_request\"]|rules:[\"deletion:{}\",\"merge_queue:{\\\"check_response_timeout_minutes\\\":60,\\\"grouping_strategy\\\":\\\"ALLGREEN\\\",\\\"max_entries_to_build\\\":5,\\\"max_entries_to_merge\\\":5,\\\"merge_method\\\":\\\"SQUASH\\\",\\\"min_entries_to_merge\\\":1,\\\"min_entries_to_merge_wait_minutes\\\":1}\",\"non_fast_forward:{}\",\"pull_request:{\\\"allowed_merge_methods\\\":[\\\"merge\\\",\\\"rebase\\\",\\\"squash\\\"],\\\"dismiss_stale_reviews_on_push\\\":false,\\\"dismissal_restriction\\\":{\\\"allowed_actors\\\":[],\\\"enabled\\\":false},\\\"require_code_owner_review\\\":true,\\\"require_extra_approval_for_unattributed_changes\\\":true,\\\"require_last_push_approval\\\":false,\\\"required_approving_review_count\\\":1,\\\"required_review_thread_resolution\\\":true,\\\"required_reviewers\\\":[]}\",\"required_status_checks:{\\\"do_not_enforce_on_create\\\":false,\\\"required_status_checks\\\":[{\\\"context\\\":\\\"CI gate\\\",\\\"integration_id\\\":15368},{\\\"context\\\":\\\"Comment convention (describes code, not process)\\\",\\\"integration_id\\\":15368},{\\\"context\\\":\\\"Independent review of the revision being merged\\\",\\\"integration_id\\\":15368},{\\\"context\\\":\\\"Integration (mysql)\\\",\\\"integration_id\\\":15368},{\\\"context\\\":\\\"Integration (postgres)\\\",\\\"integration_id\\\":15368},{\\\"context\\\":\\\"Integration (sqlite)\\\",\\\"integration_id\\\":15368},{\\\"context\\\":\\\"No AI credit\\\",\\\"integration_id\\\":15368},{\\\"context\\\":\\\"Validate PR title follows Conventional Commits\\\",\\\"integration_id\\\":15368},{\\\"context\\\":\\\"gitleaks\\\",\\\"integration_id\\\":15368}],\\\"strict_required_status_checks_policy\\\":false}\"]"
   ],
   "ruleSnapshot": [
     "deletion:{}",
+    "merge_queue:{\"check_response_timeout_minutes\":60,\"grouping_strategy\":\"ALLGREEN\",\"max_entries_to_build\":5,\"max_entries_to_merge\":5,\"merge_method\":\"SQUASH\",\"min_entries_to_merge\":1,\"min_entries_to_merge_wait_minutes\":1}",
     "non_fast_forward:{}",
-    "pull_request:{\"allowed_merge_methods\":[\"merge\",\"rebase\",\"squash\"],\"dismiss_stale_reviews_on_push\":false,\"dismissal_restriction\":{\"allowed_actors\":[],\"enabled\":false},\"require_code_owner_review\":true,\"require_extra_approval_for_unattributed_changes\":true,\"require_last_push_approval\":false,\"required_approving_review_count\":1,\"required_review_thread_resolution\":false,\"required_reviewers\":[]}"
+    "pull_request:{\"allowed_merge_methods\":[\"merge\",\"rebase\",\"squash\"],\"dismiss_stale_reviews_on_push\":false,\"dismissal_restriction\":{\"allowed_actors\":[],\"enabled\":false},\"require_code_owner_review\":true,\"require_extra_approval_for_unattributed_changes\":true,\"require_last_push_approval\":false,\"required_approving_review_count\":1,\"required_review_thread_resolution\":true,\"required_reviewers\":[]}",
+    "required_status_checks:{\"do_not_enforce_on_create\":false,\"required_status_checks\":[{\"context\":\"CI gate\",\"integration_id\":15368},{\"context\":\"Comment convention (describes code, not process)\",\"integration_id\":15368},{\"context\":\"Independent review of the revision being merged\",\"integration_id\":15368},{\"context\":\"Integration (mysql)\",\"integration_id\":15368},{\"context\":\"Integration (postgres)\",\"integration_id\":15368},{\"context\":\"Integration (sqlite)\",\"integration_id\":15368},{\"context\":\"No AI credit\",\"integration_id\":15368},{\"context\":\"Validate PR title follows Conventional Commits\",\"integration_id\":15368},{\"context\":\"gitleaks\",\"integration_id\":15368}],\"strict_required_status_checks_policy\":false}"
   ],
-  "rulesetRequiredChecks": [],
+  "rulesetRequiredChecks": [
+    "CI gate@15368",
+    "Comment convention (describes code, not process)@15368",
+    "Independent review of the revision being merged@15368",
+    "Integration (mysql)@15368",
+    "Integration (postgres)@15368",
+    "Integration (sqlite)@15368",
+    "No AI credit@15368",
+    "Validate PR title follows Conventional Commits@15368",
+    "gitleaks@15368"
+  ],
   "rulesetBypassActors": [
-    "OrganizationAdmin::always"
+    "Team:19697326:pull_request"
   ],
-  "branchProtectionRequiredChecks": [
-    "Decide what this commit can affect@15368"
-  ],
+  "branchProtectionRequiredChecks": [],
   "classicBypassAllowances": [],
   "strictRequiredChecks": false,
-  "enforceAdmins": false,
-  "classicSnapshot": "{\"allow_deletions\":{\"enabled\":false},\"allow_force_pushes\":{\"enabled\":false},\"allow_fork_syncing\":{\"enabled\":false},\"block_creations\":{\"enabled\":false},\"enforce_admins\":{\"enabled\":false},\"lock_branch\":{\"enabled\":false},\"required_conversation_resolution\":{\"enabled\":true},\"required_linear_history\":{\"enabled\":false},\"required_signatures\":{\"enabled\":false},\"required_status_checks\":{\"checks\":[{\"app_id\":15368,\"context\":\"Decide what this commit can affect\"}],\"contexts\":[\"Decide what this commit can affect\"],\"strict\":false}}",
+  "enforceAdmins": null,
+  "classicSnapshot": null,
   "requiredApprovals": 1,
   "codeOwnerReview": true,
   "dismissStaleReviews": false,
   "requireLastPushApproval": false,
   "requireThreadResolution": true,
   "profile": {
-    "authorityPolicy": "propose_and_merge",
+    "authorityPolicy": "propose_and_wait",
     "mergeEnforcement": "enforced",
     "capabilities": {
       "observe": false,

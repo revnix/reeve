@@ -102,14 +102,15 @@ export function readThreads(nwo, pr, io = null) {
  * The pull requests queued to merge into `branch`, each with the commit the
  * queue built for it, which is the commit that merges. Measured in
  * docs/measured/2026-09-27-merge-queue.md. `sha` is null until the queue has
- * built the commit. `queue` is false for a branch with no queue. Not ok when
- * the queue can't be read.
+ * built the commit, and `prHead` is the pull request's head as this read found
+ * it. `queue` is false for a branch with no queue. Not ok when the queue can't
+ * be read.
  */
 export function readMergeQueue(nwo, branch, { gh = ghJson } = {}) {
   const [owner, name] = String(nwo).split("/");
   const query = "query($owner:String!,$name:String!,$branch:String!,$after:String){repository(owner:$owner,name:$name){" +
     "mergeQueue(branch:$branch){entries(first:100,after:$after){pageInfo{hasNextPage endCursor} " +
-    "nodes{state headCommit{oid} baseCommit{oid} pullRequest{number}}}}}}";
+    "nodes{state headCommit{oid} baseCommit{oid} pullRequest{number headRefOid}}}}}}";
   const entries = [];
   // Every page: an entry past the first hundred would go unanswered until the
   // queue dropped it at its timeout.
@@ -118,14 +119,19 @@ export function readMergeQueue(nwo, branch, { gh = ghJson } = {}) {
     const r = gh(["graphql", "-f", `query=${query}`, "-f", `owner=${owner}`, "-f", `name=${name}`, "-f", `branch=${branch}`,
                   ...(after ? ["-f", `after=${after}`] : [])]);
     if (!r.ok) return { ok: false, why: r.err || "the merge queue couldn't be read" };
-    let queue;
-    try { queue = JSON.parse(r.out)?.data?.repository?.mergeQueue; } catch { return { ok: false, why: "the merge queue's answer couldn't be parsed" }; }
+    let got;
+    try { got = JSON.parse(r.out); } catch { return { ok: false, why: "the merge queue's answer couldn't be parsed" }; }
+    // An HTTP 200 can carry errors for single fields, which then read as null, as
+    // in readThreads. A queue that read as null that way would look like none.
+    if (got?.errors?.length) return { ok: false, why: `the merge queue's answer carried errors: ${got.errors[0]?.message ?? "unnamed"}` };
+    const queue = got?.data?.repository?.mergeQueue;
     if (queue === undefined) return { ok: false, why: "the merge queue's answer had no repository in it" };
     if (queue === null) return { ok: true, queue: false, entries: [] };
     const nodes = queue.entries?.nodes;
     if (!Array.isArray(nodes)) return { ok: false, why: "the merge queue's answer had no entries" };
     for (const n of nodes) if (Number.isInteger(n?.pullRequest?.number))
-      entries.push({ pr: n.pullRequest.number, sha: n.headCommit?.oid ?? null, baseSha: n.baseCommit?.oid ?? null, state: n.state ?? null });
+      entries.push({ pr: n.pullRequest.number, sha: n.headCommit?.oid ?? null, baseSha: n.baseCommit?.oid ?? null, state: n.state ?? null,
+                     prHead: n.pullRequest.headRefOid ?? null });
     const info = queue.entries.pageInfo;
     if (!info?.hasNextPage) break;
     if (!info.endCursor) return { ok: false, why: "the merge queue said there was more, and gave no cursor to read it" };
@@ -144,11 +150,17 @@ export function readMergeQueue(nwo, branch, { gh = ghJson } = {}) {
  * (`input`): its reviews, threads, findings, hold and merge state. CI is read on
  * the queue's commit and settled apart from the head, under the queue's own key,
  * so neither resets the other. The base is judged at the queue's base commit.
+ * Those facts carry over only while the queue holds the pull request at the head
+ * they were read at: a push between the two reads would carry one revision's
+ * reviews onto a commit built from another.
  */
 export function evaluateQueueEntry({ nwo, entry, input, baseRef, profile, db = null,
                                      read = readChecks, requirements = requiredChecksOf }) {
   if (!entry?.sha) return { ok: false, why: "the queue hasn't built its commit yet" };
   if (!input) return { ok: false, why: "the pull request wasn't evaluated this tick, so its facts can't carry over" };
+  if (!entry.prHead || entry.prHead !== input.head)
+    return { ok: false, why: entry.prHead ? `the queue holds the pull request at ${entry.prHead.slice(0, 10)}, not at ${String(input.head).slice(0, 10)}, which this tick judged`
+                                          : "the queue didn't say which head of the pull request it holds" };
   const reviewerContexts = profile.ci?.reviewerStatusContexts ?? [];
   const got = read(nwo, entry.sha, { reviewerContexts });
   const req = requirements({ nwo, baseRef, profile });

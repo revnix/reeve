@@ -45,6 +45,12 @@ check timeout raised to 30 minutes.
   - CI is read on the queue's commit, and settled apart from the pull request's
     head.
   - The base is judged at the queue's base commit.
+- **Only a queue commit judged whole is published on.** A check there speaks for
+  every pull request the queue put on it, so reeve publishes only when each was
+  judged this tick, without error, at the head the queue holds it at (the
+  entry's `pullRequest.headRefOid`). Otherwise it publishes nothing there, and
+  takes back a PASS standing there. A HALT is checked before each publication,
+  and again after the last.
 - **A merge queue on the base isn't a requirement only a person can settle.**
   GitHub reports a pull request whose required checks pass as CLEAN under a
   required queue. So when such a base reports BLOCKED, the queue isn't the

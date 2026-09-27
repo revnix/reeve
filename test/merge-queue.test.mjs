@@ -13,6 +13,7 @@ import { readMergeParts, readMergeQueue, evaluateQueueEntry, publishVerdict } fr
 import { computeVerdict } from "../src/verdict.mjs";
 import { open } from "../src/db/ops.mjs";
 import { join } from "node:path";
+import { writeFileSync } from "node:fs";
 import { tempDir } from "./fixtures/temp.mjs";
 import { run, EVAL } from "./fixtures/tick-harness.mjs";
 import { decisionsFor } from "../src/db/records.mjs";
@@ -65,13 +66,13 @@ const HEAD = "a".repeat(40), QUEUED = "c".repeat(40), BASE = "b".repeat(40);
 
 test("the queue is read as its entries, each with the commit the queue built for it", () => {
   const page = { data: { repository: { mergeQueue: { entries: { nodes: [
-    { state: "AWAITING_CHECKS", headCommit: { oid: QUEUED }, baseCommit: { oid: BASE }, pullRequest: { number: 7 } },
-    { state: "QUEUED", headCommit: null, baseCommit: null, pullRequest: { number: 8 } },
+    { state: "AWAITING_CHECKS", headCommit: { oid: QUEUED }, baseCommit: { oid: BASE }, pullRequest: { number: 7, headRefOid: HEAD } },
+    { state: "QUEUED", headCommit: null, baseCommit: null, pullRequest: { number: 8, headRefOid: null } },
   ] } } } } };
   const q = readMergeQueue("o/r", "main", { gh: () => ({ ok: true, out: JSON.stringify(page) }) });
   assert.deepEqual(q, { ok: true, queue: true, entries: [
-    { pr: 7, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS" },
-    { pr: 8, sha: null, baseSha: null, state: "QUEUED" },
+    { pr: 7, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS", prHead: HEAD },
+    { pr: 8, sha: null, baseSha: null, state: "QUEUED", prHead: null },
   ] });
   assert.deepEqual(readMergeQueue("o/r", "main", { gh: () => ({ ok: true, out: JSON.stringify({ data: { repository: { mergeQueue: null } } }) }) }),
                    { ok: true, queue: false, entries: [] }, "a branch without a queue");
@@ -98,7 +99,7 @@ function judgeQueued(db, conclusion) {
   // `test` reads `conclusion` on the queue's commit only; it passes at the head and on the base.
   const read = (_nwo, sha) => ({ ok: true, rows: [checkRow("test", sha === QUEUED ? conclusion : "success")], impostors: [] });
   const requirements = () => ({ required: [{ context: "test", app: null, origin: "base" }], known: true, shadowRequired: false });
-  return evaluateQueueEntry({ nwo: "o/r", entry: { pr: 7, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS" }, input: passing(),
+  return evaluateQueueEntry({ nwo: "o/r", entry: { pr: 7, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS", prHead: HEAD }, input: passing(),
                               baseRef: "main", profile: { ci: { requiredChecks: [] } }, db, read, requirements });
 }
 
@@ -227,7 +228,7 @@ test("each tick publishes its queue verdicts as queue verdicts", async () => {
 
 test("review coverage at the pull request's head carries to its queue commit, and coverage of an older head doesn't", () => {
   const withReviewer = (reviewedHead) => ({ ...passing(), reviewers: [{ login: "bot", kind: "blocking", state: "CLEAN", reviewedHead }] });
-  const judge = (input) => evaluateQueueEntry({ nwo: "o/r", entry: { pr: 7, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS" }, input,
+  const judge = (input) => evaluateQueueEntry({ nwo: "o/r", entry: { pr: 7, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS", prHead: HEAD }, input,
     baseRef: "main", profile: { ci: { requiredChecks: [] } }, db: null,
     read: () => ({ ok: true, rows: [checkRow("test", "success")], impostors: [] }),
     requirements: () => ({ required: [], known: true, shadowRequired: false }) });
@@ -295,4 +296,99 @@ test("a queue PASS is taken back when the queue can't be read, since its commit 
   const readQueue = () => (tick++ === 0 ? queued()() : { ok: false, why: "HTTP 502" });
   await run({ evaluate: evaluated, readQueue, evaluateQueue: judged, withdraw, ticks: 2 });
   assert.ok(withdrawn.some(a => JSON.stringify(a).includes(QUEUED)), JSON.stringify(withdrawn));
+});
+
+// ── from #269's third review ─────────────────────────────────────────────────
+
+test("a queue commit is published on only when every pull request on it was judged this tick", async () => {
+  const published = [];
+  const publish = async ({ verdict }) => { published.push(verdict.head); return { ok: true, id: 1 }; };
+  // #99 shares the commit, and this tick didn't evaluate it.
+  const batch = queued([{ pr: 42, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS" }, { pr: 99, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS" }]);
+  const r = await run({ evaluate: evaluated, readQueue: batch, evaluateQueue: judged, publish });
+  assert.deepEqual(published, [HEAD], "nothing on the queue commit");
+  assert.match(r.log, /queue commit c{10} \(#42, #99\): not published — not every pull request on it was judged this tick/);
+});
+
+test("a queue PASS is taken back once a pull request on its commit can't be judged", async () => {
+  const withdrawn = [];
+  const withdraw = async (a) => { withdrawn.push(a); return { ok: true }; };
+  // Both judged on the first tick, and only #42 on the second: #43's judging throws.
+  const evaluate = ({ pr }) => ({ ...EVAL, pr, baseRef: "main", head: HEAD, input: passing(), verdict: computeVerdict(passing()) });
+  const batch = queued([{ pr: 42, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS" }, { pr: 43, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS" }]);
+  let judging = 0;
+  const evaluateQueue = (a) => { if (judging++ >= 2 && a.entry.pr === 43) throw new Error("the store is full"); return judged(a); };
+  const r = await run({ evaluate, openPrs: () => [42, 43], readQueue: batch, evaluateQueue, withdraw, ticks: 2 });
+  assert.match(r.log, /#43 queued at c{10}: not judged — the store is full/);
+  assert.ok(withdrawn.some(a => a.pr === 42 && a.head === QUEUED), JSON.stringify(withdrawn));
+  assert.ok(withdrawn.some(a => a.pr === 43 && a.head === QUEUED), JSON.stringify(withdrawn));
+});
+
+test("a queue entry is judged only when the queue holds the pull request at the head judged this tick", () => {
+  const judge = (prHead) => evaluateQueueEntry({ nwo: "o/r", entry: { pr: 7, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS", prHead }, input: passing(),
+    baseRef: "main", profile: { ci: { requiredChecks: [] } }, db: null,
+    read: () => ({ ok: true, rows: [checkRow("test", "success")], impostors: [] }),
+    requirements: () => ({ required: [], known: true, shadowRequired: false }) });
+  const moved = judge("d".repeat(40));
+  assert.equal(moved.ok, false);
+  assert.equal(moved.verdict, undefined, "no verdict from another revision's facts");
+  assert.match(moved.why, /dddddddddd/);
+  assert.equal(judge(null).ok, false, "a head the queue didn't name isn't taken for this one");
+  assert.equal(judge(HEAD).ok, true, "control: the head judged this tick");
+});
+
+test("the queue's entries are read with the head each pull request is queued at", () => {
+  let asked = "";
+  const page = { data: { repository: { mergeQueue: { entries: { nodes: [
+    { state: "AWAITING_CHECKS", headCommit: { oid: QUEUED }, baseCommit: { oid: BASE }, pullRequest: { number: 7, headRefOid: HEAD } },
+  ] } } } } };
+  const q = readMergeQueue("o/r", "main", { gh: (args) => { asked = args.join(" "); return { ok: true, out: JSON.stringify(page) }; } });
+  assert.match(asked, /pullRequest\{number headRefOid\}/);
+  assert.equal(q.entries[0].prHead, HEAD);
+});
+
+test("a HALT that arrives while the queue is judged stops the queue's publications, and takes back what stands", async () => {
+  const marker = join(tempDir("reeve-queue-halt-"), "HALT");
+  const published = [];
+  const publish = async ({ verdict }) => { published.push(verdict.head); return { ok: true, id: 1 }; };
+  const evaluateQueue = (a) => { writeFileSync(marker, ""); return judged(a); };
+  const withdrawn = [];
+  const withdraw = async (a) => { withdrawn.push(a); return { ok: true }; };
+  const r = await run({ evaluate: evaluated, readQueue: queued(), evaluateQueue, publish, withdraw, haltMarker: marker });
+  assert.deepEqual(published, [HEAD], "nothing published on the queue commit");
+  assert.equal(r.r.halted, true);
+  assert.ok(withdrawn.some(a => a.head === HEAD), JSON.stringify(withdrawn));
+  assert.match(r.log, /HALTED while the merge queue was checked/);
+});
+
+test("a HALT that arrives while a queue verdict is published stops the tick right after the queue step", async () => {
+  const marker = join(tempDir("reeve-queue-halt-"), "HALT");
+  const publish = async ({ verdict }) => { if (verdict.head === QUEUED) writeFileSync(marker, ""); return { ok: true, id: 1 }; };
+  const withdrawn = [];
+  const withdraw = async (a) => { withdrawn.push(a); return { ok: true }; };
+  const r = await run({ evaluate: evaluated, readQueue: queued(), evaluateQueue: judged, publish, withdraw, haltMarker: marker });
+  assert.equal(r.r.halted, true);
+  assert.ok(withdrawn.some(a => a.head === QUEUED), JSON.stringify(withdrawn));
+  assert.match(r.log, /HALTED after the merge queue was checked/);
+});
+
+test("queue publication failures count in a row on one commit, so a gap or another commit starts again", async () => {
+  const publish = async ({ verdict }) => (verdict.head === HEAD ? { ok: true, id: 1 } : { ok: false, why: "HTTP 502" });
+  const THREE = /on the merge queue's commit on 3 ticks in a row/;
+  // Two failures, a tick the queue can't be read, then one more.
+  let t = 0;
+  const gap = () => (t++ === 2 ? { ok: false, why: "HTTP 502" } : queued()());
+  assert.doesNotMatch((await run({ evaluate: evaluated, readQueue: gap, evaluateQueue: judged, publish, ticks: 4 })).esc, THREE);
+  // Two failures on one commit, then one on the commit the queue rebuilt.
+  const REBUILT = "e".repeat(40);
+  let u = 0;
+  const rebuilt = () => queued([{ pr: 42, sha: u++ === 2 ? REBUILT : QUEUED, baseSha: BASE, state: "AWAITING_CHECKS" }])();
+  assert.doesNotMatch((await run({ evaluate: evaluated, readQueue: rebuilt, evaluateQueue: judged, publish, ticks: 3 })).esc, THREE);
+});
+
+test("a queue answer that carries GraphQL errors is a failed read, not an empty queue", () => {
+  const out = JSON.stringify({ errors: [{ message: "Resource not accessible by integration" }], data: { repository: { mergeQueue: null } } });
+  const q = readMergeQueue("o/r", "main", { gh: () => ({ ok: true, out }) });
+  assert.equal(q.ok, false);
+  assert.match(q.why, /Resource not accessible by integration/);
 });

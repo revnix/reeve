@@ -1302,6 +1302,8 @@ export async function tick(ctx) {
   // or evaluated: a checkout that moves during the tick's reads doesn't change
   // what this process loaded (#165).
   const code = ctx.code ?? (ctx.codeVersion ?? runningCode)();
+  // Which tick this is, for what counts only in a row.
+  const tickNo = ctx.tickNo = (ctx.tickNo ?? 0) + 1;
   const { nwo, profile, db, execute = false, shadow = true } = ctx;
   // Absolute, once, before ANYTHING derives from it. A relative `--log` made
   // every state path relative — the run dir, the worker's tmp, its git config and
@@ -2451,6 +2453,21 @@ export async function tick(ctx) {
     return st.some((x) => x.op === "pr.published" && x.state === PASS && x.queue === true && which(x));
   };
   const onBase = (base) => [...evaluatedHere].filter(([, e]) => (e.baseRef ?? profile.identity?.defaultBranch) === base).map(([n]) => n);
+  // A HALT that arrives while the queue is judged: nothing more is published
+  // there, and what stands is taken back at once, as after the pull requests.
+  const haltedNow = async () => {
+    if (!halted(ctx.haltMarker)) return false;
+    await takeBackAll("the merge policy is halted");
+    announce();
+    return true;
+  };
+  // Failures to publish on a queue commit, counted in a row by commit: a count
+  // the last tick didn't add to is over, so one after a gap, or on a commit the
+  // queue rebuilt, starts again.
+  const failed = (ctx.queuePublishFailures ??= new Map());
+  for (const [sha, f] of failed) if (f.tick < tickNo - 1) failed.delete(sha);
+  const RANK = { PASS: 0, UNKNOWN: 1, BLOCK: 2 };
+  const KINDS = ["waiting", "retry", "missing", "person"];
   for (const base of queueBases) {
     let q;
     try { q = (ctx.readQueue ?? readMergeQueue)(nwo, base); }
@@ -2462,53 +2479,64 @@ export async function tick(ctx) {
         if (queuePassAt(n, () => true)) await takeBack(n, "the merge queue couldn't be read, so its commit can't be re-checked", (x) => x.queue === true);
       continue;
     }
-    // Each entry judged and kept on its own, then published once per commit:
-    // the queue may batch several pull requests onto one, and a check there
-    // speaks for all of them, so it carries the worst of their verdicts.
-    const byCommit = new Map();
-    for (const entry of q.entries) {
-      if (!entry.sha) continue;
-      const at = `#${entry.pr} queued at ${entry.sha.slice(0, 10)}`;
-      const e = evaluatedHere.get(entry.pr);
-      if (!e?.input) { log(logPath, `  ${at}: not judged — the pull request wasn't evaluated this tick`); continue; }
-      let j;
-      try { j = (ctx.evaluateQueue ?? evaluateQueueEntry)({ nwo, entry, input: e.input, baseRef: base, profile, db }); }
-      catch (err) { j = { ok: false, why: err.message }; }
-      if (!j.ok) { log(logPath, `  ${at}: not judged — ${j.why}`); continue; }
-      let kept = null;
-      try {
-        kept = recordsFor({ nwo, pr: entry.pr, head: entry.sha, tree: (ctx.treeOf ?? treeOf)(nwo, entry.sha), input: j.input,
-                            verdict: j.verdict, policy: policyFor(profile), code,
-                            observedAt: new Date(now() * 1000).toISOString() });
-      } catch (err) {
-        log(logPath, `  ${at}: what this verdict was judged from could not be recorded — ${err.message}`);
+    // The queue may batch several pull requests onto one commit, and a check
+    // there speaks for all of them. So each is judged and kept on its own, and
+    // the commit is published on once, with the worst of their verdicts.
+    const onCommit = new Map();
+    for (const entry of q.entries) if (entry.sha) onCommit.set(entry.sha, [...(onCommit.get(entry.sha) ?? []), entry]);
+    for (const [sha, entries] of onCommit) {
+      const judged = [];
+      for (const entry of entries) {
+        const at = `#${entry.pr} queued at ${sha.slice(0, 10)}`;
+        const e = evaluatedHere.get(entry.pr);
+        if (!e?.input) { log(logPath, `  ${at}: not judged — the pull request wasn't evaluated this tick`); continue; }
+        let j;
+        try { j = (ctx.evaluateQueue ?? evaluateQueueEntry)({ nwo, entry, input: e.input, baseRef: base, profile, db }); }
+        catch (err) { j = { ok: false, why: err.message }; }
+        if (!j.ok) { log(logPath, `  ${at}: not judged — ${j.why}`); continue; }
+        let kept = null;
+        try {
+          kept = recordsFor({ nwo, pr: entry.pr, head: sha, tree: (ctx.treeOf ?? treeOf)(nwo, sha), input: j.input,
+                              verdict: j.verdict, policy: policyFor(profile), code,
+                              observedAt: new Date(now() * 1000).toISOString() });
+        } catch (err) {
+          log(logPath, `  ${at}: what this verdict was judged from could not be recorded — ${err.message}`);
+        }
+        try {
+          tx(db, () => {
+            const decided = db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
+              .run(now(), "daemon", "queue.decided", `pr:${entry.pr}`, JSON.stringify({
+                head: sha, base: entry.baseSha, state: j.verdict.state, summary: j.verdict.summary,
+                clauses: j.verdict.clauses.map((c) => ({ id: c.id, state: c.state })),
+                record: kept?.decision.digest ?? null,
+              }));
+            if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr: entry.pr, head: sha, ...kept });
+          });
+        } catch (err) {
+          log(logPath, `  ${at}: the verdict could not be kept — ${err.message}`);
+        }
+        log(logPath, `  ${at}: ${j.verdict.state}`);
+        judged.push({ pr: entry.pr, verdict: j.verdict });
       }
-      try {
-        tx(db, () => {
-          const decided = db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
-            .run(now(), "daemon", "queue.decided", `pr:${entry.pr}`, JSON.stringify({
-              head: entry.sha, base: entry.baseSha, state: j.verdict.state, summary: j.verdict.summary,
-              clauses: j.verdict.clauses.map((c) => ({ id: c.id, state: c.state })),
-              record: kept?.decision.digest ?? null,
-            }));
-          if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr: entry.pr, head: entry.sha, ...kept });
-        });
-      } catch (err) {
-        log(logPath, `  ${at}: the verdict could not be kept — ${err.message}`);
+      const prs = entries.map((x) => x.pr);
+      const at = `queue commit ${sha.slice(0, 10)} (${prs.map((n) => `#${n}`).join(", ")})`;
+      // Only when every pull request on it was judged this tick: a PASS there
+      // would merge the one nothing judged. Otherwise nothing is published, and
+      // a PASS standing there is taken back.
+      if (judged.length < entries.length) {
+        log(logPath, `  ${at}: not published — not every pull request on it was judged this tick`);
+        for (const n of prs)
+          if (queuePassAt(n, (x) => x.head === sha))
+            await takeBack(n, "not every pull request on this queue commit could be judged", (x) => x.queue === true && x.head === sha);
+        continue;
       }
-      log(logPath, `  ${at}: ${j.verdict.state}`);
-      byCommit.set(entry.sha, [...(byCommit.get(entry.sha) ?? []), { pr: entry.pr, verdict: j.verdict }]);
-    }
-    const RANK = { PASS: 0, UNKNOWN: 1, BLOCK: 2 };
-    const KINDS = ["waiting", "retry", "missing", "person"];
-    for (const [sha, judged] of byCommit) {
+      if (await haltedNow()) return haltStop("HALTED while the merge queue was checked");
       // The worst: a block, else the UNKNOWN of the most serious kind, else a pass.
       const worst = judged.reduce((a, b) => {
         const d = (RANK[b.verdict.state] ?? 1) - (RANK[a.verdict.state] ?? 1);
         if (d) return d > 0 ? b : a;
         return KINDS.indexOf(b.verdict.kind) > KINDS.indexOf(a.verdict.kind) ? b : a;
       });
-      const prs = judged.map((x) => x.pr);
       const verdict = prs.length === 1 ? worst.verdict
         : { ...worst.verdict, summary: `queued together: ${prs.map((n) => `#${n}`).join(", ")}. #${worst.pr}: ${worst.verdict.summary}` };
       const name = shadow ? shadowContextOf(POLICY_CONTEXT) : POLICY_CONTEXT;
@@ -2529,17 +2557,16 @@ export async function tick(ctx) {
         try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict, shadow, base, queue: true }); }
         catch (thrown) { pub = { ok: false, why: thrown.message }; }
       }
-      const at = `queue commit ${sha.slice(0, 10)} (${prs.map((n) => `#${n}`).join(", ")})`;
-      if (!pub.ok) log(logPath, `  ${at}: could not publish ${verdict.state} — ${pub.why}`);
-      const failed = (ctx.queuePublishFailures ??= new Map());
+      if (pub.ok) {
+        failed.delete(sha);
+        for (const n of prs) noteQueued(n, { state: verdict.state, name: pub.name ?? name, id: pub.id ?? null });
+        continue;
+      }
+      log(logPath, `  ${at}: could not publish ${verdict.state} — ${pub.why}`);
+      const was = failed.get(sha);
+      failed.set(sha, { n: (was?.n ?? 0) + 1, tick: tickNo });
       for (const n of prs) {
-        if (pub.ok) {
-          failed.delete(n);
-          noteQueued(n, { state: verdict.state, name: pub.name ?? name, id: pub.id ?? null });
-          continue;
-        }
-        failed.set(n, (failed.get(n) ?? 0) + 1);
-        if (failed.get(n) >= 3) raise(`#${n}: reeve couldn't publish its verdict on the merge queue's commit on 3 ticks in a row`);
+        if (failed.get(sha).n >= 3) raise(`#${n}: reeve couldn't publish its verdict on the merge queue's commit on 3 ticks in a row`);
         // Only when a PASS stands there: a take-back that finds nothing clears the
         // pull request's stuck-PASS cause, which another step may have raised.
         if (verdict.state !== PASS && queuePassAt(n, (x) => x.head === sha))
@@ -2553,6 +2580,8 @@ export async function tick(ctx) {
       if (queuePassAt(n, (x) => !held.has(x.head)))
         await takeBack(n, "the merge queue no longer holds this commit", (x) => x.queue === true && !held.has(x.head));
   }
+  // And one that arrived during the last publication there.
+  if (await haltedNow()) return haltStop("HALTED after the merge queue was checked");
 
   // A PASS left at a pull request this tick didn't list (#161), asked of GitHub
   // rather than read from the absence. One that merged under it keeps it: it's

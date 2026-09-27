@@ -50,14 +50,24 @@ export function saveDecision(db, { at, seq, pr, head, policy, evidence, decision
 }
 
 /**
- * @typedef {{ digest: string, pr: number, head: string, record: Record<string, any>, corrupt: boolean,
+ * @typedef {{ digest: string, pr: number, head: string, record: Record<string, any>, corrupt: string | null,
  *             first_at: number, last_at: number, first_seq: number, last_seq: number }} Decision
  */
 
-/** @param {any} row @returns {Decision} */
+/**
+ * A decision row, and why it can't be trusted, if it can't. Its record must match
+ * its digest, and the pull request and commit the row is found by, which sit
+ * outside the digest, must be the ones its record names.
+ * @param {any} row @returns {Decision}
+ */
 const decisionOf = row => {
   const record = JSON.parse(row.record);
-  return { ...row, record, corrupt: digestOf(record) !== row.digest };
+  const subject = record?.subject ?? {};
+  const corrupt = digestOf(record) !== row.digest ? "its record doesn't match its digest"
+    : subject.pr !== row.pr ? `its row names pull request ${row.pr}, but its record ${subject.pr}`
+    : subject.head !== row.head ? `its row names commit ${String(row.head).slice(0, 8)}, but its record ${String(subject.head).slice(0, 8)}`
+    : null;
+  return { ...row, record, corrupt };
 };
 
 /**

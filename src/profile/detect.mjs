@@ -7,7 +7,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, matchesGlob } from "node:path";
-import { runnerShells, scriptOutcome, scriptShells } from "./shellscript.mjs";
+import { runnerShells, scriptOutcome, scriptShells, listed } from "./shellscript.mjs";
 
 function sh(cmd, args, cwd) {
   try {
@@ -69,10 +69,33 @@ export function workspaceGlobs(root, manager) {
   return [];
 }
 
-/** Whether a folder the root holds is a member of its workspace. A `!` glob excludes. */
-function isMember(rel, globs) {
+/**
+ * Whether a folder the root holds is a member of its workspace. npm, yarn and bun
+ * read the patterns in order, and the last that matches decides, as `listed`
+ * does for npm's own workspaces. pnpm reads a `!` pattern as an exclusion,
+ * wherever it stands.
+ */
+function isMember(rel, globs, manager) {
+  if (manager !== "pnpm") return listed(globs, rel) === true;
   const hit = g => matchesGlob(rel, g.replace(/^\.\//, "").replace(/\/+$/, ""));
   return globs.some(g => !g.startsWith("!") && hit(g)) && !globs.some(g => g.startsWith("!") && hit(g.slice(1)));
+}
+
+/**
+ * Where a flow list's own closing bracket is: the first `]` outside quotes, so a
+ * quoted glob such as `"packages/[ab]"` doesn't end the list. -1 when it isn't
+ * there yet.
+ * @param {string} s
+ */
+function flowEnd(s) {
+  let quote = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) { if (ch === quote) quote = null; continue; }
+    if (ch === "'" || ch === '"') quote = ch;
+    else if (ch === "]") return i;
+  }
+  return -1;
 }
 
 /**
@@ -104,7 +127,14 @@ function yamlList(text, key) {
   if (at < 0) return [];
   const unquote = s => s.trim().replace(/^(['"])(.*)\1$/, "$2");
   const rest = lines[at].slice(key.length + 1).replace(/\s#.*$/, "").trim();
-  if (rest.startsWith("[")) return flowItems(rest.slice(1, rest.lastIndexOf("]"))).map(unquote).filter(Boolean);
+  if (rest.startsWith("[")) {
+    // A flow list may run across lines, so read on to its closing bracket.
+    let flow = rest;
+    for (let n = at + 1; flowEnd(flow) < 0 && n < lines.length; n++) flow += " " + lines[n].replace(/\s#.*$/, "").trim();
+    const end = flowEnd(flow);
+    if (end < 0) return [];
+    return flowItems(flow.slice(1, end)).map(unquote).filter(Boolean);
+  }
   const out = [];
   for (const line of lines.slice(at + 1)) {
     if (/^\s*(#.*)?$/.test(line)) continue;
@@ -333,7 +363,7 @@ export function detectUnits(root) {
     const language = detectLanguage(dir);
     if (!language) continue;
     let pm = rel === "." ? rootPm : detectPackageManager(dir);
-    if (rel !== "." && pm.value === null && !pm.question && language === "typescript" && isMember(rel, globs)) {
+    if (rel !== "." && pm.value === null && !pm.question && language === "typescript" && isMember(rel, globs, rootPm.value)) {
       pm = { value: rootPm.value, question: null };
       notes.push(`unit ${rel}: no lockfile of its own, and a member of the root's ${rootPm.value} workspace, so it uses ${rootPm.value}`);
     }

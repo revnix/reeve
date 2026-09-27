@@ -98,9 +98,10 @@ function braces(glob) {
 
 // Whether workspace patterns list the folder `rel`, as npm's globs do; a later
 // pattern overrides an earlier one, and `!` excludes. `*`, `**`, `?` and braces
-// are read; null when a pattern holds more, a class or an extended glob, which
-// leaves the answer unknown.
-function listed(patterns, rel) {
+// are read. A pattern that holds more, a class or an extended glob, leaves the
+// answer unknown, null, until a later pattern that is read surely matches and
+// settles it, as npm's own order would.
+export function listed(patterns, rel) {
   const path = rel.split(sep).join("/");
   let hit = false, unsure = false;
   for (const pattern of patterns) {
@@ -110,7 +111,7 @@ function listed(patterns, rel) {
     if (globs.some((g) => /[[\]{}()!+@]|\.\./.test(g))) { unsure = true; continue; }
     const matches = globs.some((g) => new RegExp(`^${g.split("/").map((seg) => (seg === "**" ? ".*"
       : seg.replace(/[.+^$|\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]"))).join("/")}$`).test(path));
-    if (matches) hit = bangs % 2 === 0;
+    if (matches) { hit = bangs % 2 === 0; unsure = false; }
   }
   return unsure ? null : hit;
 }

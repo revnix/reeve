@@ -313,6 +313,21 @@ export function validateSnapshot(path, { expectVersion = null, kind = "repo", de
     }
     // A repo store's marker is the append-only log the existing restore() probes.
     probe.prepare("SELECT count(*) c FROM event").get();
+    // AND THE RECORDS ITS DECISIONS NAME (#165). A `pr.decided` event that names
+    // a record promises the decision, evidence and policy tables beside it. A
+    // snapshot that lost one is refused: `open()` would recreate it empty, and
+    // every record the log names would be gone without a word. The CASE reads a
+    // payload only once it's known to be JSON, so an old malformed one refuses
+    // nothing here. EXISTS stops at the first: this check runs on every tick's
+    // self-audit, and a count would read the whole history each time.
+    const named = probe.prepare(`SELECT EXISTS (SELECT 1 FROM event WHERE op = 'pr.decided'
+      AND (CASE WHEN json_valid(payload) THEN json_extract(payload, '$.record') END) IS NOT NULL) AS e`).get().e;
+    if (named) {
+      const present = new Set(probe.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(r => r.name));
+      const missing = ["decision", "evidence", "policy"].filter(t => !present.has(t));
+      if (missing.length)
+        return { ok: false, why: `its log names decision records, but it has no ${missing.join(", no ")} table`, version: null, integrity };
+    }
     return { ok: true, why: null, version: null, integrity };
   } catch (e) {
     return { ok: false, why: `not a usable store: ${e.message}`, version: null, integrity: null };
@@ -530,13 +545,10 @@ export function restore(snapshotPath, dbPath, { overwrite = false, force = false
   if (existsSync(dbPath) && !overwrite)
     return { ok: false, why: `${dbPath} exists; pass overwrite to replace it, which discards anything newer than the snapshot` };
 
-  // Verify BEFORE replacing anything.
-  try {
-    const probe = new DatabaseSync(snapshotPath, { readOnly: true });
-    const n = probe.prepare("SELECT count(*) c FROM event").get().c;
-    probe.close();
-    if (typeof n !== "number") throw new Error("event table unreadable");
-  } catch (e) { return { ok: false, why: `the snapshot is not a usable store: ${e.message}` }; }
+  // Verify BEFORE replacing anything, with the same check that chooses a
+  // snapshot, so a file that can't be restored is never called usable.
+  const v = validateSnapshot(snapshotPath, { kind: "repo" });
+  if (!v.ok) return { ok: false, why: `the snapshot is not a usable store: ${String(v.why).replace(/^not a usable store: /, "")}` };
 
   // Refuse while reeve's own daemon is running.
   //

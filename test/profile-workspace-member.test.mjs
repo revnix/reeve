@@ -95,6 +95,46 @@ test("a quoted glob in an inline list keeps the commas inside it", () => {
   for (const id of ["foo", "bar", "e2e"]) assert.equal(unit(root, id).packageManager, "pnpm", id);
 });
 
+test("a flow list written across lines is read whole", () => {
+  const root = checkout({
+    "package.json": { name: "root", scripts, devDependencies },
+    "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+    "pnpm-workspace.yaml": 'packages: [\n  "apps/*",\n  "e2e"\n]\n',
+    "e2e/package.json": { name: "e2e", scripts, devDependencies },
+  });
+  assert.equal(unit(root, "e2e").packageManager, "pnpm");
+});
+
+test("an npm workspace reads its patterns in order, so a later one lists a folder again", () => {
+  const root = checkout({
+    "package.json": { name: "root", workspaces: ["*", "!bar", "bar", "!baz"], scripts, devDependencies },
+    "package-lock.json": { lockfileVersion: 3 },
+    "bar/package.json": { name: "bar", scripts, devDependencies },
+    "baz/package.json": { name: "baz", scripts, devDependencies },
+  });
+  assert.equal(unit(root, "bar").packageManager, "npm");
+  assert.equal(unit(root, "baz").packageManager, null);
+});
+
+test("a flow list across lines ends at its own bracket, not one inside a quoted glob", () => {
+  const root = checkout({
+    "package.json": { name: "root", scripts, devDependencies },
+    "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+    "pnpm-workspace.yaml": 'packages: [\n  "packages/[ab]",\n  "e2e"\n]\n',
+    "e2e/package.json": { name: "e2e", scripts, devDependencies },
+  });
+  assert.equal(unit(root, "e2e").packageManager, "pnpm");
+});
+
+test("a later pattern that surely matches settles one before it that couldn't be read", () => {
+  const root = checkout({
+    "package.json": { name: "root", workspaces: ["packages/[ab]", "e2e"], scripts, devDependencies },
+    "package-lock.json": { lockfileVersion: 3 },
+    "e2e/package.json": { name: "e2e", scripts, devDependencies },
+  });
+  assert.equal(unit(root, "e2e").packageManager, "npm");
+});
+
 test("a member with a lockfile of its own keeps what its lockfile says", () => {
   const root = checkout({
     "package.json": { name: "root", scripts, devDependencies },

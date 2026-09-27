@@ -121,6 +121,18 @@ function installReaper() {
   process.on("uncaughtException", e => { reap(); throw e; });
 }
 
+/**
+ * Stop a worker whose claim has lapsed and whose supervisor is gone (#162): its
+ * whole process group, and only while the pid is still the process that was
+ * recorded, so a stranger that inherited the pid is never signalled. SIGKILL,
+ * because nothing is left to wait out a grace period, and a halt that waits on
+ * the worker's cooperation doesn't stop it. Answers whether it signalled.
+ */
+export function stopWorkerGroup(pid, storedStart) {
+  if (!isSameProcess(pid, storedStart)) return false;
+  return killGroup(pid, "SIGKILL");
+}
+
 /** Kill a whole process group, swallowing ESRCH. Always the NEGATIVE pid. */
 function killGroup(pid, signal) {
   // A child whose spawn failed has no pid; there is no group to kill, and

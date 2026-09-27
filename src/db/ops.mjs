@@ -379,18 +379,24 @@ export function backoffSeconds(attempt, base = 30, cap = 3600) {
   return Math.floor(exp / 2 + Math.random() * (exp / 2));
 }
 
-export function reap(db, { actor = "daemon", isAlive = () => false } = {}) {
+export function reap(db, { actor = "daemon", isAlive = () => false, now = Math.floor(Date.now() / 1000) } = {}) {
+  // From the second the lease names, as heartbeat() and finishRun() already
+  // treat it as lost: a claim nothing can use shouldn't hold its task a tick
+  // longer (#162).
   const expired = db.prepare(`
     SELECT id, task_id, attempt, owner_pid, owner_boot, owner_host FROM run
-    WHERE lease_expires_at < unixepoch()
-      AND status IN ('leased','running','blocked_on_ci','blocked_on_review','awaiting_founder')`).all();
+    WHERE lease_expires_at <= ?
+      AND status IN ('leased','running','blocked_on_ci','blocked_on_review','awaiting_founder')`).all(now);
   const out = [];
   for (const r of expired) {
-    // grace: if the process is demonstrably alive on this host, extend instead of reap
+    // Grace: a run whose process is demonstrably alive on this host is spared,
+    // not reaped. Its lapsed lease is NOT renewed: heartbeat() and finishRun()
+    // treat an expired lease as lost, and a renewal here would let a stalled
+    // owner act on a claim it no longer holds (#162). The caller decides what
+    // to do with a live process that holds nothing; its pid and start time are
+    // returned for that.
     if (r.owner_host === hostname() && isAlive(r.owner_pid, r.owner_boot)) {
-      tx(db, () => db.prepare(`UPDATE run SET lease_expires_at=unixepoch()+? WHERE id=?`)
-                     .run(LEASE_SECONDS, r.id));
-      out.push({ run: r.id, action: "extended" });
+      out.push({ run: r.id, task: r.task_id, action: "spared", pid: r.owner_pid, boot: r.owner_boot });
       continue;
     }
     tx(db, () => {
@@ -410,7 +416,7 @@ export function reap(db, { actor = "daemon", isAlive = () => false } = {}) {
       emit(db, { actor, op: dead ? "run.dead_letter" : "run.reap",
                  subject: r.task_id, run_id: r.id, payload: { attempt: r.attempt } });
     });
-    out.push({ run: r.id, action: "reaped" });
+    out.push({ run: r.id, task: r.task_id, action: "reaped" });
   }
   return out;
 }

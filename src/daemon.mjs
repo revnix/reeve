@@ -18,11 +18,11 @@ import { evaluatePr, publishVerdict, withdrawVerdict, prAnchor, isBuilderPr, cle
 import { PASS } from "./verdict.mjs";
 import { nextAction, describe, ACTIONS, ESCALATIONS } from "./watcher.mjs";
 import { POLICY_CONTEXT, reconcilePr } from "./github/reconciler.mjs";
-import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, isSameProcess, OUTCOMES } from "./supervisor.mjs";
+import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, isSameProcess, stopWorkerGroup, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf, siblingRootsOf, hostEscapePaths, worktreeRootOf, linkFree, notifyCredOf, layoutDeniesAbove } from "./sandbox.mjs";
 import { verifyConfig, GIT_NEUTRALISE, gitEnv } from "./gitguard.mjs";
-import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor, commitRunWork, digestOf } from "./checkout.mjs";
+import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor, commitRunWork, digestOf, runPathFor } from "./checkout.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor, workerTmpDir } from "./workerenv.mjs";
 import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity, sandboxRuntimeIdentity } from "./containment.mjs";
@@ -34,7 +34,7 @@ import { hubSession, NO_HUB } from "./build/hubsession.mjs";
 import { resolveRepoId } from "./build/repoid.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify, printable } from "./notify.mjs";
-import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects } from "./db/ops.mjs";
+import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects, reap } from "./db/ops.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
 import { drainOutbox } from "./outbox/drain.mjs";
 import { HANDLERS, permittedHandlers } from "./outbox/effects.mjs";
@@ -1765,6 +1765,58 @@ export async function tick(ctx) {
         raise("the provider scheduler is unreadable; dispatching unscheduled");
       }
     }
+  }
+
+  // AND THE RUNS A DEAD DAEMON LEFT (#162). A run holds its pull request
+  // exclusively, and only the daemon that started it finishes it. One that died
+  // with its worker -- a crash, a reboot, a service restart that took both --
+  // left the run live, and `startRun` refused that pull request until it
+  // merged. Its lease lapses within LEASE_SECONDS of the last heartbeat. A run
+  // past it whose worker isn't the same live process on this host is
+  // abandoned, and its pull request is free again. Ungated, as the reap above
+  // is, and for the same reasons, the halt among them.
+  try {
+    // One pass reaps each run whose worker is gone, and stops each worker still
+    // running on a lapsed lease. It answers the runs whose workers it stopped.
+    const pass = () => {
+      const stopped = [];
+      for (const r of (ctx.reapRuns ?? reap)(db, { actor: "daemon", isAlive: isSameProcess })) {
+        if (r.action === "reaped") {
+          log(logPath, `run ${r.run} reaped: its lease had lapsed and its worker is gone`);
+          // Its checkout, preserved as a failed run's is, since whatever the
+          // worker committed was never fetched. Left where it was, each crash
+          // would leave a whole repository and its dependencies behind.
+          const pr = /^pr:(\d+)$/.exec(r.task ?? "")?.[1];
+          if (pr) {
+            const kept = releaseRunCheckout(runPathFor(worktreeRootOf(profile), pr, r.run), { workFetched: false });
+            if (!kept.ok) log(logPath, `  run ${r.run}: could not preserve its checkout — ${kept.why}`);
+          }
+        } else if (r.action === "spared") {
+          // A worker still running on a lapsed lease holds a claim nothing will
+          // renew: its supervisor is gone, or stalled past its lease. Nothing
+          // records its work, keeps its budget, or stops it at a halt. So it's
+          // stopped, as the supervisor stops a worker whose lease it can no
+          // longer prove.
+          const stoppedIt = (ctx.stopWorker ?? stopWorkerGroup)(r.pid, r.boot);
+          log(logPath, `run ${r.run}: its lease lapsed while its worker ran on; ${stoppedIt ? "the worker was stopped" : "the process is no longer the worker, so it was left alone"}`);
+          if (stoppedIt) stopped.push(r);
+        }
+      }
+      return stopped;
+    };
+    const stopped = pass();
+    // And reaped in this same pass once they've gone, known gone by pid and
+    // start time together, so the tick doesn't go on to report a run past its
+    // lease that nothing is working, which it has just handled.
+    if (stopped.length) {
+      for (let i = 0; i < 20 && stopped.some((r) => isSameProcess(r.pid, r.boot)); i++)
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      pass();
+    }
+  } catch (err) {
+    // Housekeeping must never take the tick with it.
+    log(logPath, `could not reap runs whose worker is gone — ${err.message}`);
+    raise("reeve could not reap the runs whose worker is gone");
   }
 
   // ONE READER for this guardian's queued rows. Two callers need them now -- the

@@ -21,11 +21,12 @@ const check = (ok, name, detail) => {
   if (!ok) { if (detail) console.log("        " + detail); fail++; }
 };
 
-const cl = (id, state, detail = "") => ({ id, state, detail });
+// An UNKNOWN clause carries its kind (#165); the watcher decides by it, not by the wording.
+const cl = (id, state, detail = "", kind = null) => (kind ? { id, state, detail, kind } : { id, state, detail });
 // DERIVED from the one declaration, so a clause added later is exercised here
 // too rather than silently absent from every case in this file.
 const all = () => CLAUSE_IDS.map(id => cl(id, "PASS"));
-const swap = (id, state, detail) => all().map(c => (c.id === id ? cl(id, state, detail) : c));
+const swap = (id, state, detail, kind = null) => all().map(c => (c.id === id ? cl(id, state, detail, kind) : c));
 const ev = (clauses, rounds) => ({
   pr: 1, state: "open",
   verdict: { state: clauses.some(c => c.state === "BLOCK") ? "BLOCK"
@@ -103,7 +104,9 @@ for (const [name, clauses] of [
     "the count survives on the detail, where a human reads it deliberately", d13.detail);
 
   // Different GATED ACTIONS are different problems and must key differently.
-  const rr = nextAction(ev(swap("review", "UNKNOWN", "not yet run: codex")), OFF);
+  const rr = nextAction(ev(swap("review", "UNKNOWN", "not yet run: codex", "missing")), OFF);
+  check(rr.gated === ACTIONS.REQUEST_REVIEW,
+    "control: a review round not yet run is the gated REQUEST_REVIEW path", JSON.stringify(rr));
   check(rr.action === ACTIONS.ESCALATE && rr.why !== d13.why,
     "a gated review request keys differently from gated thread work", rr.why);
 }

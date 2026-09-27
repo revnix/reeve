@@ -36,6 +36,7 @@ export const ESCALATIONS = {
   PROTECTION_UNMET: "GitHub's protection requires something reeve does not provide (typically an approving review)",
   REVIEWERS_DOWN: "no blocking reviewer is reachable",
   NOT_CHECKABLE: "a clause could not be evaluated and stayed that way",
+  NEEDS_PERSON: "a clause only a person can settle",
   FINDINGS_UNMOVED: "a findings repair changed nothing and would run again on the same findings",
   BODY_UNREADABLE: "a reviewer wrote a review body reeve cannot read",
 };
@@ -198,19 +199,35 @@ export function nextAction(e, p, h = {}) {
   if (unknowns.length) {
     const stuckFor = h.unknownSince != null ? now - h.unknownSince : 0;
     const limit = p.watch?.unknownEscalateSeconds ?? 3600;
+
+    // Decided by the clause's kind, never by its wording (#165): the wording is
+    // for people, and rewording it must not change what reeve does.
+    //
+    // A person first, since only one can settle a `person` UNKNOWN, the most
+    // serious kind, and by its own reason even past the settling window, which
+    // would name it only as not checkable. Asking for a missing round first
+    // would delay the same escalation by a round.
+    //
+    // Every blocking reviewer unreachable is a supply problem, not a PR problem,
+    // and only a person can restore it.
+    const review = clause(v, "review");
+    if (review?.state === "UNKNOWN" && review.kind === "person")
+      return act(ACTIONS.ESCALATE, ESCALATIONS.REVIEWERS_DOWN, { shared: true, detail: review.detail });
+    // Anything else only a person can settle goes to one now. Waiting out the
+    // settling window first would only delay the same escalation by an hour.
+    const person = unknowns.find(c => c.kind === "person");
+    if (person)
+      return act(ACTIONS.ESCALATE, person.id === "mergeable" ? ESCALATIONS.PROTECTION_UNMET : ESCALATIONS.NEEDS_PERSON,
+                 { clauses: [person.id], detail: person.detail });
+    // Anything else that has outlived the settling window is a stall.
     if (stuckFor > limit)
       return act(ACTIONS.ESCALATE, ESCALATIONS.NOT_CHECKABLE, { clauses: unknowns.map(c => c.id), stuckFor });
-
-    // A reviewer that has not run is not a stall: it is a round we have not asked
-    // for. Ask, if the budget allows.
-    const review = clause(v, "review");
-    if (review?.state === "UNKNOWN" && /not yet run/i.test(review.detail)) {
+    // A reviewer that has not run is missing evidence, not a stall: it is a round
+    // we have not asked for. Ask, if the budget allows.
+    if (review?.state === "UNKNOWN" && review.kind === "missing") {
       const R = e.rounds ?? {};
       if ((R.n ?? 0) < (R.softCap ?? 5)) return act(ACTIONS.REQUEST_REVIEW, review.detail, { round: (R.n ?? 0) + 1 });
     }
-    // Every blocking reviewer unreachable is a supply problem, not a PR problem.
-    if (review?.state === "UNKNOWN" && /unreachable/i.test(review.detail))
-      return act(ACTIONS.ESCALATE, ESCALATIONS.REVIEWERS_DOWN, { shared: true, detail: review.detail });
 
     return act(ACTIONS.WAIT, unknowns.map(c => `${c.id}: ${c.detail}`).join("; "), { unknownSince: h.unknownSince != null ? h.unknownSince : now });
   }

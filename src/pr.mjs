@@ -112,12 +112,13 @@ export function readThreads(nwo, pr, io = null) {
  *   strict, behind    whether the base requires branches up to date, and how
  *                     many commits this head is behind it
  *   unevaluated       what the base requires that reeve doesn't evaluate
+ *   settlesAlone      those of them a run settles without anyone
  * Each is null when it couldn't be told.
  */
 export function readMergeParts(nwo, baseRef, threads, { gh = ghJson, context = POLICY_CONTEXT, appId = ownAppId(), rows = null, head = null } = {}) {
   const parts = { readable: threads?.partsReadable !== false, mergeable: threads?.mergeable ?? null,
                   reviewDecision: threads?.reviewDecision ?? null, ownCheckRequired: null,
-                  others: null, unresolvedBlocks: null, strict: null, behind: null, unevaluated: null };
+                  others: null, unresolvedBlocks: null, strict: null, behind: null, unevaluated: null, settlesAlone: null };
   if (String(threads?.mergeState ?? "").toUpperCase() !== "BLOCKED" || !baseRef) return parts;
   const req = requirementsOnBase({ nwo, base: baseRef, context, gh, appId });
   parts.ownCheckRequired = req.own;
@@ -126,6 +127,7 @@ export function readMergeParts(nwo, baseRef, threads, { gh = ghJson, context = P
     : !req.threadResolution ? false
     : threads?.readable === false || !Number.isInteger(threads?.unresolved) ? null : threads.unresolved > 0;
   parts.unevaluated = req.unevaluated;
+  parts.settlesAlone = req.settlesAlone;
   // A base that wants branches up to date blocks one that is behind, and
   // BLOCKED says nothing of which. How far behind is read only then.
   parts.strict = req.strict;
@@ -213,13 +215,13 @@ export function requiredChecksOf({ nwo, baseRef, profile = /** @type {CiProfile}
 
 /**
  * A check read, classified against the required set. A read that isn't whole
- * passes nothing, since the surface that went unread may hold a failure; but a
- * failure it did read is one, and stays RED.
+ * passes nothing, since the surface that went unread may hold a failure, and
+ * says so with `readable: false`; but a failure it did read is one, and stays RED.
  */
 export function classifyRead(read, { required = [], known = true } = {}, { evidence = true } = {}) {
   const c = classify(read?.rows ?? [], required, { requiredKnown: known, evidence });
   if (read?.ok || c.verdict === "RED") return c;
-  return { verdict: "UNKNOWN", failing: [], running: [], why: `the checks couldn't be read in full: ${read?.why ?? "nothing was read"}` };
+  return { verdict: "UNKNOWN", readable: false, failing: [], running: [], why: `the checks couldn't be read in full: ${read?.why ?? "nothing was read"}` };
 }
 
 /**
@@ -667,7 +669,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // apply. Only a partial read does: it can hide a failure.
   const base = baseHead.ok
     ? classifyRead(readChecks(nwo, baseHead.sha, { reviewerContexts }), { required: profile.ci?.requiredChecks ?? [] }, { evidence: false })
-    : { verdict: "UNKNOWN" };
+    : { verdict: "UNKNOWN", readable: false };
 
   const threads = readThreads(nwo, pr);
   const reviewers = readReviewerStates(nwo, pr, pin.sha, profile.reviewers ?? []);
@@ -746,10 +748,12 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // `computeVerdict` reads nothing else.
   const input = {
     head: pin.sha,
-    checks: { verdict: s.verdict, settled: s.settled, why: s.why, failing: c.failing, inherited: c.inherited,
+    // `readable` false when the read failed, which reading again settles, and
+    // waiting for the checks to settle never does.
+    checks: { verdict: s.verdict, settled: s.settled, why: s.why, readable: c.readable !== false, failing: c.failing, inherited: c.inherited,
               // Another App's check under reeve's own name: kept, never dropped.
               impostors: read.impostors ?? [], shadowRequired: req.shadowRequired },
-    base: { verdict: base.verdict },
+    base: { verdict: base.verdict, readable: base.readable !== false },
     reviewers, rounds, threads, cleared: facts.cleared,
     bodyFindings: facts.bodyFindings, unreadableBodies: facts.unreadableBodies,
     ledgerBlockers,
@@ -830,6 +834,10 @@ function othersPassUnder(token, nwo, sha, context, runs, api) {
 // exists: they govern creating, deleting and force-pushing the branch. Linear
 // history rules out merge commits, and squash and rebase merges still merge.
 const HARMLESS_RULES = new Set(["creation", "deletion", "non_fast_forward", "required_linear_history"]);
+// Rule types reeve doesn't evaluate either, but that a run settles without
+// anyone: a deployment, a required workflow, a code scan, an automatic review.
+// Waiting settles them, where the rest need a person.
+const SETTLES_ALONE = new Set(["required_deployments", "workflows", "code_scanning", "copilot_code_review"]);
 
 /**
  * What a branch requires before a pull request merges into it, as far as reeve
@@ -841,6 +849,7 @@ const HARMLESS_RULES = new Set(["creation", "deletion", "non_fast_forward", "req
  *   unevaluated       what can stop a merge that reeve doesn't evaluate: deployments,
  *                     signatures, a merge queue, a locked branch, and any rule it
  *                     doesn't know, named
+ *   settlesAlone      those of them a run settles without anyone, a deployment say
  *   checks            every required status check, reeve's own included, as
  *                     { context, app }, with the App it is bound to or null:
  *                     known once the rules and the branch are read, whatever
@@ -870,6 +879,7 @@ export function requirementsOn({ rules, branch, protection = null }, context, { 
   const ours = (bound) => (bound == null || Number(bound) === -1 ? true : appId == null ? null : String(bound) === String(appId));
   const verdictOf = (answers) => (answers.includes(true) ? true : answers.includes(null) ? null : false);
   const others = [], unevaluated = [], every = [];
+  const settlesAlone = [];
   let byRules = null, byProtection = null, threadResolution = false, strict = false, whole = true;
   // A required check is reeve's, another App's, or, bound to an App reeve can't
   // name, both: GitHub waits for whichever App it is.
@@ -894,6 +904,7 @@ export function requirementsOn({ rules, branch, protection = null }, context, { 
       }
       // Reviews are GitHub's review decision, which the verdict reads.
       else if (r?.type === "pull_request") threadResolution ||= r.parameters?.required_review_thread_resolution === true;
+      else if (SETTLES_ALONE.has(r?.type)) { unevaluated.push(`rule ${r.type}`); settlesAlone.push(`rule ${r.type}`); }
       else if (!HARMLESS_RULES.has(r?.type)) unevaluated.push(`rule ${r?.type ?? "of no type"}`);
     }
     byRules = verdictOf(answers);
@@ -929,8 +940,8 @@ export function requirementsOn({ rules, branch, protection = null }, context, { 
   const own = byRules === true || byProtection === true ? true : byRules === null || byProtection === null ? null : false;
   const checks = Array.isArray(list) && b
     ? every.filter((c, i) => every.findIndex((d) => d.context === c.context && d.app === c.app) === i) : null;
-  return whole ? { own, others, threadResolution, strict, unevaluated, checks }
-    : { own, others: null, threadResolution: null, strict: null, unevaluated: null, checks };
+  return whole ? { own, others, threadResolution, strict, unevaluated, settlesAlone, checks }
+    : { own, others: null, threadResolution: null, strict: null, unevaluated: null, settlesAlone: null, checks };
 }
 
 const parsed = (r) => { try { return r?.ok ? JSON.parse(r.out || "{}") : undefined; } catch { return undefined; } };

@@ -16,7 +16,8 @@ const check = (n, got, want) => { const ok = got === want;
 // default is covered by test/review-gate.test.mjs rather than weakened here.
 const P = { rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
             authority: { policy: "propose_and_merge" }, watch: { reviewActions: true } };
-const cl = (id, state, detail = "") => ({ id, state, detail });
+// An UNKNOWN clause carries its kind (#165); the watcher decides by it, not by the wording.
+const cl = (id, state, detail = "", kind = null) => (kind ? { id, state, detail, kind } : { id, state, detail });
 // The clause set, kept in step with the verdict's own by a check below rather
 // than by memory. A hardcoded list here silently stopped reaching the mechanism
 // the moment a clause was added: `swap("cleared", ...)` replaced nothing, the
@@ -31,7 +32,7 @@ const ev = (clauses, extra = {}) => ({
   checks: {}, ...extra,
 });
 const allPass = () => CLAUSE_IDS.map(id => cl(id, "PASS"));
-const swap = (id, state, detail) => allPass().map(c => (c.id === id ? cl(id, state, detail) : c));
+const swap = (id, state, detail, kind = null) => allPass().map(c => (c.id === id ? cl(id, state, detail, kind) : c));
 
 // ── terminal shapes ───────────────────────────────────────────────────────
 check("a fully green PR merges", nextAction(ev(allPass()), P).action, ACTIONS.MERGE);
@@ -81,13 +82,13 @@ check("an in-flight check waits", nextAction(ev(swap("ci", "UNKNOWN", "checks no
 
 // A reviewer that has not run is not a stall: it is a round nobody asked for.
 check("a reviewer that has not run triggers a request",
-  nextAction(ev(swap("review", "UNKNOWN", "not yet run: codex")), P).action, ACTIONS.REQUEST_REVIEW);
+  nextAction(ev(swap("review", "UNKNOWN", "not yet run: codex", "missing")), P).action, ACTIONS.REQUEST_REVIEW);
 check("but not past the soft cap",
-  nextAction(ev(swap("review", "UNKNOWN", "not yet run: codex"), { rounds: { n: 5, softCap: 5, hardCap: 10, unspilledCritical: 0 } }), P).action, ACTIONS.WAIT);
+  nextAction(ev(swap("review", "UNKNOWN", "not yet run: codex", "missing"), { rounds: { n: 5, softCap: 5, hardCap: 10, unspilledCritical: 0 } }), P).action, ACTIONS.WAIT);
 
 // 65 of 65 Codex comments were quota refusals: that is a supply problem.
 {
-  const d = nextAction(ev(swap("review", "UNKNOWN", "unreachable: codex=REFUSED — absence is not approval")), P);
+  const d = nextAction(ev(swap("review", "UNKNOWN", "unreachable: codex=REFUSED — absence is not approval", "person")), P);
   check("all reviewers unreachable escalates", d.why, ESCALATIONS.REVIEWERS_DOWN);
   check("and is shared, not per-PR", d.shared, true);
 }

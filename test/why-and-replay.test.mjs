@@ -282,3 +282,41 @@ test("the policy is compared per decision, with a profile only for the repositor
   assert.equal(replayDecisions(db, {}, { profile: { ...mine, identity: { key: "x/y" } } })[0].policyChanged, null);
   assert.equal(replayDecisions(db, {}, { profile: mine })[0].policyChanged, true);
 });
+
+test("why shows each UNKNOWN clause's kind and what happens next", async () => {
+  const dbPath = join(tempDir("reeve-why-"), "s.db");
+  const settling = () => { const i = { ...input(), checks: { verdict: "SETTLING", settled: false, why: null, failing: [], inherited: [], impostors: [], shadowRequired: false } };
+                           return { ...EVAL, verdict: computeVerdict(i), input: i }; };
+  await run({ evaluate: settling, dbPath, code: CODE });
+  assert.match(why(open(dbPath), "42"), /ci\s+UNKNOWN\s+checks not settled: SETTLING\s+\[waiting: look again once the checks settle\]/);
+});
+
+/** A verdict as the code before the UNKNOWN kinds recorded it: no clause names a kind or a next action. */
+const kindless = v => ({ ...v, clauses: v.clauses.map(c => Object.fromEntries(Object.entries(c).filter(([k]) => k !== "kind" && k !== "next"))) });
+
+test("a replay shows the kind and next action a recomputed UNKNOWN clause gained, when they're all that changed", async () => {
+  const dbPath = join(tempDir("reeve-why-"), "s.db");
+  const before = () => { const i = { ...input(), checks: { verdict: "SETTLING", settled: false, why: null, failing: [], inherited: [], impostors: [], shadowRequired: false } };
+                         return { ...EVAL, verdict: kindless(computeVerdict(i)), input: i }; };
+  await run({ evaluate: before, dbPath, code: CODE });
+  const [r] = replayDecisions(open(dbPath), {});
+  assert.equal(r.outcome, "differs", "control: the clause recomputed now names its kind, and the recorded one doesn't");
+  assert.deepEqual(r.diffs?.map(d => d.id), ["ci"]);
+  const [d] = r.diffs ?? [];
+  assert.notEqual(d?.was, d?.now);
+  assert.match(String(d?.now), /\[waiting: look again once the checks settle\]/);
+});
+
+test("a clause that differs only where replay shows nothing is shown whole, never as two equal lines", async () => {
+  const { db } = await recorded();
+  const compute = i => {
+    const v = computeVerdict(i);
+    return { ...v, clauses: v.clauses.map(c => (c.id === "base" ? { ...c, seenAt: 1 } : c)) };
+  };
+  const [r] = replayDecisions(db, {}, { compute });
+  assert.equal(r.outcome, "differs", "control: the extra field is a difference");
+  const [d] = r.diffs ?? [];
+  assert.equal(d?.id, "base");
+  assert.notEqual(d?.was, d?.now);
+  assert.match(String(d?.now), /seenAt/);
+});

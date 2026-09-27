@@ -12,6 +12,8 @@
 // churn, and all three were headline stats on the board this replaces.
 
 import { execFileSync } from "node:child_process";
+import { explainDecision } from "./decisions.mjs";
+import { SelectorError } from "./db/records.mjs";
 
 const SPARK = "▁▂▃▄▅▆▇█";
 
@@ -272,18 +274,35 @@ export function statusline(db, { nwo } = {}) {
   return bits.join("  ·  ");
 }
 
-/** `reeve why <id>`: the decision trail for one PR, newest first. */
-export function why(db, id, { limit = 12 } = {}) {
+/**
+ * `reeve why <id>`: the latest decision for one PR, or for one of its commits,
+ * and the evidence it was judged from (#165); then the decision trail, newest
+ * first.
+ */
+export function why(db, id, { limit = 12, head = null } = {}) {
   const subject = id.startsWith("pr:") ? id : `pr:${String(id).replace(/^#/, "")}`;
+  const pr = Number(subject.slice(3));
+  let latest = null, refused = null;
+  try { latest = Number.isInteger(pr) ? explainDecision(db, pr, { head }) : null; }
+  catch (e) {
+    // A commit named by a start that isn't hexadecimal, or that more than one
+    // shares, is refused and says so, rather than explaining another commit.
+    if (e instanceof SelectorError) refused = e.message;
+    else latest = `could not read its decision records: ${e.message}`;
+  }
   let rows = [];
   try {
     rows = db.prepare(
       `SELECT at, actor, op, payload FROM event WHERE subject = ? ORDER BY seq DESC LIMIT ?`
     ).all(subject, limit);
   } catch (e) { return `could not read the store: ${e.message}`; }
-  if (!rows.length) return `nothing recorded for ${subject}. reeve has not looked at it yet.`;
+  if (!rows.length && !latest && !refused) return `nothing recorded for ${subject}. reeve has not looked at it yet.`;
 
-  const out = [`${subject} — most recent first`, ""];
+  const out = [];
+  if (refused) out.push(`${subject} — ${refused}`, "");
+  else if (latest) out.push(`${subject} — the latest decision${head ? ` at ${head}` : ""}`, latest, "");
+  else if (head) out.push(`${subject} — no decision record at ${head}`, "");
+  out.push(`${subject} — most recent first`, "");
   for (const r of rows) {
     let p = {}; try { p = JSON.parse(r.payload); } catch { /* show what we can */ }
     const when = new Date(r.at * 1000).toISOString().replace("T", " ").slice(0, 19);

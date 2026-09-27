@@ -565,3 +565,37 @@ CREATE TABLE IF NOT EXISTS worker_run (
   stdout_bytes    INTEGER,
   created_at      INTEGER NOT NULL
 ) STRICT, WITHOUT ROWID;
+
+-- ---------------------------------------------------------------- evidence and decisions
+-- What each verdict was judged from, so a past verdict can be explained (`reeve
+-- why`) and replayed (`reeve replay`) (#165). A digest covers what a record says,
+-- never when it was seen: a reading that doesn't change between ticks is one row
+-- seen again, and a tick that decides the same thing from it finds its decision.
+-- Written in the same transaction as the `pr.decided` event that names the decision.
+CREATE TABLE IF NOT EXISTS evidence (
+  digest     TEXT PRIMARY KEY,              -- sha256 of the canonical statement, without its observedAt
+  kind       TEXT NOT NULL,                 -- the source: head, checks, base, reviewers, reviews, ledger, merge, hold, other
+  statement  TEXT NOT NULL,                 -- canonical JSON, the in-toto Statement v1 shape, unsigned; observedAt is the first sighting
+  first_seen INTEGER NOT NULL,
+  last_seen  INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS policy (
+  hash       TEXT PRIMARY KEY,              -- sha256 of the validated profile's canonical JSON, without its path
+  body       TEXT NOT NULL,
+  first_seen INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS decision (
+  digest    TEXT PRIMARY KEY,               -- sha256 of the canonical record
+  pr        INTEGER NOT NULL,
+  head      TEXT NOT NULL,
+  record    TEXT NOT NULL,                  -- canonical JSON: subject, policy hash, code version, evidence digests, verdict
+  first_at  INTEGER NOT NULL,
+  last_at   INTEGER NOT NULL,
+  -- The seq of the first and the latest `pr.decided` event naming it. Seconds
+  -- can tie; the event log's order can't, so "latest" is read from here.
+  first_seq INTEGER NOT NULL,
+  last_seq  INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS decision_by_pr ON decision(pr, last_seq);

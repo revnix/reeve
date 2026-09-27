@@ -580,6 +580,23 @@ export function isBuilderPr({ headRef = null, authorLogin = null } = {}) {
   return typeof headRef === "string" && /^mp\//.test(headRef);
 }
 
+// A commit's tree, for the subject of the evidence a verdict is recorded with
+// (#165). A commit never changes, so each is read once per process. One that
+// can't be read is null, which the record shows as unknown, and is read again
+// next time.
+const TREES = new Map();
+export function treeOf(nwo, sha) {
+  const key = `${nwo}@${sha}`;
+  if (TREES.has(key)) return TREES.get(key);
+  const r = ghJson([`repos/${nwo}/git/commits/${sha}`, "--jq", ".tree.sha"]);
+  const tree = r.ok && /^[0-9a-f]{40}$/.test(r.out) ? r.out : null;
+  if (tree) {
+    if (TREES.size >= 1000) TREES.delete(TREES.keys().next().value);
+    TREES.set(key, tree);
+  }
+  return tree;
+}
+
 export function prAnchor({ nwo, pr }) {
   // updated_at rides along so ingest can skip a pull request that has not moved.
   // It is GitHub's timestamp, so a change reeve has not seen yet still triggers a
@@ -724,7 +741,10 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     } catch { ledgerBlockers = null; ledgerBlockerIds = null; }
   }
 
-  const verdict = computeVerdict({
+  // Everything the verdict is judged from, kept whole and returned, so the tick
+  // can record it as evidence and a past verdict can be replayed from it (#165).
+  // `computeVerdict` reads nothing else.
+  const input = {
     head: pin.sha,
     checks: { verdict: s.verdict, settled: s.settled, why: s.why, failing: c.failing, inherited: c.inherited,
               // Another App's check under reeve's own name: kept, never dropped.
@@ -742,9 +762,10 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     // an UNKNOWN one -- a guardian that was never asked about holds must not
     // drag every verdict to UNKNOWN.
     hold,
-  });
+  };
+  const verdict = computeVerdict(input);
 
-  return { ok: true, pr, title, headRef, baseRef, state, head: pin.sha, verdict,
+  return { ok: true, pr, title, headRef, baseRef, state, head: pin.sha, verdict, input,
            reviewers, threads, rounds, forcePushedAt, updatedAt, checks: c, settled: s,
            // The open threads themselves, for the actions that act ON them. An
            // empty array and an unreadable projection are different facts, so the

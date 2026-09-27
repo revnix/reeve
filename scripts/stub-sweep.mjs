@@ -30,7 +30,7 @@
  *    for the anchor. Confirmation greps have been measured inert here.
  */
 import { readFileSync, writeFileSync, copyFileSync, mkdtempSync, rmSync, realpathSync, statSync,
-         lstatSync, readlinkSync, openSync, readSync, closeSync, fstatSync, constants, readdirSync, mkdirSync } from "node:fs";
+         lstatSync, readlinkSync, openSync, readSync, closeSync, fstatSync, constants, readdirSync, mkdirSync, existsSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -508,14 +508,26 @@ copyFileSync(fileURLToPath(new URL("../test/fixtures/offline-gh/gh", import.meta
 process.on("exit", () => { try { rmSync(offlineDir, { recursive: true, force: true }); } catch { /* best effort: it holds no work */ } });
 let childRuns = 0;
 const childEnv = file => {
-  if (basename(file) === "escape.test.mjs") return process.env;
+  if (basename(file) === "escape.test.mjs") return { env: process.env, home: null, ghLog: null };
   const n = ++childRuns;
   const home = join(offlineDir, `home-${n}`);
   mkdirSync(home);
-  const env = { ...process.env, HOME: home, REEVE_TEST_GH_LOG: join(offlineDir, `gh-${n}.log`),
+  const ghLog = join(offlineDir, `gh-${n}.log`);
+  const env = { ...process.env, HOME: home, REEVE_TEST_GH_LOG: ghLog,
                 PATH: `${OFFLINE_GH_DIR}${delimiter}${process.env.PATH ?? ""}` };
   delete env.REEVE_HOME;
-  return env;
+  return { env, home, ghLog };
+};
+// WHAT THE RUNNER FAILS A FILE FOR, read as `scripts/test.mjs` reads it: a call
+// the offline gh wrote down, or a `.reeve` written into the home. A control run
+// that did either fails under `npm test` and CI, so a sweep that accepted it
+// would vouch for a test file the suite itself rejects.
+const strayedFrom = ({ home, ghLog }) => {
+  const found = [];
+  if (ghLog && existsSync(ghLog) && readFileSync(ghLog, "utf8").split("\x1e").filter(Boolean).length)
+    found.push("called gh, which a test never reaches");
+  if (home && existsSync(join(home, ".reeve"))) found.push("wrote into its home's .reeve");
+  return found;
 };
 
 const runTest = (file, expectRed = null) => new Promise(resolve => {
@@ -531,8 +543,9 @@ const runTest = (file, expectRed = null) => new Promise(resolve => {
   // reporting no assertion at all (#224). The reporter prints both, and a file
   // that doesn't use node:test never loads it. It is this script's own, not the
   // tree's under test: a fixture repository has none.
+  const offline = childEnv(file);
   const child = spawn(process.execPath, [`--test-reporter=${TEST_REPORTER}`, "--test-reporter-destination=stdout", join(ROOT, file)],
-    { cwd: ROOT, detached: true, env: childEnv(file) });
+    { cwd: ROOT, detached: true, env: offline.env });
   activeChild = child;
   // BOUNDED. A deliberately broken test that logs continuously would otherwise
   // grow one unbounded string for as long as the timeout allows, and exhausting
@@ -705,6 +718,7 @@ const runTest = (file, expectRed = null) => new Promise(resolve => {
     // return the same verdict when the new one is unused.
     resolve({ exit: timedOut || code === null ? TIMED_OUT_EXIT : code,
               observed,
+              strayed: strayedFrom(offline),
               output: kept.length ? `${kept.join("\n")}\n${body}` : body });
   });
 });
@@ -865,10 +879,12 @@ for (const entry of entries) {
   // whatever happens next, so stubbing production files and waiting out a second
   // timeout buys nothing — and it runs deliberately broken code for up to ten
   // minutes to learn something already known.
-  if (control.exit !== 0) {
+  if (control.exit !== 0 || control.strayed.length) {
     const why = control.exit === TIMED_OUT_EXIT
       ? "the test timed out BEFORE stubbing, so nothing it reports afterwards means anything"
-      : `the test does not pass before stubbing (exit ${control.exit}), so nothing it reports afterwards means anything`;
+      : control.exit !== 0
+      ? `the test does not pass before stubbing (exit ${control.exit}), so nothing it reports afterwards means anything`
+      : `the control run ${control.strayed.join(" and ")}, which the runner fails a test file for, so nothing it reports afterwards means anything`;
     // `reintroduces` rather than a second `why`: the entry's reason and the
     // verdict's reason are two different facts, and an object literal with the key
     // twice silently keeps only the last.

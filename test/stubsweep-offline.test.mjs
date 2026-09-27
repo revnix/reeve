@@ -98,3 +98,31 @@ test("the escape probe keeps the real gh, as CI gives it", () => {
   assert.match(r.out, /1\/1 stub\(s\) caught/, r.out.slice(-600));
   assert.notEqual(readCalls(), before, "the escape probe's control run never reached the real gh");
 });
+
+// ── a control run the runner would fail proves nothing ────────────────────────
+
+const verdictOf = (out, name) => new RegExp(`${name}\\s+([A-Z_]+)`).exec(out)?.[1] ?? "none";
+
+test("a control run that reaches gh is unrunnable, as the runner fails that file", () => {
+  writeFileSync(join(root, "test", "strays.test.mjs"),
+    `import test from "node:test";\n` +
+    `import assert from "node:assert/strict";\n` +
+    `import { read } from "../src/read.mjs";\n` +
+    `test("a read that can't be reached still answers", () => { assert.equal(typeof read(), "string"); });\n`);
+  const r = sweep({ name: "strays-gh", test: "test/strays.test.mjs", expectRed: "a read that can't be reached still answers",
+                    edits: [{ file: "src/read.mjs", find: "catch { return \"unreachable\"; }", replace: "catch { return 0; }" }] });
+  assert.equal(verdictOf(r.out, "strays-gh"), "UNRUNNABLE", r.out.slice(-600));
+  assert.match(r.out, /called gh/);
+});
+
+test("a control run that writes into its home's .reeve is unrunnable too", () => {
+  writeFileSync(join(root, "test", "writes.test.mjs"),
+    `import test from "node:test";\n` +
+    `import assert from "node:assert/strict";\n` +
+    `import { save } from "../src/read.mjs";\n` +
+    `test("a note is kept somewhere", () => { assert.ok(save()); });\n`);
+  const r = sweep({ name: "writes-home", test: "test/writes.test.mjs", expectRed: "a note is kept somewhere",
+                    edits: [{ file: "src/read.mjs", find: "  return dir;", replace: "  return \"\";" }] });
+  assert.equal(verdictOf(r.out, "writes-home"), "UNRUNNABLE", r.out.slice(-600));
+  assert.match(r.out, /wrote into its home's \.reeve/);
+});

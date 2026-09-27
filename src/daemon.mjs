@@ -2370,9 +2370,13 @@ export async function tick(ctx) {
       // row are for a person, in words that stay the same from tick to tick.
       failures.set(pr, (failures.get(pr) ?? 0) + 1);
       if (failures.get(pr) >= 3) raise(`#${pr}: reeve couldn't publish its verdict on 3 ticks in a row`);
-      // A PASS published at this head stands until something writes over it.
-      if (e.verdict.state !== PASS)
-        await takeBack(pr, "the merge policy couldn't publish its new verdict here", (x) => x.head === e.head);
+      // A PASS published at this head stands until something writes over it. So
+      // what this publication couldn't write over is taken back: any PASS when
+      // the new verdict isn't one, and one under another name, such as an
+      // enforcing PASS a shadow publication couldn't supersede.
+      const unwritten = (x) => x.head === e.head && (e.verdict.state !== PASS || x.name !== name);
+      if (e.verdict.state !== PASS || (at ?? []).some((x) => x.op === "pr.published" && x.state === PASS && unwritten(x)))
+        await takeBack(pr, "the merge policy couldn't publish its new verdict here", unwritten);
     }
     // A PASS left at an earlier head stays on that commit, and a push back to it
     // makes it the pull request's again, to merge on a result nothing re-checked.
@@ -2557,6 +2561,15 @@ export async function tick(ctx) {
         try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict, shadow, base, queue: true }); }
         catch (thrown) { pub = { ok: false, why: thrown.message }; }
       }
+      // An enforcing PASS a shadow publication superseded here is cancelled, so
+      // it's written down as withdrawn, as at a head.
+      if (pub.superseded && name !== POLICY_CONTEXT)
+        for (const n of prs) {
+          let st;
+          try { st = standingAt(db, n); } catch { st = null; }
+          const enforced = st?.find((x) => x.op === "pr.published" && x.name === POLICY_CONTEXT && x.head === sha);
+          if (enforced) notePublication(db, n, "pr.withdrawn", { head: sha, name: POLICY_CONTEXT, id: enforced.id ?? null, why: "superseded by a shadow result" });
+        }
       if (pub.ok) {
         failed.delete(sha);
         for (const n of prs) noteQueued(n, { state: verdict.state, name: pub.name ?? name, id: pub.id ?? null });
@@ -2567,10 +2580,12 @@ export async function tick(ctx) {
       failed.set(sha, { n: (was?.n ?? 0) + 1, tick: tickNo });
       for (const n of prs) {
         if (failed.get(sha).n >= 3) raise(`#${n}: reeve couldn't publish its verdict on the merge queue's commit on 3 ticks in a row`);
-        // Only when a PASS stands there: a take-back that finds nothing clears the
-        // pull request's stuck-PASS cause, which another step may have raised.
-        if (verdict.state !== PASS && queuePassAt(n, (x) => x.head === sha))
-          await takeBack(n, "the merge policy couldn't publish its new verdict on this queue commit", (x) => x.queue && x.head === sha);
+        // What it couldn't write over is taken back, as at a head. Only when a PASS
+        // stands there: a take-back that finds nothing clears the pull request's
+        // stuck-PASS cause, which another step may have raised.
+        const unwritten = (x) => x.queue === true && x.head === sha && (verdict.state !== PASS || x.name !== name);
+        if (queuePassAt(n, unwritten))
+          await takeBack(n, "the merge policy couldn't publish its new verdict on this queue commit", unwritten);
       }
     }
     // A PASS on a commit the queue no longer holds is taken back, whether the

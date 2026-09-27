@@ -392,3 +392,41 @@ test("a queue answer that carries GraphQL errors is a failed read, not an empty 
   assert.equal(q.ok, false);
   assert.match(q.why, /Resource not accessible by integration/);
 });
+
+// ── from #269's fourth review ────────────────────────────────────────────────
+
+/** A store where an enforcing reeve noted a PASS for #42 at `head`, as on a queue commit when `queue`. */
+function enforcedBefore(head, { queue }) {
+  const dbPath = join(tempDir("reeve-queue-enforced-"), "s.db");
+  const db = open(dbPath);
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
+    .run(1, "daemon", "pr.published", "pr:42", JSON.stringify({ head, state: "PASS", name: "ops/merge-policy", id: 5, ...(queue ? { queue: true } : {}) }));
+  db.close();
+  return dbPath;
+}
+
+test("an enforcing queue PASS that a shadow publication couldn't supersede is taken back", async () => {
+  const withdrawn = [];
+  const withdraw = async (a) => { withdrawn.push(a); return { ok: true }; };
+  const publish = async ({ verdict }) => (verdict.head === QUEUED ? { ok: false, why: "the passing result couldn't be superseded" } : { ok: true, id: 1 });
+  await run({ evaluate: evaluated, readQueue: queued(), evaluateQueue: judged, publish, withdraw, dbPath: enforcedBefore(QUEUED, { queue: true }) });
+  assert.ok(withdrawn.some(a => a.pr === 42 && a.head === QUEUED && a.name === "ops/merge-policy"), JSON.stringify(withdrawn));
+});
+
+test("an enforcing queue PASS a shadow publication superseded is written down as withdrawn", async () => {
+  const dbPath = enforcedBefore(QUEUED, { queue: true });
+  const publish = async ({ verdict }) => (verdict.head === QUEUED ? { ok: true, id: 2, name: "ops/merge-policy (shadow)", superseded: true } : { ok: true, id: 1 });
+  await run({ evaluate: evaluated, readQueue: queued(), evaluateQueue: judged, publish, dbPath });
+  const db = open(dbPath);
+  const standing = standingPasses(db);
+  db.close();
+  assert.ok(!standing.some(x => x.head === QUEUED && x.name === "ops/merge-policy"), JSON.stringify(standing));
+});
+
+test("an enforcing PASS at the head that a shadow publication couldn't supersede is taken back", async () => {
+  const withdrawn = [];
+  const withdraw = async (a) => { withdrawn.push(a); return { ok: true }; };
+  const publish = async () => ({ ok: false, why: "the passing result couldn't be superseded" });
+  await run({ evaluate: evaluated, publish, withdraw, dbPath: enforcedBefore(HEAD, { queue: false }) });
+  assert.ok(withdrawn.some(a => a.pr === 42 && a.head === HEAD && a.name === "ops/merge-policy"), JSON.stringify(withdrawn));
+});

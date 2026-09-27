@@ -41,8 +41,8 @@ function worst(a, b) {
 /**
  * @param {object} i
  * @param {string} i.head            the sha this verdict is ABOUT, pinned once
- * @param {object} i.checks          {verdict, settled, failing[]} from the reconciler
- * @param {object} i.base            {verdict} for the base branch's own head
+ * @param {object} i.checks          {verdict, settled, readable, failing[]} from the reconciler
+ * @param {object} i.base            {verdict, readable} for the base branch's own head
  * @param {object[]} i.reviewers     [{login, kind, state, reviewedHead}]
  * @param {object} i.rounds          {n, softCap, hardCap, unspilledCritical}
  * @param {object} i.threads         {unresolved, total, readable}
@@ -104,6 +104,8 @@ export function computeVerdict(i) {
   // fails: the shadow result passes the rule whatever reeve found.
   else if (i.checks?.shadowRequired) add("ci", BLOCK, "the base requires reeve's shadow check, whose result passes the rule whatever reeve finds");
   else if (!i.checks) add("ci", UNKNOWN, "no check reading", "retry", "read the head's checks again");
+  // A read that failed is not a set still settling: only reading again settles it.
+  else if (i.checks.readable === false) add("ci", UNKNOWN, i.checks.why ?? "the head's checks couldn't be read", "retry", "read the head's checks again");
   else if (!i.checks.settled) add("ci", UNKNOWN, `checks not settled: ${i.checks.verdict}${i.checks.why ? ` (${i.checks.why})` : ""}`, "waiting", "look again once the checks settle");
   else if (i.checks.verdict === "GREEN") add("ci", PASS, "all checks passing at the pinned head");
   else if (i.checks.verdict === "MISSING_REQUIRED" || i.checks.verdict === "SKIPPED_REQUIRED") add("ci", BLOCK, i.checks.why);
@@ -120,6 +122,7 @@ export function computeVerdict(i) {
   if (!i.base) add("base", UNKNOWN, "base health not read", "retry", "read the base branch's checks again");
   else if (i.base.verdict === "GREEN") add("base", PASS, "base is green");
   else if (i.base.verdict === "RED") add("base", BLOCK, "the base branch is red; merging into it hides the next failure");
+  else if (i.base.readable === false) add("base", UNKNOWN, "the base branch's checks couldn't be read", "retry", "read the base branch's checks again");
   else add("base", UNKNOWN, `base verdict ${i.base.verdict}`, "waiting", "look again once the base branch's checks settle");
 
   // 3. Review coverage AT THIS HEAD, per blocking reviewer. Four states, never two:

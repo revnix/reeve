@@ -86,6 +86,13 @@ export function policyHashFor(profile, nwo) {
 }
 
 /**
+ * A clause as replay shows it: its state and detail, and an UNKNOWN's kind and
+ * next action (#165).
+ * @param {any} c
+ */
+const shown = c => (c ? `${c.state}: ${c.detail ?? ""}${c.kind ? ` [${c.kind}: ${c.next ?? ""}]` : ""}` : "absent");
+
+/**
  * What changed between two verdicts, clause by clause.
  * @param {any} was @param {any} now
  */
@@ -97,7 +104,10 @@ function clauseDiffs(was, now) {
   for (const id of new Set([...a.keys(), ...b.keys()])) {
     const x = a.get(id), y = b.get(id);
     if (canonical(x ?? null) === canonical(y ?? null)) continue;
-    out.push({ id: String(id), was: x ? `${x.state}: ${x.detail ?? ""}` : "absent", now: y ? `${y.state}: ${y.detail ?? ""}` : "absent" });
+    // A clause that differs only where it isn't shown is shown whole, so a
+    // difference is never reported as two equal lines.
+    const plain = shown(x) === shown(y);
+    out.push({ id: String(id), was: plain ? canonical(x ?? null) : shown(x), now: plain ? canonical(y ?? null) : shown(y) });
   }
   if (!out.length) out.push({ id: "summary", was: String(was.summary ?? ""), now: String(now.summary ?? "") });
   return out;

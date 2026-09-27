@@ -213,13 +213,13 @@ export function requiredChecksOf({ nwo, baseRef, profile = /** @type {CiProfile}
 
 /**
  * A check read, classified against the required set. A read that isn't whole
- * passes nothing, since the surface that went unread may hold a failure; but a
- * failure it did read is one, and stays RED.
+ * passes nothing, since the surface that went unread may hold a failure, and
+ * says so with `readable: false`; but a failure it did read is one, and stays RED.
  */
 export function classifyRead(read, { required = [], known = true } = {}, { evidence = true } = {}) {
   const c = classify(read?.rows ?? [], required, { requiredKnown: known, evidence });
   if (read?.ok || c.verdict === "RED") return c;
-  return { verdict: "UNKNOWN", failing: [], running: [], why: `the checks couldn't be read in full: ${read?.why ?? "nothing was read"}` };
+  return { verdict: "UNKNOWN", readable: false, failing: [], running: [], why: `the checks couldn't be read in full: ${read?.why ?? "nothing was read"}` };
 }
 
 /**
@@ -667,7 +667,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // apply. Only a partial read does: it can hide a failure.
   const base = baseHead.ok
     ? classifyRead(readChecks(nwo, baseHead.sha, { reviewerContexts }), { required: profile.ci?.requiredChecks ?? [] }, { evidence: false })
-    : { verdict: "UNKNOWN" };
+    : { verdict: "UNKNOWN", readable: false };
 
   const threads = readThreads(nwo, pr);
   const reviewers = readReviewerStates(nwo, pr, pin.sha, profile.reviewers ?? []);
@@ -746,10 +746,12 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // `computeVerdict` reads nothing else.
   const input = {
     head: pin.sha,
-    checks: { verdict: s.verdict, settled: s.settled, why: s.why, failing: c.failing, inherited: c.inherited,
+    // `readable` false when the read failed, which reading again settles, and
+    // waiting for the checks to settle never does.
+    checks: { verdict: s.verdict, settled: s.settled, why: s.why, readable: c.readable !== false, failing: c.failing, inherited: c.inherited,
               // Another App's check under reeve's own name: kept, never dropped.
               impostors: read.impostors ?? [], shadowRequired: req.shadowRequired },
-    base: { verdict: base.verdict },
+    base: { verdict: base.verdict, readable: base.readable !== false },
     reviewers, rounds, threads, cleared: facts.cleared,
     bodyFindings: facts.bodyFindings, unreadableBodies: facts.unreadableBodies,
     ledgerBlockers,

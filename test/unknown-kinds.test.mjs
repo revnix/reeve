@@ -7,9 +7,13 @@
 // to do by matching that text, so rewording a detail changed a decision.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { computeVerdict, UNKNOWN_KINDS } from "../src/verdict.mjs";
 import { nextAction, ACTIONS, ESCALATIONS } from "../src/watcher.mjs";
+import { evaluatePr, clearRequirements } from "../src/pr.mjs";
+import { open } from "../src/db/ops.mjs";
+import { tempDir } from "./fixtures/temp.mjs";
 
 const HEAD = "bfbbe6ed6a1c2d3e4f5061728394a5b6c7d8e9f0";
 /** A fully satisfied input, as test/verdict.test.mjs builds it. */
@@ -35,9 +39,12 @@ const blocked = over => i => { i.mergeState = "BLOCKED"; i.mergeParts = parts(ov
 const CASES = [
   ["no check reading", "ci", "retry", i => { delete i.checks; }],
   ["checks still settling", "ci", "waiting", i => { i.checks = { verdict: "SETTLING", settled: false, failing: [] }; }],
+  ["a check read that failed", "ci", "retry", i => { i.checks = { verdict: "UNKNOWN", settled: false, readable: false, why: "the checks couldn't be read in full: HTTP 502", failing: [] }; }],
+  ["checks no run has reported yet", "ci", "waiting", i => { i.checks = { verdict: "UNKNOWN", settled: false, readable: true, why: "no checks reported at this revision", failing: [] }; }],
   ["a check verdict reeve doesn't know", "ci", "retry", i => { i.checks = { verdict: "WHATEVER", settled: true, failing: [] }; }],
   ["the base not read", "base", "retry", i => { delete i.base; }],
   ["the base still settling", "base", "waiting", i => { i.base = { verdict: "SETTLING" }; }],
+  ["the base's checks unreadable", "base", "retry", i => { i.base = { verdict: "UNKNOWN", readable: false }; }],
   ["a blocking reviewer unreachable", "review", "person", i => { i.reviewers = [{ login: "bot", kind: "blocking", state: "REFUSED" }]; }],
   ["a blocking reviewer not yet run", "review", "missing", i => { i.reviewers = [{ login: "bot", kind: "blocking", state: "NOT_RUN" }]; }],
   ["threads unreadable", "threads", "retry", i => { i.threads = { readable: false }; }],
@@ -113,7 +120,69 @@ test("a requirement reeve doesn't evaluate goes to a person at once, not after t
   assert.equal(d.why, ESCALATIONS.PROTECTION_UNMET);
 });
 
+test("a clause only a person can settle goes to one before a missing review round is asked for", () => {
+  const v = verdictFor(i => { i.reviewers = [{ login: "bot", kind: "blocking", state: "NOT_RUN" }]; blocked({ unevaluated: ["code owners' approval"] })(i); });
+  assert.equal(v.clauses.find(c => c.id === "review")?.kind, "missing", "control: the review round is missing too");
+  const d = nextAction(ev(v), P, { now: 1000, unknownSince: 1000 });
+  assert.equal(d.action, ACTIONS.ESCALATE);
+  assert.equal(d.why, ESCALATIONS.PROTECTION_UNMET);
+});
+
 test("control: an UNKNOWN reeve only waits on still waits, inside its window", () => {
   const v = verdictFor(i => { i.checks = { verdict: "SETTLING", settled: false, failing: [] }; });
   assert.equal(nextAction(ev(v), P, { now: 1000, unknownSince: 1000 }).action, ACTIONS.WAIT);
+});
+
+// ── a read that failed is a retry, through evaluatePr ─────────────────────────
+
+const HEAD_SHA = "a".repeat(40), BASE_SHA = "b".repeat(40);
+const runJson = conclusion => JSON.stringify({ name: "CI Gate", status: "completed", conclusion, id: 1,
+  completed_at: new Date().toISOString(), app: { slug: "github-actions", id: 1 } });
+const FAILED = `echo "gh: HTTP 502" >&2; exit 1`;
+
+/**
+ * The ci and base clauses after one tick of evaluatePr, with gh and git
+ * stand-ins on the PATH as test/evaluate-hands-back-input.test.mjs has them.
+ * Every read succeeds and every check passes, except the reads `fail` names.
+ * @param {string[]} fail
+ */
+function clausesAfterATick(fail = []) {
+  const bin = tempDir("reeve-kinds-bin-");
+  const answer = (what, ok) => (fail.includes(what) ? FAILED : ok);
+  const page = JSON.stringify({ data: { repository: { pullRequest: { mergeStateStatus: "CLEAN", mergeable: "MERGEABLE", reviewDecision: null,
+    reviews: { totalCount: 0 }, reviewThreads: { totalCount: 0, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } } });
+  const rule = `echo '{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"CI Gate"}]}}'`;
+  const answers = `  graphql) echo '${page}';;
+  */commits/${BASE_SHA}/check-runs*) echo '${runJson("success")}';;
+  */commits/${BASE_SHA}/status*) ${answer("the base's statuses", ":")};;
+  */check-suites*) echo '[{"app":{"slug":"github-actions"},"status":"completed"}]';;
+  */rules/branches/*) ${answer("the base's rules", rule)};;
+  */branches/main) echo '{"protected":true,"protection":{"enabled":false}}';;
+  */commits/${HEAD_SHA}/check-runs*) echo '${runJson("success")}';;
+  */commits/${HEAD_SHA}/status*) ${answer("the head's statuses", ":")};;`;
+  writeFileSync(join(bin, "gh"), `#!/bin/sh\nfor a in "$@"; do case "$a" in repos/*|graphql) p="$a";; esac; done\ncase "$p" in\n${answers}\n  *) ;;\nesac\n`, { mode: 0o755 });
+  const pin = fail.includes("the base's head") ? "exit 1" : `[ "$1" = ls-remote ] && printf '%s\\trefs/heads/main\\n' ${BASE_SHA}`;
+  writeFileSync(join(bin, "git"), `#!/bin/sh\n${pin}\nexit 0\n`, { mode: 0o755 });
+  const db = open(join(tempDir("reeve-kinds-db-"), "state.db"));
+  const path = process.env.PATH;
+  try {
+    process.env.PATH = `${bin}:${path}`;
+    clearRequirements();
+    const anchor = { ok: true, headRef: "feature", baseRef: "main", state: "OPEN", title: "t", updatedAt: "2026-09-25T00:00:00Z",
+                     head: HEAD_SHA, pin: { ok: true, sha: HEAD_SHA }, authorLogin: "someone" };
+    const e = evaluatePr({ nwo: "o/r", pr: 7, profile: { ci: { requiredChecks: [], reviewerStatusContexts: [] }, reviewers: [] }, db, anchor });
+    assert.equal(e.ok, true, e.why);
+    return { ci: e.verdict.clauses.find(c => c.id === "ci"), base: e.verdict.clauses.find(c => c.id === "base") };
+  } finally { process.env.PATH = path; db.close(); }
+}
+
+test("a check read that failed is a retry through evaluatePr, never checks still settling", () => {
+  const whole = clausesAfterATick();
+  assert.deepEqual([whole.ci?.state, whole.ci?.kind, whole.base?.state], ["UNKNOWN", "waiting", "PASS"],
+                   "control: a whole read of passing checks waits for them to settle, on a healthy base");
+  for (const [read, id] of [["the head's statuses", "ci"], ["the base's rules", "ci"], ["the base's statuses", "base"], ["the base's head", "base"]]) {
+    const c = clausesAfterATick([read])[id];
+    assert.equal(c?.state, "UNKNOWN", `control: ${read} unread leaves ${id} unknown`);
+    assert.equal(c?.kind, "retry", `${read} unread`);
+  }
 });

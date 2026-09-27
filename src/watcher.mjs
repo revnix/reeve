@@ -205,15 +205,13 @@ export function nextAction(e, p, h = {}) {
     // Decided by the clause's kind, never by its wording (#165): the wording is
     // for people, and rewording it must not change what reeve does.
     //
-    // A reviewer that has not run is missing evidence, not a stall: it is a round
-    // we have not asked for. Ask, if the budget allows.
-    const review = clause(v, "review");
-    if (review?.state === "UNKNOWN" && review.kind === "missing") {
-      const R = e.rounds ?? {};
-      if ((R.n ?? 0) < (R.softCap ?? 5)) return act(ACTIONS.REQUEST_REVIEW, review.detail, { round: (R.n ?? 0) + 1 });
-    }
+    // A person first, since only one can settle a `person` UNKNOWN, the most
+    // serious kind. Asking for a missing round first would delay the same
+    // escalation by a round.
+    //
     // Every blocking reviewer unreachable is a supply problem, not a PR problem,
     // and only a person can restore it.
+    const review = clause(v, "review");
     if (review?.state === "UNKNOWN" && review.kind === "person")
       return act(ACTIONS.ESCALATE, ESCALATIONS.REVIEWERS_DOWN, { shared: true, detail: review.detail });
     // Anything else only a person can settle goes to one now. Waiting out the
@@ -222,6 +220,12 @@ export function nextAction(e, p, h = {}) {
     if (person)
       return act(ACTIONS.ESCALATE, person.id === "mergeable" ? ESCALATIONS.PROTECTION_UNMET : ESCALATIONS.NEEDS_PERSON,
                  { clauses: [person.id], detail: person.detail });
+    // A reviewer that has not run is missing evidence, not a stall: it is a round
+    // we have not asked for. Ask, if the budget allows.
+    if (review?.state === "UNKNOWN" && review.kind === "missing") {
+      const R = e.rounds ?? {};
+      if ((R.n ?? 0) < (R.softCap ?? 5)) return act(ACTIONS.REQUEST_REVIEW, review.detail, { round: (R.n ?? 0) + 1 });
+    }
 
     return act(ACTIONS.WAIT, unknowns.map(c => `${c.id}: ${c.detail}`).join("; "), { unknownSince: h.unknownSince != null ? h.unknownSince : now });
   }

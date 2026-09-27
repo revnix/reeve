@@ -318,14 +318,15 @@ export function validateSnapshot(path, { expectVersion = null, kind = "repo", de
     // snapshot that lost one is refused: `open()` would recreate it empty, and
     // every record the log names would be gone without a word. The CASE reads a
     // payload only once it's known to be JSON, so an old malformed one refuses
-    // nothing here.
-    const named = probe.prepare(`SELECT count(*) c FROM event WHERE op = 'pr.decided'
-      AND (CASE WHEN json_valid(payload) THEN json_extract(payload, '$.record') END) IS NOT NULL`).get().c;
+    // nothing here. EXISTS stops at the first: this check runs on every tick's
+    // self-audit, and a count would read the whole history each time.
+    const named = probe.prepare(`SELECT EXISTS (SELECT 1 FROM event WHERE op = 'pr.decided'
+      AND (CASE WHEN json_valid(payload) THEN json_extract(payload, '$.record') END) IS NOT NULL) AS e`).get().e;
     if (named) {
       const present = new Set(probe.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(r => r.name));
       const missing = ["decision", "evidence", "policy"].filter(t => !present.has(t));
       if (missing.length)
-        return { ok: false, why: `its log names ${named} decision record(s), but it has no ${missing.join(", no ")} table`, version: null, integrity };
+        return { ok: false, why: `its log names decision records, but it has no ${missing.join(", no ")} table`, version: null, integrity };
     }
     return { ok: true, why: null, version: null, integrity };
   } catch (e) {

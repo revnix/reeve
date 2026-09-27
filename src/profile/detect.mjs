@@ -82,6 +82,23 @@ function isMember(rel, globs, manager) {
 }
 
 /**
+ * Where a flow list's own closing bracket is: the first `]` outside quotes, so a
+ * quoted glob such as `"packages/[ab]"` doesn't end the list. -1 when it isn't
+ * there yet.
+ * @param {string} s
+ */
+function flowEnd(s) {
+  let quote = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) { if (ch === quote) quote = null; continue; }
+    if (ch === "'" || ch === '"') quote = ch;
+    else if (ch === "]") return i;
+  }
+  return -1;
+}
+
+/**
  * A YAML flow list's items, split at the commas outside quotes: `'{foo,bar}'` is
  * one glob, not two.
  * @param {string} body
@@ -113,9 +130,10 @@ function yamlList(text, key) {
   if (rest.startsWith("[")) {
     // A flow list may run across lines, so read on to its closing bracket.
     let flow = rest;
-    for (let n = at + 1; !flow.includes("]") && n < lines.length; n++) flow += " " + lines[n].replace(/\s#.*$/, "").trim();
-    if (!flow.includes("]")) return [];
-    return flowItems(flow.slice(1, flow.lastIndexOf("]"))).map(unquote).filter(Boolean);
+    for (let n = at + 1; flowEnd(flow) < 0 && n < lines.length; n++) flow += " " + lines[n].replace(/\s#.*$/, "").trim();
+    const end = flowEnd(flow);
+    if (end < 0) return [];
+    return flowItems(flow.slice(1, end)).map(unquote).filter(Boolean);
   }
   const out = [];
   for (const line of lines.slice(at + 1)) {

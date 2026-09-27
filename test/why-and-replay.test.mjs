@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { open } from "../src/db/ops.mjs";
 import { computeVerdict } from "../src/verdict.mjs";
 import { why } from "../src/status.mjs";
-import { replayDecisions, policyHashFor } from "../src/decisions.mjs";
+import { replayDecisions, policyHashFor, renderReplay } from "../src/decisions.mjs";
 import { latestDecision, policyBody, saveDecision } from "../src/db/records.mjs";
 import { recordsFor, policyOf } from "../src/evidence.mjs";
 import { run, EVAL, HEAD } from "./fixtures/tick-harness.mjs";
@@ -115,7 +115,8 @@ test("a decision whose policy the store no longer holds can't be replayed", asyn
 
 test("replay says whether the code or the policy has changed since the decision", async () => {
   const { db } = await recorded();
-  const [r] = replayDecisions(db, {}, { code: { ...CODE, commit: "a".repeat(40) }, policyHash: "not-the-recorded-one" });
+  const [r] = replayDecisions(db, {}, { code: { ...CODE, commit: "a".repeat(40) },
+                                         profile: { schemaVersion: 1, identity: { key: "o/r" }, project: { kind: "client" } } });
   assert.equal(r.outcome, "same");
   assert.equal(r.codeChanged, true);
   assert.equal(r.policyChanged, true);
@@ -255,4 +256,29 @@ test("a code version git couldn't read makes the comparison unknown, never uncha
   const both = open(dbPath);
   assert.equal(replayDecisions(both, {}, { code: unreadable })[0].codeChanged, null, "both unreadable");
   assert.equal(replayDecisions(both, {}, { code: CODE })[0].codeChanged, null, "the recorded code unreadable");
+});
+
+// ── from #263's first review round ─────────────────────────────────────────────
+
+test("a replay whose code comparison is unknown says so, rather than that nothing changed", async () => {
+  const { db } = await recorded();
+  const compute = i => { const v = computeVerdict(i); return { ...v, state: "PASS" }; };
+  const results = replayDecisions(db, {}, { code: { commit: null, tree: null, dirty: null, diff: null }, compute });
+  assert.equal(results[0].outcome, "differs");
+  const text = renderReplay(results);
+  assert.doesNotMatch(text, /with the code and policy it was judged with/);
+  assert.match(text, /whether the code changed since is unknown/);
+});
+
+test("a code version whose tree git couldn't read compares as unknown", async () => {
+  const { db } = await recorded();
+  const [r] = replayDecisions(db, {}, { code: { ...CODE, tree: null } });
+  assert.equal(r.codeChanged, null);
+});
+
+test("the policy is compared per decision, with a profile only for the repository its record names", async () => {
+  const { db } = await recorded();
+  const mine = { schemaVersion: 1, identity: { key: "o/r" }, project: { kind: "client" } };
+  assert.equal(replayDecisions(db, {}, { profile: { ...mine, identity: { key: "x/y" } } })[0].policyChanged, null);
+  assert.equal(replayDecisions(db, {}, { profile: mine })[0].policyChanged, true);
 });

@@ -116,6 +116,25 @@ test("an npm workspace reads its patterns in order, so a later one lists a folde
   assert.equal(unit(root, "baz").packageManager, null);
 });
 
+test("a flow list across lines ends at its own bracket, not one inside a quoted glob", () => {
+  const root = checkout({
+    "package.json": { name: "root", scripts, devDependencies },
+    "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+    "pnpm-workspace.yaml": 'packages: [\n  "packages/[ab]",\n  "e2e"\n]\n',
+    "e2e/package.json": { name: "e2e", scripts, devDependencies },
+  });
+  assert.equal(unit(root, "e2e").packageManager, "pnpm");
+});
+
+test("a later pattern that surely matches settles one before it that couldn't be read", () => {
+  const root = checkout({
+    "package.json": { name: "root", workspaces: ["packages/[ab]", "e2e"], scripts, devDependencies },
+    "package-lock.json": { lockfileVersion: 3 },
+    "e2e/package.json": { name: "e2e", scripts, devDependencies },
+  });
+  assert.equal(unit(root, "e2e").packageManager, "npm");
+});
+
 test("a member with a lockfile of its own keeps what its lockfile says", () => {
   const root = checkout({
     "package.json": { name: "root", scripts, devDependencies },

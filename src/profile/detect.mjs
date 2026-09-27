@@ -70,15 +70,52 @@ export function workspaceGlobs(root, manager) {
 }
 
 /**
- * Whether a folder the root holds is a member of its workspace. npm, yarn and bun
- * read the patterns in order, and the last that matches decides, as `listed`
- * does for npm's own workspaces. pnpm reads a `!` pattern as an exclusion,
- * wherever it stands.
+ * Which yarn owns a root: its major version, from `packageManager` or from
+ * `.yarnrc.yml`'s `yarnPath`, where it's one that was measured (1 to 4); else
+ * "berry" for yarn 2 or later, as a `.yarnrc.yml` or the lockfile it writes
+ * shows; 1 for yarn 1's lockfile; and null when nothing says.
  */
-function isMember(rel, globs, manager) {
-  if (manager !== "pnpm") return listed(globs, rel) === true;
-  const hit = g => matchesGlob(rel, g.replace(/^\.\//, "").replace(/\/+$/, ""));
-  return globs.some(g => !g.startsWith("!") && hit(g)) && !globs.some(g => g.startsWith("!") && hit(g.slice(1)));
+function yarnMajor(root) {
+  const declared = readJson(join(root, "package.json"))?.packageManager;
+  let rc = "", lock = "";
+  try { rc = readFileSync(join(root, ".yarnrc.yml"), "utf8"); } catch { /* none */ }
+  try { lock = readFileSync(join(root, "yarn.lock"), "utf8").slice(0, 500); } catch { /* none */ }
+  const version = (typeof declared === "string" ? /^yarn@(\d+)\./.exec(declared) : null) ?? /yarn-(\d+)\.\d+\.\d+\.c?js/.exec(rc);
+  const major = version ? Number(version[1]) : null;
+  if (major !== null && major >= 1 && major <= 4) return major;
+  if (major !== null || rc || /^__metadata:/m.test(lock)) return "berry";
+  return /yarn lockfile v1/.test(lock) ? 1 : null;
+}
+
+/**
+ * Whether a folder the root holds is a member of its workspace, as the manager
+ * that owns it reads the patterns. They read an exclusion (`!`) in four ways,
+ * measured in docs/measured/2026-09-27-workspace-membership.md:
+ *   npm            it stands until a later pattern's own text matches it (`listed`);
+ *   pnpm, yarn 4   it wins, wherever it stands;
+ *   yarn 2 and 3   the last pattern that matches decides;
+ *   yarn 1         it's no pattern at all;
+ *   bun            differently from one version to the next.
+ * True, false, or null when it can't be told: a pattern that can't be read, a
+ * yarn whose version nothing names and whose versions disagree, or bun where
+ * an exclusion could matter.
+ */
+function isMember(rel, globs, manager, root) {
+  if (manager === "npm") return listed(globs, rel);
+  try {
+    const hit = g => matchesGlob(rel, g.replace(/^\.?\/+/, "").replace(/\/+$/, ""));
+    const exclusions = globs.filter(g => g.startsWith("!"));
+    const included = globs.some(g => !g.startsWith("!") && hit(g));
+    const exclusionWins = included && !exclusions.some(g => hit(g.slice(1)));
+    if (manager === "pnpm") return exclusionWins;
+    if (manager === "bun") return exclusionWins || (exclusions.length ? null : false);
+    if (manager !== "yarn") return false;
+    const lastWins = globs.reduce((member, g) => (g.startsWith("!") ? (hit(g.slice(1)) ? false : member) : hit(g) || member), false);
+    const major = yarnMajor(root);
+    const readings = major === 1 ? [included] : major === 2 || major === 3 ? [lastWins] : major === 4 ? [exclusionWins]
+      : major === "berry" ? [lastWins, exclusionWins] : [included, lastWins, exclusionWins];
+    return readings.every(r => r === readings[0]) ? readings[0] : null;
+  } catch { return null; }
 }
 
 /**
@@ -130,7 +167,8 @@ function yamlList(text, key) {
   if (rest.startsWith("[")) {
     // A flow list may run across lines, so read on to its closing bracket.
     let flow = rest;
-    for (let n = at + 1; flowEnd(flow) < 0 && n < lines.length; n++) flow += " " + lines[n].replace(/\s#.*$/, "").trim();
+    // A line that is only a comment is skipped, indented or not.
+    for (let n = at + 1; flowEnd(flow) < 0 && n < lines.length; n++) if (!/^\s*#/.test(lines[n])) flow += " " + lines[n].replace(/\s#.*$/, "").trim();
     const end = flowEnd(flow);
     if (end < 0) return [];
     return flowItems(flow.slice(1, end)).map(unquote).filter(Boolean);
@@ -363,9 +401,12 @@ export function detectUnits(root) {
     const language = detectLanguage(dir);
     if (!language) continue;
     let pm = rel === "." ? rootPm : detectPackageManager(dir);
-    if (rel !== "." && pm.value === null && !pm.question && language === "typescript" && isMember(rel, globs, rootPm.value)) {
+    const member = rel !== "." && pm.value === null && !pm.question && language === "typescript" ? isMember(rel, globs, rootPm.value, root) : false;
+    if (member === true) {
       pm = { value: rootPm.value, question: null };
       notes.push(`unit ${rel}: no lockfile of its own, and a member of the root's ${rootPm.value} workspace, so it uses ${rootPm.value}`);
+    } else if (member === null) {
+      notes.push(`unit ${rel}: whether the root's ${rootPm.value} workspace lists it can't be told, so it has no package manager; name one in the profile if it has`);
     }
     if (pm.question) questions.push({ ...pm.question, unit: rel });
     const { commands, questions: cq } = detectCommands(dir, language, pm.value);

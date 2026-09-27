@@ -62,6 +62,18 @@ A blank cell wasn't run.
 | the same with `"e2e"` unindented too | e2e | refused: "invalid indentation" |
 | the same with the comment indented | e2e | e2e |
 
+## bun's lockfile
+
+With a workspace member to record, `bun install` wrote:
+
+| bun | Lockfile |
+|---|---|
+| 1.1.45 | `bun.lockb` |
+| 1.2.14 | `bun.lock` |
+| 1.4.2 | `bun.lock` |
+
+With no dependency and no member, none of them wrote a lockfile.
+
 ## What each manager does
 
 - **npm 11.19.0** reads the patterns as `@npmcli/map-workspaces` does in its
@@ -96,3 +108,5 @@ A blank cell wasn't run.
   - For bun, it answers only where no exclusion could matter.
   - A folder it can't answer for takes no package manager, and a note says so.
 - A comment line inside a flow list is skipped, indented or not.
+- `bun.lock` names bun, as `bun.lockb` does, and the two together are one
+  package manager, not a question.

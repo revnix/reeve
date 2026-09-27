@@ -274,8 +274,7 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
     failing, running, skipped: skipped.map(c => c.context), malformed };
   // Green needs the whole required set: a requirement unread may be one no row
   // meets, reeve's own shadow check say, which GitHub passes on reeve's neutral.
-  // A read that wasn't whole says so, as a failed read of the checks does.
-  const green = (result) => (evidence && !requiredKnown ? { verdict: "UNKNOWN", readable: false, failing: [], running: [], malformed,
+  const green = (result) => (evidence && !requiredKnown ? { verdict: "UNKNOWN", failing: [], running: [], malformed,
     why: "the base's required checks couldn't be read, so whether each one passed can't be told" } : result);
   // A head where nothing ran has no evidence at all, however many rows say so.
   if (evidence && rows.every(r => NOT_RUN.has(String(r.conclusion)) || UNINFORMATIVE.has(String(r.conclusion))))

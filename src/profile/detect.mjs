@@ -29,23 +29,27 @@ export function detectIdentity(root) {
   return { key, defaultBranch };
 }
 
-/** Package manager from lockfiles. Two lockfiles is a QUESTION, never a pick. */
+/**
+ * Package manager from lockfiles. Two managers' lockfiles is a QUESTION, never a
+ * pick. bun 1.2 and later write bun.lock, and earlier ones bun.lockb: both are bun.
+ */
 export function detectPackageManager(dir) {
   const locks = [
     ["pnpm", "pnpm-lock.yaml"], ["npm", "package-lock.json"],
-    ["yarn", "yarn.lock"], ["bun", "bun.lockb"],
+    ["yarn", "yarn.lock"], ["bun", "bun.lock"], ["bun", "bun.lockb"],
     ["uv", "uv.lock"], ["poetry", "poetry.lock"], ["pdm", "pdm.lock"],
   ].filter(([, f]) => existsSync(join(dir, f)));
+  const managers = [...new Set(locks.map(([m]) => m))];
 
-  if (locks.length === 0) return { value: null, question: null };
-  if (locks.length === 1) return { value: locks[0][0], question: null };
+  if (managers.length === 0) return { value: null, question: null };
+  if (managers.length === 1) return { value: managers[0], question: null };
   return {
     value: null,
     question: {
       field: "units[].packageManager",
       why: `${locks.length} lockfiles are tracked and they can disagree`,
       evidence: locks.map(([m, f]) => `${f} (${m})`).join(", "),
-      options: locks.map(([m]) => m),
+      options: managers,
     },
   };
 }

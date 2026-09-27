@@ -2479,7 +2479,7 @@ export async function tick(ctx) {
         log(logPath, `  ${at}: the verdict could not be kept — ${err.message}`);
       }
       let pub;
-      try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict: j.verdict, shadow, base }); }
+      try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict: j.verdict, shadow, base, queue: true }); }
       catch (thrown) { pub = { ok: false, why: thrown.message }; }
       log(logPath, `  ${at}: ${j.verdict.state}${pub.ok ? "" : ` — could not publish: ${pub.why}`}`);
       if (pub.ok) notePublication(db, entry.pr, "queue.published",

@@ -1083,7 +1083,7 @@ export const requiredOnBase = (args) => requirementsOnBase(args).own;
  * requires the enforcement check, every pull request is blocked until reeve
  * enforces: that comes back as `held`, for the daemon to raise.
  */
-export async function publishVerdict({ nwo, verdict, shadow = true, context = "ops/merge-policy", base = null,
+export async function publishVerdict({ nwo, verdict, shadow = true, context = "ops/merge-policy", base = null, queue = false,
                                       auth: authenticateAs = authenticate, api = apiAsInstallation }) {
   const auth = await authenticateAs(nwo);
   if (!auth.ok) return { ok: false, why: auth.why };
@@ -1100,8 +1100,15 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = "o
   // nextly had accumulated 38 of these in an afternoon: the API's default
   // `filter=latest` hides that from reeve's own reads, but it is real API load and
   // it makes the PR's check list unreadable for the human who has to act on it.
+  // A merge queue reads any settled result but success as a failure, and drops
+  // the entry (measured: `failed_checks` 31 s after an `action_required`). So on
+  // a queue's commit, an UNKNOWN that waiting or reading again settles is
+  // published as still running, which the queue waits for. A block, a pass, and
+  // an UNKNOWN only a person can settle are settled there as anywhere: the last
+  // lets the queue go on rather than hold every entry behind it to its timeout.
+  const running = queue && !shadow && verdict.state === UNKNOWN && verdict.kind !== "person";
   const fields = [
-    "-f", "status=completed", "-f", `conclusion=${conclusion}`,
+    ...(running ? ["-f", "status=in_progress"] : ["-f", "status=completed", "-f", `conclusion=${conclusion}`]),
     "-f", `output[title]=${title.slice(0, 250)}`,
     "-f", `output[summary]=${body.slice(0, 60000)}`,
   ];

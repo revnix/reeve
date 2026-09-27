@@ -183,3 +183,43 @@ test("a queue commit's verdict is kept as a decision record that replays", async
   assert.ok(heads.includes(QUEUED), JSON.stringify(heads));
   assert.ok(replayed.every(x => x.outcome === "same"), JSON.stringify(replayed.map(x => x.outcome)));
 });
+
+// ── what a queue reads as a failure ───────────────────────────────────────────
+
+import { publishVerdict } from "../src/pr.mjs";
+
+/** The status and conclusion an enforcing publication writes for `verdict`, on a queue commit or not. */
+async function written(verdict, { queue }) {
+  const calls = [];
+  const api = (_token, args) => {
+    calls.push(args);
+    if (args.includes("POST") || args.includes("PATCH")) return { ok: true, out: JSON.stringify({ id: 9 }) };
+    return { ok: true, out: "" };
+  };
+  await publishVerdict({ nwo: "o/r", verdict: { head: QUEUED, summary: "s", clauses: [], ...verdict }, shadow: false, queue,
+                         auth: async () => ({ ok: true, token: "t" }), api });
+  const write = calls.find(a => a.includes("POST") || a.includes("PATCH")) ?? [];
+  const field = k => write.find(x => typeof x === "string" && x.startsWith(`${k}=`))?.slice(k.length + 1) ?? null;
+  return { status: field("status"), conclusion: field("conclusion") };
+}
+
+test("on a queue commit, an UNKNOWN still settling is published as running, which the queue waits for", async () => {
+  assert.deepEqual(await written({ state: "UNKNOWN", kind: "waiting" }, { queue: true }), { status: "in_progress", conclusion: null });
+  assert.deepEqual(await written({ state: "UNKNOWN", kind: "retry" }, { queue: true }), { status: "in_progress", conclusion: null });
+  assert.deepEqual(await written({ state: "UNKNOWN", kind: "waiting" }, { queue: false }), { status: "completed", conclusion: "action_required" },
+                   "control: at a pull request's head it holds the merge as before");
+});
+
+test("on a queue commit, a block, a pass and an UNKNOWN only a person can settle are published as settled", async () => {
+  assert.deepEqual(await written({ state: "BLOCK" }, { queue: true }), { status: "completed", conclusion: "failure" });
+  assert.deepEqual(await written({ state: "PASS" }, { queue: true }), { status: "completed", conclusion: "success" });
+  assert.deepEqual(await written({ state: "UNKNOWN", kind: "person" }, { queue: true }), { status: "completed", conclusion: "action_required" },
+                   "a person's UNKNOWN lets the queue go on rather than hold it to its timeout");
+});
+
+test("each tick publishes its queue verdicts as queue verdicts", async () => {
+  const seen = [];
+  const publish = async (a) => { seen.push({ head: a.verdict.head, queue: a.queue === true }); return { ok: true, id: 1 }; };
+  await run({ evaluate: evaluated, readQueue: queued(), evaluateQueue: judged, publish });
+  assert.deepEqual(seen, [{ head: HEAD, queue: false }, { head: QUEUED, queue: true }]);
+});

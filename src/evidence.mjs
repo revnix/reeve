@@ -91,10 +91,20 @@ export function splitEvidence(input, { nwo, pr, head, tree = null, producer, obs
     if (!claim || !Object.keys(claim).length) continue;
     const statement = { _type: STATEMENT_TYPE, subject, predicateType: EVIDENCE_PREDICATE,
                         predicate: { kind, from, claim, producer } };
-    out.push({ kind: String(kind), digest: digestOf(statement),
-               statement: { ...statement, predicate: { ...statement.predicate, observedAt } } });
+    const kept = { ...statement, predicate: { ...statement.predicate, observedAt } };
+    out.push({ kind: String(kind), digest: evidenceDigestOf(kept), statement: kept });
   }
   return out;
+}
+
+/**
+ * An evidence statement's digest: what it says, without when it was seen. The
+ * one computation for keeping a record and for checking it when it's read.
+ * @param {Record<string, any>} statement
+ */
+export function evidenceDigestOf(statement) {
+  const { observedAt: _seen, ...predicate } = statement?.predicate ?? {};
+  return digestOf({ ...statement, predicate });
 }
 
 /**

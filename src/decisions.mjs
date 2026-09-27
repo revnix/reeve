@@ -10,7 +10,7 @@
 import { computeVerdict } from "./verdict.mjs";
 import { joinEvidence, asJson } from "./evidence.mjs";
 import { canonical } from "./db/ops.mjs";
-import { latestDecision, decisionsFor, evidenceBy, policyBody } from "./db/records.mjs";
+import { latestDecision, decisionsFor, evidenceBy, policyRecord } from "./db/records.mjs";
 
 /** @typedef {import("node:sqlite").DatabaseSync} Db */
 
@@ -36,14 +36,17 @@ export function explainDecision(db, pr, { head = null } = {}) {
   const r = d.record;
   /** @type {{ id: string, state: string, detail?: string }[]} */
   const clauses = r.verdict.clauses ?? [];
-  const out = [`${r.verdict.state} at ${short(r.subject.head)}, tree ${short(r.subject.tree)}, judged ${span(d.first_at, d.last_at)} (record ${short(d.digest)})`];
+  const out = [];
+  if (d.corrupt) out.push(`  this record doesn't match its digest ${short(d.digest)}: it was changed after it was kept, so what follows can't be trusted`);
+  out.push(`${r.verdict.state} at ${short(r.subject.head)}, tree ${short(r.subject.tree)}, judged ${span(d.first_at, d.last_at)} (record ${short(d.digest)})`);
   if (r.verdict.summary) out.push(`  ${r.verdict.summary}`);
   const w = Math.max(0, ...clauses.map(c => c.id.length));
   for (const c of clauses) out.push(`  ${c.id.padEnd(w)}  ${c.state.padEnd(7)}  ${c.detail ?? ""}`.trimEnd());
-  const { found, missing } = evidenceBy(db, Object.values(r.evidence));
+  const { found, missing, corrupt } = evidenceBy(db, Object.values(r.evidence));
   out.push("  judged from:");
   for (const e of found) out.push(`    ${e.kind.padEnd(9)}  seen ${span(e.first_seen, e.last_seen)}  ${e.statement.predicate?.from ?? ""}`.trimEnd());
   for (const m of missing) out.push(`    missing    ${short(m)}: the store no longer holds this evidence`);
+  for (const m of corrupt) out.push(`    corrupt    ${short(m)}: this evidence doesn't match its digest`);
   const c = r.code ?? {};
   out.push(`  policy ${short(r.policy)}, code ${short(c.commit)} (tree ${short(c.tree)})` +
            (c.dirty === null || c.dirty === undefined ? ", whether it differed from that commit is unknown"
@@ -96,13 +99,17 @@ export function replayDecisions(db, which = {}, { code = null, policyHash = null
     const base = { digest: d.digest, pr: d.pr, head: d.head, recorded: r.verdict.state,
                    codeChanged: code ? !sameCode(r.code, code) : null,
                    policyChanged: policyHash ? r.policy !== policyHash : null };
-    const { found, missing } = evidenceBy(db, Object.values(r.evidence));
-    const profile = policyBody(db, r.policy);
-    if (missing.length || !profile) {
-      results.push({ ...base, outcome: "unreplayable",
-                     why: missing.length ? `${missing.length} piece(s) of its evidence are missing` : "its policy is missing" });
-      continue;
-    }
+    // A record, evidence or policy that doesn't match its digest is not the one
+    // its key names, so what it would replay to proves nothing either way.
+    if (d.corrupt) { results.push({ ...base, outcome: "unreplayable", why: "its record doesn't match its digest" }); continue; }
+    const { found, missing, corrupt } = evidenceBy(db, Object.values(r.evidence));
+    const policy = policyRecord(db, r.policy);
+    const why = missing.length ? `${missing.length} piece(s) of its evidence are missing`
+      : corrupt.length ? `${corrupt.length} piece(s) of its evidence don't match their digests`
+      : !policy ? "its policy is missing"
+      : policy.corrupt ? "its policy doesn't match its hash" : null;
+    if (why) { results.push({ ...base, outcome: "unreplayable", why }); continue; }
+    const profile = /** @type {{ body: Record<string, unknown> }} */ (policy).body;
     let now;
     try {
       const v = compute(/** @type {any} */ (joinEvidence(found.map(e => e.statement), profile)));

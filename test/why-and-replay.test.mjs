@@ -12,7 +12,8 @@ import { open } from "../src/db/ops.mjs";
 import { computeVerdict } from "../src/verdict.mjs";
 import { why } from "../src/status.mjs";
 import { replayDecisions } from "../src/decisions.mjs";
-import { latestDecision } from "../src/db/records.mjs";
+import { latestDecision, policyBody, saveDecision } from "../src/db/records.mjs";
+import { recordsFor } from "../src/evidence.mjs";
 import { run, EVAL, HEAD } from "./fixtures/tick-harness.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 import { offlineEnv } from "./fixtures/offline-github.mjs";
@@ -155,4 +156,71 @@ test("reeve replay refuses a --since it can't read, rather than replaying everyt
   const r = replayCli(dbPath, "--since", "not-a-date");
   assert.equal(r.status, 1);
   assert.match(r.stderr, /--since takes a date/);
+});
+
+// ── what a record says must match the digest it's kept under ──────────────────
+
+test("a decision record that doesn't match its digest is corrupt: why says so, and replay can't replay it", async () => {
+  const { db } = await recorded();
+  const d = latestDecision(db, 42);
+  const forged = { ...d.record, verdict: { ...d.record.verdict, state: "PASS" } };
+  db.prepare(`UPDATE decision SET record = ? WHERE digest = ?`).run(JSON.stringify(forged), d.digest);
+  assert.match(why(db, "42"), /doesn't match its digest/);
+  const [r] = replayDecisions(db);
+  assert.equal(r.outcome, "unreplayable");
+  assert.match(String(r.why), /doesn't match its digest/);
+});
+
+test("evidence that doesn't match its digest can't be replayed", async () => {
+  const { db } = await recorded();
+  const d = latestDecision(db, 42);
+  const row = /** @type {any} */ (db.prepare(`SELECT statement FROM evidence WHERE digest = ?`).get(d.record.evidence.checks));
+  const s = JSON.parse(row.statement);
+  s.predicate.claim.checks.verdict = "GREEN";
+  db.prepare(`UPDATE evidence SET statement = ? WHERE digest = ?`).run(JSON.stringify(s), d.record.evidence.checks);
+  const [r] = replayDecisions(db);
+  assert.equal(r.outcome, "unreplayable");
+  assert.match(String(r.why), /1 piece\(s\) of its evidence don't match their digests/);
+});
+
+test("a policy that doesn't match its hash can't be replayed", async () => {
+  const { db } = await recorded();
+  db.prepare(`UPDATE policy SET body = '{"schemaVersion":1,"project":{"kind":"client"}}'`).run();
+  const [r] = replayDecisions(db);
+  assert.equal(r.outcome, "unreplayable");
+  assert.match(String(r.why), /its policy doesn't match its hash/);
+});
+
+// ── a commit or record is chosen by its hexadecimal start, never by a pattern ──
+
+test("a --head or --record that isn't hexadecimal is refused, never read as a pattern", async () => {
+  const { db, dbPath } = await recorded();
+  const text = why(db, "42", { head: "%" });
+  assert.match(text, /must be 4 to 40 hexadecimal characters/);
+  assert.doesNotMatch(text, /the latest decision/);
+  assert.throws(() => replayDecisions(db, { digest: "%" }), /must be 4 to 64 hexadecimal characters/);
+  db.close();
+  const r = replayCli(dbPath, "--record", "%");
+  assert.equal(r.status, 1, r.stdout);
+  assert.match(r.stderr, /must be 4 to 64 hexadecimal characters/);
+});
+
+test("a start that more than one commit or record shares is refused as ambiguous", async () => {
+  const { db } = await recorded();
+  const d = latestDecision(db, 42);
+  const policy = { hash: d.record.policy, body: policyBody(db, d.record.policy) ?? {} };
+  let seq = 1000;
+  for (const head of ["abcd1111".padEnd(40, "1"), "abcd2222".padEnd(40, "2")]) {
+    const i = { ...input(), head };
+    const kept = recordsFor({ nwo: "o/r", pr: 42, head, input: i, verdict: computeVerdict(i), policy, code: CODE,
+                              observedAt: "2026-09-27T05:00:00Z" });
+    saveDecision(db, { at: 1_800_000_000, seq: ++seq, pr: 42, head, ...kept });
+  }
+  assert.match(why(db, "42", { head: "abcd" }), /abcd is ambiguous: it starts 2 commits/);
+  // Two records whose digests share a start, held as the store holds them.
+  for (const digest of ["abcd".padEnd(64, "0"), "abcd".padEnd(64, "1")])
+    db.prepare(`INSERT INTO decision(digest, pr, head, record, first_at, last_at, first_seq, last_seq) VALUES(?,?,?,?,?,?,?,?)`)
+      .run(digest, 43, HEAD, JSON.stringify(d.record), 1, 1, ++seq, seq);
+  assert.throws(() => replayDecisions(db, { digest: "abcd" }), /abcd is ambiguous: it starts 2 records/);
+  assert.throws(() => replayDecisions(db, { digest: "0" }), /must be 4 to 64 hexadecimal characters/);
 });

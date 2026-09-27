@@ -854,16 +854,17 @@ function record(db, { pr, head, verdict, decision, effects = [], retire = new Ma
     // UNKNOWN timeout can all have moved, so the next tick may legitimately decide
     // something else and the effect is simply lost.
     return tx(db, () => {
-      // What the verdict was judged from, in the same transaction as the event
-      // that names it, so neither stands without the other (#165).
-      if (kept) saveDecision(db, { at: now(), pr, head, ...kept });
-      db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
+      const decided = db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
         .run(now(), "daemon", "pr.decided", `pr:${pr}`, JSON.stringify({
           head, state: verdict.state, summary: verdict.summary,
           action: decision.action, why: decision.why,
           clauses: verdict.clauses.map(c => ({ id: c.id, state: c.state })),
           ...(kept ? { record: kept.decision.digest } : {}),
         }));
+      // What the verdict was judged from, in the same transaction as the event
+      // that names it, so neither stands without the other, and under that
+      // event's seq, which orders decisions where seconds tie (#165).
+      if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr, head, ...kept });
       // `enqueue` returns null for a key it already holds, which is success: the
       // effect is durable, it was simply made durable by an earlier tick.
       let queued = 0, known = 0, dropped = 0;
@@ -1296,6 +1297,10 @@ const RATE_LIMIT_COOLDOWN_SECONDS = 600;
 export const CANARY_PAGE = "guardian:sandbox:canary-failed";
 
 export async function tick(ctx) {
+  // The code a verdict is recorded as judged by, taken before anything is read
+  // or evaluated: a checkout that moves during the tick's reads doesn't change
+  // what this process loaded (#165).
+  const code = ctx.code ?? (ctx.codeVersion ?? runningCode)();
   const { nwo, profile, db, execute = false, shadow = true } = ctx;
   // Absolute, once, before ANYTHING derives from it. A relative `--log` made
   // every state path relative — the run dir, the worker's tmp, its git config and
@@ -2284,7 +2289,7 @@ export async function tick(ctx) {
     if (e.input) {
       try {
         kept = recordsFor({ nwo, pr, head: e.head, tree: (ctx.treeOf ?? treeOf)(nwo, e.head), input: e.input,
-                            verdict: e.verdict, policy: policyFor(profile), code: ctx.code ?? runningCode(),
+                            verdict: e.verdict, policy: policyFor(profile), code,
                             observedAt: new Date(now() * 1000).toISOString() });
       } catch (err) {
         log(logPath, `  #${pr}: what this verdict was judged from could not be recorded — ${err.message}`);

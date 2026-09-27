@@ -87,7 +87,7 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
                     queuedRequests, cancelQueued, measureContainment, noteRateLimit,
                     carriedReleases, carriedCooldowns, providerBind,
                     resolveRepoIdFn, project, keepDir = false, seams = null,
-                    haltMarker, openPrs, containment, ticks = 1, dbPath, evaluate, treeOf, code } = {}) => {
+                    haltMarker, openPrs, containment, ticks = 1, dbPath, evaluate, treeOf, code, codeVersion } = {}) => {
   const dir = tempDir("reeve-prov-");
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
@@ -186,6 +186,7 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     // this checkout runs.
     ...(treeOf ? { treeOf } : {}),
     ...(code ? { code } : {}),
+    ...(codeVersion ? { codeVersion } : {}),
     publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
     spawnWorker: spawnWorker ?? (async a => { spawned.push(a); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }; }),
     ...(heartbeatMs != null ? { heartbeatMs } : {}),

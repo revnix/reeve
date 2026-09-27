@@ -587,11 +587,15 @@ CREATE TABLE IF NOT EXISTS policy (
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS decision (
-  digest   TEXT PRIMARY KEY,                -- sha256 of the canonical record
-  pr       INTEGER NOT NULL,
-  head     TEXT NOT NULL,
-  record   TEXT NOT NULL,                   -- canonical JSON: subject, policy hash, code version, evidence digests, verdict
-  first_at INTEGER NOT NULL,
-  last_at  INTEGER NOT NULL
+  digest    TEXT PRIMARY KEY,               -- sha256 of the canonical record
+  pr        INTEGER NOT NULL,
+  head      TEXT NOT NULL,
+  record    TEXT NOT NULL,                  -- canonical JSON: subject, policy hash, code version, evidence digests, verdict
+  first_at  INTEGER NOT NULL,
+  last_at   INTEGER NOT NULL,
+  -- The seq of the first and the latest `pr.decided` event naming it. Seconds
+  -- can tie; the event log's order can't, so "latest" is read from here.
+  first_seq INTEGER NOT NULL,
+  last_seq  INTEGER NOT NULL
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS decision_by_pr ON decision(pr, last_at);
+CREATE INDEX IF NOT EXISTS decision_by_pr ON decision(pr, last_seq);

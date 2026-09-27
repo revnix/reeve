@@ -8,8 +8,8 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import { open } from "../src/db/ops.mjs";
 import { computeVerdict } from "../src/verdict.mjs";
-import { joinEvidence, asJson } from "../src/evidence.mjs";
-import { latestDecision, evidenceBy, policyBody } from "../src/db/records.mjs";
+import { joinEvidence, asJson, recordsFor } from "../src/evidence.mjs";
+import { latestDecision, evidenceBy, policyBody, saveDecision } from "../src/db/records.mjs";
 import { run, EVAL, HEAD } from "./fixtures/tick-harness.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 
@@ -99,4 +99,44 @@ test("the record carries the head's tree and the code that judged", async () => 
 test("a tree that can't be read is kept as unknown, not guessed", async () => {
   const { db } = await ticked();
   assert.equal(latestDecision(db, 42)?.record.subject.tree, null);
+});
+
+test("the code version is taken when the tick starts, before anything is evaluated", async () => {
+  let evaluated = false;
+  const before = { ...CODE, commit: "1".repeat(40) }, after = { ...CODE, commit: "2".repeat(40) };
+  const { db } = await ticked({ codeVersion: () => (evaluated ? after : before),
+                                evaluate: (...a) => { evaluated = true; return evaluate(...a); } });
+  assert.equal(latestDecision(db, 42)?.record.code.commit, before.commit);
+});
+
+test("the latest decision is the one recorded last, even within the same second", async () => {
+  const { db } = await ticked();
+  const d = latestDecision(db, 42);
+  assert.ok(d, "a decision record was kept");
+  const policy = { hash: d.record.policy, body: policyBody(db, d.record.policy) ?? {} };
+  const kept = i => recordsFor({ nwo: "o/r", pr: 42, head: HEAD, input: i, verdict: computeVerdict(i), policy, code: CODE,
+                                 observedAt: "2026-09-27T05:00:00Z" });
+  const first = kept({ ...input(), mergeState: "BEHIND" }), second = kept({ ...input(), mergeState: "DIRTY" });
+  // The same second for both, and the later one sorts first by digest, so only
+  // the order they were recorded in can tell them apart.
+  const [earlier, later] = first.decision.digest > second.decision.digest ? [first, second] : [second, first];
+  saveDecision(db, { at: 1_900_000_000, seq: 9001, pr: 42, head: HEAD, ...earlier });
+  saveDecision(db, { at: 1_900_000_000, seq: 9002, pr: 42, head: HEAD, ...later });
+  assert.equal(latestDecision(db, 42)?.digest, later.decision.digest);
+});
+
+test("each decision is kept under the seq of the event that names it, so the latest is the last one decided", async () => {
+  // Two ticks over one store, each deciding from a different reading.
+  const dbPath = join(tempDir("reeve-records-"), "s.db");
+  const judging = mergeState => () => { const i = { ...input(), mergeState }; return { ...EVAL, verdict: computeVerdict(i), input: i }; };
+  await run({ evaluate: judging("BEHIND"), dbPath });
+  await run({ evaluate: judging("DIRTY"), dbPath });
+  const db = open(dbPath);
+  const events = db.prepare(`SELECT seq, payload FROM event WHERE op = 'pr.decided' AND subject = 'pr:42' ORDER BY seq`).all()
+    .map(r => ({ seq: Number(/** @type {any} */ (r).seq), record: JSON.parse(/** @type {any} */ (r).payload).record }));
+  assert.equal(events.length, 2);
+  assert.notEqual(events[0].record, events[1].record);
+  const latest = latestDecision(db, 42);
+  assert.equal(latest?.digest, events[1].record);
+  assert.equal(latest?.last_seq, events[1].seq);
 });

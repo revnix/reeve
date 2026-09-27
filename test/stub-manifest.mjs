@@ -8508,7 +8508,7 @@ export const STUBS = [
     test: "test/profile-workspace-member.test.mjs",
     expectRed: "a pnpm workspace member without a lockfile uses pnpm, as the root does",
     edits: [{ file: "src/profile/detect.mjs",
-              find: "    if (rel !== \".\" && pm.value === null && !pm.question && isMember(rel, globs)) {",
+              find: "    if (rel !== \".\" && pm.value === null && !pm.question && language === \"typescript\" && isMember(rel, globs)) {",
               replace: "    if (false) {" }],
   },
   {
@@ -8517,7 +8517,7 @@ export const STUBS = [
     test: "test/profile-workspace-member.test.mjs",
     expectRed: "a folder the workspace doesn't list is not given the root's package manager",
     edits: [{ file: "src/profile/detect.mjs",
-              find: "    if (rel !== \".\" && pm.value === null && !pm.question && isMember(rel, globs)) {",
+              find: "    if (rel !== \".\" && pm.value === null && !pm.question && language === \"typescript\" && isMember(rel, globs)) {",
               replace: "    if (rel !== \".\" && pm.value === null && !pm.question && rootPm.value) {" }],
   },
   {
@@ -8537,5 +8537,23 @@ export const STUBS = [
     edits: [{ file: "src/profile/detect.mjs",
               find: "      notes.push(`unit ${rel}: no lockfile of its own, and a member of the root's ${rootPm.value} workspace, so it uses ${rootPm.value}`);",
               replace: "" }],
+  },
+  {
+    name: "workspace-inheritance-js-packages-only",
+    why: "give any folder a broad workspace glob matches the root's package manager, a JavaScript package or not. A Python unit then gets a JavaScript runner, and its missing package manager goes unreported",
+    test: "test/profile-workspace-member.test.mjs",
+    expectRed: "a folder that isn't a JavaScript package doesn't take a JavaScript workspace's manager, whatever the glob says",
+    edits: [{ file: "src/profile/detect.mjs",
+              find: "    if (rel !== \".\" && pm.value === null && !pm.question && language === \"typescript\" && isMember(rel, globs)) {",
+              replace: "    if (rel !== \".\" && pm.value === null && !pm.question && isMember(rel, globs)) {" }],
+  },
+  {
+    name: "workspace-flow-list-keeps-quoted-commas",
+    why: "split an inline workspace list at every comma. A quoted brace glob such as '{foo,bar}' then becomes two broken globs, and its members fall back to npm",
+    test: "test/profile-workspace-member.test.mjs",
+    expectRed: "a quoted glob in an inline list keeps the commas inside it",
+    edits: [{ file: "src/profile/detect.mjs",
+              find: "  if (rest.startsWith(\"[\")) return flowItems(rest.slice(1, rest.lastIndexOf(\"]\"))).map(unquote).filter(Boolean);",
+              replace: "  if (rest.startsWith(\"[\")) return rest.slice(1, rest.lastIndexOf(\"]\")).split(\",\").map(unquote).filter(Boolean);" }],
   },
 ];

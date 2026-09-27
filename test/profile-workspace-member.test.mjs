@@ -71,6 +71,30 @@ test("a folder the workspace excludes with ! is not given the root's package man
   assert.equal(unit(root, "sandbox").packageManager, null);
 });
 
+test("a folder that isn't a JavaScript package doesn't take a JavaScript workspace's manager, whatever the glob says", () => {
+  const root = checkout({
+    "package.json": { name: "root", scripts, devDependencies },
+    "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+    "pnpm-workspace.yaml": "packages:\n  - '*'\n",
+    "e2e/package.json": { name: "e2e", scripts, devDependencies },
+    "tools/pyproject.toml": "[project]\nname = \"tools\"\n",
+  });
+  assert.equal(unit(root, "e2e").packageManager, "pnpm");
+  assert.equal(unit(root, "tools").packageManager, null);
+});
+
+test("a quoted glob in an inline list keeps the commas inside it", () => {
+  const root = checkout({
+    "package.json": { name: "root", scripts, devDependencies },
+    "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+    "pnpm-workspace.yaml": "packages: ['{foo,bar}', \"e2e\"]\n",
+    "foo/package.json": { name: "foo", scripts, devDependencies },
+    "bar/package.json": { name: "bar", scripts, devDependencies },
+    "e2e/package.json": { name: "e2e", scripts, devDependencies },
+  });
+  for (const id of ["foo", "bar", "e2e"]) assert.equal(unit(root, id).packageManager, "pnpm", id);
+});
+
 test("a member with a lockfile of its own keeps what its lockfile says", () => {
   const root = checkout({
     "package.json": { name: "root", scripts, devDependencies },

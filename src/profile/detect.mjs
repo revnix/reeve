@@ -76,6 +76,24 @@ function isMember(rel, globs) {
 }
 
 /**
+ * A YAML flow list's items, split at the commas outside quotes: `'{foo,bar}'` is
+ * one glob, not two.
+ * @param {string} body
+ */
+function flowItems(body) {
+  const out = [];
+  let item = "", quote = null;
+  for (const ch of body) {
+    if (quote) { item += ch; if (ch === quote) quote = null; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; item += ch; continue; }
+    if (ch === ",") { out.push(item); item = ""; continue; }
+    item += ch;
+  }
+  out.push(item);
+  return out;
+}
+
+/**
  * The string items of a top-level list, in YAML as pnpm-workspace.yaml writes it:
  * a block list under the key, with comments and blank lines among the items, or a
  * flow list on the key's own line. Anything else reads as no list.
@@ -86,7 +104,7 @@ function yamlList(text, key) {
   if (at < 0) return [];
   const unquote = s => s.trim().replace(/^(['"])(.*)\1$/, "$2");
   const rest = lines[at].slice(key.length + 1).replace(/\s#.*$/, "").trim();
-  if (rest.startsWith("[")) return rest.slice(1, rest.lastIndexOf("]")).split(",").map(unquote).filter(Boolean);
+  if (rest.startsWith("[")) return flowItems(rest.slice(1, rest.lastIndexOf("]"))).map(unquote).filter(Boolean);
   const out = [];
   for (const line of lines.slice(at + 1)) {
     if (/^\s*(#.*)?$/.test(line)) continue;
@@ -305,7 +323,8 @@ export function detectUnits(root) {
   }
   // A workspace keeps one lockfile, at its root, so a member without one of its
   // own uses the root's package manager. A folder the workspace doesn't list
-  // stays unsettled, as before.
+  // stays unsettled, as before, and so does one that isn't a JavaScript package:
+  // those managers know only packages, whatever a broad glob matches.
   const rootPm = detectPackageManager(root);
   const globs = rootPm.value ? workspaceGlobs(root, rootPm.value) : [];
   const units = [];
@@ -314,7 +333,7 @@ export function detectUnits(root) {
     const language = detectLanguage(dir);
     if (!language) continue;
     let pm = rel === "." ? rootPm : detectPackageManager(dir);
-    if (rel !== "." && pm.value === null && !pm.question && isMember(rel, globs)) {
+    if (rel !== "." && pm.value === null && !pm.question && language === "typescript" && isMember(rel, globs)) {
       pm = { value: rootPm.value, question: null };
       notes.push(`unit ${rel}: no lockfile of its own, and a member of the root's ${rootPm.value} workspace, so it uses ${rootPm.value}`);
     }

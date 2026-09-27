@@ -109,6 +109,11 @@ next:
   error died rather than failed, and never counts as catching a stub. The older
   script-style files keep working: put a new case in a `node:test` file of its
   own rather than into one of them, and move a file over when you rewrite it.
+- **Tests never reach GitHub or the real reeve home.** Give each GitHub read
+  a stand-in (`test/fixtures/offline-github.mjs` has the tick's), and give
+  reeve a home of its own with `REEVE_HOME`. `npm test` and CI run each file
+  with an offline `gh` first on PATH and an empty home, and fail a file that
+  calls `gh` or writes a `.reeve` into that home.
 - **Recovery checks what actually happened before it retries.** Promise safe
   retries and reconciliation, never "exactly once".
 - **Stop after two rounds of the same review disagreement** and ask the founder.
@@ -152,6 +157,9 @@ macOS it probes the login keychain. CI still runs it, because CI runs on a
 clean runner.
 
 CI runs the tests twice: under `TZ=UTC` and under `TZ=Asia/Karachi`.
+
+To run one file as `npm test` does, offline and with a home of its own:
+`h="$(mktemp -d)"; PATH="$PWD/test/fixtures/offline-gh:$PATH" HOME="$h" env -u REEVE_HOME node test/<file>.test.mjs; rm -rf "$h"`.
 
 ## Types
 

@@ -14,6 +14,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tempDir } from "./fixtures/temp.mjs";
+import { OFFLINE_READS } from "./fixtures/offline-github.mjs";
 
 const dir = tempDir("reeve-e2e-");
 // The clone and the worktree root are separate directories, as a real
@@ -62,6 +63,7 @@ const evaluation = {
 
 let spawned = [];
 const baseCtx = () => ({
+  ...OFFLINE_READS,
   nwo: "o/r", profile, db: open(dbPath), logPath,
   execute: true, shadow: true, running: 0,
   // Deterministic: the real capacity() backs off on the host's load average, so

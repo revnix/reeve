@@ -49,6 +49,7 @@ const check = (ok, name, detail) => {
  */
 import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
+import { OFFLINE_READS } from "./fixtures/offline-github.mjs";
 
 // ── the happy path: a lease is taken and given back ───────────────────────
 {
@@ -219,6 +220,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   let seen;
   const dir2 = tempDir("reeve-prov-hold-st-");
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(dir2, "s.db")), logPath: join(dir2, "log.txt"),
     execute: false, shadow: false, running: 0,
     containment: { credentialRead: "closed", why: "test" },
@@ -270,6 +272,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   let seen;
   const dir = tempDir("reeve-prov-unread-");
   const base = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
     execute: false, shadow: false, running: 0,
     containment: { credentialRead: "closed", why: "test" },
@@ -353,6 +356,7 @@ import { tempDir } from "./fixtures/temp.mjs";
     let seen;
     const dir = tempDir("reeve-prov-cls-");
     const ctx = {
+      ...OFFLINE_READS,
       nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
       execute: false, shadow: false, running: 0,
       containment: { credentialRead: "closed", why: "test" },
@@ -485,6 +489,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   const retry = new Map();
   let reachable = true;
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
     containment: { credentialRead: "closed", why: "test" },
@@ -539,6 +544,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   const dir = tempDir("reeve-prov-sweep-");
   const cancelled = [];
   const base = (decisionsWanted) => ({
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(dir, `s${cancelled.length}.db`)), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
     containment: { credentialRead: "closed", why: "test" },
@@ -636,6 +642,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   const dir = tempDir("reeve-prov-canary-");
   const cooldowns = [];
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
@@ -720,6 +727,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   let asked = 0;
   const seen = [];
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
     containment: { credentialRead: "closed", why: "test" },
@@ -777,6 +785,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   let asked = 0;
   const seen = [];
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
     containment: { credentialRead: "closed", why: "test" },
@@ -829,6 +838,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   const dir = tempDir("reeve-prov-beat-");
   const beats = [];
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
     containment: { credentialRead: "closed", why: "test" },
@@ -884,6 +894,7 @@ import { tempDir } from "./fixtures/temp.mjs";
     const dir = tempDir("reeve-prov-paid-");
     const claims = [];
     return { dir, claims, ctx: {
+      ...OFFLINE_READS,
       nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
       execute: true, shadow: true, running: 0,
       keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
@@ -964,6 +975,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   const dir = tempDir("reeve-prov-unread-q-");
   const cancelled = [];
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
     containment: { credentialRead: "closed", why: "test" },
@@ -1014,6 +1026,7 @@ import { tempDir } from "./fixtures/temp.mjs";
     const dir = tempDir("reeve-prov-reap-");
     const reaped = [];
     return { dir, reaped, ctx: {
+      ...OFFLINE_READS,
       nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
       execute: true, shadow: true, running: 0,
       containment: { credentialRead: "closed", why: "test" },
@@ -1066,6 +1079,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   const spawned = [];
   let permitted = null;
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
@@ -1117,6 +1131,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   const notes = [];
   const dir = tempDir("reeve-prov-cool-");
   const mk = (reachable) => ({
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(dir, `s${notes.length}.db`)), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
     containment: { credentialRead: "closed", why: "test" },
@@ -1178,6 +1193,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   const dir = tempDir("reeve-prov-anchor-");
   const cancelled = [];
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
     containment: { credentialRead: "closed", why: "test" },
@@ -1227,6 +1243,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   const dir = tempDir("reeve-prov-outage-");
   const reaped = [];
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
     containment: { credentialRead: "closed", why: "test" },
@@ -1270,6 +1287,7 @@ import { tempDir } from "./fixtures/temp.mjs";
 {
   const dir = tempDir("reeve-prov-idthrow-");
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
     containment: { credentialRead: "closed", why: "test" },
@@ -1324,6 +1342,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   const dir = tempDir("reeve-prov-observe-");
   const reaped = [];
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
     // OBSERVATIONAL: the default, and the whole point of this block.
     execute: false, shadow: true, running: 0,
@@ -1464,6 +1483,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   const store = open(join(dir, "s.db"));
   let calls = 0;
   const mk = () => ({
+    ...OFFLINE_READS,
     nwo: "o/r", db: store, logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
     containment: { credentialRead: "closed", why: "test" },
@@ -1533,6 +1553,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   const store = open(join(dir, "s.db"));
   let threw = null, r = null;
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: store, logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
     containment: { credentialRead: "closed", why: "test" },
@@ -1658,6 +1679,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   const store = open(join(dir, "s.db"));
   const spawned = [];
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: store, logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
     containment: { credentialRead: "closed", why: "test" },
@@ -1748,6 +1770,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   writeFileSync(marker, "stop");
   const cancelled = [], spawned = [], reaped = [];
   const base = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
     containment: { credentialRead: "closed", why: "test" },
@@ -1854,6 +1877,7 @@ import { tempDir } from "./fixtures/temp.mjs";
   let refuse = true;
   const releases = [];
   const mk = () => ({
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(dir, `s${releases.length}.db`)), logPath: join(dir, "log.txt"),
     execute: true, shadow: true, running: 0,
     containment: { credentialRead: "closed", why: "test" },

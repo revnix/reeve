@@ -13,6 +13,7 @@ import * as daemon from "../src/daemon.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { open } from "../src/db/ops.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
+import { OFFLINE_READS } from "./fixtures/offline-github.mjs";
 
 const linux = { skip: process.platform !== "linux" && "Linux only" };
 // Under /mnt, but not a drive: only root can make it, so code that wrote under
@@ -55,6 +56,7 @@ test("a worker whose checkout is under /mnt isn't started, and the refusal says 
   let spawned = 0, prepared = 0;
   mkdirSync(stateDir, { recursive: true });
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(stateDir, "e.db")), logPath: join(stateDir, "reeve.log"), dbPath: join(stateDir, "e.db"),
     profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: UNDER_MNT, checkout: clone },
                authority: { policy: "propose_and_merge" }, rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
@@ -97,6 +99,7 @@ test("a checkout that lands under a denied path, though its root doesn't, is ref
   let spawned = 0;
   mkdirSync(stateDir, { recursive: true });
   const ctx = {
+    ...OFFLINE_READS,
     nwo: "o/r", db: open(join(stateDir, "e.db")), logPath: join(stateDir, "reeve.log"), dbPath: join(stateDir, "e.db"),
     profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: tempDir("rl2-root-"), checkout: clone },
                authority: { policy: "propose_and_merge" }, rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },

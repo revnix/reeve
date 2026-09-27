@@ -228,8 +228,8 @@ function checkArtifactDrift(pluginCacheRoot, repoPluginDir) {
  * bind. Measured from parent counts rather than from settings, because settings
  * describe what is allowed and parents describe what happened.
  */
-function checkMergeShape(nwo, declared) {
-  const r = gh(`repos/${nwo}/commits?sha=main&per_page=20`, ".[].parents|length");
+function checkMergeShape(nwo, declared, { api = gh } = {}) {
+  const r = api(`repos/${nwo}/commits?sha=main&per_page=20`, ".[].parents|length");
   if (!r.ok) return { id: "R-03", level: UNKNOWN, title: "merge shape", lines: ["could not read main's history"] };
   const counts = r.out.split("\n").filter(Boolean).map(Number);
   const twoParent = counts.filter(n => n === 2).length;
@@ -1116,13 +1116,15 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
 
 // ── driver ────────────────────────────────────────────────────────────────
 
-export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null, baselineIo = {}, stateDir = null, canaryIo = {}, keychainIo = {}, reachIo = {} }) {
+// `githubIo` reaches the checks that read GitHub: `api` for a REST read, `sh`
+// for a `gh` command. A test fills it, so it never calls gh (#243).
+export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null, baselineIo = {}, stateDir = null, canaryIo = {}, keychainIo = {}, reachIo = {}, githubIo = {} }) {
   const checks = [
-    checkMergeAuthority(nwo),
+    checkMergeAuthority(nwo, githubIo),
     pluginCacheRoot ? checkArtifactDrift(pluginCacheRoot, repoPluginDir) : null,
-    checkMergeShape(nwo, profile.merge?.method ?? null),
+    checkMergeShape(nwo, profile.merge?.method ?? null, githubIo),
     checkBaseHealth(nwo, profile.ci?.workflow ?? "ci.yml",
-                    profile.identity?.baseBranch ?? profile.identity?.defaultBranch ?? "main"),
+                    profile.identity?.baseBranch ?? profile.identity?.defaultBranch ?? "main", githubIo),
     profile.reviewers?.length ? checkReviewerSupply(nwo, profile.reviewers) : null,
     checkLeases(db),
     profile.reviewers?.length ? checkDetectors(db, profile) : null,

@@ -30,11 +30,11 @@
  *    for the anchor. Confirmation greps have been measured inert here.
  */
 import { readFileSync, writeFileSync, copyFileSync, mkdtempSync, rmSync, realpathSync, statSync,
-         lstatSync, readlinkSync, openSync, readSync, closeSync, fstatSync, constants, readdirSync } from "node:fs";
+         lstatSync, readlinkSync, openSync, readSync, closeSync, fstatSync, constants, readdirSync, mkdirSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join, resolve, dirname, basename, sep } from "node:path";
+import { join, resolve, dirname, basename, sep, delimiter } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdit, validateManifest, classify, summarise, parsePorcelainZ, fingerprint,
          CAUGHT, UNRUNNABLE, TIMED_OUT_EXIT,
@@ -491,6 +491,33 @@ const reporterDir = mkdtempSync(join(tmpdir(), "stub-sweep-reporter-"));
 const TEST_REPORTER = join(reporterDir, "test-reporter.mjs");
 copyFileSync(fileURLToPath(new URL("./test-reporter.mjs", import.meta.url)), TEST_REPORTER);
 process.on("exit", () => { try { rmSync(reporterDir, { recursive: true, force: true }); } catch { /* best effort: it holds no work */ } });
+
+// OFFLINE, AS THE RUNNER RUNS THEM (#257). `npm test` and CI give each test file
+// the tests' offline gh first on PATH and an empty home of its own. A sweep's
+// child had neither, so a stub that switched off one of a test's stand-ins sent
+// its read to whatever gh came first, under the developer's own login, and one
+// that sent a write into the home wrote into the real one. Each file now gets
+// both, from a copy of this script's own offline gh taken before any stub lands,
+// as the reporter is: a stub of that gh must change only the runs that test it.
+// The escape probe is the exception, as in CI: it measures the sandbox against
+// the real gh and home, and so do its stubs.
+const offlineDir = mkdtempSync(join(tmpdir(), "stub-sweep-offline-"));
+const OFFLINE_GH_DIR = join(offlineDir, "bin");
+mkdirSync(OFFLINE_GH_DIR);
+copyFileSync(fileURLToPath(new URL("../test/fixtures/offline-gh/gh", import.meta.url)), join(OFFLINE_GH_DIR, "gh"));
+process.on("exit", () => { try { rmSync(offlineDir, { recursive: true, force: true }); } catch { /* best effort: it holds no work */ } });
+let childRuns = 0;
+const childEnv = file => {
+  if (basename(file) === "escape.test.mjs") return process.env;
+  const n = ++childRuns;
+  const home = join(offlineDir, `home-${n}`);
+  mkdirSync(home);
+  const env = { ...process.env, HOME: home, REEVE_TEST_GH_LOG: join(offlineDir, `gh-${n}.log`),
+                PATH: `${OFFLINE_GH_DIR}${delimiter}${process.env.PATH ?? ""}` };
+  delete env.REEVE_HOME;
+  return env;
+};
+
 const runTest = (file, expectRed = null) => new Promise(resolve => {
   // DETACHED, so the child leads its own process GROUP.
   //
@@ -505,7 +532,7 @@ const runTest = (file, expectRed = null) => new Promise(resolve => {
   // that doesn't use node:test never loads it. It is this script's own, not the
   // tree's under test: a fixture repository has none.
   const child = spawn(process.execPath, [`--test-reporter=${TEST_REPORTER}`, "--test-reporter-destination=stdout", join(ROOT, file)],
-    { cwd: ROOT, detached: true });
+    { cwd: ROOT, detached: true, env: childEnv(file) });
   activeChild = child;
   // BOUNDED. A deliberately broken test that logs continuously would otherwise
   // grow one unbounded string for as long as the timeout allows, and exhausting

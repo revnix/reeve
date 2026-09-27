@@ -141,7 +141,7 @@ jobs:
               mkdir "$own/$name"
               HOME="$own/$name" REEVE_TEST_GH_LOG="$own/$name.gh" PATH="$PWD/test/fixtures/offline-gh:$PATH" \
                 env -u REEVE_HOME node "$f" || fail=1
-              if [ -s "$own/$name.gh" ]; then echo "CALLED GH: $f"; tr '\037\036' ' \n' < "$own/$name.gh" | head -5; fail=1; fi
+              if [ -s "$own/$name.gh" ]; then echo "CALLED GH: $f"; head -c 1500 "$own/$name.gh" | tr '\037\036' ' \n'; echo; fail=1; fi
               if [ -e "$own/$name/.reeve" ]; then echo "WROTE INTO ITS HOME'S .reeve: $f"; fail=1; fi
             fi
             left="$(ls -A "$TMPDIR")"
@@ -172,7 +172,7 @@ jobs:
               mkdir "$own/$name"
               HOME="$own/$name" REEVE_TEST_GH_LOG="$own/$name.gh" PATH="$PWD/test/fixtures/offline-gh:$PATH" \
                 env -u REEVE_HOME node "$f" >/dev/null || { echo "FAILED under TZ=$TZ: $f"; fail=1; }
-              if [ -s "$own/$name.gh" ]; then echo "CALLED GH under TZ=$TZ: $f"; tr '\037\036' ' \n' < "$own/$name.gh" | head -5; fail=1; fi
+              if [ -s "$own/$name.gh" ]; then echo "CALLED GH under TZ=$TZ: $f"; head -c 1500 "$own/$name.gh" | tr '\037\036' ' \n'; echo; fail=1; fi
               if [ -e "$own/$name/.reeve" ]; then echo "WROTE INTO ITS HOME'S .reeve under TZ=$TZ: $f"; fail=1; fi
             fi
             left="$(ls -A "$TMPDIR")"

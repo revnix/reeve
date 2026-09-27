@@ -145,7 +145,7 @@ For a reviewer of a pull request here, a person or a review bot.
 | Task | Command |
 |---|---|
 | Run the tests, stopping at the first failure (Node 24.10 or later) | `npm test` |
-| Run every test file and list all failures (exits non-zero if any fail) | `( fail=0; for f in test/*.test.mjs; do case "$f" in */escape.test.mjs) continue;; esac; node "$f" >/dev/null \|\| { echo "FAILED $f"; fail=1; }; done; exit $fail )` |
+| Run every test file and list all failures (exits non-zero if any fail) | `( fail=0; for f in test/*.test.mjs; do case "$f" in */escape.test.mjs) continue;; esac; node scripts/test.mjs "$f" >/dev/null \|\| { echo "FAILED $f"; fail=1; }; done; exit $fail )` |
 | The containment escape probe (run deliberately, on a quiet machine) | `npm run test:escape` |
 | Lint | `npm run lint` |
 | Type-check every file marked `// @ts-check` | `npm run typecheck` |

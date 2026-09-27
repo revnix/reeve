@@ -32,6 +32,21 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const callsIn = (log) => existsSync(log)
   ? readFileSync(log, "utf8").split("\x1e").filter(Boolean).map((call) => call.split("\x1f").slice(0, -1))
   : [];
+// A gh that stands for the real one, and never reaches the network: it says it
+// isn't the offline one. Put beneath the offline gh on a PATH, it answers only
+// if the offline gh wasn't put first -- so a test of that ordering can fail
+// without ever calling the real gh, even when a stub sweep removes the ordering.
+const sentinel = (() => {
+  let dir = null;
+  return () => {
+    if (dir) return dir;
+    dir = tempDir("sentinel-gh-");
+    writeFileSync(join(dir, "gh"), "#!/bin/sh\necho 'not the offline gh' >&2\nexit 3\n", { mode: 0o755 });
+    return dir;
+  };
+})();
+const withSentinel = (env = process.env) => ({ ...env, PATH: `${sentinel()}${delimiter}${env.PATH ?? ""}` });
+
 const offlineGh = (args, log) =>
   spawnSync(join(OFFLINE_GH_DIR, "gh"), args, { encoding: "utf8", env: { ...process.env, REEVE_TEST_GH_LOG: log } });
 
@@ -84,7 +99,7 @@ test("the offline gh treats a subcommand's --version as the call it is, which th
 
 test("a process started with offlineEnv meets the offline gh, and its calls aren't written down for the runner", () => {
   const log = join(tempDir("oe-"), "calls");
-  const r = spawnSync("sh", ["-c", "gh api repos/o/r"], { encoding: "utf8", env: offlineEnv({ ...process.env, REEVE_TEST_GH_LOG: log }) });
+  const r = spawnSync("sh", ["-c", "gh api repos/o/r"], { encoding: "utf8", env: offlineEnv({ ...withSentinel(), REEVE_TEST_GH_LOG: log }) });
   assert.equal(r.status, 1, r.stdout + r.stderr);
   assert.match(r.stderr, /a test never reaches GitHub/, "it wasn't the offline gh that answered");
   assert.deepEqual(callsIn(log), []);
@@ -203,8 +218,10 @@ const suite = (files) => {
   for (const [name, source] of Object.entries(files)) writeFileSync(join(dir, name), source);
   return dir;
 };
+// The runner puts the offline gh first itself; the sentinel beneath it answers
+// only if it didn't.
 const runSuite = (dir, env = {}) =>
-  spawnSync(process.execPath, [join(ROOT, "scripts", "test.mjs"), dir], { encoding: "utf8", env: { ...process.env, ...env } });
+  spawnSync(process.execPath, [join(ROOT, "scripts", "test.mjs"), dir], { encoding: "utf8", env: { ...withSentinel(), ...env } });
 
 test("the runner fails a test file that called gh, and names the call", () => {
   const dir = suite({ "a.test.mjs": `import { spawnSync } from "node:child_process";\nspawnSync("gh", ["api", "repos/o/r/pulls/7"]);\n` });
@@ -218,7 +235,7 @@ test("the runner runs one test file as it runs each of the suite's, and fails it
   // A test that ignores gh's failure passes on its own; the runner is what
   // notices the call.
   const dir = suite({ "a.test.mjs": `import { spawnSync } from "node:child_process";\nspawnSync("gh", ["api", "repos/o/r/pulls/7"]);\n` });
-  const r = spawnSync(process.execPath, [join(ROOT, "scripts", "test.mjs"), join(dir, "a.test.mjs")], { encoding: "utf8" });
+  const r = runSuite(join(dir, "a.test.mjs"));
   assert.notEqual(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stderr, /a\.test\.mjs called gh/, r.stderr);
 });

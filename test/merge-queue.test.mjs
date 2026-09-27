@@ -108,6 +108,15 @@ test("the queue's commit is judged by its own checks: failing there blocks, thou
   assert.match(v.clauses.find(c => c.id === "ci")?.detail ?? "", /test/);
 });
 
+test("a queue commit is judged only with the pull request's facts from this tick", () => {
+  const r = evaluateQueueEntry({ nwo: "o/r", entry: { pr: 7, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS" }, input: undefined,
+                                 baseRef: "main", profile: { ci: { requiredChecks: [] } }, db: null,
+                                 read: () => ({ ok: true, rows: [checkRow("test", "success")], impostors: [] }),
+                                 requirements: () => ({ required: [], known: true, shadowRequired: false }) });
+  assert.equal(r.ok, false);
+  assert.equal(r.verdict, undefined, "no verdict built from nothing");
+});
+
 test("the queue's commit settles apart from the pull request's head, and passes once settled", () => {
   const db = open(join(tempDir("reeve-queue-"), "s.db"));
   const first = judgeQueued(db, "success").verdict;

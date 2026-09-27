@@ -9569,12 +9569,12 @@ export const STUBS = [
               replace: "      try { pub = ({ ok: false, why: \"not published\" }); }" }],
   },
   {
-    name: "tick-queue-needs-evaluation",
+    name: "queue-needs-the-pull-requests-facts",
     why: "judge a queued pull request this tick didn't evaluate. Its facts then carry over from nothing, and its queue commit can pass unjudged",
     test: "test/merge-queue.test.mjs",
-    expectRed: "a queued pull request this tick didn't evaluate isn't judged, since its facts can't carry over",
-    edits: [{ file: "src/daemon.mjs",
-              find: "      if (!e?.input) { log(logPath, `  ${at}: not judged — the pull request wasn't evaluated this tick`); continue; }\n",
+    expectRed: "a queue commit is judged only with the pull request's facts from this tick",
+    edits: [{ file: "src/pr.mjs",
+              find: "  if (!input) return { ok: false, why: \"the pull request wasn't evaluated this tick, so its facts can't carry over\" };\n",
               replace: "" }],
   },
   {

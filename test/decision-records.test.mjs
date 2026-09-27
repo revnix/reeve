@@ -59,10 +59,11 @@ test("a tick keeps what its verdict was judged from, and names the record on its
 test("a past verdict replays to the same result from its record", async () => {
   const { db } = await ticked();
   const d = latestDecision(db, 42);
-  const { found } = evidenceBy(db, Object.values(d?.record.evidence ?? {}));
-  const replayed = computeVerdict(joinEvidence(found.map(e => e.statement), policyBody(db, d?.record.policy)));
-  assert.deepEqual(asJson({ state: replayed.state, summary: replayed.summary, clauses: replayed.clauses }), d?.record.verdict);
-  assert.equal(d?.record.verdict.state, "BLOCK");
+  assert.ok(d, "a decision record was kept");
+  const { found } = evidenceBy(db, Object.values(d.record.evidence));
+  const replayed = computeVerdict(joinEvidence(found.map(e => e.statement), policyBody(db, d.record.policy)));
+  assert.deepEqual(asJson({ state: replayed.state, summary: replayed.summary, clauses: replayed.clauses }), d.record.verdict);
+  assert.equal(d.record.verdict.state, "BLOCK");
 });
 
 test("ticks that decide the same thing from the same evidence keep one record, seen again", async () => {
@@ -87,9 +88,10 @@ test("an evaluation that carries no input records nothing new, and its decision 
 test("the record carries the head's tree and the code that judged", async () => {
   const { db } = await ticked({ treeOf: () => TREE, code: CODE });
   const d = latestDecision(db, 42);
-  assert.equal(d?.record.subject.tree, TREE);
-  assert.deepEqual(d?.record.code, CODE);
-  const [e] = evidenceBy(db, [d?.record.evidence.checks]).found;
+  assert.ok(d, "a decision record was kept");
+  assert.equal(d.record.subject.tree, TREE);
+  assert.deepEqual(d.record.code, CODE);
+  const [e] = evidenceBy(db, [d.record.evidence.checks]).found;
   assert.deepEqual(e.statement.subject[0].digest, { gitCommit: HEAD, gitTree: TREE });
   assert.equal(e.statement.predicate.producer.version, CODE.commit);
 });

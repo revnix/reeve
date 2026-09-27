@@ -112,10 +112,13 @@ test("the queue's commit is judged by its own checks: failing there blocks, thou
 });
 
 test("a queue commit is judged only with the pull request's facts from this tick", () => {
-  const r = evaluateQueueEntry({ nwo: "o/r", entry: { pr: 7, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS" }, input: undefined,
-                                 baseRef: "main", profile: { ci: { requiredChecks: [] } }, db: null,
-                                 read: () => ({ ok: true, rows: [checkRow("test", "success")], impostors: [] }),
-                                 requirements: () => ({ required: [], known: true, shadowRequired: false }) });
+  let r;
+  assert.doesNotThrow(() => {
+    r = evaluateQueueEntry({ nwo: "o/r", entry: { pr: 7, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS" }, input: undefined,
+                             baseRef: "main", profile: { ci: { requiredChecks: [] } }, db: null,
+                             read: () => ({ ok: true, rows: [checkRow("test", "success")], impostors: [] }),
+                             requirements: () => ({ required: [], known: true, shadowRequired: false }) });
+  });
   assert.equal(r.ok, false);
   assert.equal(r.verdict, undefined, "no verdict built from nothing");
 });
@@ -270,4 +273,26 @@ test("a queue verdict reeve can't publish on three ticks running goes to a perso
   const publish = async ({ verdict }) => (verdict.head === QUEUED ? { ok: false, why: "HTTP 502" } : { ok: true, id: 1 });
   const r = await run({ evaluate: evaluated, readQueue: queued(), evaluateQueue: judged, publish, ticks: 3 });
   assert.match(r.esc, /#42: reeve couldn't publish its verdict on the merge queue's commit on 3 ticks in a row/);
+});
+
+// ── from #269's second review ────────────────────────────────────────────────
+
+test("pull requests the queue batched on one commit get one verdict there, the worst of theirs", async () => {
+  const published = [];
+  const publish = async ({ verdict }) => { published.push({ head: verdict.head, state: verdict.state }); return { ok: true, id: published.length }; };
+  const red = () => ({ ...passing(), checks: { ...passing().checks, verdict: "RED", failing: [{ name: "unit", id: "1" }] } });
+  // The blocked one queued first, so the one after it can't overwrite it.
+  const evaluate = ({ pr }) => { const input = pr === 42 ? red() : passing(); return { ...EVAL, pr, baseRef: "main", head: HEAD, input, verdict: computeVerdict(input) }; };
+  const batch = queued([{ pr: 42, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS" }, { pr: 43, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS" }]);
+  await run({ evaluate, openPrs: () => [42, 43], readQueue: batch, evaluateQueue: judged, publish });
+  assert.deepEqual(published.filter(p => p.head === QUEUED), [{ head: QUEUED, state: "BLOCK" }]);
+});
+
+test("a queue PASS is taken back when the queue can't be read, since its commit can't be re-checked", async () => {
+  const withdrawn = [];
+  const withdraw = async (a) => { withdrawn.push(a); return { ok: true }; };
+  let tick = 0;
+  const readQueue = () => (tick++ === 0 ? queued()() : { ok: false, why: "HTTP 502" });
+  await run({ evaluate: evaluated, readQueue, evaluateQueue: judged, withdraw, ticks: 2 });
+  assert.ok(withdrawn.some(a => JSON.stringify(a).includes(QUEUED)), JSON.stringify(withdrawn));
 });

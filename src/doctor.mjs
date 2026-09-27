@@ -228,8 +228,8 @@ function checkArtifactDrift(pluginCacheRoot, repoPluginDir) {
  * bind. Measured from parent counts rather than from settings, because settings
  * describe what is allowed and parents describe what happened.
  */
-function checkMergeShape(nwo, declared) {
-  const r = gh(`repos/${nwo}/commits?sha=main&per_page=20`, ".[].parents|length");
+function checkMergeShape(nwo, declared, { api = gh } = {}) {
+  const r = api(`repos/${nwo}/commits?sha=main&per_page=20`, ".[].parents|length");
   if (!r.ok) return { id: "R-03", level: UNKNOWN, title: "merge shape", lines: ["could not read main's history"] };
   const counts = r.out.split("\n").filter(Boolean).map(Number);
   const twoParent = counts.filter(n => n === 2).length;
@@ -298,7 +298,9 @@ export function runExecutedSteps(nwo, runId, io = null) {
  */
 export function checkBaseHealth(nwo, workflow = "ci.yml", branch = "main", io = null) {
   const run = io?.sh ?? sh;
-  const steps = io?.steps ?? runExecutedSteps;
+  // The default step reader reads through the same io, so a failed run's jobs
+  // are read as its list was (#243).
+  const steps = io?.steps ?? ((n, id) => runExecutedSteps(n, id, io));
   // COMPLETED RUNS ONLY, because a run that has not finished cannot answer the
   // question and was still counting toward the denominator.
   //
@@ -366,19 +368,19 @@ export function checkBaseHealth(nwo, workflow = "ci.yml", branch = "main", io = 
  * reports success and an uninstalled one reports nothing, and both are
  * byte-identical to "found no problems" unless something counts.
  */
-function checkReviewerSupply(nwo, reviewers) {
+function checkReviewerSupply(nwo, reviewers, { api = gh, sh: run = sh } = {}) {
   const lines = [];
   let level = OK;
-  const prs = sh("gh", ["pr", "list", "--repo", nwo, "--state", "merged", "--limit", "40", "--json", "number", "--jq", ".[].number"]);
+  const prs = run("gh", ["pr", "list", "--repo", nwo, "--state", "merged", "--limit", "40", "--json", "number", "--jq", ".[].number"]);
   if (!prs.ok) return { id: "R-05", level: UNKNOWN, title: "reviewer supply", lines: ["could not list merged PRs"] };
   const numbers = prs.out.split("\n").filter(Boolean).slice(0, 20);
 
   for (const rev of reviewers) {
     let seen = 0, refused = 0, real = 0;
     for (const n of numbers) {
-      const c = gh(`repos/${nwo}/issues/${n}/comments`,
+      const c = api(`repos/${nwo}/issues/${n}/comments`,
         `[.[]|select(.user.login|test("${rev.login}";"i"))]|length`);
-      const rl = gh(`repos/${nwo}/issues/${n}/comments`,
+      const rl = api(`repos/${nwo}/issues/${n}/comments`,
         `[.[]|select((.user.login|test("${rev.login}";"i")) and (.body|test("${rev.refusal}";"i")))]|length`);
       if (c.ok) seen += Number(c.out || 0);
       if (rl.ok) refused += Number(rl.out || 0);
@@ -1121,14 +1123,16 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
 
 // ── driver ────────────────────────────────────────────────────────────────
 
-export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null, baselineIo = {}, stateDir = null, canaryIo = {}, keychainIo = {}, reachIo = {} }) {
+// `githubIo` reaches the checks that read GitHub: `api` for a REST read, `sh`
+// for a `gh` command. A test fills it, so it never calls gh (#243).
+export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null, baselineIo = {}, stateDir = null, canaryIo = {}, keychainIo = {}, reachIo = {}, githubIo = {} }) {
   const checks = [
-    checkMergeAuthority(nwo),
+    checkMergeAuthority(nwo, githubIo),
     pluginCacheRoot ? checkArtifactDrift(pluginCacheRoot, repoPluginDir) : null,
-    checkMergeShape(nwo, profile.merge?.method ?? null),
+    checkMergeShape(nwo, profile.merge?.method ?? null, githubIo),
     checkBaseHealth(nwo, profile.ci?.workflow ?? "ci.yml",
-                    profile.identity?.baseBranch ?? profile.identity?.defaultBranch ?? "main"),
-    profile.reviewers?.length ? checkReviewerSupply(nwo, profile.reviewers) : null,
+                    profile.identity?.baseBranch ?? profile.identity?.defaultBranch ?? "main", githubIo),
+    profile.reviewers?.length ? checkReviewerSupply(nwo, profile.reviewers, githubIo) : null,
     checkLeases(db),
     profile.reviewers?.length ? checkDetectors(db, profile) : null,
     appCheck,

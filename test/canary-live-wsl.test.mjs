@@ -12,19 +12,24 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { canaryScript, sandboxCanary } from "../src/canary.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
+import { resolveHome } from "../src/home.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 
+// Reeve's home is deny-read, so the decoy must sit under it to be measurable.
+// The test gives reeve a home of its own for it, in a temp folder, so
+// the decoy never lands in the real one, where a running daemon keeps its
+// canary's results (#245). Set before the policy is built, which denies it.
+process.env.REEVE_HOME = tempDir("reeve-canary-live-home-");
 const block = sandboxFor({ profile: { identity: { key: "o/r", defaultBranch: "main" }, units: [] }, action: "FIX_CI", worktree: "/w", tmpDir: "/t" }).settings;
 const baseFor = (platform) => {
   const root = tempDir("reeve-canary-live-");
   return {
     cliVersion: "2.1.278 (Claude Code)", sandbox: block.sandbox, permissionsDeny: block.permissions.deny,
     dir: join(root, "canary"), outsideDir: join(root, "outside"), tmpDir: join(root, "tmp"),
-    decoyPath: join(homedir(), ".reeve", "canary", `live-decoy-${process.pid}-${Math.random().toString(16).slice(2)}.txt`),
+    decoyPath: join(resolveHome(), "canary", `live-decoy-${process.pid}-${Math.random().toString(16).slice(2)}.txt`),
     bin: "/bin/sh", env: { PATH: "/usr/bin:/bin" },
     netProbe: { url: "http://127.0.0.1:59999/canary", selfReachable: () => true, wasHit: () => false },
     platform,

@@ -21,6 +21,7 @@ import { openHub } from "../src/build/hubdb.mjs";
 // R-15 is where the token path becomes an instruction to an operator.
 import { checkKeychain } from "../src/doctor.mjs";
 import { hubPathFor } from "../src/paths.mjs";
+import { offlineEnv } from "./fixtures/offline-github.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -29,10 +30,13 @@ const check = (ok, name, detail) => {
 };
 
 const ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..");
+// The environment of each reeve these tests run. Its own reads of GitHub, which
+// they don't measure, meet a GitHub out of reach (#243).
+const reeveEnv = (extra) => offlineEnv({ ...process.env, ...extra });
 const dir = mkdtempSync(join(tmpdir(), "reeve-flags-"));
 const run = (...args) => {
   const r = spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
-    { encoding: "utf8", env: { ...process.env, REEVE_HOME: join(dir, "envhome") } });
+    { encoding: "utf8", env: reeveEnv({ REEVE_HOME: join(dir, "envhome") }) });
   // stdout and stderr SEPARATELY, additively. `out` is the concatenation every
   // existing assertion here reads; the two halves are needed because one contract
   // asserted below is precisely that the machine shape goes to stdout and the
@@ -62,7 +66,7 @@ for (const args of [["init", "-q"],
   spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
 const runIn = (...args) => {
   const r = spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
-    { encoding: "utf8", cwd: repo, env: { ...process.env, REEVE_HOME: join(dir, "envhome") } });
+    { encoding: "utf8", cwd: repo, env: reeveEnv({ REEVE_HOME: join(dir, "envhome") }) });
   return { status: r.status, out: (r.stdout ?? "") + (r.stderr ?? "") };
 };
 check(existsSync(join(repo, ".git")),
@@ -450,7 +454,7 @@ check(existsSync(join(repo, ".git")),
   openHub(hubPathFor(eHome)).close();
   const runH = (...args) => {
     const r = spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
-      { encoding: "utf8", env: { ...process.env, REEVE_HOME: eHome } });
+      { encoding: "utf8", env: reeveEnv({ REEVE_HOME: eHome }) });
     return { status: r.status, out: (r.stdout ?? "") + (r.stderr ?? "") };
   };
   const out1 = join(eHome, "helped.jsonl");
@@ -786,7 +790,7 @@ check(existsSync(join(repo, ".git")),
   // one, so the send path is unreachable by construction rather than by luck.
   const runIsolated = (...args) => {
     const r = spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
-      { encoding: "utf8", cwd: dir, env: { ...process.env, REEVE_HOME: join(dir, "envhome") } });
+      { encoding: "utf8", cwd: dir, env: reeveEnv({ REEVE_HOME: join(dir, "envhome") }) });
     return { status: r.status, out: (r.stdout ?? "") + (r.stderr ?? ""), stdout: r.stdout ?? "" };
   };
   const missing = APPLIES.json.filter(c => !INVOCATION[c]);

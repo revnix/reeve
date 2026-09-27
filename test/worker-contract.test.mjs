@@ -7,6 +7,7 @@ import { tick } from "../src/daemon.mjs";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tempDir } from "./fixtures/temp.mjs";
+import { OFFLINE_READS } from "./fixtures/offline-github.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -48,6 +49,7 @@ const db = open(join(dir, "c.db"));
   // Each context gets its own worktree dir: the daemon quarantines (moves) a
   // worktree after a failed run, and a shared one strands every later tick.
   var ctxFor = (db_, logPath) => ({
+    ...OFFLINE_READS,
     nwo: "o/r", db: db_, logPath, execute: true, shadow: true, running: 0, containment: { credentialRead: "closed", why: "test" }, keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "2.1.237",
     // Deterministic: the real capacity() backs off on the host's load average, so
     // a busy machine would fail these assertions for a reason that is not the code.

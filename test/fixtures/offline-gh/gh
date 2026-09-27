@@ -1,0 +1,25 @@
+#!/bin/sh
+# The gh every test file runs with, first on PATH (#243).
+#
+# A test never reaches GitHub. A real call spends the developer's API budget,
+# on repositories that mostly don't exist, and waits on the network for an
+# answer no assertion depends on. So each call is written down to
+# $REEVE_TEST_GH_LOG, its arguments ended by the unit separator and the call by
+# the record separator, and fails as a gh with no login fails. The runner then
+# fails the test file that made it.
+#
+# gh's own version check, `gh --version` or `gh version`, is answered here,
+# and isn't written down: it never leaves the machine, and a test may use it as
+# a command that only prints. A subcommand's `--version` isn't one: the real gh
+# rejects `gh api --version` as an unknown flag, so it's a call like any other.
+case "$#:$1" in
+  "1:--version"|"1:version")
+    echo "gh version 0.0.0 (the tests' offline stand-in)"
+    exit 0 ;;
+esac
+if [ -n "${REEVE_TEST_GH_LOG-}" ]; then
+  printf '%s\037' "$@" >> "$REEVE_TEST_GH_LOG"
+  printf '\036' >> "$REEVE_TEST_GH_LOG"
+fi
+echo "gh: a test never reaches GitHub; give this read a stand-in" >&2
+exit 1

@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { publishVerdict, requiredOn, requiredOnBase, requirementsOnBase, shadowContextOf } from "../src/pr.mjs";
 import { tick } from "../src/daemon.mjs";
 import { open } from "../src/db/ops.mjs";
+import { OFFLINE_READS } from "./fixtures/offline-github.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -232,6 +233,7 @@ check(requiredOn({ rules: FORBIDDEN, branch: NOT_PROTECTED }, CONTEXT, { appId: 
       reviewers: [], threads: { readable: true, total: 0, unresolved: 0, seen: 0 }, settled: { settled: true } });
     const held = `a rule requires ${CONTEXT} on main, and reeve publishes it only when enforcing, so every pull request there is blocked until it enforces or the rule stops requiring it`;
     const ctx = {
+      ...OFFLINE_READS,
       nwo: NWO, profile: { identity: { key: NWO, defaultBranch: "main" }, authority: { policy: "propose_only" },
         ci: { provider: "github-actions", requiredChecks: [] }, watch: { maxWorkers: 1 }, reviewers: [] },
       db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"), execute: false, shadow: true, running: 0,

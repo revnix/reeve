@@ -8,7 +8,7 @@ import { open, tx, enqueue, leaseOutbox, recoverOutbox, supersedeEffects } from 
 import { drainOutbox } from "../src/outbox/drain.mjs";
 import { ghPrComment, markerFor, retryableFrom, HANDLERS } from "../src/outbox/effects.mjs";
 import { apiAsInstallation } from "../src/github/app.mjs";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -90,15 +90,30 @@ const statusOf = key => db.prepare(`SELECT status, attempts, result, last_error 
   // timeout is transient and worth retrying, while an overflow means the request
   // SUCCEEDED and the answer did not fit -- and this handler reads a failed read
   // as "no marker found" and posts the duplicate it exists to prevent.
-  const big = apiAsInstallation("t", ["--version"], { maxBuffer: 4 });
-  check(big.ok === false, "control: a four-byte buffer really does fail", JSON.stringify(big));
-  check(big.truncated === true && !big.timedOut,
-    "an output that did not fit is reported as truncation, not as a timeout", JSON.stringify(big));
+  //
+  // A gh of this test's own answers both calls, first on PATH: it prints more
+  // than four bytes and then waits. So the buffer overflows at once, and a
+  // one-millisecond timeout always fires first. Relying on a real gh's slow
+  // start made the timeout miss a quarter of the time once gh was a quick
+  // stand-in, and a test never reaches the real one (#243).
+  const slowGh = mkdtempSync(join(tmpdir(), "reeve-slow-gh-"));
+  writeFileSync(join(slowGh, "gh"), "#!/bin/sh\necho 'more than four bytes'\nexec sleep 5\n", { mode: 0o755 });
+  const path = process.env.PATH;
+  process.env.PATH = `${slowGh}:${path}`;
+  try {
+    const big = apiAsInstallation("t", ["--version"], { maxBuffer: 4 });
+    check(big.ok === false, "control: a four-byte buffer really does fail", JSON.stringify(big));
+    check(big.truncated === true && !big.timedOut,
+      "an output that did not fit is reported as truncation, not as a timeout", JSON.stringify(big));
 
-  const slow = apiAsInstallation("t", ["--version"], { timeoutMs: 1 });
-  check(slow.ok === false, "control: a one-millisecond timeout really does fail", JSON.stringify(slow));
-  check(slow.timedOut === true && !slow.truncated,
-    "and a timeout is reported as a timeout", JSON.stringify(slow));
+    const slow = apiAsInstallation("t", ["--version"], { timeoutMs: 1 });
+    check(slow.ok === false, "control: a one-millisecond timeout really does fail", JSON.stringify(slow));
+    check(slow.timedOut === true && !slow.truncated,
+      "and a timeout is reported as a timeout", JSON.stringify(slow));
+  } finally {
+    process.env.PATH = path;
+    rmSync(slowGh, { recursive: true, force: true });
+  }
 }
 
 // --- a wildcard in a prefix is a literal character ----------------------------

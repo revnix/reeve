@@ -15,6 +15,7 @@ import { claimProvider, releaseProvider, queuedGuardianRequests } from "../src/p
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { tempDir } from "./fixtures/temp.mjs";
+import { OFFLINE_READS } from "./fixtures/offline-github.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -116,6 +117,7 @@ const release = (db, runRef, got) => releaseProvider(db, {
 
   const guest = openHubAsGuest(hubPath);
   const ctx = {
+    ...OFFLINE_READS,
     nwo: NWO, db: open(join(d2, "s.db")), logPath: join(d2, "log.txt"),
     execute: true, shadow: true, running: 0,
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",

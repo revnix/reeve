@@ -19,6 +19,7 @@ import { open } from "../src/db/ops.mjs";
 import { statePathFor } from "../src/paths.mjs";
 import { withDefaults } from "../src/profile/schema.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
+import { OFFLINE_READS } from "./fixtures/offline-github.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const NWO = "acme/widget";
@@ -36,6 +37,7 @@ const setup = ({ cap = 20, publish = null, withdraw = null } = {}) => {
   const dir = tempDir("reeve-withdraw-");
   const published = [], withdrawn = [];
   const ctx = {
+    ...OFFLINE_READS,
     nwo: NWO, profile: { identity: { key: NWO, defaultBranch: "main" }, authority: { policy: "propose_only" },
       ci: { provider: "github-actions", requiredChecks: [] }, watch: { maxWorkers: 1, maxOpenPrs: cap }, reviewers: [] },
     db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"), haltMarker: join(dir, "HALT"),

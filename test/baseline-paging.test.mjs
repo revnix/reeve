@@ -35,7 +35,9 @@ test("a paged list is read in full with the gh Ubuntu ships, which has no --slur
 });
 
 test("an empty list reads as empty, not as a failure", () => {
-  assert.deepEqual(ghApi("repos/o/r/rulesets", { list: true, exec: gh246([]) }), []);
+  let got;
+  assert.doesNotThrow(() => { got = ghApi("repos/o/r/rulesets", { list: true, exec: gh246([]) }); });
+  assert.deepEqual(got, []);
 });
 
 test("a single read still returns its object", () => {

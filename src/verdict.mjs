@@ -310,6 +310,9 @@ export function computeVerdict(i) {
              || parts.strict == null || (parts.strict && !Number.isInteger(parts.behind)))
       add("mergeable", UNKNOWN, "mergeStateStatus BLOCKED, and what else the base requires couldn't be read", "retry", "read the base's rules again");
     else if (waiting.length) add("mergeable", UNKNOWN, `mergeStateStatus BLOCKED, waiting for required check(s): ${waiting.join(", ")}`, "waiting", "look again once the required checks report");
+    // Only a person settles the base's other requirements, unless a run settles
+    // each of them without anyone. Unmarked, a requirement is a person's.
+    else if (parts.unevaluated.length && parts.unevaluated.every((u) => Array.isArray(parts.settlesAlone) && parts.settlesAlone.includes(u))) add("mergeable", UNKNOWN, `mergeStateStatus BLOCKED, waiting for what the base requires that reeve doesn't evaluate and a run settles: ${parts.unevaluated.join(", ")}`, "waiting", "look again once the base's other requirements settle");
     else if (parts.unevaluated.length) add("mergeable", UNKNOWN, `mergeStateStatus BLOCKED, and the base requires what reeve doesn't evaluate: ${parts.unevaluated.join(", ")}`, "person", "a person decides whether the base's other requirements are met");
     else if (parts.mergeable !== "MERGEABLE") add("mergeable", UNKNOWN, `mergeStateStatus BLOCKED, and GitHub hasn't settled whether the branch merges (${parts.mergeable ?? "unread"})`, "waiting", "look again once GitHub settles whether the branch merges");
     else add("mergeable", PASS, "mergeStateStatus BLOCKED by reeve's own required check, which this verdict decides; nothing else the base requires is outstanding");

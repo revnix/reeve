@@ -11,7 +11,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { computeVerdict, UNKNOWN_KINDS } from "../src/verdict.mjs";
 import { nextAction, ACTIONS, ESCALATIONS } from "../src/watcher.mjs";
-import { evaluatePr, clearRequirements } from "../src/pr.mjs";
+import { evaluatePr, clearRequirements, readMergeParts } from "../src/pr.mjs";
 import { open } from "../src/db/ops.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 
@@ -57,6 +57,9 @@ const CASES = [
   ["the base's other rules unreadable", "mergeable", "retry", blocked({ others: null })],
   ["required checks still running", "mergeable", "waiting", blocked({ others: [{ context: "CI gate", state: "running" }] })],
   ["a requirement reeve doesn't evaluate", "mergeable", "person", blocked({ unevaluated: ["code owners' approval"] })],
+  ["a requirement a run settles without anyone", "mergeable", "waiting", blocked({ unevaluated: ["rule required_deployments"], settlesAlone: ["rule required_deployments"] })],
+  ["one a person settles beside one a run does", "mergeable", "person",
+   blocked({ unevaluated: ["rule required_deployments", "rule required_signatures"], settlesAlone: ["rule required_deployments"] })],
   ["GitHub not settled on merging", "mergeable", "waiting", blocked({ mergeable: "UNKNOWN" })],
 ];
 const verdictFor = mutate => { const i = good(); mutate(i); return computeVerdict(i); };
@@ -126,6 +129,38 @@ test("a clause only a person can settle goes to one before a missing review roun
   const d = nextAction(ev(v), P, { now: 1000, unknownSince: 1000 });
   assert.equal(d.action, ACTIONS.ESCALATE);
   assert.equal(d.why, ESCALATIONS.PROTECTION_UNMET);
+});
+
+test("a requirement a run settles without anyone waits inside the settling window, never going to a person at once", () => {
+  const v = verdictFor(blocked({ unevaluated: ["rule code_scanning"], settlesAlone: ["rule code_scanning"] }));
+  assert.equal(nextAction(ev(v), P, { now: 1000, unknownSince: 1000 }).action, ACTIONS.WAIT);
+});
+
+test("a clause only a person can settle goes to one by its own reason, even past the settling window", () => {
+  const stale = { now: 10_000, unknownSince: 0 };
+  const settling = verdictFor(i => { i.checks = { verdict: "SETTLING", settled: false, failing: [] }; });
+  assert.equal(nextAction(ev(settling), P, stale).why, ESCALATIONS.NOT_CHECKABLE, "control: past the window, anything else isn't checkable");
+  const requirement = verdictFor(blocked({ unevaluated: ["code owners' approval"] }));
+  assert.equal(nextAction(ev(requirement), P, stale).why, ESCALATIONS.PROTECTION_UNMET);
+  const down = verdictFor(i => { i.reviewers = [{ login: "bot", kind: "blocking", state: "REFUSED" }]; });
+  assert.equal(nextAction(ev(down), P, stale).why, ESCALATIONS.REVIEWERS_DOWN);
+});
+
+test("the base's rules a run settles without anyone are marked so, and the rest aren't", () => {
+  const rules = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "ops/merge-policy", integration_id: 1 }] } },
+    { type: "required_deployments", parameters: { required_deployment_environments: ["preview"] } }, { type: "workflows" }, { type: "code_scanning" },
+    { type: "required_signatures" }, { type: "merge_queue" }, { type: "some_future_rule" }];
+  const gh = args => {
+    const path = args.find(a => a.startsWith("repos/"));
+    if (path.includes("/rules/branches/")) return { ok: true, out: rules.map(r => JSON.stringify(r)).join("\n") };
+    if (path.endsWith("/protection")) return { ok: false, err: "gh: Branch not protected (HTTP 404)" };
+    return { ok: true, out: JSON.stringify({ protected: true, protection: { enabled: false, required_status_checks: { contexts: [], checks: [] } } }) };
+  };
+  const parts = readMergeParts("o/r", "kinds-base", { mergeState: "BLOCKED", mergeable: "MERGEABLE", reviewDecision: null, readable: true, unresolved: 0 },
+                               { gh, appId: "1", rows: [] });
+  assert.equal(parts.ownCheckRequired, true, "control: the rules were read");
+  assert.deepEqual(parts.unevaluated, ["rule required_deployments", "rule workflows", "rule code_scanning", "rule required_signatures", "rule merge_queue", "rule some_future_rule"]);
+  assert.deepEqual(parts.settlesAlone, ["rule required_deployments", "rule workflows", "rule code_scanning"]);
 });
 
 test("control: an UNKNOWN reeve only waits on still waits, inside its window", () => {

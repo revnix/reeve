@@ -6,10 +6,17 @@
 // can't. So when a base with a queue reports BLOCKED, the queue isn't among the
 // reasons, and reading it as a requirement only a person can settle made a
 // pull request whose one outstanding check is reeve's own an UNKNOWN for good.
+
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readMergeParts } from "../src/pr.mjs";
+import { readMergeParts, readMergeQueue, evaluateQueueEntry, publishVerdict } from "../src/pr.mjs";
 import { computeVerdict } from "../src/verdict.mjs";
+import { open } from "../src/db/ops.mjs";
+import { join } from "node:path";
+import { tempDir } from "./fixtures/temp.mjs";
+import { run, EVAL } from "./fixtures/tick-harness.mjs";
+import { decisionsFor } from "../src/db/records.mjs";
+import { replayDecisions } from "../src/decisions.mjs";
 
 const OWN = { type: "required_status_checks", parameters: { required_status_checks: [{ context: "ops/merge-policy", integration_id: 1 }, { context: "test", integration_id: 15368 }] } };
 const QUEUE = { type: "merge_queue", parameters: { merge_method: "SQUASH", grouping_strategy: "ALLGREEN", check_response_timeout_minutes: 10 } };
@@ -52,11 +59,6 @@ test("a pull request blocked only by reeve's own check can pass on a base with a
 });
 
 // ── reading the queue, and judging the commit it built ────────────────────────
-
-import { readMergeQueue, evaluateQueueEntry } from "../src/pr.mjs";
-import { open } from "../src/db/ops.mjs";
-import { join } from "node:path";
-import { tempDir } from "./fixtures/temp.mjs";
 
 const HEAD = "a".repeat(40), QUEUED = "c".repeat(40), BASE = "b".repeat(40);
 
@@ -132,17 +134,12 @@ test("the queue's commit settles apart from the pull request's head, and passes 
 
 // ── each tick judges the queue's commits ──────────────────────────────────────
 
-import { run, EVAL } from "./fixtures/tick-harness.mjs";
-import { decisionsFor } from "../src/db/records.mjs";
-import { replayDecisions } from "../src/decisions.mjs";
-import { computeVerdict as recompute } from "../src/verdict.mjs";
-
 /** PR 42 evaluated at its head with every clause passing, on base main. */
 const evaluated = () => ({ ...EVAL, baseRef: "main", head: HEAD, input: passing(), verdict: computeVerdict(passing()) });
 /** The queue holding PR 42 at QUEUED, awaiting its checks. */
 const queued = (entries = [{ pr: 42, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS" }]) => () => ({ ok: true, queue: true, entries });
 /** A queue commit judged PASS from the pull request's input. */
-const judged = ({ entry, input }) => { const i = { ...input, head: entry.sha }; return { ok: true, input: i, verdict: recompute(i) }; };
+const judged = ({ entry, input }) => { const i = { ...input, head: entry.sha }; return { ok: true, input: i, verdict: computeVerdict(i) }; };
 
 test("each tick publishes a verdict on a queued pull request's own commit, beside the one at its head", async () => {
   const published = [];
@@ -185,8 +182,6 @@ test("a queue commit's verdict is kept as a decision record that replays", async
 });
 
 // ── what a queue reads as a failure ───────────────────────────────────────────
-
-import { publishVerdict } from "../src/pr.mjs";
 
 /** The status and conclusion an enforcing publication writes for `verdict`, on a queue commit or not. */
 async function written(verdict, { queue }) {

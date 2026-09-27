@@ -120,8 +120,8 @@ test("the latest decision is the one recorded last, even within the same second"
   // The same second for both, and the later one sorts first by digest, so only
   // the order they were recorded in can tell them apart.
   const [earlier, later] = first.decision.digest > second.decision.digest ? [first, second] : [second, first];
-  saveDecision(db, { at: 1_900_000_000, seq: 9001, pr: 42, head: HEAD, ...earlier });
-  saveDecision(db, { at: 1_900_000_000, seq: 9002, pr: 42, head: HEAD, ...later });
+  assert.doesNotThrow(() => saveDecision(db, { at: 1_900_000_000, seq: 9001, pr: 42, head: HEAD, ...earlier }));
+  assert.doesNotThrow(() => saveDecision(db, { at: 1_900_000_000, seq: 9002, pr: 42, head: HEAD, ...later }));
   assert.equal(latestDecision(db, 42)?.digest, later.decision.digest);
 });
 

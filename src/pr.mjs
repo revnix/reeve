@@ -99,6 +99,64 @@ export function readThreads(nwo, pr, io = null) {
 }
 
 /**
+ * The pull requests queued to merge into `branch`, each with the commit the
+ * queue built for it, which is the commit that merges. Measured in
+ * docs/measured/2026-09-27-merge-queue.md. `sha` is null until the queue has
+ * built the commit. `queue` is false for a branch with no queue. Not ok when
+ * the queue can't be read.
+ */
+export function readMergeQueue(nwo, branch, { gh = ghJson } = {}) {
+  const [owner, name] = String(nwo).split("/");
+  const query = "query($owner:String!,$name:String!,$branch:String!){repository(owner:$owner,name:$name){" +
+    "mergeQueue(branch:$branch){entries(first:100){nodes{state headCommit{oid} baseCommit{oid} pullRequest{number}}}}}}";
+  const r = gh(["graphql", "-f", `query=${query}`, "-f", `owner=${owner}`, "-f", `name=${name}`, "-f", `branch=${branch}`]);
+  if (!r.ok) return { ok: false, why: r.err || "the merge queue couldn't be read" };
+  let queue;
+  try { queue = JSON.parse(r.out)?.data?.repository?.mergeQueue; } catch { return { ok: false, why: "the merge queue's answer couldn't be parsed" }; }
+  if (queue === undefined) return { ok: false, why: "the merge queue's answer had no repository in it" };
+  if (queue === null) return { ok: true, queue: false, entries: [] };
+  const nodes = queue.entries?.nodes;
+  if (!Array.isArray(nodes)) return { ok: false, why: "the merge queue's answer had no entries" };
+  return { ok: true, queue: true, entries: nodes.filter((n) => Number.isInteger(n?.pullRequest?.number)).map((n) => ({
+    pr: n.pullRequest.number, sha: n.headCommit?.oid ?? null, baseSha: n.baseCommit?.oid ?? null, state: n.state ?? null })) };
+}
+
+/**
+ * The verdict on the commit a merge queue built for a pull request (#163). The
+ * queue merges that commit, not the pull request's head, and waits for its
+ * required checks there, so a verdict at the head counts for nothing in the
+ * queue.
+ *
+ * The pull request's own facts carry over from its evaluation this tick
+ * (`input`): its reviews, threads, findings, hold and merge state. CI is read on
+ * the queue's commit and settled apart from the head, under the queue's own key,
+ * so neither resets the other. The base is judged at the queue's base commit.
+ */
+export function evaluateQueueEntry({ nwo, entry, input, baseRef, profile, db = null,
+                                     read = readChecks, requirements = requiredChecksOf }) {
+  if (!entry?.sha) return { ok: false, why: "the queue hasn't built its commit yet" };
+  if (!input) return { ok: false, why: "the pull request wasn't evaluated this tick, so its facts can't carry over" };
+  const reviewerContexts = profile.ci?.reviewerStatusContexts ?? [];
+  const got = read(nwo, entry.sha, { reviewerContexts });
+  const req = requirements({ nwo, baseRef, profile });
+  const c = classifyRead(got, req);
+  const reading = { ...c, sha: entry.sha, rows: got?.rows ?? [],
+    suitesComplete: c.verdict === "MISSING_REQUIRED" ? missingSettled(nwo, entry.sha, c.missingChecks, profile) : null };
+  const key = `${nwo}@merge-queue`;
+  const s = db ? saveSettlement(db, key, entry.pr, settle(loadSettlement(db, key, entry.pr), reading))
+    : { ...settle(null, reading), settled: false, why: "settlement needs a state store to compare readings across ticks" };
+  // For health, as evaluatePr judges the base: only failures on it count.
+  const health = { required: profile.ci?.requiredChecks ?? [] };
+  const base = entry.baseSha ? classifyRead(read(nwo, entry.baseSha, { reviewerContexts }), health, { evidence: false })
+    : { verdict: "UNKNOWN", readable: false, why: "the queue's base commit isn't known" };
+  const queued = { ...input, head: entry.sha,
+    checks: { verdict: s.verdict, settled: s.settled, why: s.why, readable: c.readable !== false, failing: c.failing, inherited: [],
+              impostors: got?.impostors ?? [], shadowRequired: req.shadowRequired },
+    base: { verdict: base.verdict, readable: base.readable !== false } };
+  return { ok: true, input: queued, verdict: computeVerdict(queued) };
+}
+
+/**
  * The parts of GitHub's mergeability that reeve can read, for when
  * mergeStateStatus is BLOCKED and the verdict has to take it apart: whether the
  * branch conflicts, the review decision, whether reeve's own check is required on
@@ -836,8 +894,12 @@ function othersPassUnder(token, nwo, sha, context, runs, api) {
 
 // Rule types that can't stop a pull request merging into a branch that already
 // exists: they govern creating, deleting and force-pushing the branch. Linear
-// history rules out merge commits, and squash and rebase merges still merge.
-const HARMLESS_RULES = new Set(["creation", "deletion", "non_fast_forward", "required_linear_history"]);
+// history rules out merge commits, and squash and rebase merges still merge. A
+// merge queue is where a pull request merges, not a reason it can't: measured
+// (docs/measured/2026-09-27-merge-queue.md), GitHub reports one whose required
+// checks pass as CLEAN under a required queue, so the queue is never why it's
+// BLOCKED. Its own commit is judged apart, in the queue (#163).
+const HARMLESS_RULES = new Set(["creation", "deletion", "non_fast_forward", "required_linear_history", "merge_queue"]);
 // Rule types reeve doesn't evaluate either, but that a run settles without
 // anyone: a deployment, a required workflow, a code scan, an automatic review.
 // Waiting settles them, where the rest need a person.

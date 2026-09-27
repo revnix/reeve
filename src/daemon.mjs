@@ -14,7 +14,8 @@
 //     it WOULD do. Shipping a loop that acts before its decisions have been
 //     watched is how an unattended run becomes an incident.
 
-import { evaluatePr, publishVerdict, withdrawVerdict, prAnchor, isBuilderPr, clearRequirements, shadowContextOf, treeOf } from "./pr.mjs";
+import { evaluatePr, publishVerdict, withdrawVerdict, prAnchor, isBuilderPr, clearRequirements, shadowContextOf, treeOf,
+         readMergeQueue, evaluateQueueEntry } from "./pr.mjs";
 import { PASS } from "./verdict.mjs";
 import { nextAction, describe, ACTIONS, ESCALATIONS } from "./watcher.mjs";
 import { POLICY_CONTEXT, reconcilePr } from "./github/reconciler.mjs";
@@ -2425,6 +2426,65 @@ export async function tick(ctx) {
     await takeBackAll("the merge policy is halted");
     announce();
     return haltStop("HALTED after the pull requests were checked");
+  }
+
+  // ── the merge queue (#163) ──────────────────────────────────────────────────
+  // A queue merges the commit it builds for each pull request, not the pull
+  // request's head, and waits for its required checks there. Measured, a verdict
+  // at the head counts for nothing in the queue, and a queue commit nothing
+  // answers is dropped at the queue's timeout. So each queued pull request's
+  // commit is judged here, from what this tick found at its head, and the
+  // verdict is published on that commit and kept with its evidence.
+  //
+  // Kept apart from the pull request's own publications, as `queue.published`.
+  // A queue commit isn't one of the pull request's heads, so it's never taken
+  // back as a head the pull request moved on from. And the queue merges within
+  // seconds of a pass (34 s measured), so no PASS stands there for a stop to take
+  // back.
+  const evaluatedHere = new Map(decisions.map(({ e }) => [e.pr, e]));
+  const queueBases = new Set([...evaluatedHere.values()].map((e) => e.baseRef ?? profile.identity?.defaultBranch).filter(Boolean));
+  for (const base of queueBases) {
+    let q;
+    try { q = (ctx.readQueue ?? readMergeQueue)(nwo, base); }
+    catch (err) { q = { ok: false, why: err.message }; }
+    if (!q.ok) { log(logPath, `  merge queue for ${base}: could not read — ${q.why}`); continue; }
+    for (const entry of q.entries) {
+      if (!entry.sha) continue;
+      const at = `#${entry.pr} queued at ${entry.sha.slice(0, 10)}`;
+      const e = evaluatedHere.get(entry.pr);
+      if (!e?.input) { log(logPath, `  ${at}: not judged — the pull request wasn't evaluated this tick`); continue; }
+      let j;
+      try { j = (ctx.evaluateQueue ?? evaluateQueueEntry)({ nwo, entry, input: e.input, baseRef: base, profile, db }); }
+      catch (err) { j = { ok: false, why: err.message }; }
+      if (!j.ok) { log(logPath, `  ${at}: not judged — ${j.why}`); continue; }
+      let kept = null;
+      try {
+        kept = recordsFor({ nwo, pr: entry.pr, head: entry.sha, tree: (ctx.treeOf ?? treeOf)(nwo, entry.sha), input: j.input,
+                            verdict: j.verdict, policy: policyFor(profile), code,
+                            observedAt: new Date(now() * 1000).toISOString() });
+      } catch (err) {
+        log(logPath, `  ${at}: what this verdict was judged from could not be recorded — ${err.message}`);
+      }
+      try {
+        tx(db, () => {
+          const decided = db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
+            .run(now(), "daemon", "queue.decided", `pr:${entry.pr}`, JSON.stringify({
+              head: entry.sha, base: entry.baseSha, state: j.verdict.state, summary: j.verdict.summary,
+              clauses: j.verdict.clauses.map((c) => ({ id: c.id, state: c.state })),
+              record: kept?.decision.digest ?? null,
+            }));
+          if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr: entry.pr, head: entry.sha, ...kept });
+        });
+      } catch (err) {
+        log(logPath, `  ${at}: the verdict could not be kept — ${err.message}`);
+      }
+      let pub;
+      try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict: j.verdict, shadow, base }); }
+      catch (thrown) { pub = { ok: false, why: thrown.message }; }
+      log(logPath, `  ${at}: ${j.verdict.state}${pub.ok ? "" : ` — could not publish: ${pub.why}`}`);
+      if (pub.ok) notePublication(db, entry.pr, "queue.published",
+        { head: entry.sha, state: j.verdict.state, name: pub.name ?? (shadow ? shadowContextOf(POLICY_CONTEXT) : POLICY_CONTEXT), id: pub.id ?? null });
+    }
   }
 
   // A PASS left at a pull request this tick didn't list (#161), asked of GitHub

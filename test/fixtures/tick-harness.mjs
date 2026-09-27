@@ -87,7 +87,8 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
                     queuedRequests, cancelQueued, measureContainment, noteRateLimit,
                     carriedReleases, carriedCooldowns, providerBind,
                     resolveRepoIdFn, project, keepDir = false, seams = null,
-                    haltMarker, openPrs, containment, ticks = 1, dbPath, evaluate, treeOf, code, codeVersion } = {}) => {
+                    haltMarker, openPrs, containment, ticks = 1, dbPath, evaluate, treeOf, code, codeVersion,
+                    readQueue, evaluateQueue, publish, withdraw } = {}) => {
   const dir = tempDir("reeve-prov-");
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
@@ -187,7 +188,12 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     ...(treeOf ? { treeOf } : {}),
     ...(code ? { code } : {}),
     ...(codeVersion ? { codeVersion } : {}),
-    publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    publish: publish ?? (async () => ({ ok: true, id: 1, conclusion: "neutral" })),
+    // The merge queue (#163): what it holds, and how its commit is judged. Unset,
+    // the queue is the offline read's, which holds nothing.
+    ...(readQueue ? { readQueue } : {}),
+    ...(evaluateQueue ? { evaluateQueue } : {}),
+    ...(withdraw ? { withdraw } : {}),
     spawnWorker: spawnWorker ?? (async a => { spawned.push(a); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }; }),
     ...(heartbeatMs != null ? { heartbeatMs } : {}),
     ...(providerHeartbeat ? { providerHeartbeat } : {}),

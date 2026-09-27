@@ -1,0 +1,44 @@
+# Measured: how GitHub's merge queue treats reeve's required check
+
+Date: 2026-09-27. Repository: `nextlyhq/merge-queue-sandbox`, public, made for
+this measurement (#163). The Merge Policy app is installed on it.
+
+`main`'s ruleset:
+- requires a pull request, merged by squash, with no approval;
+- requires two checks: `test` from GitHub Actions (App 15368), which runs on
+  `pull_request` and `merge_group`, and `ops/merge-policy` from the Merge
+  Policy app (App 4660593);
+- requires a merge queue: squash, grouped all green, and a check timeout of 10
+  minutes.
+
+Pull requests were queued with GraphQL's `enqueuePullRequest`. `ops/merge-policy`
+was published by hand as the app, as an enforcing reeve would publish it.
+
+| Step | What GitHub did |
+|---|---|
+| A pull request with `test` passing and no `ops/merge-policy` | `mergeStateStatus` BLOCKED. reeve read the base's rules as requiring `ops/merge-policy`, with `rule merge_queue` among what it doesn't evaluate. |
+| `ops/merge-policy` passing on the pull request's head | `mergeStateStatus` CLEAN. A required queue doesn't make a pull request BLOCKED. |
+| Queued (14:55:26 UTC) | Within 28 seconds it built a commit, 149edfc, on the branch `gh-readonly-queue/main/pr-1-<base sha>`. `mergeQueue.entries` and the pull request's `mergeQueueEntry` showed the entry `AWAITING_CHECKS`, with that commit as `headCommit`. `test` ran on it and passed. The pull request stayed CLEAN. |
+| Nothing published on the queue's commit | At 15:06:13 GitHub removed the entry, with the reason `checks_timed_out`. That's 10 minutes 47 seconds after queuing. The pull request stayed open and CLEAN, and the queue's branch was deleted. The pass on the pull request's head counted for nothing there. |
+| Queued again. `ops/merge-policy` passed on the new queue commit, 56e3345, at 15:06:53 | Merged at 15:07:27, 34 seconds later. `main`'s head became 56e3345, the queue's commit itself. |
+| A second pull request queued. `ops/merge-policy` failed on its queue commit, 6ff3054, at 15:08:17 | Removed at 15:08:49, with the reason `failed_checks`. The pull request stayed open. |
+
+## What followed
+
+- **The queue commit is what merges.** A required check has to pass on it, and a
+  pass on the pull request's head doesn't count there. So reeve judges each
+  queue entry's own commit, and publishes on it.
+- **The queue commit's verdict:**
+  - The pull request's own facts carry over: its reviews, threads, findings and
+    holds.
+  - CI is read on the queue's commit, and settled apart from the pull request's
+    head.
+  - The base is judged at the queue's base commit.
+- **A merge queue on the base isn't a requirement only a person can settle.**
+  GitHub reports a pull request whose required checks pass as CLEAN under a
+  required queue. So when such a base reports BLOCKED, the queue isn't the
+  reason, and reeve counts `merge_queue` among the rules that can't stop a merge.
+- **Timing.** Nextly's queue waits 60 minutes for checks. A daemon that polls every
+  5 minutes, and settles CI over three readings, answers within about 15 minutes of
+  the queue's own checks finishing. The sandbox's 10 minutes is too short for that,
+  so its timeout goes up for the end-to-end test.

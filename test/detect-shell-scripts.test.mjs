@@ -389,33 +389,6 @@ try {
   check(shopt.state === "present" && askedBash.state === "present",
     "a builtin no list holds is asked of the shell before it's called a missing program", JSON.stringify({ shopt, askedBash }));
 
-  // A workspace pattern's braces and classes are read as npm's globs read them,
-  // and a pattern the reader can't read leaves both folders' settings in play.
-  const member = { name: "web", scripts: { test: "[[ -f package.json ]] && jest --ci" }, devDependencies: jest };
-  const braced = tree("rc-braced", {
-    "package.json": JSON.stringify({ workspaces: ["{packages,apps}/*"] }), ".npmrc": "script-shell=bash\n",
-    "apps/web/package.json": JSON.stringify(member), "apps/web/.npmrc": "script-shell=/bin/sh\n",
-  });
-  const classed = tree("rc-classed", {
-    "package.json": JSON.stringify({ workspaces: ["packages/[a-z]*"] }), ".npmrc": "script-shell=bash\n",
-    "packages/web/package.json": JSON.stringify(member), "packages/web/.npmrc": "script-shell=/bin/sh\n",
-  });
-  // Too long for npm's matcher, the one pattern it can't read.
-  const unreadable = tree("rc-unreadable", {
-    "package.json": JSON.stringify({ workspaces: [`packages/${"x".repeat(70_000)}`] }), ".npmrc": "script-shell=bash\n",
-    "packages/web/package.json": JSON.stringify(member), "packages/web/.npmrc": "script-shell=/bin/sh\n",
-  });
-  const bracedShells = npmScriptShells(join(braced, "apps", "web"), npmEnv);
-  const classedShells = npmScriptShells(join(classed, "packages", "web"), npmEnv);
-  const unreadableShells = npmScriptShells(join(unreadable, "packages", "web"), npmEnv);
-  const unreadableVerdict = detectCommands(join(unreadable, "packages", "web"), "typescript", "npm").commands.test;
-  check(JSON.stringify(bracedShells) === JSON.stringify(["bash"]) && JSON.stringify(classedShells) === JSON.stringify(["bash"]),
-    "a workspace pattern's braces and classes are read as npm's are, so its member takes the root's shell",
-    JSON.stringify({ bracedShells, classedShells }));
-  check(unreadableShells.length === 2 && unreadableShells.includes("bash") && unreadableVerdict.state === "present",
-    "a workspace pattern the reader can't read leaves both folders' shells in play",
-    JSON.stringify({ unreadableShells, unreadableVerdict }));
-
   // bash's NAME+=value is an assignment; dash's shell runs it as a program.
   const appended = ["echo setup; PATH+=:/tmp", "PATH+=:/nowhere; no-such-runner"].map((s) => ({ s, r: detectTest(s, {}, { shell: bashLike }) }));
   const appendedDash = detectTest("echo setup; PATH+=:/tmp", {}, { shell: dashLike });

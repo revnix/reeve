@@ -54,6 +54,23 @@ A blank cell wasn't run.
 | `["**", "!bar"]` | bar/x, foo |
 | `["bar/"]` | bar |
 
+## A leading slash, an extglob and a backslash
+
+Folders foo and bar. pnpm 10 is 10.28.1, pnpm 12 is 12.5.1, yarn 3 is 3.8.7, yarn 4 is 4.14.1, and bun 1.2 is 1.2.14.
+
+| Patterns | npm | pnpm 10 | pnpm 12 | yarn 1 | yarn 3 | yarn 4 | bun 1.2 | bun 1.4.2 |
+|---|---|---|---|---|---|---|---|---|
+| `["*", "!/bar"]` | foo | bar, foo | bar, foo | bar, foo | bar, foo | bar, foo | bar, foo | bar, foo |
+| `["/bar"]` | bar | none | none | none | none | none | refused | refused |
+| `["b?(a)r"]` | bar | bar | refused: `ERR_PNPM_WORKSPACE_INVALID_GLOB` | bar | bar | bar | none | none |
+| `["*", "!b?(a)r"]` | foo | foo | refused | bar, foo | foo | foo | bar, foo | bar, foo |
+| `["*", "!b\\ar"]` | foo | foo | refused | bar, foo | foo | foo | bar, foo | foo |
+
+So:
+- Only npm drops a leading slash. The others keep it, and it matches no folder.
+- An extglob is read by npm, pnpm 10 and yarn, refused by pnpm 12, and matched by no bun.
+- A backslash is an escape to npm, pnpm 10 and yarn 3 and 4, where Node's matcher (`path.matchesGlob`) reads it as a separator.
+
 ## pnpm-workspace.yaml: a flow list with a comment line
 
 | File | pnpm 10.28.1 | pnpm 12.5.1 |
@@ -107,6 +124,13 @@ With no dependency and no member, none of them wrote a lockfile.
     it answers only where the versions it could be agree.
   - For bun, it answers only where no exclusion could matter.
   - A folder it can't answer for takes no package manager, and a note says so.
-- A comment line inside a flow list is skipped, indented or not.
+- A comment line inside a flow list is skipped, indented or not. An item with
+  no indent, which pnpm 10 reads and pnpm 12 refuses, leaves pnpm's answer
+  unknown.
+- A backslash leaves every manager's answer unknown. An extglob leaves pnpm's
+  unknown, and a folder that only an extglob lists is unknown for bun. A
+  leading slash stays literal except for npm, and bun refuses a list with one.
+- A yarnPath and a packageManager that name different yarns leave both
+  readings open.
 - `bun.lock` names bun, as `bun.lockb` does, and the two together are one
   package manager, not a question.

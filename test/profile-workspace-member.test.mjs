@@ -234,3 +234,60 @@ test("a comment line with no indent inside a flow list is skipped, not read into
   });
   assert.equal(unit(root, "e2e").packageManager, "pnpm");
 });
+
+// ── what the managers read differently, from #266's review ─────────────────
+
+/** Whether detection says it can't tell whether the root's workspace lists `id`. */
+const untold = (root, id) => new RegExp(`unit ${id}: whether the root's \\w+ workspace lists it can't be told`).test(detectUnits(root).notes.join("\n"));
+
+test("a backslash, which npm reads as an escape and Node's matcher as a separator, leaves the answer unknown", () => {
+  assert.equal(listed(["*", "!b\\ar"], "bar"), null);
+  const { root, members } = inheritors(["*", "!b\\ar"], { "yarn.lock": "" }, { packageManager: "yarn@4.14.1" });
+  assert.deepEqual(members, [], "every folder's membership is unknown");
+  assert.ok(untold(root, "bar"));
+});
+
+test("a yarnPath that names another yarn than packageManager leaves open which one runs", () => {
+  const { root, members } = inheritors(["!bar", "*"], { "yarn.lock": "", ".yarnrc.yml": "yarnPath: .yarn/releases/yarn-3.8.7.cjs\n" },
+                                       { packageManager: "yarn@4.14.1" });
+  assert.deepEqual(members, ["foo"]);
+  assert.ok(untold(root, "bar"), "yarn 3 lists bar, and yarn 4 doesn't");
+});
+
+/** A pnpm workspace whose pnpm-workspace.yaml is `yaml`, with folders foo and bar. */
+function pnpmWorkspace(yaml) {
+  const root = checkout({
+    "package.json": { name: "root", scripts, devDependencies },
+    "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+    "pnpm-workspace.yaml": yaml,
+    "foo/package.json": { name: "foo", scripts, devDependencies },
+    "bar/package.json": { name: "bar", scripts, devDependencies },
+  });
+  return { root, members: ["foo", "bar"].filter(id => unit(root, id).packageManager !== null) };
+}
+
+test("pnpm keeps a leading slash in a pattern literal, so it matches no folder", () => {
+  assert.deepEqual(pnpmWorkspace("packages:\n  - '*'\n  - '!/bar'\n").members, ["foo", "bar"]);
+  assert.deepEqual(pnpmWorkspace("packages:\n  - '/bar'\n").members, []);
+});
+
+test("an extglob, which pnpm 12 refuses and pnpm 10 reads, leaves pnpm's answer unknown", () => {
+  const { root, members } = pnpmWorkspace("packages:\n  - 'b?(a)r'\n");
+  assert.deepEqual(members, []);
+  assert.ok(untold(root, "bar"));
+});
+
+test("a flow-list item with no indent, which pnpm 12 refuses and pnpm 10 reads, leaves pnpm's answer unknown", () => {
+  const { root, members } = pnpmWorkspace('packages: [\n# Browser tests\n"foo"\n]\n');
+  assert.deepEqual(members, []);
+  assert.ok(untold(root, "foo"));
+});
+
+test("bun, which matches no extglob and refuses a leading slash, leaves either unknown", () => {
+  const extglob = inheritors(["b?(a)r", "foo"], { "bun.lockb": "" });
+  assert.deepEqual(extglob.members, ["foo"], "control: a plain name still lists its folder");
+  assert.ok(untold(extglob.root, "bar"));
+  const slash = inheritors(["*", "/bar"], { "bun.lockb": "" });
+  assert.deepEqual(slash.members, [], "bun refuses the whole list");
+  assert.ok(untold(slash.root, "foo"));
+});

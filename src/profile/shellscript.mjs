@@ -99,9 +99,11 @@ const envReplace = (value, env) => value.replace(/(?<!\\)(\\*)\$\{([^${}?]+)(\?)
 //   - a pattern whose text a standing exclusion matches is dropped;
 //   - a folder is listed when a pattern left matches it and no exclusion does.
 // Globs are read with Node's matcher, which is npm's (minimatch). Null when a
-// pattern can't be read.
+// pattern can't be read, or holds a backslash, which npm reads as an escape and
+// Node's matcher as a separator.
 export function listed(patterns, rel) {
   const path = rel.split(sep).join("/");
+  if (patterns.some((p) => typeof p === "string" && p.includes("\\"))) return null;
   const include = [], exclude = [];
   try {
     for (const pattern of patterns) {

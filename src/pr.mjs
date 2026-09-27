@@ -220,6 +220,10 @@ export function requiredChecksOf({ nwo, baseRef, profile = /** @type {CiProfile}
  */
 export function classifyRead(read, { required = [], known = true } = {}, { evidence = true } = {}) {
   const c = classify(read?.rows ?? [], required, { requiredKnown: known, evidence });
+  // Checks judged while the base's requirements couldn't be read are read again,
+  // whatever else left them unknown, no check reported yet say: only reading
+  // the requirements again settles them.
+  if (read?.ok && evidence && !known && c.verdict === "UNKNOWN") return { ...c, readable: false };
   if (read?.ok || c.verdict === "RED") return c;
   return { verdict: "UNKNOWN", readable: false, failing: [], running: [], why: `the checks couldn't be read in full: ${read?.why ?? "nothing was read"}` };
 }

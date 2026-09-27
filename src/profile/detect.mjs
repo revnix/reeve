@@ -29,23 +29,27 @@ export function detectIdentity(root) {
   return { key, defaultBranch };
 }
 
-/** Package manager from lockfiles. Two lockfiles is a QUESTION, never a pick. */
+/**
+ * Package manager from lockfiles. Two managers' lockfiles is a QUESTION, never a
+ * pick. bun 1.2 and later write bun.lock, and earlier ones bun.lockb: both are bun.
+ */
 export function detectPackageManager(dir) {
   const locks = [
     ["pnpm", "pnpm-lock.yaml"], ["npm", "package-lock.json"],
-    ["yarn", "yarn.lock"], ["bun", "bun.lockb"],
+    ["yarn", "yarn.lock"], ["bun", "bun.lock"], ["bun", "bun.lockb"],
     ["uv", "uv.lock"], ["poetry", "poetry.lock"], ["pdm", "pdm.lock"],
   ].filter(([, f]) => existsSync(join(dir, f)));
+  const managers = [...new Set(locks.map(([m]) => m))];
 
-  if (locks.length === 0) return { value: null, question: null };
-  if (locks.length === 1) return { value: locks[0][0], question: null };
+  if (managers.length === 0) return { value: null, question: null };
+  if (managers.length === 1) return { value: managers[0], question: null };
   return {
     value: null,
     question: {
       field: "units[].packageManager",
       why: `${locks.length} lockfiles are tracked and they can disagree`,
       evidence: locks.map(([m, f]) => `${f} (${m})`).join(", "),
-      options: locks.map(([m]) => m),
+      options: managers,
     },
   };
 }
@@ -53,7 +57,8 @@ export function detectPackageManager(dir) {
 /**
  * The member globs of the workspace the root declares, for the manager that owns
  * it: pnpm keeps them in pnpm-workspace.yaml; npm, yarn and bun in package.json's
- * `workspaces`, as a list or as `{ packages: [...] }`.
+ * `workspaces`, as a list or as `{ packages: [...] }`. Null when the list is one
+ * the manager's versions read differently.
  */
 export function workspaceGlobs(root, manager) {
   if (manager === "pnpm") {
@@ -70,15 +75,81 @@ export function workspaceGlobs(root, manager) {
 }
 
 /**
- * Whether a folder the root holds is a member of its workspace. npm, yarn and bun
- * read the patterns in order, and the last that matches decides, as `listed`
- * does for npm's own workspaces. pnpm reads a `!` pattern as an exclusion,
- * wherever it stands.
+ * The majors of yarn that may own a root, among those measured (1 to 4):
+ *   - each one `packageManager` or `.yarnrc.yml`'s `yarnPath` setting names,
+ *     since a yarnPath runs in place of the version packageManager names;
+ *   - 2 to 4 for a `.yarnrc.yml`, or a lockfile that yarn 2 or later wrote;
+ *   - 1 for yarn 1's lockfile;
+ *   - all four when nothing says.
  */
-function isMember(rel, globs, manager) {
-  if (manager !== "pnpm") return listed(globs, rel) === true;
-  const hit = g => matchesGlob(rel, g.replace(/^\.\//, "").replace(/\/+$/, ""));
-  return globs.some(g => !g.startsWith("!") && hit(g)) && !globs.some(g => g.startsWith("!") && hit(g.slice(1)));
+function yarnMajors(root) {
+  const declared = readJson(join(root, "package.json"))?.packageManager;
+  let rc = "", lock = "";
+  try { rc = readFileSync(join(root, ".yarnrc.yml"), "utf8"); } catch { /* none */ }
+  try { lock = readFileSync(join(root, "yarn.lock"), "utf8").slice(0, 500); } catch { /* none */ }
+  const byManager = typeof declared === "string" ? /^yarn@(\d+)\./.exec(declared)?.[1] : undefined;
+  // Only the yarnPath setting names a yarn, not a file name elsewhere, in a
+  // comment say. One whose version can't be read is some yarn from 2 up.
+  const yarnPath = /^yarnPath:\s*["']?([^"'#\s]+)/m.exec(rc)?.[1];
+  const byPath = yarnPath === undefined ? undefined : /yarn-(\d+)\.\d+\.\d+\.c?js$/.exec(yarnPath)?.[1] ?? "unread";
+  const berry = [2, 3, 4];
+  const named = [byManager, byPath].filter(v => v !== undefined).map(Number);
+  if (named.length) return [...new Set(named.flatMap(m => (m >= 1 && m <= 4 ? [m] : berry)))];
+  if (rc || /^__metadata:/m.test(lock)) return berry;
+  return /yarn lockfile v1/.test(lock) ? [1] : [1, ...berry];
+}
+
+/**
+ * Whether a folder the root holds is a member of its workspace, as the manager
+ * that owns it reads the patterns. They read an exclusion (`!`) in four ways,
+ * measured in docs/measured/2026-09-27-workspace-membership.md:
+ *   npm            it stands until a later pattern's own text matches it (`listed`);
+ *   pnpm, yarn 4   it wins, wherever it stands;
+ *   yarn 2 and 3   the last pattern that matches decides;
+ *   yarn 1         it's no pattern at all;
+ *   bun            differently from one version to the next.
+ * Only npm drops a leading slash; the others keep it, so it matches no folder.
+ * True, false, or null when it can't be told: a list the manager's versions
+ * read differently, a yarn whose possible versions disagree, or bun where an
+ * exclusion or an extglob could matter.
+ */
+function isMember(rel, globs, manager, root) {
+  if (manager === "npm") return listed(globs, rel);
+  if (globs === null) return null;
+  try {
+    const hit = g => matchesGlob(rel, g.replace(/^!/, "").replace(/^\.\//, "").replace(/\/+$/, ""));
+    // The folder's path with its slash too, which `bar/**` reaches.
+    const asFolder = g => hit(g) || matchesGlob(`${rel}/`, g.replace(/^!/, "").replace(/^\.\//, "").replace(/\/+$/, ""));
+    const extglob = g => /[?*+@!]\(/.test(g.replace(/^!/, ""));
+    // What a manager reads unlike Node's matcher leaves its answer unknown: a
+    // backslash, an escape to each manager and a separator to the matcher; an
+    // extglob, which pnpm 12 refuses and pnpm 10 reads; a leading slash, for
+    // which bun refuses the whole list.
+    if (globs.some(g => g.includes("\\"))) return null;
+    if (manager === "pnpm" && globs.some(extglob)) return null;
+    if (manager === "bun" && globs.some(g => /^!?\//.test(g))) return null;
+    // Repeated bangs, which yarn 3 and 4 read their own ways.
+    if (manager === "yarn" && globs.some(g => g.startsWith("!!"))) return null;
+    const exclusions = globs.filter(g => g.startsWith("!"));
+    // Measured: `bar/**` lists bar for pnpm, yarn 1 and bun, and not for yarn 3
+    // or 4; `!bar/**` excludes it for pnpm and yarn 3 and 4, and not for bun.
+    const included = globs.some(g => !g.startsWith("!") && asFolder(g));
+    const exclusionWins = included && !exclusions.some(asFolder);
+    if (manager === "pnpm") return exclusionWins;
+    if (manager === "bun") {
+      // bun matches no extglob, so a folder only one lists is unknown.
+      const plainly = globs.some(g => !g.startsWith("!") && !extglob(g) && asFolder(g));
+      if (plainly && !exclusions.some(hit)) return true;
+      return exclusions.length || included ? null : false;
+    }
+    if (manager !== "yarn") return false;
+    const berryIncluded = globs.some(g => !g.startsWith("!") && hit(g));
+    const lastWins = globs.reduce((member, g) => (g.startsWith("!") ? (asFolder(g) ? false : member) : hit(g) || member), false);
+    const berryExclusionWins = berryIncluded && !exclusions.some(asFolder);
+    const reading = { 1: included, 2: lastWins, 3: lastWins, 4: berryExclusionWins };
+    const readings = new Set(yarnMajors(root).map(m => reading[m]));
+    return readings.size === 1 ? [...readings][0] : null;
+  } catch { return null; }
 }
 
 /**
@@ -119,7 +190,8 @@ function flowItems(body) {
 /**
  * The string items of a top-level list, in YAML as pnpm-workspace.yaml writes it:
  * a block list under the key, with comments and blank lines among the items, or a
- * flow list on the key's own line. Anything else reads as no list.
+ * flow list on the key's own line. Anything else reads as no list, and a flow
+ * list that pnpm 12 refuses, and pnpm 10 reads, as null.
  */
 function yamlList(text, key) {
   const lines = text.split(/\r?\n/);
@@ -129,10 +201,18 @@ function yamlList(text, key) {
   const rest = lines[at].slice(key.length + 1).replace(/\s#.*$/, "").trim();
   if (rest.startsWith("[")) {
     // A flow list may run across lines, so read on to its closing bracket.
-    let flow = rest;
-    for (let n = at + 1; flowEnd(flow) < 0 && n < lines.length; n++) flow += " " + lines[n].replace(/\s#.*$/, "").trim();
+    let flow = rest, unindented = false;
+    for (let n = at + 1; flowEnd(flow) < 0 && n < lines.length; n++) {
+      // A line that is only a comment is skipped, indented or not.
+      if (/^\s*#/.test(lines[n])) continue;
+      // An item with no indent, which pnpm 10 reads and pnpm 12 refuses.
+      if (/^[^\s\]]/.test(lines[n])) unindented = true;
+      flow += " " + lines[n].replace(/\s#.*$/, "").trim();
+    }
     const end = flowEnd(flow);
     if (end < 0) return [];
+    // Which pnpm owns the checkout isn't known, so neither reading is taken.
+    if (unindented) return null;
     return flowItems(flow.slice(1, end)).map(unquote).filter(Boolean);
   }
   const out = [];
@@ -363,9 +443,12 @@ export function detectUnits(root) {
     const language = detectLanguage(dir);
     if (!language) continue;
     let pm = rel === "." ? rootPm : detectPackageManager(dir);
-    if (rel !== "." && pm.value === null && !pm.question && language === "typescript" && isMember(rel, globs, rootPm.value)) {
+    const member = rel !== "." && pm.value === null && !pm.question && language === "typescript" ? isMember(rel, globs, rootPm.value, root) : false;
+    if (member === true) {
       pm = { value: rootPm.value, question: null };
       notes.push(`unit ${rel}: no lockfile of its own, and a member of the root's ${rootPm.value} workspace, so it uses ${rootPm.value}`);
+    } else if (member === null) {
+      notes.push(`unit ${rel}: whether the root's ${rootPm.value} workspace lists it can't be told, so it has no package manager; name one in the profile if it has`);
     }
     if (pm.question) questions.push({ ...pm.question, unit: rel });
     const { commands, questions: cq } = detectCommands(dir, language, pm.value);

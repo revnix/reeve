@@ -183,7 +183,8 @@ const FAILED = `echo "gh: HTTP 502" >&2; exit 1`;
  */
 function clausesAfterATick(fail = []) {
   const bin = tempDir("reeve-kinds-bin-");
-  const answer = (what, ok) => (fail.includes(what) ? FAILED : ok);
+  // "No check at the head" reads the head's check runs whole, and finds none.
+  const answer = (what, ok) => (fail.includes(what) ? FAILED : what === "the head's check runs" && fail.includes("no check at the head") ? ":" : ok);
   const page = JSON.stringify({ data: { repository: { pullRequest: { mergeStateStatus: "CLEAN", mergeable: "MERGEABLE", reviewDecision: null,
     reviews: { totalCount: 0 }, reviewThreads: { totalCount: 0, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } } });
   const rule = `echo '{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"CI Gate"}]}}'`;
@@ -193,7 +194,7 @@ function clausesAfterATick(fail = []) {
   */check-suites*) echo '[{"app":{"slug":"github-actions"},"status":"completed"}]';;
   */rules/branches/*) ${answer("the base's rules", rule)};;
   */branches/main) echo '{"protected":true,"protection":{"enabled":false}}';;
-  */commits/${HEAD_SHA}/check-runs*) echo '${runJson("success")}';;
+  */commits/${HEAD_SHA}/check-runs*) ${answer("the head's check runs", `echo '${runJson("success")}'`)};;
   */commits/${HEAD_SHA}/status*) ${answer("the head's statuses", ":")};;`;
   writeFileSync(join(bin, "gh"), `#!/bin/sh\nfor a in "$@"; do case "$a" in repos/*|graphql) p="$a";; esac; done\ncase "$p" in\n${answers}\n  *) ;;\nesac\n`, { mode: 0o755 });
   const pin = fail.includes("the base's head") ? "exit 1" : `[ "$1" = ls-remote ] && printf '%s\\trefs/heads/main\\n' ${BASE_SHA}`;
@@ -220,4 +221,11 @@ test("a check read that failed is a retry through evaluatePr, never checks still
     assert.equal(c?.state, "UNKNOWN", `control: ${read} unread leaves ${id} unknown`);
     assert.equal(c?.kind, "retry", `${read} unread`);
   }
+});
+
+test("a head with no check yet, whose base's rules couldn't be read, is a retry: reading the rules again is what settles it", () => {
+  assert.equal(clausesAfterATick(["no check at the head"]).ci?.kind, "waiting", "control: with the rules read, no check yet waits for one");
+  const c = clausesAfterATick(["no check at the head", "the base's rules"]).ci;
+  assert.equal(c?.state, "UNKNOWN", "control: the head's CI is unknown");
+  assert.equal(c?.kind, "retry");
 });

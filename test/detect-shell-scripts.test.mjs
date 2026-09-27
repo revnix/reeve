@@ -389,27 +389,6 @@ try {
   check(shopt.state === "present" && askedBash.state === "present",
     "a builtin no list holds is asked of the shell before it's called a missing program", JSON.stringify({ shopt, askedBash }));
 
-  // A workspace pattern's braces are expanded as npm's globs expand them, and a
-  // pattern the reader can't match leaves both folders' settings in play.
-  const braced = tree("rc-braced", {
-    "package.json": JSON.stringify({ workspaces: ["{packages,apps}/*"] }), ".npmrc": "script-shell=bash\n",
-    "apps/web/package.json": JSON.stringify({ name: "web", scripts: { test: "[[ -f package.json ]] && jest --ci" }, devDependencies: jest }),
-    "apps/web/.npmrc": "script-shell=/bin/sh\n",
-  });
-  const classed = tree("rc-classed", {
-    "package.json": JSON.stringify({ workspaces: ["packages/[a-z]*"] }), ".npmrc": "script-shell=bash\n",
-    "packages/web/package.json": JSON.stringify({ name: "web", scripts: { test: "[[ -f package.json ]] && jest --ci" }, devDependencies: jest }),
-    "packages/web/.npmrc": "script-shell=/bin/sh\n",
-  });
-  const bracedShells = npmScriptShells(join(braced, "apps", "web"), npmEnv);
-  const classedShells = npmScriptShells(join(classed, "packages", "web"), npmEnv);
-  const bracedVerdict = detectCommands(join(braced, "apps", "web"), "typescript", "npm").commands.test;
-  const classedVerdict = detectCommands(join(classed, "packages", "web"), "typescript", "npm").commands.test;
-  check(JSON.stringify(bracedShells) === JSON.stringify(["bash"]) && classedShells.length === 2 && classedShells.includes("bash")
-    && bracedVerdict.state === "present" && classedVerdict.state === "present",
-    "a workspace pattern's braces are expanded as npm's are, and one the reader can't match leaves both folders' shells in play",
-    JSON.stringify({ bracedShells, classedShells, bracedVerdict, classedVerdict }));
-
   // bash's NAME+=value is an assignment; dash's shell runs it as a program.
   const appended = ["echo setup; PATH+=:/tmp", "PATH+=:/nowhere; no-such-runner"].map((s) => ({ s, r: detectTest(s, {}, { shell: bashLike }) }));
   const appendedDash = detectTest("echo setup; PATH+=:/tmp", {}, { shell: dashLike });

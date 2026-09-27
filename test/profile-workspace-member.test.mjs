@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { detectUnits } from "../src/profile/detect.mjs";
+import { listed } from "../src/profile/shellscript.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 
 const scripts = { lint: "eslint .", "check-types": "tsc --noEmit" };
@@ -126,15 +127,6 @@ test("a flow list across lines ends at its own bracket, not one inside a quoted 
   assert.equal(unit(root, "e2e").packageManager, "pnpm");
 });
 
-test("a later pattern that surely matches settles one before it that couldn't be read", () => {
-  const root = checkout({
-    "package.json": { name: "root", workspaces: ["packages/[ab]", "e2e"], scripts, devDependencies },
-    "package-lock.json": { lockfileVersion: 3 },
-    "e2e/package.json": { name: "e2e", scripts, devDependencies },
-  });
-  assert.equal(unit(root, "e2e").packageManager, "npm");
-});
-
 test("a member with a lockfile of its own keeps what its lockfile says", () => {
   const root = checkout({
     "package.json": { name: "root", scripts, devDependencies },
@@ -154,4 +146,175 @@ test("the inherited package manager is noted, so the operator sees where it came
     "e2e/package.json": { name: "e2e", scripts, devDependencies },
   });
   assert.match(detectUnits(root).notes.join("\n"), /e2e.*pnpm workspace/);
+});
+
+// ── how each manager reads its patterns, as measured on 2026-09-27 ────────────
+// docs/measured/2026-09-27-workspace-membership.md has the runs these come from.
+
+test("npm's members follow npm's own rule, as measured with npm 11.19.0", () => {
+  const NPM = [
+    [["*", "!bar", "bar"], "bar", true],
+    [["*", "!bar"], "bar", false],
+    [["!bar", "*"], "bar", false],
+    [["e2e", "packages/[ab]"], "e2e", true],
+    [["e2e", "packages/[ab]"], "packages/a", true],
+    [["e2e", "packages/[ab]", "!e2e"], "e2e", false],
+    [["*", "!bar/**"], "bar", false],
+    [["*", "!**/bar"], "bar", false],
+    [["*", "!./bar"], "bar", false],
+    [["*", "!ba*"], "baz", false],
+    [["*", "!bar", "!ba*", "bar"], "bar", false],
+    [["*", "!ba*", "bar"], "baz", true],
+    [["bar", "!b*"], "bar", false],
+    [["packages/**", "!packages/*"], "packages/a/b", false],
+    [["packages/*/*", "!packages/a"], "packages/a/b", true],
+    [["bar/**"], "bar", true],
+    [["bar/"], "bar", true],
+    [["**", "!bar"], "bar", false],
+    [["**", "!bar"], "bar/x", true],
+  ];
+  for (const [patterns, folder, member] of NPM) assert.equal(listed(patterns, folder), member, `${JSON.stringify(patterns)}: ${folder}`);
+});
+
+test("a pattern npm's matcher can't read leaves npm's answer unknown", () => {
+  let answer;
+  assert.doesNotThrow(() => { answer = listed(["x".repeat(70_000)], "e2e"); });
+  assert.equal(answer, null);
+});
+
+/** Which of foo and bar take the root's package manager, for a root whose `workspaces` are `patterns`. */
+function inheritors(patterns, files = {}, rootFields = {}) {
+  const root = checkout({
+    "package.json": { name: "root", workspaces: patterns, scripts, devDependencies, ...rootFields },
+    "foo/package.json": { name: "foo", scripts, devDependencies },
+    "bar/package.json": { name: "bar", scripts, devDependencies },
+    ...files,
+  });
+  return { root, members: ["foo", "bar"].filter(id => unit(root, id).packageManager !== null) };
+}
+
+test("yarn reads an exclusion as its own version does", () => {
+  const yarn = (version, patterns) => inheritors(patterns, { "yarn.lock": "" }, { packageManager: `yarn@${version}` }).members;
+  assert.deepEqual(yarn("1.22.22", ["*", "!bar"]), ["foo", "bar"], "yarn 1 reads no exclusion");
+  assert.deepEqual(yarn("3.8.7", ["!bar", "*"]), ["foo", "bar"], "yarn 3: the last pattern that matches decides");
+  assert.deepEqual(yarn("3.8.7", ["*", "!bar"]), ["foo"], "yarn 3: an exclusion after a match excludes");
+  assert.deepEqual(yarn("4.14.1", ["*", "!bar", "bar"]), ["foo"], "yarn 4: an exclusion wins wherever it stands");
+  assert.deepEqual(inheritors(["!bar", "*"], { "yarn.lock": "", ".yarnrc.yml": "yarnPath: .yarn/releases/yarn-3.8.7.cjs\n" }).members, ["foo", "bar"],
+                   "a yarnPath names the version too");
+});
+
+test("a yarn whose version nothing names answers only where its versions agree", () => {
+  assert.deepEqual(inheritors(["*", "!bar"], { "yarn.lock": "" }).members, ["foo"]);
+  assert.deepEqual(inheritors(["*", "!bar"], { "yarn.lock": "# yarn lockfile v1\n" }).members, ["foo", "bar"], "a yarn 1 lockfile names yarn 1");
+  const berry = { "yarn.lock": "__metadata:\n  version: 8\n" };
+  const disagree = inheritors(["!bar", "*"], berry);
+  assert.deepEqual(disagree.members, ["foo"], "a lockfile of yarn 2 or later leaves yarn 3 and 4 to disagree");
+  assert.match(detectUnits(disagree.root).notes.join("\n"), /unit bar: whether/);
+  const agree = inheritors(["*", "!bar"], berry);
+  assert.deepEqual(agree.members, ["foo"]);
+  assert.doesNotMatch(detectUnits(agree.root).notes.join("\n"), /unit bar: whether/, "where yarn 3 and 4 agree, the answer is known");
+});
+
+test("bun, which reads an exclusion differently from one version to the next, answers only where no exclusion could matter", () => {
+  assert.deepEqual(inheritors(["!bar", "*"], { "bun.lockb": "" }).members, ["foo"]);
+  assert.deepEqual(inheritors(["*"], { "bun.lockb": "" }).members, ["foo", "bar"], "control: with no exclusion, every match is a member");
+});
+
+test("a folder whose membership can't be told says so, rather than silently taking no package manager", () => {
+  const { root } = inheritors(["!bar", "*"], { "bun.lockb": "" });
+  assert.match(detectUnits(root).notes.join("\n"), /unit bar: whether the root's bun workspace lists it can't be told/);
+});
+
+test("a comment line with no indent inside a flow list is skipped, not read into an item", () => {
+  const root = checkout({
+    "package.json": { name: "root", scripts, devDependencies },
+    "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+    "pnpm-workspace.yaml": 'packages: [\n# Browser tests\n  "e2e"\n]\n',
+    "e2e/package.json": { name: "e2e", scripts, devDependencies },
+  });
+  assert.equal(unit(root, "e2e").packageManager, "pnpm");
+});
+
+// ── what the managers read differently, from #266's review ─────────────────
+
+/** Whether detection says it can't tell whether the root's workspace lists `id`. */
+const untold = (root, id) => new RegExp(`unit ${id}: whether the root's \\w+ workspace lists it can't be told`).test(detectUnits(root).notes.join("\n"));
+
+test("a backslash, which npm reads as an escape and Node's matcher as a separator, leaves the answer unknown", () => {
+  assert.equal(listed(["*", "!b\\ar"], "bar"), null);
+  const { root, members } = inheritors(["*", "!b\\ar"], { "yarn.lock": "" }, { packageManager: "yarn@4.14.1" });
+  assert.deepEqual(members, [], "every folder's membership is unknown");
+  assert.ok(untold(root, "bar"));
+});
+
+test("a yarnPath that names another yarn than packageManager leaves open which one runs", () => {
+  const { root, members } = inheritors(["!bar", "*"], { "yarn.lock": "", ".yarnrc.yml": "yarnPath: .yarn/releases/yarn-3.8.7.cjs\n" },
+                                       { packageManager: "yarn@4.14.1" });
+  assert.deepEqual(members, ["foo"]);
+  assert.ok(untold(root, "bar"), "yarn 3 lists bar, and yarn 4 doesn't");
+});
+
+/** A pnpm workspace whose pnpm-workspace.yaml is `yaml`, with folders foo and bar. */
+function pnpmWorkspace(yaml) {
+  const root = checkout({
+    "package.json": { name: "root", scripts, devDependencies },
+    "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+    "pnpm-workspace.yaml": yaml,
+    "foo/package.json": { name: "foo", scripts, devDependencies },
+    "bar/package.json": { name: "bar", scripts, devDependencies },
+  });
+  return { root, members: ["foo", "bar"].filter(id => unit(root, id).packageManager !== null) };
+}
+
+test("pnpm keeps a leading slash in a pattern literal, so it matches no folder", () => {
+  assert.deepEqual(pnpmWorkspace("packages:\n  - '*'\n  - '!/bar'\n").members, ["foo", "bar"]);
+  assert.deepEqual(pnpmWorkspace("packages:\n  - '/bar'\n").members, []);
+});
+
+test("an extglob, which pnpm 12 refuses and pnpm 10 reads, leaves pnpm's answer unknown", () => {
+  const { root, members } = pnpmWorkspace("packages:\n  - 'b?(a)r'\n");
+  assert.deepEqual(members, []);
+  assert.ok(untold(root, "bar"));
+});
+
+test("a flow-list item with no indent, which pnpm 12 refuses and pnpm 10 reads, leaves pnpm's answer unknown", () => {
+  const { root, members } = pnpmWorkspace('packages: [\n# Browser tests\n"foo"\n]\n');
+  assert.deepEqual(members, []);
+  assert.ok(untold(root, "foo"));
+});
+
+test("bun, which matches no extglob and refuses a leading slash, leaves either unknown", () => {
+  const extglob = inheritors(["b?(a)r", "foo"], { "bun.lockb": "" });
+  assert.deepEqual(extglob.members, ["foo"], "control: a plain name still lists its folder");
+  assert.ok(untold(extglob.root, "bar"));
+  const slash = inheritors(["*", "/bar"], { "bun.lockb": "" });
+  assert.deepEqual(slash.members, [], "bun refuses the whole list");
+  assert.ok(untold(slash.root, "foo"));
+});
+
+// ── from #266's second review, measured on 2026-09-27 ─────────────────────────
+
+test("only .yarnrc.yml's yarnPath setting names a yarn, not a file name in a comment, and one it can't read leaves yarn 2 to 4 open", () => {
+  const berry = { "yarn.lock": "__metadata:\n  version: 8\n" };
+  const commented = inheritors(["*", "!bar"], { ...berry, ".yarnrc.yml": "# was .yarn/releases/yarn-1.22.22.cjs\nnodeLinker: node-modules\n" });
+  assert.deepEqual(commented.members, ["foo"], "yarn 2 to 4 exclude bar, where yarn 1 wouldn't");
+  const custom = inheritors(["!bar", "*"], { ...berry, ".yarnrc.yml": "yarnPath: .yarn/releases/custom-build.cjs\n" }, { packageManager: "yarn@4.14.1" });
+  assert.deepEqual(custom.members, ["foo"]);
+  assert.ok(untold(custom.root, "bar"), "yarn 3 lists bar and yarn 4 doesn't");
+});
+
+test("repeated bangs, which yarn 3 and 4 read their own ways, leave yarn's answer unknown", () => {
+  const { root, members } = inheritors(["*", "!!bar"], { "yarn.lock": "" }, { packageManager: "yarn@4.14.1" });
+  assert.deepEqual(members, []);
+  assert.ok(untold(root, "foo"));
+});
+
+test("a pattern ending in /** reaches the folder itself as each manager does", () => {
+  assert.deepEqual(pnpmWorkspace("packages:\n  - '*'\n  - '!bar/**'\n").members, ["foo"], "pnpm: the exclusion takes bar");
+  assert.deepEqual(pnpmWorkspace("packages:\n  - 'bar/**'\n").members, ["bar"], "pnpm: the pattern lists bar");
+  const yarn4 = patterns => inheritors(patterns, { "yarn.lock": "" }, { packageManager: "yarn@4.14.1" }).members;
+  assert.deepEqual(yarn4(["*", "!bar/**"]), ["foo"], "yarn 4: the exclusion takes bar");
+  assert.deepEqual(yarn4(["bar/**"]), [], "yarn 4: the pattern doesn't list bar");
+  assert.deepEqual(inheritors(["bar/**"], { "yarn.lock": "" }, { packageManager: "yarn@1.22.22" }).members, ["bar"], "yarn 1: the pattern lists bar");
+  assert.deepEqual(inheritors(["bar/**"], { "bun.lockb": "" }).members, ["bar"], "bun: the pattern lists bar");
 });

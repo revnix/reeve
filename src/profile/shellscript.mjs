@@ -17,7 +17,7 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, matchesGlob, relative, resolve, sep } from "node:path";
 
 // Words some shell treats as its own, keywords and builtins: POSIX's, and
 // bash's, zsh's and ksh's. Which of them the shell that runs a script actually
@@ -89,31 +89,37 @@ function npmrc(file) {
 const envReplace = (value, env) => value.replace(/(?<!\\)(\\*)\$\{([^${}?]+)(\?)?\}/g, (orig, esc, name, opt) =>
   (esc.length % 2 ? orig.slice((esc.length + 1) / 2) : esc.slice(esc.length / 2) + (env[name] ?? (opt ? "" : `\${${name}}`))));
 
-// A glob's alternatives, its braces expanded: `{a,b}/*` is `a/*` and `b/*`.
-function braces(glob) {
-  const m = /\{([^{}]*)\}/.exec(glob);
-  if (!m || !m[1].includes(",")) return [glob];
-  return m[1].split(",").flatMap((alt) => braces(glob.slice(0, m.index) + alt + glob.slice(m.index + m[0].length)));
-}
-
-// Whether workspace patterns list the folder `rel`, as npm's globs do; a later
-// pattern overrides an earlier one, and `!` excludes. `*`, `**`, `?` and braces
-// are read. A pattern that holds more, a class or an extended glob, leaves the
-// answer unknown, null, until a later pattern that is read surely matches and
-// settles it, as npm's own order would.
+// Whether workspace patterns list the folder `rel`, as npm's own mapping reads
+// them (@npmcli/map-workspaces 5.0.3, in npm 11.19.0, measured in
+// docs/measured/2026-09-27-workspace-membership.md):
+//   - an exclusion (`!`) stands wherever it is, unless a later pattern's own
+//     text matches it, which lifts it. Of two exclusions in a row that one
+//     pattern lifts, npm lifts only the first: its loop skips the exclusion
+//     that moves into the lifted one's place;
+//   - a pattern whose text a standing exclusion matches is dropped;
+//   - a folder is listed when a pattern left matches it and no exclusion does.
+// Globs are read with Node's matcher, which is npm's (minimatch). Null when a
+// pattern can't be read, or holds a backslash, which npm reads as an escape and
+// Node's matcher as a separator.
 export function listed(patterns, rel) {
   const path = rel.split(sep).join("/");
-  let hit = false, unsure = false;
-  for (const pattern of patterns) {
-    if (typeof pattern !== "string") continue;
-    const bangs = /^!*/.exec(pattern)[0].length;
-    const globs = braces(pattern.slice(bangs).replace(/^\.?\/+/, "").replace(/\/+$/, ""));
-    if (globs.some((g) => /[[\]{}()!+@]|\.\./.test(g))) { unsure = true; continue; }
-    const matches = globs.some((g) => new RegExp(`^${g.split("/").map((seg) => (seg === "**" ? ".*"
-      : seg.replace(/[.+^$|\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]"))).join("/")}$`).test(path));
-    if (matches) { hit = bangs % 2 === 0; unsure = false; }
-  }
-  return unsure ? null : hit;
+  if (patterns.some((p) => typeof p === "string" && p.includes("\\"))) return null;
+  const include = [], exclude = [];
+  try {
+    for (const pattern of patterns) {
+      if (typeof pattern !== "string") continue;
+      const bangs = /^!*/.exec(pattern)[0].length;
+      const glob = pattern.slice(bangs).replace(/^\.?\/+/, "");
+      if (bangs % 2) { exclude.push(glob); continue; }
+      for (let i = 0; i < exclude.length; ++i) if (matchesGlob(glob, exclude[i])) exclude.splice(i, 1);
+      include.push(glob);
+    }
+    const kept = include.filter((g) => !exclude.some((x) => matchesGlob(g, x)));
+    // As npm globs: a pattern for folders only, and an exclusion as glob's
+    // `ignore`, which takes a folder's path with its slash too.
+    const folder = (g) => (g.endsWith("/") ? g : `${g}/`);
+    return kept.some((g) => matchesGlob(`${path}/`, folder(g))) && !exclude.some((x) => matchesGlob(path, x) || matchesGlob(`${path}/`, x));
+  } catch { return null; }
 }
 
 // The folders whose .npmrc may be the project's: the package's own, or that of

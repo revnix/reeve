@@ -43,4 +43,7 @@ export const OFFLINE_READS = Object.freeze({
   // The real reads, each given a GitHub that doesn't answer.
   observe: (nwo, pr) => observe(nwo, pr, OFFLINE_IO),
   mergeRate: (nwo, n, _probe, options) => cleanMergeRate(nwo, n, { merged: () => null, checks: () => null }, options),
+  // The head's tree, for the subject of a verdict's evidence (#165): unreadable,
+  // which the record keeps as unknown.
+  treeOf: () => null,
 });

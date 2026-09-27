@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { tempDir } from "./fixtures/temp.mjs";
 import { run, EVAL } from "./fixtures/tick-harness.mjs";
 import { decisionsFor } from "../src/db/records.mjs";
+import { standingPasses } from "../src/daemon.mjs";
 import { replayDecisions } from "../src/decisions.mjs";
 
 const OWN = { type: "required_status_checks", parameters: { required_status_checks: [{ context: "ops/merge-policy", integration_id: 1 }, { context: "test", integration_id: 15368 }] } };
@@ -217,4 +218,56 @@ test("each tick publishes its queue verdicts as queue verdicts", async () => {
   const publish = async (a) => { seen.push({ head: a.verdict.head, queue: a.queue === true }); return { ok: true, id: 1 }; };
   await run({ evaluate: evaluated, readQueue: queued(), evaluateQueue: judged, publish });
   assert.deepEqual(seen, [{ head: HEAD, queue: false }, { head: QUEUED, queue: true }]);
+});
+
+// ── from #269's first review ─────────────────────────────────────────────────
+
+test("review coverage at the pull request's head carries to its queue commit, and coverage of an older head doesn't", () => {
+  const withReviewer = (reviewedHead) => ({ ...passing(), reviewers: [{ login: "bot", kind: "blocking", state: "CLEAN", reviewedHead }] });
+  const judge = (input) => evaluateQueueEntry({ nwo: "o/r", entry: { pr: 7, sha: QUEUED, baseSha: BASE, state: "AWAITING_CHECKS" }, input,
+    baseRef: "main", profile: { ci: { requiredChecks: [] } }, db: null,
+    read: () => ({ ok: true, rows: [checkRow("test", "success")], impostors: [] }),
+    requirements: () => ({ required: [], known: true, shadowRequired: false }) });
+  const carried = judge(withReviewer(HEAD.slice(0, 10)));
+  assert.equal(carried.verdict.clauses.find(c => c.id === "review")?.state, "PASS");
+  assert.equal(carried.input.reviewers[0].coveredAt, HEAD.slice(0, 10), "the record says which commit the review covered");
+  const older = judge(withReviewer("d".repeat(10)));
+  assert.equal(older.verdict.clauses.find(c => c.id === "review")?.state, "BLOCK", "control: a review of another commit still doesn't count");
+});
+
+test("a queue PASS is noted before it's published, so a stop or a halt takes it back", async () => {
+  const publish = async ({ verdict }) => { if (verdict.head === QUEUED) throw new Error("network"); return { ok: true, id: 1 }; };
+  const r = await run({ evaluate: evaluated, readQueue: queued(), evaluateQueue: judged, publish, keepDir: true });
+  const db = open(r.dbPath);
+  const standing = standingPasses(db);
+  db.close();
+  assert.ok(standing.some(x => x.pr === 42 && x.head === QUEUED && x.state === "PASS"), JSON.stringify(standing));
+});
+
+test("a queue PASS whose commit has left the queue is taken back", async () => {
+  const withdrawn = [];
+  const withdraw = async (a) => { withdrawn.push(a); return { ok: true }; };
+  let tick = 0;
+  const readQueue = () => (tick++ === 0 ? queued()() : { ok: true, queue: true, entries: [] });
+  await run({ evaluate: evaluated, readQueue, evaluateQueue: judged, withdraw, ticks: 2 });
+  assert.ok(withdrawn.some(a => JSON.stringify(a).includes(QUEUED)), JSON.stringify(withdrawn));
+});
+
+test("the whole queue is read, past its first page", () => {
+  const asked = [];
+  const page = (nodes, next) => ({ data: { repository: { mergeQueue: { entries: { nodes, pageInfo: { hasNextPage: Boolean(next), endCursor: next } } } } } });
+  const node = (n, sha) => ({ state: "QUEUED", headCommit: { oid: sha }, baseCommit: { oid: BASE }, pullRequest: { number: n } });
+  const gh = (args) => {
+    asked.push(args.find(a => a.startsWith("after=")) ?? "first");
+    return { ok: true, out: JSON.stringify(asked.length === 1 ? page([node(1, QUEUED)], "c1") : page([node(2, HEAD)], null)) };
+  };
+  const q = readMergeQueue("o/r", "main", { gh });
+  assert.deepEqual(q.entries.map(e => e.pr), [1, 2]);
+  assert.deepEqual(asked, ["first", "after=c1"]);
+});
+
+test("a queue verdict reeve can't publish on three ticks running goes to a person", async () => {
+  const publish = async ({ verdict }) => (verdict.head === QUEUED ? { ok: false, why: "HTTP 502" } : { ok: true, id: 1 });
+  const r = await run({ evaluate: evaluated, readQueue: queued(), evaluateQueue: judged, publish, ticks: 3 });
+  assert.match(r.esc, /#42: reeve couldn't publish its verdict on the merge queue's commit on 3 ticks in a row/);
 });

@@ -10,7 +10,7 @@
 import { pinHead, readChecks, classify, settle, inheritedOrCaused, readTimeline, lastForcePush, suitesComplete } from "./github/reconciler.mjs";
 import { loadSettlement, saveSettlement } from "./db/ops.mjs";
 import { rootCause } from "./ci-rootcause.mjs";
-import { computeVerdict, renderVerdict, PASS, BLOCK, UNKNOWN } from "./verdict.mjs";
+import { computeVerdict, renderVerdict, coversHead, PASS, BLOCK, UNKNOWN } from "./verdict.mjs";
 // The builder App's name has one home already; the classifier reads it rather
 // than restating it.
 import { POLICY_APP, POLICY_CONTEXT } from "./github/reconciler.mjs";
@@ -107,18 +107,31 @@ export function readThreads(nwo, pr, io = null) {
  */
 export function readMergeQueue(nwo, branch, { gh = ghJson } = {}) {
   const [owner, name] = String(nwo).split("/");
-  const query = "query($owner:String!,$name:String!,$branch:String!){repository(owner:$owner,name:$name){" +
-    "mergeQueue(branch:$branch){entries(first:100){nodes{state headCommit{oid} baseCommit{oid} pullRequest{number}}}}}}";
-  const r = gh(["graphql", "-f", `query=${query}`, "-f", `owner=${owner}`, "-f", `name=${name}`, "-f", `branch=${branch}`]);
-  if (!r.ok) return { ok: false, why: r.err || "the merge queue couldn't be read" };
-  let queue;
-  try { queue = JSON.parse(r.out)?.data?.repository?.mergeQueue; } catch { return { ok: false, why: "the merge queue's answer couldn't be parsed" }; }
-  if (queue === undefined) return { ok: false, why: "the merge queue's answer had no repository in it" };
-  if (queue === null) return { ok: true, queue: false, entries: [] };
-  const nodes = queue.entries?.nodes;
-  if (!Array.isArray(nodes)) return { ok: false, why: "the merge queue's answer had no entries" };
-  return { ok: true, queue: true, entries: nodes.filter((n) => Number.isInteger(n?.pullRequest?.number)).map((n) => ({
-    pr: n.pullRequest.number, sha: n.headCommit?.oid ?? null, baseSha: n.baseCommit?.oid ?? null, state: n.state ?? null })) };
+  const query = "query($owner:String!,$name:String!,$branch:String!,$after:String){repository(owner:$owner,name:$name){" +
+    "mergeQueue(branch:$branch){entries(first:100,after:$after){pageInfo{hasNextPage endCursor} " +
+    "nodes{state headCommit{oid} baseCommit{oid} pullRequest{number}}}}}}";
+  const entries = [];
+  // Every page: an entry past the first hundred would go unanswered until the
+  // queue dropped it at its timeout.
+  for (let after = null, pages = 0; ; pages++) {
+    if (pages >= 50) return { ok: false, why: "the merge queue ran past 50 pages" };
+    const r = gh(["graphql", "-f", `query=${query}`, "-f", `owner=${owner}`, "-f", `name=${name}`, "-f", `branch=${branch}`,
+                  ...(after ? ["-f", `after=${after}`] : [])]);
+    if (!r.ok) return { ok: false, why: r.err || "the merge queue couldn't be read" };
+    let queue;
+    try { queue = JSON.parse(r.out)?.data?.repository?.mergeQueue; } catch { return { ok: false, why: "the merge queue's answer couldn't be parsed" }; }
+    if (queue === undefined) return { ok: false, why: "the merge queue's answer had no repository in it" };
+    if (queue === null) return { ok: true, queue: false, entries: [] };
+    const nodes = queue.entries?.nodes;
+    if (!Array.isArray(nodes)) return { ok: false, why: "the merge queue's answer had no entries" };
+    for (const n of nodes) if (Number.isInteger(n?.pullRequest?.number))
+      entries.push({ pr: n.pullRequest.number, sha: n.headCommit?.oid ?? null, baseSha: n.baseCommit?.oid ?? null, state: n.state ?? null });
+    const info = queue.entries.pageInfo;
+    if (!info?.hasNextPage) break;
+    if (!info.endCursor) return { ok: false, why: "the merge queue said there was more, and gave no cursor to read it" };
+    after = info.endCursor;
+  }
+  return { ok: true, queue: true, entries };
 }
 
 /**
@@ -149,7 +162,14 @@ export function evaluateQueueEntry({ nwo, entry, input, baseRef, profile, db = n
   const health = { required: profile.ci?.requiredChecks ?? [] };
   const base = entry.baseSha ? classifyRead(read(nwo, entry.baseSha, { reviewerContexts }), health, { evidence: false })
     : { verdict: "UNKNOWN", readable: false, why: "the queue's base commit isn't known" };
-  const queued = { ...input, head: entry.sha,
+  // A review of the pull request's head covers its queue commit, which carries
+  // exactly that change onto the base: the queue builds the commit, no one
+  // reviews it. Carried explicitly, with the commit the review covered, so the
+  // record says what was reviewed. A review of any other commit still doesn't
+  // count.
+  const reviewers = (input.reviewers ?? []).map((r) => (coversHead(r.reviewedHead, input.head)
+    ? { ...r, reviewedHead: entry.sha, coveredAt: r.reviewedHead } : r));
+  const queued = { ...input, reviewers, head: entry.sha,
     checks: { verdict: s.verdict, settled: s.settled, why: s.why, readable: c.readable !== false, failing: c.failing, inherited: [],
               impostors: got?.impostors ?? [], shadowRequired: req.shadowRequired },
     base: { verdict: base.verdict, readable: base.readable !== false } };

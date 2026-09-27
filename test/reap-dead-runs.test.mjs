@@ -1,34 +1,43 @@
-// A run whose worker died is reaped on the next tick (#162).
+// The runs a dead daemon left are reaped on the next tick (#162).
 //
 // A run holds its pull request exclusively, and only the daemon that started it
 // finishes it. When that daemon dies with its worker -- a crash, a reboot, a
 // service restart that takes both -- the run is left live, and startRun refused
-// the pull request until it merged. These tests leave a store exactly as such a
-// daemon does: a run started and bound to a real worker process, and its lease
-// lapsed. Then a new daemon's tick runs over that store.
+// the pull request until it merged. These tests leave a store as such a daemon
+// does: a run started and bound to a real worker process, and its lease lapsed.
+// Then a new daemon's tick runs over that store.
+//
+// A worker still running on a lapsed lease has no claim anything will renew: its
+// supervisor is gone, or stalled past its lease. So it's stopped, as the
+// supervisor stops a worker whose lease it can no longer prove, and its run is
+// reaped once it's gone. Its claim is never renewed, which would let a stalled
+// supervisor publish work it no longer holds.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { open, startRun, bindRun } from "../src/db/ops.mjs";
 import { readStart } from "../src/supervisor.mjs";
 import { statePathFor } from "../src/paths.mjs";
+import { runPathFor } from "../src/checkout.mjs";
+import { tick } from "../src/daemon.mjs";
 import { run, HEAD } from "./fixtures/tick-harness.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 
-// A store with one live run for o/r#42, bound to a real worker, its lease lapsed.
-// The worker killed, or still running.
-const leftBehind = async ({ killWorker }) => {
+// A store with one live run for o/r#42, bound to a real worker in a process
+// group of its own, as workers are, and its lease lapsed. `boot` overrides the
+// start time recorded for it.
+const leftBehind = async ({ killWorker, boot = null }) => {
   const dbPath = join(tempDir("reap-"), "s.db");
   const db = open(dbPath);
   const started = startRun(db, { nwo: "o/r", pr: 42, action: "FIX_CI", head: HEAD });
   assert.ok(started.ok, started.why);
-  const worker = spawn("sleep", ["60"], { stdio: "ignore" });
+  const worker = spawn("sleep", ["60"], { stdio: "ignore", detached: true });
   await once(worker, "spawn");
-  bindRun(db, { runId: started.runId, pid: worker.pid, boot: readStart(worker.pid) });
+  bindRun(db, { runId: started.runId, pid: worker.pid, boot: boot ?? readStart(worker.pid) });
   if (killWorker) {
     worker.kill("SIGKILL");
     await once(worker, "exit");
@@ -37,31 +46,84 @@ const leftBehind = async ({ killWorker }) => {
   db.close();
   return { dbPath, runId: started.runId, worker };
 };
-// The run's row once the tick is done. The harness closes the store it ran on.
+// The run's row once a tick is done. The harness closes the store it ran on.
 const runRow = (dbPath, runId) => {
   const db = open(dbPath);
   try { return db.prepare("SELECT status, lease_expires_at FROM run WHERE id = ?").get(runId); }
   finally { db.close(); }
 };
+const now = () => Math.floor(Date.now() / 1000);
+// Whether the worker has exited, waiting up to `ms` for it.
+const exits = (worker, ms = 5000) => worker.exitCode !== null || worker.signalCode !== null
+  ? Promise.resolve(true)
+  : Promise.race([once(worker, "exit").then(() => true), new Promise((r) => setTimeout(() => r(false), ms).unref())]);
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
-test("a run whose worker died is reaped on the next tick, and its pull request is worked again", async () => {
+test("a run whose worker died is reaped on the next tick, and its pull request is free to be worked again", async () => {
   const { dbPath, runId } = await leftBehind({ killWorker: true });
   const out = await run({ dbPath });
   assert.equal(runRow(dbPath, runId).status, "abandoned", out.log.slice(-1500));
   assert.equal(out.spawned.length, 1, `no worker was dispatched for the pull request:\n${out.log.slice(-1500)}`);
 });
 
-test("a run whose worker is still running keeps its pull request, though its lease lapsed", async () => {
+test("a worker still running on a lapsed lease is stopped, its claim isn't renewed, and its run is reaped on the next tick", async () => {
   const { dbPath, runId, worker } = await leftBehind({ killWorker: false });
   try {
-    const out = await run({ dbPath });
-    const row = runRow(dbPath, runId);
-    assert.equal(row.status, "running", out.log.slice(-1500));
-    assert.ok(row.lease_expires_at > Math.floor(Date.now() / 1000), "the live worker's lease wasn't extended");
-    assert.equal(out.spawned.length, 0, "a second worker was dispatched beside the live one");
+    const first = await run({ dbPath });
+    assert.equal(first.spawned.length, 0, "a second worker was dispatched beside the live one");
+    assert.ok(runRow(dbPath, runId).lease_expires_at < now(), "the lapsed claim was renewed");
+    assert.ok(await exits(worker), `the worker wasn't stopped:\n${first.log.slice(-1500)}`);
+    const second = await run({ dbPath });
+    assert.equal(runRow(dbPath, runId).status, "abandoned", second.log.slice(-1500));
+    assert.equal(second.spawned.length, 1, `the pull request wasn't worked again:\n${second.log.slice(-1500)}`);
   } finally {
-    worker.kill("SIGKILL");
+    try { process.kill(-worker.pid, "SIGKILL"); } catch { /* stopped */ }
   }
+});
+
+test("a halted tick stops a worker left running on a lapsed lease", async () => {
+  const { dbPath, worker } = await leftBehind({ killWorker: false });
+  const haltMarker = join(tempDir("reap-halt-"), "HALT");
+  writeFileSync(haltMarker, "");
+  try {
+    const out = await run({ dbPath, haltMarker });
+    assert.equal(out.spawned.length, 0);
+    assert.ok(await exits(worker), `a halted tick left the orphaned worker running:\n${out.log.slice(-1500)}`);
+  } finally {
+    try { process.kill(-worker.pid, "SIGKILL"); } catch { /* stopped */ }
+  }
+});
+
+test("a pid now held by another process is never signalled: its run is reaped as dead, and the process left alone", async () => {
+  // The recorded start time isn't this process's, as when the worker died and
+  // its pid was given to a stranger.
+  const { dbPath, runId, worker } = await leftBehind({ killWorker: false, boot: "Thu Jan  1 00:00:00 1970" });
+  try {
+    const out = await run({ dbPath });
+    assert.equal(runRow(dbPath, runId).status, "abandoned", out.log.slice(-1500));
+    assert.equal(alive(worker.pid), true, "a process that isn't the worker was signalled");
+  } finally {
+    try { process.kill(-worker.pid, "SIGKILL"); } catch { /* gone */ }
+  }
+});
+
+test("a reaped run's checkout is preserved as a failed run's is, not left behind", async () => {
+  const root = tempDir("reap-root-");
+  const dbPath = join(tempDir("reap-co-"), "s.db");
+  const db = open(dbPath);
+  const started = startRun(db, { nwo: "o/r", pr: 42, action: "FIX_CI", head: HEAD });
+  db.prepare("UPDATE run SET lease_expires_at = unixepoch() - 1 WHERE id = ?").run(started.runId);
+  const checkout = runPathFor(root, 42, started.runId);
+  mkdirSync(checkout, { recursive: true });
+  writeFileSync(join(checkout, "work.txt"), "a worker's unfetched change\n");
+  // GitHub can't be asked, so the tick stops after its housekeeping.
+  await tick({ nwo: "o/r", db, logPath: join(dirname(dbPath), "reeve.log"), execute: false, shadow: true,
+               profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: root } },
+               openPrs: () => null });
+  db.close();
+  assert.equal(runRow(dbPath, started.runId).status, "abandoned");
+  assert.equal(existsSync(checkout), false, "the dead run's checkout was left where it was");
+  assert.equal(existsSync(join(`${checkout}.unfetched`, "work.txt")), true, "the dead run's checkout wasn't preserved");
 });
 
 test("the doctor's advice for a run past its lease is the daemon's next tick, not a command that was never built", () => {

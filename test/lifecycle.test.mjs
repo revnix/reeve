@@ -51,14 +51,20 @@ reap(db);
 ok("dead-lettered at max_attempts", db.prepare("SELECT status FROM node WHERE id='task:a'").get().status==="dead_letter");
 ok("dead-lettered task never appears in v_ready", db.prepare("SELECT count(*) c FROM v_ready WHERE id='task:a'").get().c===0);
 
-// 6. liveness grace: an alive owner gets its lease extended, not reaped
+// 6. liveness grace: an alive owner is spared, not reaped, and its lapsed lease
+// isn't renewed: renewing it would let a stalled owner act on a claim it lost (#162)
 tx(db,()=>{ db.prepare(`INSERT INTO node(id,kind,title,status,created_at,updated_at)
   VALUES('task:b','task','b','ready',unixepoch(),unixepoch())`).run(); });
 const rb = claim(db,{lane:"L4",runId:"run-4",pid:process.pid,boot:"boot-x"});
 tx(db,()=>db.prepare("UPDATE run SET lease_expires_at=unixepoch()-1 WHERE id='run-4'").run());
 const g = reap(db,{ isAlive:(pid,boot)=>pid===process.pid && boot==="boot-x" });
-ok("live owner extended not reaped", g.length===1 && g[0].action==="extended");
+ok("a live owner is spared, not reaped, and its lapsed lease isn't renewed",
+   g.length===1 && g[0].action==="spared"
+   && db.prepare("SELECT lease_expires_at FROM run WHERE id='run-4'").get().lease_expires_at < Math.floor(Date.now()/1000));
 ok("run still live after grace", db.prepare("SELECT status FROM run WHERE id='run-4'").get().status==="leased");
+// Steps 7 and 8 need a run that holds its lease. The grace above no longer
+// renews one, so the claim is given back here, as a fresh one would stand.
+tx(db,()=>db.prepare("UPDATE run SET lease_expires_at=unixepoch()+120 WHERE id='run-4'").run());
 
 // 7. cancellation is cooperative and observed by heartbeat
 tx(db,()=>db.prepare(`INSERT INTO task_exec(task_id,cancel_requested) VALUES('task:b',1)

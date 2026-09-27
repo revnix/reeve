@@ -386,11 +386,14 @@ export function reap(db, { actor = "daemon", isAlive = () => false } = {}) {
       AND status IN ('leased','running','blocked_on_ci','blocked_on_review','awaiting_founder')`).all();
   const out = [];
   for (const r of expired) {
-    // grace: if the process is demonstrably alive on this host, extend instead of reap
+    // Grace: a run whose process is demonstrably alive on this host is spared,
+    // not reaped. Its lapsed lease is NOT renewed: heartbeat() and finishRun()
+    // treat an expired lease as lost, and a renewal here would let a stalled
+    // owner act on a claim it no longer holds (#162). The caller decides what
+    // to do with a live process that holds nothing; its pid and start time are
+    // returned for that.
     if (r.owner_host === hostname() && isAlive(r.owner_pid, r.owner_boot)) {
-      tx(db, () => db.prepare(`UPDATE run SET lease_expires_at=unixepoch()+? WHERE id=?`)
-                     .run(LEASE_SECONDS, r.id));
-      out.push({ run: r.id, action: "extended" });
+      out.push({ run: r.id, task: r.task_id, action: "spared", pid: r.owner_pid, boot: r.owner_boot });
       continue;
     }
     tx(db, () => {
@@ -410,7 +413,7 @@ export function reap(db, { actor = "daemon", isAlive = () => false } = {}) {
       emit(db, { actor, op: dead ? "run.dead_letter" : "run.reap",
                  subject: r.task_id, run_id: r.id, payload: { attempt: r.attempt } });
     });
-    out.push({ run: r.id, action: "reaped" });
+    out.push({ run: r.id, task: r.task_id, action: "reaped" });
   }
   return out;
 }

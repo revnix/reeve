@@ -18,11 +18,11 @@ import { evaluatePr, publishVerdict, withdrawVerdict, prAnchor, isBuilderPr, cle
 import { PASS } from "./verdict.mjs";
 import { nextAction, describe, ACTIONS, ESCALATIONS } from "./watcher.mjs";
 import { POLICY_CONTEXT, reconcilePr } from "./github/reconciler.mjs";
-import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, isSameProcess, OUTCOMES } from "./supervisor.mjs";
+import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, isSameProcess, stopWorkerGroup, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf, siblingRootsOf, hostEscapePaths, worktreeRootOf, linkFree, notifyCredOf, layoutDeniesAbove } from "./sandbox.mjs";
 import { verifyConfig, GIT_NEUTRALISE, gitEnv } from "./gitguard.mjs";
-import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor, commitRunWork, digestOf } from "./checkout.mjs";
+import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor, commitRunWork, digestOf, runPathFor } from "./checkout.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor, workerTmpDir } from "./workerenv.mjs";
 import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity, sandboxRuntimeIdentity } from "./containment.mjs";
@@ -1773,12 +1773,30 @@ export async function tick(ctx) {
   // left the run live, and `startRun` refused that pull request until it
   // merged. Its lease lapses within LEASE_SECONDS of the last heartbeat. A run
   // past it whose worker isn't the same live process on this host is
-  // abandoned, and its pull request is free again this tick; one whose worker
-  // is still running is a long job, and keeps it. Ungated, as the reap above
-  // is, and for the same reasons.
+  // abandoned, and its pull request is free again. Ungated, as the reap above
+  // is, and for the same reasons, the halt among them.
   try {
-    for (const r of (ctx.reapRuns ?? reap)(db, { actor: "daemon", isAlive: isSameProcess }))
-      if (r.action === "reaped") log(logPath, `run ${r.run} reaped: its lease had lapsed and its worker is gone`);
+    for (const r of (ctx.reapRuns ?? reap)(db, { actor: "daemon", isAlive: isSameProcess })) {
+      if (r.action === "reaped") {
+        log(logPath, `run ${r.run} reaped: its lease had lapsed and its worker is gone`);
+        // Its checkout, preserved as a failed run's is, since whatever the
+        // worker committed was never fetched. Left where it was, each crash
+        // would leave a whole repository and its dependencies behind.
+        const pr = /^pr:(\d+)$/.exec(r.task ?? "")?.[1];
+        if (pr) {
+          const kept = releaseRunCheckout(runPathFor(worktreeRootOf(profile), pr, r.run), { workFetched: false });
+          if (!kept.ok) log(logPath, `  run ${r.run}: could not preserve its checkout — ${kept.why}`);
+        }
+      } else if (r.action === "spared") {
+        // A worker still running on a lapsed lease holds a claim nothing will
+        // renew: its supervisor is gone, or stalled past its lease. Nothing
+        // records its work, keeps its budget, or stops it at a halt. So it's
+        // stopped, as the supervisor stops a worker whose lease it can no
+        // longer prove, and its run is reaped once it's gone.
+        const stopped = (ctx.stopWorker ?? stopWorkerGroup)(r.pid, r.boot);
+        log(logPath, `run ${r.run}: its lease lapsed while its worker ran on; ${stopped ? "the worker was stopped" : "the process is no longer the worker, so it was left alone"}`);
+      }
+    }
   } catch (err) {
     // Housekeeping must never take the tick with it.
     log(logPath, `could not reap runs whose worker is gone — ${err.message}`);

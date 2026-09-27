@@ -76,8 +76,8 @@ export function workspaceGlobs(root, manager) {
 
 /**
  * The majors of yarn that may own a root, among those measured (1 to 4):
- *   - each one `packageManager` or `.yarnrc.yml`'s `yarnPath` names, since a
- *     yarnPath runs in place of the version packageManager names;
+ *   - each one `packageManager` or `.yarnrc.yml`'s `yarnPath` setting names,
+ *     since a yarnPath runs in place of the version packageManager names;
  *   - 2 to 4 for a `.yarnrc.yml`, or a lockfile that yarn 2 or later wrote;
  *   - 1 for yarn 1's lockfile;
  *   - all four when nothing says.
@@ -88,7 +88,10 @@ function yarnMajors(root) {
   try { rc = readFileSync(join(root, ".yarnrc.yml"), "utf8"); } catch { /* none */ }
   try { lock = readFileSync(join(root, "yarn.lock"), "utf8").slice(0, 500); } catch { /* none */ }
   const byManager = typeof declared === "string" ? /^yarn@(\d+)\./.exec(declared)?.[1] : undefined;
-  const byPath = /yarn-(\d+)\.\d+\.\d+\.c?js/.exec(rc)?.[1];
+  // Only the yarnPath setting names a yarn, not a file name elsewhere, in a
+  // comment say. One whose version can't be read is some yarn from 2 up.
+  const yarnPath = /^yarnPath:\s*["']?([^"'#\s]+)/m.exec(rc)?.[1];
+  const byPath = yarnPath === undefined ? undefined : /yarn-(\d+)\.\d+\.\d+\.c?js$/.exec(yarnPath)?.[1] ?? "unread";
   const berry = [2, 3, 4];
   const named = [byManager, byPath].filter(v => v !== undefined).map(Number);
   if (named.length) return [...new Set(named.flatMap(m => (m >= 1 && m <= 4 ? [m] : berry)))];
@@ -115,6 +118,8 @@ function isMember(rel, globs, manager, root) {
   if (globs === null) return null;
   try {
     const hit = g => matchesGlob(rel, g.replace(/^!/, "").replace(/^\.\//, "").replace(/\/+$/, ""));
+    // The folder's path with its slash too, which `bar/**` reaches.
+    const asFolder = g => hit(g) || matchesGlob(`${rel}/`, g.replace(/^!/, "").replace(/^\.\//, "").replace(/\/+$/, ""));
     const extglob = g => /[?*+@!]\(/.test(g.replace(/^!/, ""));
     // What a manager reads unlike Node's matcher leaves its answer unknown: a
     // backslash, an escape to each manager and a separator to the matcher; an
@@ -123,19 +128,25 @@ function isMember(rel, globs, manager, root) {
     if (globs.some(g => g.includes("\\"))) return null;
     if (manager === "pnpm" && globs.some(extglob)) return null;
     if (manager === "bun" && globs.some(g => /^!?\//.test(g))) return null;
+    // Repeated bangs, which yarn 3 and 4 read their own ways.
+    if (manager === "yarn" && globs.some(g => g.startsWith("!!"))) return null;
     const exclusions = globs.filter(g => g.startsWith("!"));
-    const included = globs.some(g => !g.startsWith("!") && hit(g));
-    const exclusionWins = included && !exclusions.some(hit);
+    // Measured: `bar/**` lists bar for pnpm, yarn 1 and bun, and not for yarn 3
+    // or 4; `!bar/**` excludes it for pnpm and yarn 3 and 4, and not for bun.
+    const included = globs.some(g => !g.startsWith("!") && asFolder(g));
+    const exclusionWins = included && !exclusions.some(asFolder);
     if (manager === "pnpm") return exclusionWins;
     if (manager === "bun") {
       // bun matches no extglob, so a folder only one lists is unknown.
-      const plainly = globs.some(g => !g.startsWith("!") && !extglob(g) && hit(g));
+      const plainly = globs.some(g => !g.startsWith("!") && !extglob(g) && asFolder(g));
       if (plainly && !exclusions.some(hit)) return true;
       return exclusions.length || included ? null : false;
     }
     if (manager !== "yarn") return false;
-    const lastWins = globs.reduce((member, g) => (hit(g) ? !g.startsWith("!") : member), false);
-    const reading = { 1: included, 2: lastWins, 3: lastWins, 4: exclusionWins };
+    const berryIncluded = globs.some(g => !g.startsWith("!") && hit(g));
+    const lastWins = globs.reduce((member, g) => (g.startsWith("!") ? (asFolder(g) ? false : member) : hit(g) || member), false);
+    const berryExclusionWins = berryIncluded && !exclusions.some(asFolder);
+    const reading = { 1: included, 2: lastWins, 3: lastWins, 4: berryExclusionWins };
     const readings = new Set(yarnMajors(root).map(m => reading[m]));
     return readings.size === 1 ? [...readings][0] : null;
   } catch { return null; }

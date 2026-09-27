@@ -291,3 +291,30 @@ test("bun, which matches no extglob and refuses a leading slash, leaves either u
   assert.deepEqual(slash.members, [], "bun refuses the whole list");
   assert.ok(untold(slash.root, "foo"));
 });
+
+// ── from #266's second review, measured on 2026-09-27 ─────────────────────────
+
+test("only .yarnrc.yml's yarnPath setting names a yarn, not a file name in a comment, and one it can't read leaves yarn 2 to 4 open", () => {
+  const berry = { "yarn.lock": "__metadata:\n  version: 8\n" };
+  const commented = inheritors(["*", "!bar"], { ...berry, ".yarnrc.yml": "# was .yarn/releases/yarn-1.22.22.cjs\nnodeLinker: node-modules\n" });
+  assert.deepEqual(commented.members, ["foo"], "yarn 2 to 4 exclude bar, where yarn 1 wouldn't");
+  const custom = inheritors(["!bar", "*"], { ...berry, ".yarnrc.yml": "yarnPath: .yarn/releases/custom-build.cjs\n" }, { packageManager: "yarn@4.14.1" });
+  assert.deepEqual(custom.members, ["foo"]);
+  assert.ok(untold(custom.root, "bar"), "yarn 3 lists bar and yarn 4 doesn't");
+});
+
+test("repeated bangs, which yarn 3 and 4 read their own ways, leave yarn's answer unknown", () => {
+  const { root, members } = inheritors(["*", "!!bar"], { "yarn.lock": "" }, { packageManager: "yarn@4.14.1" });
+  assert.deepEqual(members, []);
+  assert.ok(untold(root, "foo"));
+});
+
+test("a pattern ending in /** reaches the folder itself as each manager does", () => {
+  assert.deepEqual(pnpmWorkspace("packages:\n  - '*'\n  - '!bar/**'\n").members, ["foo"], "pnpm: the exclusion takes bar");
+  assert.deepEqual(pnpmWorkspace("packages:\n  - 'bar/**'\n").members, ["bar"], "pnpm: the pattern lists bar");
+  const yarn4 = patterns => inheritors(patterns, { "yarn.lock": "" }, { packageManager: "yarn@4.14.1" }).members;
+  assert.deepEqual(yarn4(["*", "!bar/**"]), ["foo"], "yarn 4: the exclusion takes bar");
+  assert.deepEqual(yarn4(["bar/**"]), [], "yarn 4: the pattern doesn't list bar");
+  assert.deepEqual(inheritors(["bar/**"], { "yarn.lock": "" }, { packageManager: "yarn@1.22.22" }).members, ["bar"], "yarn 1: the pattern lists bar");
+  assert.deepEqual(inheritors(["bar/**"], { "bun.lockb": "" }).members, ["bar"], "bun: the pattern lists bar");
+});

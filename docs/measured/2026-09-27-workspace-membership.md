@@ -66,7 +66,14 @@ Folders foo and bar. pnpm 10 is 10.28.1, pnpm 12 is 12.5.1, yarn 3 is 3.8.7, yar
 | `["*", "!b?(a)r"]` | foo | foo | refused | bar, foo | foo | foo | bar, foo | bar, foo |
 | `["*", "!b\\ar"]` | foo | foo | refused | bar, foo | foo | foo | bar, foo | foo |
 
+| `["bar/**"]` | bar | bar | bar | bar | none | none | bar | bar |
+| `["*", "!bar/**"]` | foo | foo | foo | bar, foo | foo | foo | bar, foo | bar, foo |
+| `["*", "!!bar"]` | bar, foo | bar, foo | bar, foo | bar, foo | foo | none | bar, foo | bar, foo |
+
 So:
+- `bar/**` lists bar for npm, pnpm, yarn 1 and bun, and not for yarn 3 or 4.
+  `!bar/**` excludes it for npm, pnpm and yarn 3 and 4, and not for bun.
+- Repeated bangs are read differently by yarn 3 and by yarn 4.
 - Only npm drops a leading slash. The others keep it, and it matches no folder.
 - An extglob is read by npm, pnpm 10 and yarn, refused by pnpm 12, and matched by no bun.
 - A backslash is an escape to npm, pnpm 10 and yarn 3 and 4, where Node's matcher (`path.matchesGlob`) reads it as a separator.
@@ -131,6 +138,12 @@ With no dependency and no member, none of them wrote a lockfile.
   unknown, and a folder that only an extglob lists is unknown for bun. A
   leading slash stays literal except for npm, and bun refuses a list with one.
 - A yarnPath and a packageManager that name different yarns leave both
-  readings open.
+  readings open. Only the `yarnPath:` setting counts, not a yarn file named
+  in a comment, and a yarnPath whose version can't be read is some yarn from 2
+  up.
+- A pattern reaches a folder through its path with its slash too, where the
+  manager's measured reading does: `bar/**` for pnpm, yarn 1 and bun, and
+  `!bar/**` for pnpm and yarn 3 and 4. Repeated bangs leave yarn's answer
+  unknown.
 - `bun.lock` names bun, as `bun.lockb` does, and the two together are one
   package manager, not a question.

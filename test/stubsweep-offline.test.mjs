@@ -44,12 +44,15 @@ writeFileSync(join(root, "src", "read.mjs"),
 writeFileSync(join(root, "test", "read.test.mjs"),
   `import test from "node:test";\n` +
   `import assert from "node:assert/strict";\n` +
-  `import { mkdtempSync } from "node:fs";\n` +
+  `import { mkdtempSync, rmSync } from "node:fs";\n` +
   `import { tmpdir } from "node:os";\n` +
   `import { join } from "node:path";\n` +
   `import { read, save } from "../src/read.mjs";\n` +
   `test("a read goes through its stand-in", () => { assert.equal(read(() => "stand-in"), "stand-in"); });\n` +
-  `test("a note goes where it is told", () => { const at = mkdtempSync(join(tmpdir(), "n-")); assert.equal(save(at), at); });\n`);
+  `test("a note goes where it is told", () => {\n` +
+  `  const at = mkdtempSync(join(tmpdir(), "n-"));\n` +
+  `  try { assert.equal(save(at), at); } finally { rmSync(at, { recursive: true, force: true }); }\n` +
+  `});\n`);
 // The escape probe, by name: it reads through the real gh on purpose.
 writeFileSync(join(root, "test", "escape.test.mjs"),
   `import test from "node:test";\n` +

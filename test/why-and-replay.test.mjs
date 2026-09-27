@@ -282,3 +282,11 @@ test("the policy is compared per decision, with a profile only for the repositor
   assert.equal(replayDecisions(db, {}, { profile: { ...mine, identity: { key: "x/y" } } })[0].policyChanged, null);
   assert.equal(replayDecisions(db, {}, { profile: mine })[0].policyChanged, true);
 });
+
+test("why shows each UNKNOWN clause's kind and what happens next", async () => {
+  const dbPath = join(tempDir("reeve-why-"), "s.db");
+  const settling = () => { const i = { ...input(), checks: { verdict: "SETTLING", settled: false, why: null, failing: [], inherited: [], impostors: [], shadowRequired: false } };
+                           return { ...EVAL, verdict: computeVerdict(i), input: i }; };
+  await run({ evaluate: settling, dbPath, code: CODE });
+  assert.match(why(open(dbPath), "42"), /ci\s+UNKNOWN\s+checks not settled: SETTLING\s+\[waiting: look again once the checks settle\]/);
+});

@@ -63,6 +63,17 @@ function worst(a, b) {
  * is listed here because the question is "which ids exist", not "which appear on
  * every verdict".
  */
+/**
+ * The kinds of UNKNOWN (#165), from the least serious to the most. The direction
+ * says each UNKNOWN names its kind and its next action, and only the last kind
+ * reaches a person:
+ *   waiting  something is still running or settling; reeve looks again when it's done
+ *   retry    a read failed; reeve reads again, with backoff
+ *   missing  something required was never produced; reeve asks for it
+ *   person   only a person can settle it
+ */
+export const UNKNOWN_KINDS = Object.freeze(["waiting", "retry", "missing", "person"]);
+
 export const CLAUSE_IDS = Object.freeze(
   ["ci", "base", "review", "rounds", "threads", "findings", "mergeable", "cleared", "hold",
    // Two facts about review BODIES, and they are separate because their answers
@@ -75,7 +86,9 @@ export const CLAUSE_IDS = Object.freeze(
 
 export function computeVerdict(i) {
   const clauses = [];
-  const add = (id, state, detail) => clauses.push({ id, state, detail });
+  // An UNKNOWN clause also says what kind it is and what happens next (#165).
+  const add = (id, state, detail, kind = null, next = null) =>
+    clauses.push(state === UNKNOWN ? { id, state, detail, kind, next } : { id, state, detail });
 
   // 1. CI at the pinned head, settled. An unsettled green is a workflow that has
   //    not scheduled its jobs yet, which reads identically to a clean run.
@@ -90,8 +103,8 @@ export function computeVerdict(i) {
   // A base that requires reeve's shadow check is gated by a result that never
   // fails: the shadow result passes the rule whatever reeve found.
   else if (i.checks?.shadowRequired) add("ci", BLOCK, "the base requires reeve's shadow check, whose result passes the rule whatever reeve finds");
-  else if (!i.checks) add("ci", UNKNOWN, "no check reading");
-  else if (!i.checks.settled) add("ci", UNKNOWN, `checks not settled: ${i.checks.verdict}${i.checks.why ? ` (${i.checks.why})` : ""}`);
+  else if (!i.checks) add("ci", UNKNOWN, "no check reading", "retry", "read the head's checks again");
+  else if (!i.checks.settled) add("ci", UNKNOWN, `checks not settled: ${i.checks.verdict}${i.checks.why ? ` (${i.checks.why})` : ""}`, "waiting", "look again once the checks settle");
   else if (i.checks.verdict === "GREEN") add("ci", PASS, "all checks passing at the pinned head");
   else if (i.checks.verdict === "MISSING_REQUIRED" || i.checks.verdict === "SKIPPED_REQUIRED") add("ci", BLOCK, i.checks.why);
   else if (i.checks.verdict === "RED") {
@@ -100,14 +113,14 @@ export function computeVerdict(i) {
     // worse, but it also cannot be called green. The scheduler decides whether to
     // proceed; the verdict only reports.
     add("ci", BLOCK, `failing: ${names}${i.checks.inherited?.length ? ` (inherited from base: ${i.checks.inherited.join(", ")})` : ""}`);
-  } else add("ci", UNKNOWN, `check verdict ${i.checks.verdict}`);
+  } else add("ci", UNKNOWN, `check verdict ${i.checks.verdict}`, "retry", "read the head's checks again");
 
   // 2. The base's own health. GitHub does not check this when strict is false, so
   //    a PR can merge cleanly into a branch that is already broken.
-  if (!i.base) add("base", UNKNOWN, "base health not read");
+  if (!i.base) add("base", UNKNOWN, "base health not read", "retry", "read the base branch's checks again");
   else if (i.base.verdict === "GREEN") add("base", PASS, "base is green");
   else if (i.base.verdict === "RED") add("base", BLOCK, "the base branch is red; merging into it hides the next failure");
-  else add("base", UNKNOWN, `base verdict ${i.base.verdict}`);
+  else add("base", UNKNOWN, `base verdict ${i.base.verdict}`, "waiting", "look again once the base branch's checks settle");
 
   // 3. Review coverage AT THIS HEAD, per blocking reviewer. Four states, never two:
   //    a refusal is ABSENT, never a pass. 65 of 65 Codex comments on the last 40
@@ -127,8 +140,8 @@ export function computeVerdict(i) {
     const notRun = blocking.filter(r => r.state === "NOT_RUN");
 
     if (atHead.length === blocking.length) add("review", PASS, `${blocking.length} blocking reviewer(s) covered at ${i.head?.slice(0, 8)}`);
-    else if (unreachable.length) add("review", UNKNOWN, `unreachable: ${unreachable.map(r => `${r.login}=${r.state}`).join(", ")} — absence is not approval`);
-    else if (notRun.length) add("review", UNKNOWN, `not yet run: ${notRun.map(r => r.login).join(", ")}`);
+    else if (unreachable.length) add("review", UNKNOWN, `unreachable: ${unreachable.map(r => `${r.login}=${r.state}`).join(", ")} — absence is not approval`, "person", "a person makes a blocking reviewer reachable again");
+    else if (notRun.length) add("review", UNKNOWN, `not yet run: ${notRun.map(r => r.login).join(", ")}`, "missing", "ask the reviewers for a round at this head");
     else add("review", BLOCK, `covered at a different revision: ${covered.map(r => `${r.login}@${(r.reviewedHead ?? "?").slice(0, 8)}`).join(", ")}`);
   }
 
@@ -167,12 +180,12 @@ export function computeVerdict(i) {
   // That gap is closed: a body reeve cannot read is counted as one unknown
   // finding, so the cap is enforced rather than announced as unenforced.
   else if (R.n >= R.softCap && R.unspilledCritical == null)
-    add("rounds", UNKNOWN, `past soft cap ${R.softCap} and reeve cannot say how many criticals are open`);
+    add("rounds", UNKNOWN, `past soft cap ${R.softCap} and reeve cannot say how many criticals are open`, "retry", "read the open findings again");
   else add("rounds", PASS, `round ${R.n} of ${R.softCap}/${R.hardCap}`);
 
   // 5. Unresolved threads. A truncated read is not zero: reviewThreads(first:100)
   //    has produced four consecutive false "zero unresolved" reports.
-  if (!i.threads || i.threads.readable === false) add("threads", UNKNOWN, "thread state not readable");
+  if (!i.threads || i.threads.readable === false) add("threads", UNKNOWN, "thread state not readable", "retry", "read the review threads again");
   else if (i.threads.unresolved > 0) add("threads", BLOCK, `${i.threads.unresolved} of ${i.threads.total} thread(s) unresolved`);
   else add("threads", PASS, `0 of ${i.threads.total} threads unresolved`);
 
@@ -192,7 +205,7 @@ export function computeVerdict(i) {
   //     Scoped upstream to blocking reviewers, so an advisory reviewer going quiet
   //     cannot block a pull request for ever.
   if (!i.cleared || i.cleared.readable === false)
-    add("cleared", UNKNOWN, `cannot say which threads a reviewer has returned to${i.cleared?.why ? ` — ${i.cleared.why}` : ""}`);
+    add("cleared", UNKNOWN, `cannot say which threads a reviewer has returned to${i.cleared?.why ? ` — ${i.cleared.why}` : ""}`, "retry", "read which threads each reviewer returned to again");
   else if (i.cleared.uncleared > 0)
     add("cleared", BLOCK, `${i.cleared.uncleared} thread(s) that ${i.cleared.reviewers.join(", ") || "a blocking reviewer"} has not come back to`);
   else add("cleared", PASS, "every blocking reviewer's threads have been returned to");
@@ -211,7 +224,7 @@ export function computeVerdict(i) {
   //     a worker rather than another request for a round.
   const B = i.bodyFindings;
   if (!B || B.readable === false)
-    add("bodyFindings", UNKNOWN, `cannot say what a reviewer stated in a review body${B?.why ? ` — ${B.why}` : ""}`);
+    add("bodyFindings", UNKNOWN, `cannot say what a reviewer stated in a review body${B?.why ? ` — ${B.why}` : ""}`, "retry", "read the review bodies again");
   else if (B.open > 0)
     add("bodyFindings", BLOCK, `${B.open} finding(s) stated in a review body by ${B.reviewers.join(", ") || "a blocking reviewer"}, with no thread to resolve`);
   else add("bodyFindings", PASS, "no open review-body findings");
@@ -231,14 +244,14 @@ export function computeVerdict(i) {
   //     as a configured reviewer's.
   const U = i.unreadableBodies;
   if (!U || U.readable === false)
-    add("bodyReadable", UNKNOWN, `cannot say whether every review body was readable${U?.why ? ` — ${U.why}` : ""}`);
+    add("bodyReadable", UNKNOWN, `cannot say whether every review body was readable${U?.why ? ` — ${U.why}` : ""}`, "retry", "read the review bodies again");
   else if (U.open > 0)
     add("bodyReadable", BLOCK, `${U.open} review body/bodies from ${U.reviewers.join(", ")} that reeve cannot read — declare bodyFindings for them`);
   else add("bodyReadable", PASS, "every review body was readable");
 
   // 6. Ledger blockers. null means the store could not answer, which is not zero.
   //    The previous gate skipped this check entirely when the read failed.
-  if (i.ledgerBlockers === null || i.ledgerBlockers === undefined) add("findings", UNKNOWN, "could not read blocking findings");
+  if (i.ledgerBlockers === null || i.ledgerBlockers === undefined) add("findings", UNKNOWN, "could not read blocking findings", "retry", "read the ledger's findings again");
   else if (i.ledgerBlockers > 0) add("findings", BLOCK, `${i.ledgerBlockers} active finding(s) block this PR`);
   else add("findings", PASS, "no active blocking findings");
 
@@ -255,7 +268,7 @@ export function computeVerdict(i) {
   //     holds, and an UNKNOWN clause would drag every verdict it renders to
   //     UNKNOWN for a question it was never asked.
   if (i.hold) {
-    if (i.hold.readable === false) add("hold", UNKNOWN, `builder hold not readable: ${i.hold.why}`);
+    if (i.hold.readable === false) add("hold", UNKNOWN, `builder hold not readable: ${i.hold.why}`, "person", "a person makes the builder's holds readable");
     else if (i.hold.held) add("hold", BLOCK, i.hold.detail ? `${i.hold.reason}: ${i.hold.detail}` : String(i.hold.reason));
     else add("hold", PASS, "the builder has not held this PR");
   }
@@ -275,10 +288,10 @@ export function computeVerdict(i) {
   // because a verdict that did would flip on each publish.
   const MS = String(i.mergeState ?? "").toUpperCase();
   const parts = i.mergeParts ?? null;
-  if (!MS) add("mergeable", UNKNOWN, "mergeStateStatus not read");
+  if (!MS) add("mergeable", UNKNOWN, "mergeStateStatus not read", "retry", "read the merge state again");
   else if (MS === "CLEAN" || MS === "UNSTABLE") add("mergeable", PASS, MS);
-  else if (MS === "UNKNOWN") add("mergeable", UNKNOWN, "GitHub is still computing mergeability");
-  else if (MS === "BLOCKED" && parts?.readable === false) add("mergeable", UNKNOWN, "mergeStateStatus BLOCKED, and GitHub reported an error reading its parts");
+  else if (MS === "UNKNOWN") add("mergeable", UNKNOWN, "GitHub is still computing mergeability", "waiting", "look again once GitHub has computed mergeability");
+  else if (MS === "BLOCKED" && parts?.readable === false) add("mergeable", UNKNOWN, "mergeStateStatus BLOCKED, and GitHub reported an error reading its parts", "retry", "read what the base requires again");
   else if (MS === "BLOCKED" && parts) {
     const review = parts.reviewDecision === "CHANGES_REQUESTED" || parts.reviewDecision === "REVIEW_REQUIRED";
     const others = (state) => (parts.others ?? []).filter((c) => c.state === state).map((c) => c.context);
@@ -286,23 +299,27 @@ export function computeVerdict(i) {
     if (parts.mergeable === "CONFLICTING") add("mergeable", BLOCK, "mergeStateStatus BLOCKED: the branch conflicts with its base");
     else if (review) add("mergeable", BLOCK, `mergeStateStatus BLOCKED: review ${parts.reviewDecision}`);
     else if (parts.ownCheckRequired === false) add("mergeable", BLOCK, "mergeStateStatus BLOCKED, and not by reeve's own check");
-    else if (parts.ownCheckRequired === null) add("mergeable", UNKNOWN, "mergeStateStatus BLOCKED, and whether reeve's own required check is among the reasons couldn't be read");
+    else if (parts.ownCheckRequired === null) add("mergeable", UNKNOWN, "mergeStateStatus BLOCKED, and whether reeve's own required check is among the reasons couldn't be read", "retry", "read the base's rules again");
     else if (failing.length) add("mergeable", BLOCK, `mergeStateStatus BLOCKED: required check(s) not passing: ${failing.join(", ")}`);
     else if (parts.unresolvedBlocks === true) add("mergeable", BLOCK, "mergeStateStatus BLOCKED: the base requires every conversation resolved");
     else if (parts.strict === true && parts.behind > 0) add("mergeable", BLOCK, `mergeStateStatus BLOCKED: the base requires branches up to date, and this one is ${parts.behind} commit(s) behind`);
     else if (!Array.isArray(parts.others) || parts.unresolvedBlocks == null || !Array.isArray(parts.unevaluated)
              || parts.strict == null || (parts.strict && !Number.isInteger(parts.behind)))
-      add("mergeable", UNKNOWN, "mergeStateStatus BLOCKED, and what else the base requires couldn't be read");
-    else if (waiting.length) add("mergeable", UNKNOWN, `mergeStateStatus BLOCKED, waiting for required check(s): ${waiting.join(", ")}`);
-    else if (parts.unevaluated.length) add("mergeable", UNKNOWN, `mergeStateStatus BLOCKED, and the base requires what reeve doesn't evaluate: ${parts.unevaluated.join(", ")}`);
-    else if (parts.mergeable !== "MERGEABLE") add("mergeable", UNKNOWN, `mergeStateStatus BLOCKED, and GitHub hasn't settled whether the branch merges (${parts.mergeable ?? "unread"})`);
+      add("mergeable", UNKNOWN, "mergeStateStatus BLOCKED, and what else the base requires couldn't be read", "retry", "read the base's rules again");
+    else if (waiting.length) add("mergeable", UNKNOWN, `mergeStateStatus BLOCKED, waiting for required check(s): ${waiting.join(", ")}`, "waiting", "look again once the required checks report");
+    else if (parts.unevaluated.length) add("mergeable", UNKNOWN, `mergeStateStatus BLOCKED, and the base requires what reeve doesn't evaluate: ${parts.unevaluated.join(", ")}`, "person", "a person decides whether the base's other requirements are met");
+    else if (parts.mergeable !== "MERGEABLE") add("mergeable", UNKNOWN, `mergeStateStatus BLOCKED, and GitHub hasn't settled whether the branch merges (${parts.mergeable ?? "unread"})`, "waiting", "look again once GitHub settles whether the branch merges");
     else add("mergeable", PASS, "mergeStateStatus BLOCKED by reeve's own required check, which this verdict decides; nothing else the base requires is outstanding");
   }
   else add("mergeable", BLOCK, `mergeStateStatus ${MS}`);
 
   const state = clauses.reduce((acc, c) => worst(acc, c.state), PASS);
+  // An UNKNOWN verdict carries the most serious kind among its UNKNOWN clauses.
+  const kind = state === UNKNOWN
+    ? clauses.filter(c => c.state === UNKNOWN).reduce((k, c) => (UNKNOWN_KINDS.indexOf(c.kind) > UNKNOWN_KINDS.indexOf(k) ? c.kind : k), UNKNOWN_KINDS[0])
+    : null;
   return {
-    state, head: i.head, clauses,
+    state, head: i.head, clauses, ...(kind ? { kind } : {}),
     summary: state === PASS ? "every clause satisfied at this revision"
            : state === BLOCK ? clauses.filter(c => c.state === BLOCK).map(c => c.id).join(", ") + " blocked"
            : clauses.filter(c => c.state === UNKNOWN).map(c => c.id).join(", ") + " could not be determined",

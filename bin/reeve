@@ -15,6 +15,7 @@ import { snapshot, restore, latestSnapshot, exportEvents,
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick, measuredContainment, withdrawStanding, tellStuck, runningCode } from "../src/daemon.mjs";
 import { replayDecisions, renderReplay } from "../src/decisions.mjs";
+import { withdrawUnrecorded, unrecordedWithdrawn } from "../src/unrecorded.mjs";
 import { SelectorError } from "../src/db/records.mjs";
 import { readState, render as renderStatus, statusline, why, cleanMergeRate } from "../src/status.mjs";
 import { init } from "../src/init.mjs";
@@ -225,6 +226,7 @@ const FLAGS = {
   pr:                 { value: true,  what: "a pull request number" },
   head:               { value: true,  what: "a commit, or the start of one" },
   record:             { value: true,  what: "a decision record's digest, or the start of one" },
+  unrecorded:         { value: false, what: "withdraw, once, the results reeve published before it kept a record" },
 
   hub:            { value: false, what: "operate on the builder hub rather than a repository" },
   anyway:         { value: false, what: "file a near-twin of an existing task anyway" },
@@ -875,6 +877,14 @@ switch (cmd) {
     if (!existsSync(dbPath)) { console.error(`reeve withdraw: ${missingStoreMessage(dbPath, { initCreatesIt: !opt("db"), nwo })}`); process.exit(1); }
     const logPath = resolve(opt("log") ?? join(HOME, "reeve.log"));
     const ctx = { nwo, db: open(dbPath), logPath, profile: null };
+    // ONCE, BEFORE ENFORCING (#242): what reeve published before it kept a record.
+    if (flag("unrecorded")) {
+      const r = await withdrawUnrecorded({ nwo, db: ctx.db, log: (line) => console.log(line) });
+      if (r.already) console.log(`reeve withdraw: the results reeve published on ${nwo} before it kept a record were withdrawn before`);
+      else if (r.ok) console.log(`reeve withdraw: checked ${r.checked} pull request(s) that didn't merge, and withdrew reeve's result at ${r.withdrawn.length}`);
+      else console.error(`reeve withdraw: ${r.why}. Run it again.`);
+      process.exit(r.ok ? 0 : 1);
+    }
     const stuck = await withdrawStanding(ctx, "the merge policy stopped");
     // The profile says where a person is told. It's read after withdrawing, and
     // one that won't load leaves the telling to the log, so it costs nothing.
@@ -2366,6 +2376,18 @@ switch (cmd) {
     // nobody. (Codex #4g-[2].)
     const dbPath = resolve(opt("db") ?? stateFor(nwo));
     if (!existsSync(dbPath)) { console.error(`reeve run: ${missingStoreMessage(dbPath, { initCreatesIt: !opt("db"), nwo })}`); process.exit(1); }
+    // NOT ENFORCING while a result reeve published before it kept a record may
+    // stand (#242): a required check reads its old `neutral` as passing.
+    if (flag("enforce")) {
+      const store = open(dbPath);
+      const done = unrecordedWithdrawn(store, nwo);
+      store.close();
+      if (!done) {
+        console.error(`reeve run: --enforce waits until reeve has withdrawn the results it published before it kept a record, ` +
+                      `at the head of every pull request on ${nwo} that didn't merge.\n-> reeve withdraw ${nwo} --unrecorded`);
+        process.exit(1);
+      }
+    }
     // Resolved before the context so the REASON survives. A project that is
     // simply not registered is `{ project: null, why: null }` -- an ordinary
     // state. A registry that could not be parsed is a fault that says so.
@@ -2563,6 +2585,10 @@ function usage() {
       --halt <path>         marker file that stops everything (default ~/.reeve/HALT)
   withdraw [owner/repo] withdraw every PASS reeve left standing there; systemd runs it
                         after the daemon stops, however it stopped
+      --unrecorded          once, before enforcing: withdraw reeve's results under the
+                            enforcement check at the head of every pull request that
+                            didn't merge, published before it kept a record
+                            (0 done or done before · 1 not done, run it again)
 
   everywhere:
       --home <dir>          the reeve home to operate on (default $REEVE_HOME, else ~/.reeve)

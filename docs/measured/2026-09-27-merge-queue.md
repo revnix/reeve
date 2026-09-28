@@ -33,6 +33,13 @@ check timeout raised to 30 minutes.
 | Queued at 22:19:04 UTC, while reeve published a settling UNKNOWN on the queue's commit as `action_required` | Removed at 22:20:50, with the reason `failed_checks`, 31 seconds after that publication. A queue reads any settled result that isn't success as a failure. |
 | After the fix, queued at 22:23:37. On the queue's commit, 9bf42da, reeve published its settling UNKNOWN as in progress, at 22:26:54 and 22:28:12 | The queue waited. |
 | reeve's verdict on 9bf42da was PASS, published at 22:29:29 | Merged at 22:29:43, 14 seconds later. `main`'s head became 9bf42da. |
+| On 2026-09-28, from `main` at 2a8692d: pull request #4 passed at its head at 00:40:39 and was queued at 00:40:50. The ruleset's own `test` passed on its queue commit, 4bfe2c3, at 00:41:16 | An unresolved review thread was added at 00:41:26. The ruleset doesn't require resolved conversations, so only reeve reads it. |
+| reeve judged 4bfe2c3 BLOCK, and published `ops/merge-policy` as a failure there at 00:42:04 | Removed at 00:42:34, with the reason `failed_checks`. The pull request stayed open. |
+
+A pull request on a branch named `mp/…`, reeve's builders' prefix, is judged as a
+builder's, whose holds are read from the builder hub. With no hub on this machine,
+the first attempt, #3, was UNKNOWN for that reason. Renaming its branch closed it,
+as GitHub reads a renamed head branch as deleted, so #4 used the new name.
 
 ## What followed
 

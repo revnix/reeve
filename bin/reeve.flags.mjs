@@ -67,6 +67,7 @@ export const APPLIES = Object.freeze({
   // record, to replay, and which commit `why` explains.
   pr: Object.freeze(["replay"]),
   record: Object.freeze(["replay"]),
+  unrecorded: Object.freeze(["withdraw"]),
   head: Object.freeze(["why"]),
 
   // `--test` is the whole of `reeve notify`: there is no other thing that

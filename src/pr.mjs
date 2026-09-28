@@ -141,6 +141,24 @@ export function readMergeQueue(nwo, branch, { gh = ghJson } = {}) {
 }
 
 /**
+ * Every pull request that didn't merge, open or closed, with its head (#242). A
+ * merged one keeps reeve's result, as the record of why it merged, so it isn't
+ * listed. Not ok unless the whole list was read.
+ */
+export function unmergedHeads(nwo, { gh = ghJson } = {}) {
+  const r = gh(["--paginate", `repos/${nwo}/pulls?state=all&per_page=100`, "--jq", ".[] | select(.merged_at == null) | {pr: .number, head: .head.sha}"]);
+  if (!r.ok) return { ok: false, why: r.err || "the pull requests couldn't be listed" };
+  const prs = [];
+  for (const line of String(r.out ?? "").split("\n").filter(Boolean)) {
+    let x;
+    try { x = JSON.parse(line); } catch { return { ok: false, why: "the list of pull requests couldn't be read" }; }
+    if (!Number.isInteger(x?.pr) || typeof x?.head !== "string") return { ok: false, why: "the list of pull requests named one without its head" };
+    prs.push({ pr: x.pr, head: x.head });
+  }
+  return { ok: true, prs };
+}
+
+/**
  * The verdict on the commit a merge queue built for a pull request (#163). The
  * queue merges that commit, not the pull request's head, and waits for its
  * required checks there, so a verdict at the head counts for nothing in the

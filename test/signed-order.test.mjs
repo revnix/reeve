@@ -4,7 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { fileSigner, knownKeys, latestStatement, signStatement, signingKey } from "../src/signing.mjs";
@@ -1685,4 +1685,81 @@ test("reeve restore syncs the store's folder once the store is in place, before 
   const failed = restore(snap, dbPath, { overwrite: true, isDaemonRunning: () => null, syncDir: () => { throw new Error("EIO: i/o error"); } });
   assert.equal(failed.ok, false, "and a store whose folder couldn't be synced isn't said to be restored");
   assert.match(String(failed.why), /couldn't be synced to disk/);
+});
+
+// ── from #278's seventeenth review ───────────────────────────────────────────
+
+test("a store the host's anchor is bound to, stripped of its baseline and every record while its reeve was down, isn't given a baseline again", async () => {
+  const dir = credentials();
+  // The first ordering tick binds the anchor, and its reeve stops before an entry is noted.
+  const h = host(dir);
+  const dbPath = await ticks([at(A)], { ...h, anchor: { ...h.anchor, note: () => false } });
+  let db = open(dbPath);
+  const id = identityOf(db);
+  // While it's down: its baseline, its records and its order all taken away.
+  db.prepare("DELETE FROM event WHERE op IN ('signing.baseline', 'decision.latest')").run();
+  db.prepare("DELETE FROM decision").run();
+  db.close();
+  const a = readAnchor(dir, REPO);
+  assert.deepEqual({ began: a?.began, store: a?.store }, { began: true, store: id }, "control: the host's anchor is bound to it, and says it began");
+  const r = await closedTick(dbPath, host(dir));
+  db = open(dbPath);
+  const baselines = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n;
+  db.close();
+  assert.equal(baselines, 0, "none made over nothing, which would leave no digest to find the rollback by");
+  assert.match(r.log, /the host's anchor says this store began signing, though it holds no baseline or signed record/);
+});
+
+test("a store holding a record of the repository that doesn't hold as it was kept doesn't bind the host's anchor, so the repository's own store still can", async () => {
+  const dir = credentials();
+  // A store kept before signing, named by --db say, its record's row moved to another pull request.
+  const moved = await ticks([at(A)], {});
+  let db = open(moved);
+  db.prepare("UPDATE decision SET pr = 43").run();
+  db.close();
+  const r = await closedTick(moved, host(dir));
+  assert.equal(readAnchor(dir, REPO)?.store ?? null, null, "the host's anchor for o/r isn't bound to it");
+  assert.match(r.log, /this store holds a record of o\/r that doesn't hold as it was kept \(its row names pull request 43, but its record 42\), so it isn't taken as o\/r's own/);
+  db = open(await ticks([at(A)], host(dir)));
+  const id = identityOf(db);
+  db.close();
+  assert.equal(readAnchor(dir, REPO)?.store, id, "and o/r's own store binds it");
+});
+
+test("a restore whose copy can't be put in place leaves the store's log where it was, and nothing beside it", () => {
+  const dir = tempDir("reeve-order-restore-log-");
+  const dbPath = join(dir, "s.db"), snap = join(dir, "snap.db");
+  open(dbPath).close();
+  copyFileSync(dbPath, snap);
+  // What the store committed before an unclean stop, in its log alone.
+  writeFileSync(`${dbPath}-wal`, "committed");
+  const rename = (from, to) => { if (to === dbPath) throw new Error("EIO: i/o error"); renameSync(from, to); };
+  const r = restore(snap, dbPath, { overwrite: true, isDaemonRunning: () => null, rename });
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.equal(existsSync(`${dbPath}-wal`) && readFileSync(`${dbPath}-wal`, "utf8"), "committed", "the store's log is where it was");
+  assert.deepEqual(readdirSync(dir).filter((n) => n.includes(".restoring")), [], "and nothing is left beside it");
+});
+
+test("a restore puts right what one killed partway left: its copy removed, and the store's log it had moved aside put back", () => {
+  const dir = tempDir("reeve-order-restore-reap-");
+  const dbPath = join(dir, "s.db"), snap = join(dir, "snap.db");
+  open(dbPath).close();
+  copyFileSync(dbPath, snap);
+  const gone = spawnSync(process.execPath, ["-e", ""]).pid;
+  // One killed after moving the store's log aside, before its copy was put in place.
+  writeFileSync(`${dbPath}.${gone}.deadbeef.restoring`, "partway");
+  writeFileSync(`${dbPath}.${gone}.deadbeef.restoring-wal`, "committed");
+  // One killed once its copy was in place, the old store's index still aside.
+  writeFileSync(`${dbPath}.${gone}.cafebabe.restoring-shm`, "old");
+  // And a running process's own.
+  const live = `${dbPath}.${process.ppid}.feedface.restoring`;
+  writeFileSync(live, "partway");
+  let during = null;
+  const r = restore(snap, dbPath, { overwrite: true, isDaemonRunning: () => null,
+    copy: (from, to) => {
+      during = { log: existsSync(`${dbPath}-wal`) && readFileSync(`${dbPath}-wal`, "utf8"), left: readdirSync(dir).filter((n) => n.includes(".restoring")).sort() };
+      copyFileSync(from, to);
+    } });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.deepEqual(during, { log: "committed", left: [basename(live)] }, "the log put back, and only a running process's left");
 });

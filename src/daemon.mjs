@@ -945,7 +945,8 @@ function standingAt(db, pr) {
  * sign of it, its baseline and every signature were taken away, or it was
  * restored from before: no baseline is made over what it holds, which would
  * vouch for whatever was rewritten there, and its unsigned records aren't
- * trusted. One holding no record at all begins again, as that vouches for none.
+ * trusted. One holding no record at all begins again, as that vouches for none,
+ * unless it's the store the anchor is bound to: its records were taken away.
  * Where it began, the caller says so on the host's anchor, once this store's
  * transaction has committed.
  * @returns {{ began: boolean, why?: string }}
@@ -959,13 +960,16 @@ function beginSigning(db, sign, logPath, anchor = null, nwo = null) {
       if (db.prepare(`SELECT 1 FROM decision WHERE envelope IS NOT NULL LIMIT 1`).get()) return { began: true };
       // An entry of a signed order is signed too, and only made once a store began.
       if (db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(LATEST_OP)) return { began: true };
-      let hostSays = false;
+      let hostSays = false, ours = false;
       if (anchor) {
-        // One that can't be read might say so: taken as saying it.
-        try { hostSays = Boolean(anchor.read(nwo)?.began); }
-        catch (err) { hostSays = true; log(logPath, `signing: ${err.message}, so it's taken to say this store began signing`); }
+        // One that can't be read might say so, of this store: taken as saying it.
+        try { const a = anchor.read(nwo); hostSays = Boolean(a?.began); ours = hostSays && Boolean(a?.store) && a?.store === storeIdentity(db); }
+        catch (err) { hostSays = ours = true; log(logPath, `signing: ${err.message}, so it's taken to say this store began signing`); }
       }
-      if (hostSays && db.prepare(`SELECT 1 FROM decision LIMIT 1`).get()) {
+      // A store the anchor is bound to that holds no record at all had them all
+      // taken away, as reeve never removes one: a baseline over nothing would
+      // leave no digest to find that by. One it isn't bound to vouches for none.
+      if (hostSays && (ours || db.prepare(`SELECT 1 FROM decision LIMIT 1`).get())) {
         log(logPath, "signing: the host's anchor says this store began signing, though it holds no baseline or signed record: " +
                      "they were taken away, or the store restored from before. No baseline is made over what it holds, and its unsigned records aren't trusted");
         return { began: true };

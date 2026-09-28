@@ -13,4 +13,10 @@ can read the key, and no worker can. Its public half is written beside it, as
 host's own. A record signed by any other key, or whose signature doesn't hold,
 reads as corrupt. One kept before records were signed reads as unsigned.
 
+On the host that signed them, `why` and `replay` also read
+`credentials/signing-anchor.json`, which records what the host signed last:
+whether each store began signing, and each pull request's highest entry of the
+signed order of its decisions. A store holding less than that, restored from an
+older copy or cut short, reads as not to be trusted.
+
 Keep a replaced key's file here, so the records it signed still check.

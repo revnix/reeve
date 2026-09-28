@@ -15,7 +15,7 @@ import { snapshot, restore, latestSnapshot, exportEvents,
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick, measuredContainment, withdrawStanding, tellStuck, runningCode } from "../src/daemon.mjs";
 import { replayDecisions, renderReplay } from "../src/decisions.mjs";
-import { knownKeys, fileSigner, PUBLIC_FILE } from "../src/signing.mjs";
+import { knownKeys, fileSigner, fileAnchor, readAnchor, PUBLIC_FILE } from "../src/signing.mjs";
 import { SelectorError } from "../src/db/records.mjs";
 import { readState, render as renderStatus, statusline, why, cleanMergeRate } from "../src/status.mjs";
 import { init } from "../src/init.mjs";
@@ -927,7 +927,7 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     let results;
     try {
       results = replayDecisions(open(dbPath), { pr: pr == null ? null : Number(pr), since: sinceAt, digest: opt("record") ?? null },
-                                { code: runningCode(), profile, keys: signingKeys() });
+                                { code: runningCode(), profile, keys: signingKeys(), anchor: readAnchor(join(HOME, "credentials")) });
     } catch (e) {
       // A record named by a start that isn't hexadecimal, or that more than one
       // shares, is refused rather than replayed as a pattern.
@@ -975,7 +975,7 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     if (cmd === "why") {
       const target = positionals.find(a => /^#?\d+$/.test(a) || a.startsWith("pr:"));
       if (!target) { console.error("reeve why <pr-number>"); process.exit(1); }
-      console.log(why(db, target, { head: opt("head") ?? null, keys: signingKeys() }));
+      console.log(why(db, target, { head: opt("head") ?? null, keys: signingKeys(), anchor: readAnchor(join(HOME, "credentials")) }));
       process.exit(0);
     }
 
@@ -2405,6 +2405,8 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       // Each decision record is signed with the host's key, made on first use in
       // the credentials folder, which no worker may read (#165).
       signer: fileSigner(join(HOME, "credentials")),
+      // And what it signed last, kept beside the key, outside every store.
+      anchor: fileAnchor(join(HOME, "credentials")),
       // Execution is opt-in. A loop that acts before its decisions have been
       // watched is how an unattended run becomes an incident.
       execute: flag("execute"),

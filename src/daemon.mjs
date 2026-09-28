@@ -940,13 +940,17 @@ function standingAt(db, pr) {
  */
 function beginSigning(db, sign, logPath) {
   try {
-    if (db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(BASELINE_OP)) return;
-    if (db.prepare(`SELECT 1 FROM decision WHERE envelope IS NOT NULL LIMIT 1`).get()) return;
-    const digests = db.prepare(`SELECT digest FROM decision ORDER BY digest`).all().map((r) => r.digest);
-    const s = sign(baselineStatement(digests));
-    if (!s?.envelope) { log(logPath, `signing: the records kept before signing couldn't be signed — ${s?.unsigned}`); return; }
-    db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
-      .run(now(), "daemon", BASELINE_OP, "store", JSON.stringify({ digests: baselineStatement(digests).predicate.digests, envelope: s.envelope }));
+    // Under the store's write lock, so a second daemon on the store can't list
+    // and sign between this one's checks and its insert.
+    tx(db, () => {
+      if (db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(BASELINE_OP)) return;
+      if (db.prepare(`SELECT 1 FROM decision WHERE envelope IS NOT NULL LIMIT 1`).get()) return;
+      const digests = db.prepare(`SELECT digest FROM decision ORDER BY digest`).all().map((r) => r.digest);
+      const s = sign(baselineStatement(digests));
+      if (!s?.envelope) { log(logPath, `signing: the records kept before signing couldn't be signed — ${s?.unsigned}`); return; }
+      db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
+        .run(now(), "daemon", BASELINE_OP, "store", JSON.stringify({ digests: baselineStatement(digests).predicate.digests, envelope: s.envelope }));
+    });
   } catch (err) {
     log(logPath, `signing: the records kept before signing couldn't be listed and signed — ${err.message}`);
   }
@@ -1348,6 +1352,16 @@ export async function tick(ctx) {
   // unsigned, made once and before its first signed record: after it, a record
   // that isn't signed, or whose signature was stripped, isn't one of them.
   if (ctx.signer) beginSigning(db, signed, logPath);
+  // The host's anchor says so too, beside the key, where a store restored from
+  // before can't take it back (#165).
+  if (ctx.signer && ctx.anchor) {
+    try { if (db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(BASELINE_OP)) ctx.anchor.began(nwo); } catch { /* next tick */ }
+  }
+  // And each entry of the signed order, once it's kept.
+  const anchorLatest = (pr, latest) => {
+    if (!ctx.anchor || !latest) return;
+    if (!ctx.anchor.note(nwo, pr, latest.n)) log(logPath, `signing: #${pr}: the host's anchor couldn't be written, so it lags until the next change`);
+  };
   // Each change of a pull request's latest decision, numbered and signed, so which
   // is latest isn't read from the store's own order alone.
   const nextLatest = (pr, decision) => {
@@ -2347,6 +2361,7 @@ export async function tick(ctx) {
       }
     }
     const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire, kept });
+    if (decided.ok) anchorLatest(pr, kept?.latest);
     if (effects.length && !decided.ok) {
       log(logPath, `  #${pr}: REQUEST_REVIEW — the decision and its ${effects.length} effect(s) could NOT be recorded: ${decided.why}`);
       // Escalated, not merely logged. Nothing else covers this: no worker is
@@ -2565,6 +2580,7 @@ export async function tick(ctx) {
               }));
             if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr: entry.pr, head: sha, ...kept });
           });
+          anchorLatest(entry.pr, kept?.latest);
         } catch (err) {
           log(logPath, `  ${at}: the verdict could not be kept — ${err.message}`);
         }

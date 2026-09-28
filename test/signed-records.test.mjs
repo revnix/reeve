@@ -5,8 +5,8 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { generateKeyPairSync } from "node:crypto";
-import { signingKey, fileSigner, signDecision, checkSignature, knownKeys, keyIdOf, decisionStatement,
-         KEY_FILE, PUBLIC_FILE, PAYLOAD_TYPE } from "../src/signing.mjs";
+import { signingKey, fileSigner, signDecision, checkSignature, knownKeys, keyIdOf, decisionStatement, baselineStatement,
+         fileAnchor, readAnchor, KEY_FILE, PUBLIC_FILE, PAYLOAD_TYPE, ANCHOR_FILE } from "../src/signing.mjs";
 import { decisionRecord, digestOf } from "../src/evidence.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 import { open } from "../src/db/ops.mjs";
@@ -253,10 +253,11 @@ test("a queue commit's record is signed too", async () => {
   const QUEUED = "c".repeat(40);
   const readQueue = () => ({ ok: true, queue: true, entries: [{ pr: 42, sha: QUEUED, baseSha: "f".repeat(40), state: "AWAITING_CHECKS", prHead: "a".repeat(40) }] });
   const evaluateQueue = ({ entry, input: i }) => { const q = { ...i, head: entry.sha }; return { ok: true, input: q, verdict: computeVerdict(q) }; };
-  const r = await run({ evaluate: evaluated, readQueue, evaluateQueue, signer: fileSigner(dir), keepDir: true });
+  const r = await run({ evaluate: evaluated, readQueue, evaluateQueue, signer: fileSigner(dir), anchor: fileAnchor(dir), keepDir: true });
   const queued = rowsOf(r.dbPath).filter(x => x.head === QUEUED);
   assert.equal(queued.length, 1);
   assert.equal(checkSignature(queued[0], knownKeys({ local: dir })).state, "signed");
+  assert.equal(readAnchor(dir).latest.get("o/r#42"), 2, "the host's anchor holds the queue commit's entry, after the head's");
 });
 
 test("a tick whose run was given no signer keeps its records unsigned, and says why", async () => {
@@ -347,7 +348,7 @@ const at = (head, ci = "GREEN") => {
  * Ticks over one store, each with its own evaluation, and with `signer` from
  * tick `from` on. The ticks with one signer share a run, and so its profile.
  */
-async function ticks(evals, { signer = null, from = 0 } = {}) {
+async function ticks(evals, { signer = null, from = 0, anchor = null } = {}) {
   const dbPath = join(tempDir("reeve-signing-ticks-"), "s.db");
   open(dbPath).close();
   const each = async (list, s) => {
@@ -355,7 +356,7 @@ async function ticks(evals, { signer = null, from = 0 } = {}) {
     // By tick, not by call: a tick may evaluate a pull request more than once.
     let tick = 0;
     await run({ openPrs: () => { tick++; return [42]; }, evaluate: () => list[Math.min(tick, list.length) - 1],
-                dbPath, ticks: list.length, ...(s ? { signer: s } : {}) });
+                dbPath, ticks: list.length, ...(s ? { signer: s } : {}), ...(s && anchor ? { anchor } : {}) });
   };
   await each(evals.slice(0, from), null);
   await each(evals.slice(from), signer);
@@ -485,4 +486,112 @@ test("an entry the signed order names twice is caught", async () => {
   const shown = explainDecision(db, 42, { keys: knownKeys({ local: dir }) });
   db.close();
   assert.match(String(shown), /can't be trusted as the latest: the signed order of its decisions names entry 1 twice/);
+});
+
+// ── from #271's second review ────────────────────────────────────────────────
+
+test("only a store's first baseline vouches for records, so a later one can't launder a stripped record", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], { signer: fileSigner(dir) }));
+  const later = db.prepare("SELECT digest FROM decision ORDER BY first_seq DESC LIMIT 1").get().digest;
+  const s = fileSigner(dir)(baselineStatement([later]));
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
+    .run(2, "daemon", "signing.baseline", "store", JSON.stringify({ digests: [later], envelope: "envelope" in s ? s.envelope : null }));
+  db.prepare("UPDATE decision SET envelope = NULL WHERE digest = ?").run(later);
+  const replayed = replayDecisions(db, { digest: later.slice(0, 12) }, { keys: knownKeys({ local: dir }) });
+  db.close();
+  assert.deepEqual(replayed.map(r => r.outcome), ["unreplayable"]);
+});
+
+test("a public half whose writing fails leaves nothing behind, and signing goes on", () => {
+  const dir = credentials();
+  assert.equal(signingKey(dir, { create: true }).ok, true);
+  writeFileSync(join(dir, PUBLIC_FILE), "cut short");
+  const full = () => { throw Object.assign(new Error("no space left on device"), { code: "ENOSPC" }); };
+  const k = signingKey(dir, { write: full });
+  assert.equal(k.ok, true, "the key still signs");
+  assert.deepEqual(readdirSync(dir).filter(f => f.endsWith(".tmp")), [], "no half-written public file left beside it");
+});
+
+// ── the host's anchor, from #271's second review ─────────────────────────────
+
+test("a signed order cut short of its newest entries is caught against the host's anchor", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], { signer: fileSigner(dir), anchor: fileAnchor(dir) }));
+  const older = db.prepare("SELECT digest FROM decision ORDER BY first_seq LIMIT 1").get().digest;
+  db.prepare("DELETE FROM event WHERE op = 'decision.latest' AND json_extract(payload, '$.n') = 2").run();
+  db.prepare("UPDATE decision SET last_seq = 999999 WHERE digest = ?").run(older);
+  const keys = knownKeys({ local: dir });
+  const shown = explainDecision(db, 42, { keys, anchor: readAnchor(dir) });
+  db.close();
+  assert.match(String(shown), /can't be trusted as the latest: the signed order of its decisions ends at entry 1, though this host signed up to entry 2/);
+});
+
+test("a store that reads as never signed, where the host's anchor says it began, isn't trusted", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A)], { signer: fileSigner(dir), anchor: fileAnchor(dir) }));
+  db.prepare("DELETE FROM event WHERE op IN ('signing.baseline', 'decision.latest')").run();
+  db.prepare("UPDATE decision SET envelope = NULL, unsigned = 'it was kept before records were signed'").run();
+  const keys = knownKeys({ local: dir });
+  const replayed = replayDecisions(db, { pr: 42 }, { keys, anchor: readAnchor(dir) });
+  const shown = explainDecision(db, 42, { keys, anchor: readAnchor(dir) });
+  db.close();
+  assert.deepEqual(replayed.map(r => r.outcome), ["unreplayable"]);
+  assert.match(String(shown), /can't be trusted as the latest: the store holds no signed order of its decisions, though this host signed up to entry 1/);
+});
+
+test("the host's anchor only moves forward, and is readable only by its owner", () => {
+  const dir = credentials();
+  const anchor = fileAnchor(dir);
+  assert.equal(anchor.note("o/r", 7, 3), true);
+  assert.equal(anchor.note("o/r", 7, 2), true);
+  assert.equal(anchor.began("o/r"), true);
+  const read = readAnchor(dir);
+  assert.equal(read.latest.get("o/r#7"), 3);
+  assert.equal(read.began.has("o/r"), true);
+  assert.equal(statSync(join(dir, ANCHOR_FILE)).mode & 0o777, 0o600);
+  assert.deepEqual(readdirSync(dir).filter(f => f.endsWith(".tmp")), []);
+});
+
+test("reeve why reads the host's anchor, and says when the store holds less than this host signed", async () => {
+  const home = tempDir("reeve-signing-anchor-cli-");
+  const dir = join(home, "credentials");
+  mkdirSync(dir, { mode: 0o700 });
+  const dbPath = await ticks([at(A), at(A, "RED")], { signer: fileSigner(dir), anchor: fileAnchor(dir) });
+  const db = open(dbPath);
+  const older = db.prepare("SELECT digest FROM decision ORDER BY first_seq LIMIT 1").get().digest;
+  db.prepare("DELETE FROM event WHERE op = 'decision.latest' AND json_extract(payload, '$.n') = 2").run();
+  db.prepare("UPDATE decision SET last_seq = 999999 WHERE digest = ?").run(older);
+  db.close();
+  const shown = spawnSync(process.execPath, [REEVE, "why", "o/r", "42", "--db", dbPath], { encoding: "utf8", env: { ...offlineEnv(), REEVE_HOME: home } });
+  assert.match(shown.stdout, /though this host signed up to entry 2/, shown.stderr);
+});
+
+test("the host's anchor says a store began signing once its baseline is made, before any record", async () => {
+  const dir = credentials();
+  await run({ openPrs: () => [], signer: fileSigner(dir), anchor: fileAnchor(dir) });
+  assert.equal(readAnchor(dir).began.has("o/r"), true);
+});
+
+test("reeve replay reads the host's anchor, and doesn't replay a store stripped to look never signed", async () => {
+  const home = tempDir("reeve-signing-anchor-replay-");
+  const dir = join(home, "credentials");
+  mkdirSync(dir, { mode: 0o700 });
+  const dbPath = await ticks([at(A)], { signer: fileSigner(dir), anchor: fileAnchor(dir) });
+  const db = open(dbPath);
+  db.prepare("DELETE FROM event WHERE op IN ('signing.baseline', 'decision.latest')").run();
+  db.prepare("UPDATE decision SET envelope = NULL").run();
+  db.close();
+  const replayed = spawnSync(process.execPath, [REEVE, "replay", "o/r", "--db", dbPath], { encoding: "utf8", env: { ...offlineEnv(), REEVE_HOME: home } });
+  assert.equal(replayed.status, 1, replayed.stdout + replayed.stderr);
+  assert.match(replayed.stdout, /unsigned, though it was kept after this store began signing/);
+});
+
+test("an anchor whose writing fails leaves it as it was, and nothing beside it", () => {
+  const dir = credentials();
+  assert.equal(fileAnchor(dir).note("o/r", 7, 1), true);
+  const full = () => { throw Object.assign(new Error("no space left on device"), { code: "ENOSPC" }); };
+  assert.equal(fileAnchor(dir, { write: full }).note("o/r", 7, 2), false, "it says the write didn't land");
+  assert.equal(readAnchor(dir).latest.get("o/r#7"), 1);
+  assert.deepEqual(readdirSync(dir).filter(f => f.endsWith(".tmp")), []);
 });

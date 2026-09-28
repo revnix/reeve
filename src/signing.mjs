@@ -29,6 +29,8 @@ export const LATEST_PREDICATE = "https://revnix.com/reeve/latest-decision/v1";
 /** The private key's file in the credentials folder, and its public half's. */
 export const KEY_FILE = "signing-ed25519.pem";
 export const PUBLIC_FILE = "signing-ed25519.pub";
+/** What the host signed last, kept beside the key, outside every store. */
+export const ANCHOR_FILE = "signing-anchor.json";
 
 /** @typedef {import("node:crypto").KeyObject} KeyObject */
 /** @typedef {{ payloadType: string, payload: string, signatures: { keyid: string, sig: string }[] }} Envelope */
@@ -132,7 +134,9 @@ export function signingKey(dir, { create = false, write = (fd, text) => { writeS
     if (key.asymmetricKeyType !== "ed25519") return { ok: false, why: `the signing key at ${path} isn't an Ed25519 key` };
     const pub = createPublicKey(key);
     const keyid = keyIdOf(pub);
-    if (publicIdAt(join(dir, PUBLIC_FILE)) !== keyid) writePublic(dir, pub);
+    // A public half that can't be written now is written the next time; the key
+    // signs either way, and its records check against the published copy.
+    if (publicIdAt(join(dir, PUBLIC_FILE)) !== keyid) { try { writePublic(dir, pub, write); } catch { /* next time */ } }
     return { ok: true, key, keyid, created };
   } catch (err) {
     return { ok: false, why: `the signing key couldn't be read or made: ${/** @type {Error} */ (err).message}` };
@@ -144,13 +148,79 @@ function publicIdAt(path) {
   try { return keyIdOf(createPublicKey(readFileSync(path))); } catch { return null; }
 }
 
-/** The public half, written whole to a file of its own and renamed into place. @param {string} dir @param {KeyObject} publicKey */
-function writePublic(dir, publicKey) {
+/**
+ * The public half, written whole to a file of its own and renamed into place.
+ * Its own file is gone afterwards, whatever failed.
+ * @param {string} dir @param {KeyObject} publicKey @param {(fd: number, text: string) => void} write
+ */
+function writePublic(dir, publicKey, write) {
   const path = join(dir, PUBLIC_FILE);
   const temp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-  const fd = openSync(temp, "wx", 0o644);
-  try { writeSync(fd, String(publicKey.export({ type: "spki", format: "pem" }))); fsyncSync(fd); } finally { closeSync(fd); }
-  try { renameSync(temp, path); } catch (err) { try { unlinkSync(temp); } catch { /* gone */ } throw err; }
+  try {
+    const fd = openSync(temp, "wx", 0o644);
+    try { write(fd, String(publicKey.export({ type: "spki", format: "pem" }))); fsyncSync(fd); } finally { closeSync(fd); }
+    renameSync(temp, path);
+  } finally { try { unlinkSync(temp); } catch { /* renamed, or gone */ } }
+}
+
+/**
+ * The host's anchor (#165): what it signed last, kept beside the key, where
+ * whoever can change a store, or restore an older one, can't. For each
+ * repository, whether its store began signing, and each pull request's highest
+ * entry of the signed order. It only moves forward, and is written whole and
+ * renamed into place. Each write says whether it landed; a write that didn't
+ * leaves the anchor behind, which reads as nothing taken away.
+ * @param {string} dir  the credentials folder
+ * @param {{ write?: (fd: number, text: string) => void }} [o]  `write` for a test's faults
+ */
+export function fileAnchor(dir, { write = (fd, text) => { writeSync(fd, text); } } = {}) {
+  const path = join(dir, ANCHOR_FILE);
+  const update = (/** @type {(a: { began: Record<string, true>, latest: Record<string, number> }) => boolean} */ change) => {
+    try {
+      const a = anchorAt(path);
+      if (!change(a)) return true;
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const temp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+      try {
+        const fd = openSync(temp, "wx", 0o600);
+        try { write(fd, canonical(a)); fsyncSync(fd); } finally { closeSync(fd); }
+        renameSync(temp, path);
+      } finally { try { unlinkSync(temp); } catch { /* renamed, or gone */ } }
+      return true;
+    } catch { return false; }
+  };
+  return {
+    /** @param {string} repo */
+    began: (repo) => update((a) => (a.began[repo] ? false : ((a.began[repo] = true), true))),
+    /** @param {string} repo @param {number} pr @param {number} n */
+    note: (repo, pr, n) => update((a) => {
+      const k = `${repo}#${pr}`;
+      if ((a.latest[k] ?? 0) >= n) return false;
+      a.latest[k] = n;
+      a.began[repo] = true;
+      return true;
+    }),
+  };
+}
+
+/** The anchor in `path`, or an empty one when there's none. Throws when it can't be read. @param {string} path */
+function anchorAt(path) {
+  if (!existsSync(path)) return { began: {}, latest: {} };
+  const a = JSON.parse(readFileSync(path, "utf8"));
+  return { began: { ...(a?.began ?? {}) }, latest: { ...(a?.latest ?? {}) } };
+}
+
+/**
+ * The host's anchor, to check stores against. Empty when there's none, or when
+ * it can't be read: then it tells nothing, and takes nothing away.
+ * @param {string} dir  the credentials folder
+ * @returns {{ began: Set<string>, latest: Map<string, number> }}
+ */
+export function readAnchor(dir) {
+  try {
+    const a = anchorAt(join(dir, ANCHOR_FILE));
+    return { began: new Set(Object.keys(a.began)), latest: new Map(Object.entries(a.latest).filter(([, n]) => Number.isInteger(n))) };
+  } catch { return { began: new Set(), latest: new Map() }; }
 }
 
 /**

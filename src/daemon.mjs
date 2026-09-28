@@ -1468,20 +1468,30 @@ export async function tick(ctx) {
     if (top && !ctx.anchor.note(nwo, pr, top))
       log(logPath, `signing: #${pr}: the host's anchor couldn't be moved to entry ${top} of its order, so it lags until a later tick`);
   };
-  // The pull requests whose latest record came after their order's last entry,
-  // read from the store: work a tick couldn't do, as another daemon held the
-  // lock, or it stopped or halted first, is done by the next, though the pull
-  // request is never judged again. Extended once a tick, at its end or where it
+  // The pull requests with a record their order doesn't name yet, or a latest
+  // that isn't its last entry's, read from the store: work a tick couldn't do,
+  // as another daemon held the lock, or it stopped or halted first, is done by
+  // the next, though the pull request is never judged again. Extended once a tick, at its end or where it
   // halts, to the store's latest then: not as its passes went by, as a pull
   // request in the merge queue is judged at its head and at the queue's commit
   // every tick, and would add both, tick after tick.
   // And those whose order ran ahead of the anchor, an entry committed and its
   // note never made: noted, though the pull request is never judged again.
   const pendingOrders = (/** @type {import("./anchor.mjs").Anchor} */ a) => {
+    // What the entries say, as candidates only: each order is checked whole
+    // before anything is signed on it. A record no entry names, or a latest
+    // that isn't its last entry's, is work; one seen again, already named, isn't.
+    const payload = "CASE WHEN json_valid(v.payload) THEN v.payload ELSE '{}' END";
     const prs = new Set(/** @type {any[]} */ (db.prepare(
       `SELECT d.pr FROM decision d
+        WHERE NOT EXISTS (SELECT 1 FROM event v WHERE v.op = ?1 AND v.subject = 'pr:' || d.pr
+                            AND (json_extract(${payload}, '$.digest') = d.digest
+                                 OR EXISTS (SELECT 1 FROM json_each(${payload}, '$.records') r WHERE r.value = d.digest)))
+       UNION
+       SELECT d.pr FROM decision d
         WHERE d.last_seq = (SELECT max(e.last_seq) FROM decision e WHERE e.pr = d.pr)
-          AND d.last_seq > coalesce((SELECT max(v.seq) FROM event v WHERE v.op = ? AND v.subject = 'pr:' || d.pr), 0)`).all(LATEST_OP))
+          AND d.digest IS NOT (SELECT json_extract(${payload}, '$.digest') FROM event v WHERE v.op = ?1 AND v.subject = 'pr:' || d.pr
+                                ORDER BY json_extract(${payload}, '$.n') DESC LIMIT 1)`).all(LATEST_OP))
       .map((r) => Number(r.pr)));
     for (const r of /** @type {any[]} */ (db.prepare(
       `SELECT subject, max(json_extract(payload, '$.n')) AS n FROM event WHERE op = ? AND json_valid(payload) GROUP BY subject`).all(LATEST_OP))) {

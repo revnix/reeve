@@ -855,3 +855,41 @@ test("a record kept while its pull request's latest stays the same is named by a
   db.close();
   assert.ok(replayed.some((r) => r.digest === side && /no longer holds it/.test(String(r.why))), JSON.stringify(replayed));
 });
+
+// ── from #278's sixth review ─────────────────────────────────────────────────
+
+test("replay --since still checks a pull request whose records and entries were all taken away", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A), at(A, "RED")], host(dir));
+  // Another pull request judged after, whose record the date takes.
+  await run({ openPrs: () => [43], evaluate: () => ({ ...at(B), pr: 43 }), prState: () => "CLOSED", prIsFinished: () => true, dbPath, ...host(dir) });
+  const db = open(dbPath);
+  db.prepare("DELETE FROM decision WHERE pr = ?").run(PR);
+  db.prepare("DELETE FROM event WHERE subject = ?").run(`pr:${PR}`);
+  const replayed = replayDecisions(db, { since: 0 }, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.ok(replayed.some((r) => r.pr === 43), "control: the date takes the other pull request's record");
+  assert.ok(replayed.some((r) => r.pr === PR && /though this host signed up to entry 2/.test(String(r.why))), JSON.stringify(replayed));
+});
+
+test("replay --since still checks the records an order names that the store no longer holds", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A), at(A, "RED")], host(dir));
+  await run({ openPrs: () => [43], evaluate: () => ({ ...at(B), pr: 43 }), prState: () => "CLOSED", prIsFinished: () => true, dbPath, ...host(dir) });
+  const db = open(dbPath);
+  const gone = digestsOf(db);
+  db.prepare("DELETE FROM decision WHERE pr = ?").run(PR);
+  const replayed = replayDecisions(db, { since: 0 }, { keys: knownKeys({ local: dir }), repo: REPO, anchor: null });
+  db.close();
+  assert.ok(gone.length === 2, "control: two records were taken away");
+  for (const g of gone) assert.ok(replayed.some((r) => r.digest === g && /no longer holds it/.test(String(r.why))), `${g}: ${JSON.stringify(replayed)}`);
+});
+
+test("a pull request whose latest is seen again, already named, isn't extended or noted again", async () => {
+  const dir = credentials();
+  let notes = 0;
+  const anchor = fileAnchor(dir);
+  const counted = { ...anchor, note: (...args) => { notes++; return anchor.note(...args); } };
+  await ticks([at(A), at(A), at(A)], { ...host(dir), anchor: counted });
+  assert.equal(notes, 1, "noted once, when its entry was made");
+});

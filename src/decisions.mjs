@@ -355,8 +355,8 @@ export function replayDecisions(db, which = {}, { code = null, profile = null, c
  * host's anchor (#274), as replay results: an order that doesn't hold, one cut
  * short of what the host signed, and each record it names that the store no
  * longer holds, a record taken away, adverse perhaps. Never passed over.
- * Every pull request with records, an order or an anchor entry is read, or only
- * the one asked for; with `since`, those with records replayed.
+ * Every pull request with records replayed, an order or an anchor entry is
+ * read, whatever `since` says, or only the one asked for.
  * @param {Db} db @param {Replayed[]} replayed
  * @param {{ pr?: number | null, since?: number | null }} which
  * @param {Keys} keys @param {string} repo @param {AnchorRead | null} anchor
@@ -370,10 +370,10 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
   if (which.pr != null) prs.add(which.pr);
   else {
     for (const r of replayed) prs.add(r.pr);
-    if (which.since == null) {
-      for (const r of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ?`).all(LATEST_OP))) prs.add(Number(String(r.subject).slice(3)));
-      for (const pr of anchor?.anchor?.latest.keys() ?? []) prs.add(pr);
-    }
+    // Every pull request an order or the host's anchor names, whatever the date:
+    // a rollback takes the very records the date would have matched.
+    for (const r of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ?`).all(LATEST_OP))) prs.add(Number(String(r.subject).slice(3)));
+    for (const pr of anchor?.anchor?.latest.keys() ?? []) prs.add(pr);
   }
   const held = db.prepare(`SELECT 1 FROM decision WHERE digest = ? LIMIT 1`);
   /** @type {Replayed[]} */ const out = [];

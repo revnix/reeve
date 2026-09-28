@@ -34,6 +34,9 @@ const unanswered = () => ({ ok: false, out: "", err: WHY });
 export const OFFLINE_IO = Object.freeze({ gh: unanswered, api: unanswered, sh: unanswered });
 
 export const OFFLINE_READS = Object.freeze({
+  // The merge queue (#163): read as a branch with none, so a tick's queue pass
+  // judges nothing unless a test gives it a queue.
+  readQueue: () => ({ ok: true, queue: false, entries: [] }),
   // What reconcilePr returns for a read that failed. It writes nothing first.
   reconcile: () => ({ ok: false, why: WHY }),
   // What rootCause returns when its first read fails.

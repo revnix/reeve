@@ -10,7 +10,7 @@
 import { pinHead, readChecks, classify, settle, inheritedOrCaused, readTimeline, lastForcePush, suitesComplete } from "./github/reconciler.mjs";
 import { loadSettlement, saveSettlement } from "./db/ops.mjs";
 import { rootCause } from "./ci-rootcause.mjs";
-import { computeVerdict, renderVerdict, PASS, BLOCK, UNKNOWN } from "./verdict.mjs";
+import { computeVerdict, renderVerdict, coversHead, PASS, BLOCK, UNKNOWN } from "./verdict.mjs";
 // The builder App's name has one home already; the classifier reads it rather
 // than restating it.
 import { POLICY_APP, POLICY_CONTEXT } from "./github/reconciler.mjs";
@@ -96,6 +96,96 @@ export function readThreads(nwo, pr, io = null) {
   }
   // Only claim readability when the count seen matches the count declared.
   return { readable: seen >= total, total, unresolved, seen, mergeState, reviewTotal, mergeable, reviewDecision, partsReadable };
+}
+
+/**
+ * The pull requests queued to merge into `branch`, each with the commit the
+ * queue built for it, which is the commit that merges. Measured in
+ * docs/measured/2026-09-27-merge-queue.md. `sha` is null until the queue has
+ * built the commit, and `prHead` is the pull request's head as this read found
+ * it. `queue` is false for a branch with no queue. Not ok when the queue can't
+ * be read.
+ */
+export function readMergeQueue(nwo, branch, { gh = ghJson } = {}) {
+  const [owner, name] = String(nwo).split("/");
+  const query = "query($owner:String!,$name:String!,$branch:String!,$after:String){repository(owner:$owner,name:$name){" +
+    "mergeQueue(branch:$branch){entries(first:100,after:$after){pageInfo{hasNextPage endCursor} " +
+    "nodes{state headCommit{oid} baseCommit{oid} pullRequest{number headRefOid}}}}}}";
+  const entries = [];
+  // Every page: an entry past the first hundred would go unanswered until the
+  // queue dropped it at its timeout.
+  for (let after = null, pages = 0; ; pages++) {
+    if (pages >= 50) return { ok: false, why: "the merge queue ran past 50 pages" };
+    const r = gh(["graphql", "-f", `query=${query}`, "-f", `owner=${owner}`, "-f", `name=${name}`, "-f", `branch=${branch}`,
+                  ...(after ? ["-f", `after=${after}`] : [])]);
+    if (!r.ok) return { ok: false, why: r.err || "the merge queue couldn't be read" };
+    let got;
+    try { got = JSON.parse(r.out); } catch { return { ok: false, why: "the merge queue's answer couldn't be parsed" }; }
+    // An HTTP 200 can carry errors for single fields, which then read as null, as
+    // in readThreads. A queue that read as null that way would look like none.
+    if (got?.errors?.length) return { ok: false, why: `the merge queue's answer carried errors: ${got.errors[0]?.message ?? "unnamed"}` };
+    const queue = got?.data?.repository?.mergeQueue;
+    if (queue === undefined) return { ok: false, why: "the merge queue's answer had no repository in it" };
+    if (queue === null) return { ok: true, queue: false, entries: [] };
+    const nodes = queue.entries?.nodes;
+    if (!Array.isArray(nodes)) return { ok: false, why: "the merge queue's answer had no entries" };
+    for (const n of nodes) if (Number.isInteger(n?.pullRequest?.number))
+      entries.push({ pr: n.pullRequest.number, sha: n.headCommit?.oid ?? null, baseSha: n.baseCommit?.oid ?? null, state: n.state ?? null,
+                     prHead: n.pullRequest.headRefOid ?? null });
+    const info = queue.entries.pageInfo;
+    if (!info?.hasNextPage) break;
+    if (!info.endCursor) return { ok: false, why: "the merge queue said there was more, and gave no cursor to read it" };
+    after = info.endCursor;
+  }
+  return { ok: true, queue: true, entries };
+}
+
+/**
+ * The verdict on the commit a merge queue built for a pull request (#163). The
+ * queue merges that commit, not the pull request's head, and waits for its
+ * required checks there, so a verdict at the head counts for nothing in the
+ * queue.
+ *
+ * The pull request's own facts carry over from its evaluation this tick
+ * (`input`): its reviews, threads, findings, hold and merge state. CI is read on
+ * the queue's commit and settled apart from the head, under the queue's own key,
+ * so neither resets the other. The base is judged at the queue's base commit.
+ * Those facts carry over only while the queue holds the pull request at the head
+ * they were read at: a push between the two reads would carry one revision's
+ * reviews onto a commit built from another.
+ */
+export function evaluateQueueEntry({ nwo, entry, input, baseRef, profile, db = null,
+                                     read = readChecks, requirements = requiredChecksOf }) {
+  if (!entry?.sha) return { ok: false, why: "the queue hasn't built its commit yet" };
+  if (!input) return { ok: false, why: "the pull request wasn't evaluated this tick, so its facts can't carry over" };
+  if (!entry.prHead || entry.prHead !== input.head)
+    return { ok: false, why: entry.prHead ? `the queue holds the pull request at ${entry.prHead.slice(0, 10)}, not at ${String(input.head).slice(0, 10)}, which this tick judged`
+                                          : "the queue didn't say which head of the pull request it holds" };
+  const reviewerContexts = profile.ci?.reviewerStatusContexts ?? [];
+  const got = read(nwo, entry.sha, { reviewerContexts });
+  const req = requirements({ nwo, baseRef, profile });
+  const c = classifyRead(got, req);
+  const reading = { ...c, sha: entry.sha, rows: got?.rows ?? [],
+    suitesComplete: c.verdict === "MISSING_REQUIRED" ? missingSettled(nwo, entry.sha, c.missingChecks, profile) : null };
+  const key = `${nwo}@merge-queue`;
+  const s = db ? saveSettlement(db, key, entry.pr, settle(loadSettlement(db, key, entry.pr), reading))
+    : { ...settle(null, reading), settled: false, why: "settlement needs a state store to compare readings across ticks" };
+  // For health, as evaluatePr judges the base: only failures on it count.
+  const health = { required: profile.ci?.requiredChecks ?? [] };
+  const base = entry.baseSha ? classifyRead(read(nwo, entry.baseSha, { reviewerContexts }), health, { evidence: false })
+    : { verdict: "UNKNOWN", readable: false, why: "the queue's base commit isn't known" };
+  // A review of the pull request's head covers its queue commit, which carries
+  // exactly that change onto the base: the queue builds the commit, no one
+  // reviews it. Carried explicitly, with the commit the review covered, so the
+  // record says what was reviewed. A review of any other commit still doesn't
+  // count.
+  const reviewers = (input.reviewers ?? []).map((r) => (coversHead(r.reviewedHead, input.head)
+    ? { ...r, reviewedHead: entry.sha, coveredAt: r.reviewedHead } : r));
+  const queued = { ...input, reviewers, head: entry.sha,
+    checks: { verdict: s.verdict, settled: s.settled, why: s.why, readable: c.readable !== false, failing: c.failing, inherited: [],
+              impostors: got?.impostors ?? [], shadowRequired: req.shadowRequired },
+    base: { verdict: base.verdict, readable: base.readable !== false } };
+  return { ok: true, input: queued, verdict: computeVerdict(queued) };
 }
 
 /**
@@ -836,8 +926,12 @@ function othersPassUnder(token, nwo, sha, context, runs, api) {
 
 // Rule types that can't stop a pull request merging into a branch that already
 // exists: they govern creating, deleting and force-pushing the branch. Linear
-// history rules out merge commits, and squash and rebase merges still merge.
-const HARMLESS_RULES = new Set(["creation", "deletion", "non_fast_forward", "required_linear_history"]);
+// history rules out merge commits, and squash and rebase merges still merge. A
+// merge queue is where a pull request merges, not a reason it can't: measured
+// (docs/measured/2026-09-27-merge-queue.md), GitHub reports one whose required
+// checks pass as CLEAN under a required queue, so the queue is never why it's
+// BLOCKED. Its own commit is judged apart, in the queue (#163).
+const HARMLESS_RULES = new Set(["creation", "deletion", "non_fast_forward", "required_linear_history", "merge_queue"]);
 // Rule types reeve doesn't evaluate either, but that a run settles without
 // anyone: a deployment, a required workflow, a code scan, an automatic review.
 // Waiting settles them, where the rest need a person.
@@ -1021,7 +1115,7 @@ export const requiredOnBase = (args) => requirementsOnBase(args).own;
  * requires the enforcement check, every pull request is blocked until reeve
  * enforces: that comes back as `held`, for the daemon to raise.
  */
-export async function publishVerdict({ nwo, verdict, shadow = true, context = "ops/merge-policy", base = null,
+export async function publishVerdict({ nwo, verdict, shadow = true, context = "ops/merge-policy", base = null, queue = false,
                                       auth: authenticateAs = authenticate, api = apiAsInstallation }) {
   const auth = await authenticateAs(nwo);
   if (!auth.ok) return { ok: false, why: auth.why };
@@ -1038,8 +1132,15 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = "o
   // nextly had accumulated 38 of these in an afternoon: the API's default
   // `filter=latest` hides that from reeve's own reads, but it is real API load and
   // it makes the PR's check list unreadable for the human who has to act on it.
+  // A merge queue reads any settled result but success as a failure, and drops
+  // the entry (measured: `failed_checks` 31 s after an `action_required`). So on
+  // a queue's commit, an UNKNOWN that waiting or reading again settles is
+  // published as still running, which the queue waits for. A block, a pass, and
+  // an UNKNOWN only a person can settle are settled there as anywhere: the last
+  // lets the queue go on rather than hold every entry behind it to its timeout.
+  const running = queue && !shadow && verdict.state === UNKNOWN && verdict.kind !== "person";
   const fields = [
-    "-f", "status=completed", "-f", `conclusion=${conclusion}`,
+    ...(running ? ["-f", "status=in_progress"] : ["-f", "status=completed", "-f", `conclusion=${conclusion}`]),
     "-f", `output[title]=${title.slice(0, 250)}`,
     "-f", `output[summary]=${body.slice(0, 60000)}`,
   ];

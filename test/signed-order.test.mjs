@@ -1310,11 +1310,12 @@ test("an entry filed under another name while a reeve runs is caught by its next
   const dbPath = join(tempDir("reeve-order-renamed-"), "s.db");
   open(dbPath).close();
   let tick = 0;
-  const r = await run({ ticks: 2, dbPath, ...host(dir), prState: () => "CLOSED", prIsFinished: () => true,
+  // The first tick makes the entry, and the second finds its order whole; then it's filed as pr:042.
+  const r = await run({ ticks: 3, dbPath, ...host(dir), prState: () => "CLOSED", prIsFinished: () => true,
                         evaluate: () => at(A, "RED"),
                         openPrs: () => (++tick === 1 ? [PR] : []),
                         afterTick: async (i) => {
-                          if (i !== 0) return;
+                          if (i !== 1) return;
                           const s = open(dbPath);
                           s.prepare("UPDATE event SET subject = 'pr:042' WHERE op = 'decision.latest'").run();
                           s.close();

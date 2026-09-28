@@ -1432,17 +1432,14 @@ export async function tick(ctx) {
   // number a store edit put there. The top it answers is noted on the anchor once
   // the transaction has committed; 0 for none.
   /** @type {Map<string, any> | null | undefined} */ let orderKeys;
-  const extendOrder = (pr) => {
+  const extendOrder = (pr, anchored) => {
     const decision = latestDecision(db, pr);
     if (!decision) return 0;
     const order = signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys));
     if ("corrupt" in order) { log(logPath, `signing: #${pr}: its signed order doesn't hold, so it isn't extended — ${order.corrupt}`); return 0; }
     // Nor one cut short of what the host signed: an entry signed now would take
     // a number the host already signed, and two entries under one number would
-    // each pass for the latest. Nor where that can't be read.
-    let anchored = 0;
-    try { anchored = ctx.anchor.read(nwo)?.latest.get(pr) ?? 0; }
-    catch (err) { log(logPath, `signing: #${pr}: ${err.message}, so its signed order isn't extended`); return 0; }
+    // each pass for the latest.
     if (order.top < anchored) {
       log(logPath, `signing: #${pr}: its signed order ends at entry ${order.top}, though this host signed up to entry ${anchored}, so it isn't extended`);
       return 0;
@@ -1488,7 +1485,7 @@ export async function tick(ctx) {
       if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
       if (!orderKeys) return;
       (ctx.durably ?? durably)(db, () => {
-        let id = null, bound = null;
+        let id = null, a = null;
         try {
           // The store's identity, kept the first time it's needed.
           id = tx(db, () => {
@@ -1497,8 +1494,12 @@ export async function tick(ctx) {
             db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`).run(now(), "daemon", STORE_ID_OP, "store", canonical({ id: made }));
             return made;
           });
-          bound = ctx.anchor.read(nwo)?.store ?? null;
+          // Read once: nothing else writes it while this holds its lock. One that
+          // can't be read extends nothing, as whether an order was cut short
+          // can't be told.
+          a = ctx.anchor.read(nwo) ?? { began: false, latest: new Map(), store: null };
         } catch (err) { log(logPath, `signing: ${err.message}, so no signed order is extended`); return; }
+        const bound = a.store;
         if (!id || (bound && bound !== id)) {
           log(logPath, `signing: the host's anchor for ${nwo} is another store's, so this store's signed orders aren't extended`);
           return;
@@ -1509,7 +1510,7 @@ export async function tick(ctx) {
         }
         for (const pr of pendingOrders()) {
           let top = 0;
-          try { top = tx(db, () => extendOrder(pr)); }
+          try { top = tx(db, () => extendOrder(pr, a.latest.get(pr) ?? 0)); }
           catch (err) { log(logPath, `signing: #${pr}: its signed order couldn't be extended — ${err.message}`); continue; }
           noteAnchor(pr, top);
         }

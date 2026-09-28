@@ -369,3 +369,32 @@ test("a .yarnrc.yml of comments only names no yarn, and one with settings leaves
   assert.deepEqual(both.members, ["foo"]);
   assert.ok(untold(both.root, "bar"), "yarn 1 lists bar, and yarn 2 to 4 don't");
 });
+
+// ── from #270's first review ─────────────────────────────────────────────────
+
+/** Whether yarn 4 gives folder `id` the root's yarn, with folders `ids` and workspaces `patterns`. */
+function yarn4Folder(patterns, ids, id) {
+  const files = { "package.json": { name: "root", workspaces: patterns, packageManager: "yarn@4.14.1", scripts, devDependencies }, "yarn.lock": "" };
+  for (const f of ids) files[`${f}/package.json`] = { name: f.replace(/[^a-z]/g, "") || "x", scripts, devDependencies };
+  const root = checkout(files);
+  return { root, member: unit(root, id).packageManager !== null };
+}
+
+test("to yarn 4, a leading !( is never an exclusion, so a folder named like its group isn't excluded", () => {
+  assert.equal(yarn4Folder(["*", "!(foo)"], ["(foo)", "bar"], "(foo)").member, true);
+});
+
+test("yarn 4 reaches a folder through a trailing /** only after the wildcards it was measured with, and leaves other forms unknown", () => {
+  for (const pattern of ["???/**", "!(foo)/**", "{bar,baz}/**", "b[a]r/**"]) {
+    const { root, member } = yarn4Folder([pattern], ["bar"], "bar");
+    assert.equal(member, false, pattern);
+    assert.ok(untold(root, "bar"), pattern);
+  }
+  assert.equal(yarn4Folder(["b*/**"], ["bar"], "bar").member, true, "control: a measured form");
+});
+
+test("yarn 4's literal base keeps punctuation that isn't a glob, so a folder named with it is still the base", () => {
+  const { root, member } = yarn4Folder(["foo+bar/**"], ["foo+bar"], "foo+bar");
+  assert.equal(member, false);
+  assert.ok(!untold(root, "foo+bar"), "measured: the base isn't listed");
+});

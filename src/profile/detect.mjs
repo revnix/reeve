@@ -157,15 +157,22 @@ function isMember(rel, globs, manager, root) {
     }
     if (manager !== "yarn") return false;
     // Where only a trailing `/**` reaches the folder itself, short of the base
-    // the pattern's glob walks from.
-    const base = g => { const at = clean(g).split("/"); const n = at.findIndex(s => /[*?[\]{}()!+@]/.test(s)); return at.slice(0, n < 0 ? at.length : n).join("/"); };
+    // the pattern's glob walks from: the part before its first `*`. Yarn 4 was
+    // measured with `*` wildcards before it, so in any other form (`?`, a class,
+    // braces, an extglob) that alone would reach the folder, its answer is
+    // unknown.
+    const base = g => { const at = clean(g).split("/"); const n = at.findIndex(s => s.includes("*")); return at.slice(0, n < 0 ? at.length : n).join("/"); };
     const onlyAsFolder = g => !g.startsWith("!") && !hit(g) && asFolder(g) && rel !== base(g);
-    const berryIncluded = globs.some(g => (!g.startsWith("!") && (hit(g) || onlyAsFolder(g))) || (negated(g) && matchesGlob(rel, g)));
+    const unmeasured = g => /[?[\]{}()]/.test(clean(g));
+    const berryIncluded = globs.some(g => (!g.startsWith("!") && (hit(g) || (onlyAsFolder(g) && !unmeasured(g)))) || (negated(g) && matchesGlob(rel, g)));
+    const fourUnsure = globs.some(g => (onlyAsFolder(g) && unmeasured(g)) || (negated(g) && !matchesGlob(rel, g) && matchesGlob(`${rel}/`, g)));
+    // A leading `!(` is a pattern to yarn 4, never an exclusion.
+    const fourExcluded = exclusions.some(g => !negated(g) && asFolder(g));
+    const four = fourExcluded ? false : berryIncluded ? true : fourUnsure ? null : false;
     const lastWins = globs.reduce((member, g) => (g.startsWith("!") ? (asFolder(g) ? false : member) : hit(g) || member), false);
-    const berryExclusionWins = berryIncluded && !exclusions.some(asFolder);
     // Yarn 2 and 3 read either form in a way not measured.
     const twoAndThree = globs.some(negated) || globs.some(onlyAsFolder) ? null : lastWins;
-    const reading = { 1: included, 2: twoAndThree, 3: twoAndThree, 4: berryExclusionWins };
+    const reading = { 1: included, 2: twoAndThree, 3: twoAndThree, 4: four };
     const readings = new Set(yarnMajors(root).map(m => reading[m]));
     return readings.size === 1 ? [...readings][0] : null;
   } catch { return null; }

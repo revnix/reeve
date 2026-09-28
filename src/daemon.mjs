@@ -964,6 +964,8 @@ function beginSigning(db, sign, logPath, anchor = null, nwo = null) {
     return tx(db, () => {
       if (db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(BASELINE_OP)) return saidBegun();
       if (db.prepare(`SELECT 1 FROM decision WHERE envelope IS NOT NULL LIMIT 1`).get()) return saidBegun();
+      // An entry of a signed order is signed too, and only made once a store began.
+      if (db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(LATEST_OP)) return saidBegun();
       let hostSays = false;
       if (anchor) {
         // One that can't be read might say so: taken as saying it.
@@ -1414,6 +1416,18 @@ export async function tick(ctx) {
     if (!orderKeys) return;
     const order = signedOrder(db, nwo, pr, orderKeys);
     if ("corrupt" in order) { log(logPath, `signing: #${pr}: its signed order doesn't hold, so it isn't extended — ${order.corrupt}`); return; }
+    // Nor one cut short of what the host signed: an entry signed now would take
+    // a number the host already signed, and two entries under one number would
+    // each pass for the latest. Nor where that can't be read.
+    if (ctx.anchor) {
+      let anchored = 0;
+      try { anchored = ctx.anchor.read(nwo)?.latest.get(pr) ?? 0; }
+      catch (err) { log(logPath, `signing: #${pr}: ${err.message}, so its signed order isn't extended`); return; }
+      if (order.top < anchored) {
+        log(logPath, `signing: #${pr}: its signed order ends at entry ${order.top}, though this host signed up to entry ${anchored}, so it isn't extended`);
+        return;
+      }
+    }
     let top = order.top;
     if (order.digest !== decision.digest) {
       const s = signWith(latestStatement({ repo: nwo, pr, n: top + 1, digest: decision.digest }));

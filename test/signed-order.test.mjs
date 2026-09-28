@@ -3,7 +3,7 @@
 // short, or restored from before, doesn't pass for the one the host kept.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -151,9 +151,9 @@ test("an anchor that can't be read vouches for nothing, and isn't written over",
   assert.ok(replayed.some((r) => r.outcome === "unreplayable" && /anchor for o\/r can't be read/.test(String(r.why))), JSON.stringify(replayed));
   const r = await run({ evaluate: () => at(A, "RED"), dbPath, ...host(dir) });
   assert.equal(readFileSync(file, "utf8"), "cut sho", "a tick leaves it as it was");
-  assert.match(r.log, /the host's anchor couldn't be moved to entry 2/);
+  assert.match(r.log, /#42: the host's anchor for o\/r can't be read: it isn't JSON, so its signed order isn't extended/);
   db = open(dbPath);
-  assert.equal(signedOrder(db, REPO, PR, keys).top, 2, "control: the order went on");
+  assert.equal(signedOrder(db, REPO, PR, keys).top, 1, "nor is the order extended, as whether it was cut short can't be told");
   db.close();
 });
 
@@ -304,9 +304,11 @@ test("an entry taken out of the middle of the signed order leaves it missing, an
   const twice = signedOrder(db, REPO, PR, keys);
   db.close();
   assert.deepEqual(twice, { corrupt: "its signed order names entry 2 twice" });
-  const db2 = open(await ticks([at(A), at(A, "RED")], host(dir)));
+  // Another host's store: on this one, its anchor would hold the first store's order.
+  const other = credentials();
+  const db2 = open(await ticks([at(A), at(A, "RED")], host(other)));
   db2.prepare("DELETE FROM event WHERE op = 'decision.latest' AND json_extract(payload, '$.n') = 1").run();
-  const gap = signedOrder(db2, REPO, PR, knownKeys({ local: dir }));
+  const gap = signedOrder(db2, REPO, PR, knownKeys({ local: other }));
   db2.close();
   assert.deepEqual(gap, { corrupt: "its signed order is missing entry 1" });
 });
@@ -364,7 +366,12 @@ test("a queue commit's record takes its place in the pull request's signed order
 
 test("a tick says on the host's anchor that its store began signing, though it judges nothing", async () => {
   const dir = credentials();
-  const dbPath = await ticks([at(A)], { signer: fileSigner(dir) });
+  // A store that began signing, as #271's reeve did, without judging any pull
+  // request: none stands whose state a tick with none open would look up.
+  const dbPath = join(tempDir("reeve-order-idle-"), "s.db");
+  open(dbPath).close();
+  await run({ openPrs: () => [], evaluate: () => at(A), dbPath, signer: fileSigner(dir) });
+  assert.equal(readAnchor(dir, REPO), null, "control: no anchor yet");
   await run({ openPrs: () => [], evaluate: () => at(A), dbPath, ...host(dir) });
   assert.equal(readAnchor(dir, REPO)?.began, true);
 });
@@ -393,4 +400,59 @@ test("reeve why says when the host's anchor for the repository can't be read", a
   writeFileSync(anchorPath(dir, REPO), "{");
   const shown = spawnSync(process.execPath, [REEVE, "why", REPO, String(PR), "--db", dbPath], { encoding: "utf8", env: { ...offlineEnv(), REEVE_HOME: home } });
   assert.match(shown.stdout, /can't be trusted as the latest: the host's anchor for o\/r can't be read/, shown.stdout + shown.stderr);
+});
+
+// ── from #278's first review ─────────────────────────────────────────────────
+
+test("an order cut short of the host's anchor is never extended, so no entry number is signed twice", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A), at(A, "RED")], host(dir));
+  let db = open(dbPath);
+  db.prepare("DELETE FROM event WHERE op = 'decision.latest' AND json_extract(payload, '$.n') = 2").run();
+  db.close();
+  const r = await run({ evaluate: () => at(B), dbPath, ...host(dir) });
+  db = open(dbPath);
+  const entries = db.prepare("SELECT json_extract(payload, '$.n') AS n FROM event WHERE op = 'decision.latest'").all().map((x) => x.n);
+  db.close();
+  assert.deepEqual(entries, [1], "no second entry 2 signed");
+  assert.match(r.log, /#42: its signed order ends at entry 1, though this host signed up to entry 2, so it isn't extended/);
+});
+
+test("a sync of the anchor's folders that failed is made again, though the anchor already holds the value", () => {
+  const dir = credentials();
+  let failing = true;
+  const seen = [];
+  const anchor = fileAnchor(dir, { syncDir: (d) => { if (failing) throw new Error("input/output error"); seen.push(d); } });
+  assert.equal(anchor.note(REPO, 7, 1), false, "control: the first write's sync failed");
+  assert.equal(readAnchor(dir, REPO)?.latest.get(7), 1, "control: though the anchor holds it");
+  failing = false;
+  assert.equal(anchor.note(REPO, 7, 1), true);
+  assert.ok(seen.includes(dirname(anchorPath(dir, REPO))), `its folder synced again: ${JSON.stringify(seen)}`);
+});
+
+test("a store holding a signed order isn't given a baseline again, though its baseline, its signatures and the host's anchor are gone", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A), at(A, "RED")], host(dir));
+  let db = open(dbPath);
+  db.prepare("DELETE FROM event WHERE op = 'signing.baseline'").run();
+  db.prepare("UPDATE decision SET envelope = NULL").run();
+  db.close();
+  rmSync(join(dir, "signing-anchors"), { recursive: true });
+  await run({ evaluate: () => at(B), dbPath, ...host(dir) });
+  db = open(dbPath);
+  const baselines = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n;
+  db.close();
+  assert.equal(baselines, 0, "none made over records that may have been rewritten");
+});
+
+test("an anchor's temporaries left by a process that's gone are removed, and a running process's are left", () => {
+  const dir = credentials();
+  const file = anchorPath(dir, REPO);
+  mkdirSync(dirname(file), { recursive: true });
+  const gone = spawnSync(process.execPath, ["-e", ""]).pid;
+  const left = `${file}.${gone}.deadbeef.tmp`, live = `${file}.${process.ppid}.feedface.tmp`;
+  writeFileSync(left, "partway");
+  writeFileSync(live, "partway");
+  assert.equal(fileAnchor(dir).note(REPO, 7, 1), true, "control: it was written");
+  assert.deepEqual({ left: existsSync(left), live: existsSync(live) }, { left: false, live: true });
 });

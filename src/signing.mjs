@@ -316,7 +316,7 @@ function reapTemporaries(dir) {
 }
 
 /** Whether process `pid` is running. One that can't be signalled is, but isn't this user's. @param {number} pid */
-function running(pid) {
+export function running(pid) {
   if (pid === process.pid) return true;
   try { process.kill(pid, 0); return true; }
   catch (err) { return /** @type {NodeJS.ErrnoException} */ (err).code === "EPERM"; }

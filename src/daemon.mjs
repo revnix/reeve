@@ -944,7 +944,7 @@ export function standingPasses(db) {
   return db.prepare(`SELECT e.subject, e.payload FROM event e WHERE e.op = 'pr.published'
                        AND NOT EXISTS (SELECT 1 FROM event f WHERE f.subject = e.subject AND f.seq > e.seq AND ${STANDING}
                          AND (f.op = 'pr.merged'
-                              OR (${field("f", "name")} IS ${field("e", "name")} AND ${field("f", "head")} IS ${field("e", "head")})))`).all()
+                              OR (json_valid(e.payload) AND ${field("f", "name")} IS ${field("e", "name")} AND ${field("f", "head")} IS ${field("e", "head")})))`).all()
     .map((r) => {
       const pr = Number(String(r.subject).slice(3));
       try { return { ...JSON.parse(r.payload), pr }; } catch (err) { return { pr, unread: err.message }; }

@@ -287,7 +287,9 @@ test("an enforced PASS stays tracked when reeve goes back to shadow and the shad
   await daemon.tick(ctx);
   // In shadow again, and every shadow publication fails before it writes anything.
   const shadowed = { ...ctx, shadow: true, publish: async () => ({ ok: false, why: "no App credentials" }) };
-  await daemon.tick(shadowed);
+  // Taking the enforced PASS back fails too, so it's still standing when HALT
+  // comes: only tracked under its own name does it stay found.
+  await daemon.tick({ ...shadowed, withdraw: async () => ({ ok: false, why: "HTTP 502" }) });
   halt();
   await daemon.tick(shadowed);
   assert.deepEqual(prsOf(withdrawn.filter((w) => w.name === "ops/merge-policy")), [7, 8], JSON.stringify(withdrawn));

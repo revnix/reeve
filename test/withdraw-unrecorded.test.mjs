@@ -15,8 +15,8 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { open } from "../src/db/ops.mjs";
-import { unmergedHeads } from "../src/pr.mjs";
-import { withdrawUnrecorded, unrecordedWithdrawn } from "../src/unrecorded.mjs";
+import { sweptHeads, withdrawVerdict } from "../src/pr.mjs";
+import { withdrawUnrecorded, unrecordedWithdrawn, reeveRunsFor } from "../src/unrecorded.mjs";
 import { standingPasses } from "../src/daemon.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 import { statePathFor } from "../src/paths.mjs";
@@ -37,10 +37,10 @@ function withdrawals({ fails = [], none = [] } = {}) {
   return { asked, withdraw };
 }
 
-test("every pull request that didn't merge has reeve's enforcement result withdrawn at its head, and that's recorded", async () => {
+test("every pull request's head has reeve's enforcement result withdrawn, and that's recorded", async () => {
   const db = store();
   const { asked, withdraw } = withdrawals({ none: ["b".repeat(40)] });
-  const r = await withdrawUnrecorded({ nwo: "o/r", db, list: listed([{ pr: 1, head: "a".repeat(40) }, { pr: 2, head: "b".repeat(40) }]), withdraw });
+  const r = await withdrawUnrecorded({ nwo: "o/r", db, running: () => [], list: listed([{ pr: 1, head: "a".repeat(40) }, { pr: 2, head: "b".repeat(40) }]), withdraw });
   assert.deepEqual(asked.map(a => [a.head, a.name]), [["a".repeat(40), "ops/merge-policy"], ["b".repeat(40), "ops/merge-policy"]]);
   assert.equal(r.ok, true);
   assert.deepEqual(r.withdrawn, [1], "only where reeve's result stood");
@@ -50,9 +50,9 @@ test("every pull request that didn't merge has reeve's enforcement result withdr
 
 test("once recorded, it isn't done again", async () => {
   const db = store();
-  await withdrawUnrecorded({ nwo: "o/r", db, list: listed([{ pr: 1, head: "a".repeat(40) }]), withdraw: withdrawals().withdraw });
+  await withdrawUnrecorded({ nwo: "o/r", db, running: () => [], list: listed([{ pr: 1, head: "a".repeat(40) }]), withdraw: withdrawals().withdraw });
   const { asked, withdraw } = withdrawals();
-  const again = await withdrawUnrecorded({ nwo: "o/r", db, list: listed([{ pr: 1, head: "a".repeat(40) }]), withdraw });
+  const again = await withdrawUnrecorded({ nwo: "o/r", db, running: () => [], list: listed([{ pr: 1, head: "a".repeat(40) }]), withdraw });
   db.close();
   assert.equal(again.already, true);
   assert.deepEqual(asked, []);
@@ -60,7 +60,7 @@ test("once recorded, it isn't done again", async () => {
 
 test("a list that couldn't be read is retried, never recorded as done", async () => {
   const db = store();
-  const r = await withdrawUnrecorded({ nwo: "o/r", db, list: () => ({ ok: false, why: "HTTP 502" }), withdraw: withdrawals().withdraw });
+  const r = await withdrawUnrecorded({ nwo: "o/r", db, running: () => [], list: () => ({ ok: false, why: "HTTP 502" }), withdraw: withdrawals().withdraw });
   assert.equal(r.ok, false);
   assert.match(r.why, /HTTP 502/);
   assert.equal(unrecordedWithdrawn(db, "o/r"), false);
@@ -70,7 +70,7 @@ test("a list that couldn't be read is retried, never recorded as done", async ()
 test("a withdrawal that failed is retried, never recorded as done", async () => {
   const db = store();
   const { withdraw } = withdrawals({ fails: ["b".repeat(40)] });
-  const r = await withdrawUnrecorded({ nwo: "o/r", db, list: listed([{ pr: 1, head: "a".repeat(40) }, { pr: 2, head: "b".repeat(40) }]), withdraw });
+  const r = await withdrawUnrecorded({ nwo: "o/r", db, running: () => [], list: listed([{ pr: 1, head: "a".repeat(40) }, { pr: 2, head: "b".repeat(40) }]), withdraw });
   assert.equal(r.ok, false);
   assert.deepEqual(r.failed.map(f => f.pr), [2]);
   assert.equal(unrecordedWithdrawn(db, "o/r"), false);
@@ -79,28 +79,34 @@ test("a withdrawal that failed is retried, never recorded as done", async () => 
 
 test("the record is kept per repository", async () => {
   const db = store();
-  await withdrawUnrecorded({ nwo: "o/r", db, list: listed([]), withdraw: withdrawals().withdraw });
+  await withdrawUnrecorded({ nwo: "o/r", db, running: () => [], list: listed([]), withdraw: withdrawals().withdraw });
   assert.equal(unrecordedWithdrawn(db, "o/r"), true);
   assert.equal(unrecordedWithdrawn(db, "o/other"), false);
   db.close();
 });
 
-test("the pull requests listed are every one that didn't merge, open or closed, past the first page", () => {
+test("the pull requests listed are every one reeve's App could have published on, merged or not, past the first page", () => {
   const asked = [];
-  const gh = (args) => {
-    asked.push(args.join(" "));
+  const gh = (args, opts = {}) => {
+    asked.push({ args: args.join(" "), maxBuffer: opts.maxBuffer ?? null });
+    if (args[0] === "apps/merge-policy") return { ok: true, out: "2026-08-20T10:00:00Z" };
     return { ok: true, out: [
-      JSON.stringify({ pr: 1, head: "a".repeat(40) }),
-      JSON.stringify({ pr: 3, head: "c".repeat(40) }),
+      JSON.stringify({ pr: 1, head: "a".repeat(40), closed: null }),
+      JSON.stringify({ pr: 2, head: "b".repeat(40), closed: "2026-09-01T00:00:00Z" }),
+      JSON.stringify({ pr: 3, head: "c".repeat(40), closed: "2026-08-01T00:00:00Z" }),
     ].join("\n") };
   };
-  const r = unmergedHeads("o/r", { gh });
-  assert.deepEqual(r, { ok: true, prs: [{ pr: 1, head: "a".repeat(40) }, { pr: 3, head: "c".repeat(40) }] });
-  assert.match(asked[0], /--paginate/);
-  assert.match(asked[0], /state=all/);
-  assert.match(asked[0], /merged_at == null/, "a merged pull request keeps its result, as the record of why it merged");
-  assert.equal(unmergedHeads("o/r", { gh: () => ({ ok: false, err: "HTTP 502" }) }).ok, false);
-  assert.equal(unmergedHeads("o/r", { gh: () => ({ ok: true, out: "not json" }) }).ok, false, "an answer that can't be read");
+  const r = sweptHeads("o/r", { gh });
+  assert.deepEqual(r, { ok: true, prs: [{ pr: 1, head: "a".repeat(40) }, { pr: 2, head: "b".repeat(40) }] },
+                   "#3 closed before the App existed, so it can carry none of its results");
+  const list = asked.find(a => a.args.includes("pulls?state=all"));
+  assert.match(list.args, /--paginate/);
+  assert.doesNotMatch(list.args, /merged_at == null/, "a merged pull request's head can head another one");
+  assert.ok(list.maxBuffer >= 64 * 1024 * 1024, "a long history is read whole");
+  assert.equal(sweptHeads("o/r", { gh: (args) => (args[0].startsWith("apps/") ? { ok: false, err: "HTTP 502" } : gh(args)) }).prs.length, 3,
+               "an App whose age can't be read limits nothing");
+  assert.equal(sweptHeads("o/r", { gh: (args) => (args[0].startsWith("apps/") ? gh(args) : { ok: false, err: "HTTP 502" }) }).ok, false);
+  assert.equal(sweptHeads("o/r", { gh: (args) => (args[0].startsWith("apps/") ? gh(args) : { ok: true, out: "not json" }) }).ok, false, "an answer that can't be read");
 });
 
 test("reeve run --enforce refuses until the unrecorded results are withdrawn", () => {
@@ -152,5 +158,72 @@ test("reeve withdraw --unrecorded that can't list the pull requests says so, exi
   assert.match(r.stderr, /couldn't be listed.*Run it again/s);
   const db = open(dbPath);
   assert.equal(unrecordedWithdrawn(db, NWO), false);
+  db.close();
+});
+
+// ── from #273's first review ─────────────────────────────────────────────────
+
+test("the sweep refuses while a reeve daemon for the repository runs, since it could publish behind it", async () => {
+  const db = store();
+  const { asked, withdraw } = withdrawals();
+  const r = await withdrawUnrecorded({ nwo: "o/r", db, running: () => [{ pid: 4242, args: "node /x/bin/reeve run o/r --interval 300" }],
+                                       list: listed([{ pr: 1, head: "a".repeat(40) }]), withdraw });
+  assert.equal(r.ok, false);
+  assert.match(r.why, /pid 4242/);
+  assert.deepEqual(asked, []);
+  assert.equal(unrecordedWithdrawn(db, "o/r"), false);
+  let blind;
+  try { blind = await withdrawUnrecorded({ nwo: "o/r", db, running: () => null, list: listed([]), withdraw }); }
+  catch (err) { blind = { ok: `threw: ${err.message}` }; }
+  assert.equal(blind.ok, false, "one that can't tell whether a daemon runs refuses too");
+  db.close();
+});
+
+test("a reeve daemon is told from the processes running by its command and repository", () => {
+  const ps = () => ["  101 node /h/reeve-daemon/bin/reeve run o/r --interval 300",
+                    "  102 node /h/reeve/bin/reeve run o/other --interval 300",
+                    "  103 node /h/reeve/bin/reeve tick o/r",
+                    "  104 node /h/reeve/bin/reeve withdraw o/r --unrecorded",
+                    "  105 vim notes-about-reeve-run-o/r.md"].join("\n");
+  assert.deepEqual(reeveRunsFor("o/r", { ps }).map(x => x.pid), [101, 103]);
+  assert.equal(reeveRunsFor("o/r", { ps: () => { throw new Error("no ps"); } }), null);
+});
+
+test("each result is kept in the store before it's withdrawn, and one that can't be kept isn't withdrawn", async () => {
+  const db = store();
+  const run = { id: 7, conclusion: "neutral", title: "[shadow] PASS: every clause satisfied", summary: "..." };
+  const withdraw = async (a) => (a.keep(run) ? { ok: true, id: 7 } : { ok: false, why: "not kept" });
+  await withdrawUnrecorded({ nwo: "o/r", db, running: () => [], list: listed([{ pr: 1, head: "a".repeat(40) }]), withdraw });
+  const kept = db.prepare("SELECT subject, payload FROM event WHERE op = 'unrecorded.kept'").all().map(r => [r.subject, JSON.parse(r.payload)]);
+  db.close();
+  assert.deepEqual(kept, [["pr:1", { head: "a".repeat(40), run: 7, conclusion: "neutral", title: run.title, summary: "..." }]]);
+});
+
+test("only a result that could pass is withdrawn, and it's kept first", async () => {
+  const runs = (conclusion) => [{ name: "ops/merge-policy", id: 9, conclusion, app: "merge-policy", title: "t", summary: "s" }];
+  const at = async (conclusion, keeps = true) => {
+    const writes = [], kept = [];
+    const api = (_t, args) => {
+      if (args.includes("PATCH")) { writes.push(args); return { ok: true, out: "{}" }; }
+      return { ok: true, out: runs(conclusion).map(r => JSON.stringify(r)).join("\n") };
+    };
+    const r = await withdrawVerdict({ nwo: "o/r", head: "a".repeat(40), name: "ops/merge-policy", why: "w", passing: true,
+                                      keep: (x) => { kept.push(x.id); return keeps; }, auth: async () => ({ ok: true, token: "t" }), api });
+    return { r, writes: writes.length, kept };
+  };
+  const failing = await at("failure");
+  assert.deepEqual([failing.r.id, failing.writes, failing.kept], [null, 0, []], "a failure can't pass the check, so it stays");
+  const neutral = await at("neutral");
+  assert.deepEqual([neutral.r.id, neutral.writes, neutral.kept], [9, 1, [9]]);
+  const unkept = await at("neutral", false);
+  assert.deepEqual([unkept.r.ok, unkept.writes], [false, 0], "one that couldn't be kept isn't withdrawn");
+});
+
+test("a publication record reeve can't read stays standing past a later record it can't read either", () => {
+  const db = store();
+  const put = (op, payload) => db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(1, "daemon", op, "pr:9", payload);
+  put("pr.published", "{not json");
+  put("pr.withdrawn", "{not json either");
+  assert.ok(standingPasses(db).some(x => x.pr === 9 && x.unread), JSON.stringify(standingPasses(db)));
   db.close();
 });

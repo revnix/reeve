@@ -28,8 +28,8 @@ import { execFileSync } from "node:child_process";
  * @typedef {{ reviewState?: typeof reviewState, compare?: typeof compare, foldPrecedesEvaluation?: boolean }} ReviewIo
  */
 
-function ghJson(args) {
-  try { return { ok: true, out: execFileSync("gh", ["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() }; }
+function ghJson(args, { maxBuffer = undefined } = {}) {
+  try { return { ok: true, out: execFileSync("gh", ["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer }).trim() }; }
   catch (e) { return { ok: false, out: "", err: String(e.stderr || e.message).trim() }; }
 }
 
@@ -141,18 +141,24 @@ export function readMergeQueue(nwo, branch, { gh = ghJson } = {}) {
 }
 
 /**
- * Every pull request that didn't merge, open or closed, with its head (#242). A
- * merged one keeps reeve's result, as the record of why it merged, so it isn't
- * listed. Not ok unless the whole list was read.
+ * Every pull request reeve's App could have published on, with its head (#242):
+ * open, or closed since the App was made, merged or not. A merged one's head can
+ * head another pull request later, against another base. An App whose age can't
+ * be read limits nothing. Not ok unless the whole list was read.
  */
-export function unmergedHeads(nwo, { gh = ghJson } = {}) {
-  const r = gh(["--paginate", `repos/${nwo}/pulls?state=all&per_page=100`, "--jq", ".[] | select(.merged_at == null) | {pr: .number, head: .head.sha}"]);
+export function sweptHeads(nwo, { gh = ghJson } = {}) {
+  const made = gh([`apps/${POLICY_APP}`, "--jq", ".created_at"]);
+  const since = made.ok && /^\d{4}-\d\d-\d\dT/.test(String(made.out).trim()) ? String(made.out).trim() : null;
+  // A long history is read whole: past the default buffer, the read would fail on every retry.
+  const r = gh(["--paginate", `repos/${nwo}/pulls?state=all&per_page=100`, "--jq", ".[] | {pr: .number, head: .head.sha, closed: .closed_at}"],
+               { maxBuffer: 256 * 1024 * 1024 });
   if (!r.ok) return { ok: false, why: r.err || "the pull requests couldn't be listed" };
   const prs = [];
   for (const line of String(r.out ?? "").split("\n").filter(Boolean)) {
     let x;
     try { x = JSON.parse(line); } catch { return { ok: false, why: "the list of pull requests couldn't be read" }; }
     if (!Number.isInteger(x?.pr) || typeof x?.head !== "string") return { ok: false, why: "the list of pull requests named one without its head" };
+    if (since && typeof x.closed === "string" && x.closed < since) continue;
     prs.push({ pr: x.pr, head: x.head });
   }
   return { ok: true, prs };
@@ -916,7 +922,7 @@ export const shadowContextOf = (context) => `${context} (shadow)`;
  */
 function existingRuns(token, nwo, sha, names, api = apiAsInstallation) {
   const r = api(token, ["--paginate", `repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=latest`,
-    "--jq", ".check_runs[] | {name, id, conclusion, app: .app.slug}"]);
+    "--jq", ".check_runs[] | {name, id, conclusion, app: .app.slug, title: .output.title, summary: .output.summary}"]);
   if (!r.ok) return null;
   const rows = [];
   for (const line of (r.out ?? "").split("\n").filter(Boolean)) { try { rows.push(JSON.parse(line)); } catch { return null; } }
@@ -1241,7 +1247,7 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = "o
  * The run's text shows on the watched repository's pull requests, so it names
  * the merge policy, never reeve.
  */
-export async function withdrawVerdict({ nwo, head, name, id = null, why,
+export async function withdrawVerdict({ nwo, head, name, id = null, why, passing = false, keep = null,
                                         auth: authenticateAs = authenticate, api = apiAsInstallation }) {
   const auth = await authenticateAs(nwo);
   if (!auth.ok) return { ok: false, why: auth.why };
@@ -1258,6 +1264,10 @@ export async function withdrawVerdict({ nwo, head, name, id = null, why,
   const run = runs.mine[name]?.id ?? null;
   // Nothing of reeve's stands there, so there is nothing to take back.
   if (run == null) return { ok: true, id: null };
+  // With `passing`, only a result that could pass the check: a failure can't.
+  if (passing && !PASSING_RUN.has(runs.mine[name]?.conclusion)) return { ok: true, id: null };
+  // With `keep`, what stood there is kept first, and isn't withdrawn unless it was.
+  if (keep && !keep(runs.mine[name])) return { ok: false, why: "what stood there couldn't be kept first, so it wasn't withdrawn" };
   const res = cancel(run);
   if (!res.ok) return { ok: false, why: String(res.err ?? "").split("\n")[0] };
   return { ok: true, id: run };

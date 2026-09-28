@@ -881,7 +881,7 @@ switch (cmd) {
     if (flag("unrecorded")) {
       const r = await withdrawUnrecorded({ nwo, db: ctx.db, log: (line) => console.log(line) });
       if (r.already) console.log(`reeve withdraw: the results reeve published on ${nwo} before it kept a record were withdrawn before`);
-      else if (r.ok) console.log(`reeve withdraw: checked ${r.checked} pull request(s) that didn't merge, and withdrew reeve's result at ${r.withdrawn.length}`);
+      else if (r.ok) console.log(`reeve withdraw: checked ${r.checked} pull request(s), and withdrew reeve's result at ${r.withdrawn.length}, each kept in the store first`);
       else console.error(`reeve withdraw: ${r.why}. Run it again.`);
       process.exit(r.ok ? 0 : 1);
     }
@@ -2384,7 +2384,7 @@ switch (cmd) {
       store.close();
       if (!done) {
         console.error(`reeve run: --enforce waits until reeve has withdrawn the results it published before it kept a record, ` +
-                      `at the head of every pull request on ${nwo} that didn't merge.\n-> reeve withdraw ${nwo} --unrecorded`);
+                      `at every pull request's head on ${nwo}. Stop the daemon for it first.\n-> reeve withdraw ${nwo} --unrecorded`);
         process.exit(1);
       }
     }
@@ -2585,9 +2585,10 @@ function usage() {
       --halt <path>         marker file that stops everything (default ~/.reeve/HALT)
   withdraw [owner/repo] withdraw every PASS reeve left standing there; systemd runs it
                         after the daemon stops, however it stopped
-      --unrecorded          once, before enforcing: withdraw reeve's results under the
-                            enforcement check at the head of every pull request that
-                            didn't merge, published before it kept a record
+      --unrecorded          once, before enforcing, with the daemon stopped: withdraw
+                            reeve's results under the enforcement check that could pass,
+                            at every pull request's head, published before it kept a
+                            record, each kept in the store first
                             (0 done or done before · 1 not done, run it again)
 
   everywhere:

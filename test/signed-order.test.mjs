@@ -300,6 +300,7 @@ test("an entry taken out of the middle of the signed order leaves it missing, an
   const db = open(await ticks([at(A), at(A, "RED")], host(dir)));
   const keys = knownKeys({ local: dir });
   const second = db.prepare("SELECT at, actor, op, subject, payload FROM event WHERE op = 'decision.latest' AND json_extract(payload, '$.n') = 2").get();
+  assert.ok(second, "control: the order has an entry 2");
   db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(second.at, second.actor, second.op, second.subject, second.payload);
   const twice = signedOrder(db, REPO, PR, keys);
   db.close();

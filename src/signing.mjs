@@ -87,18 +87,24 @@ export function baselineStatement(digests) {
  * so a stop or a full disk partway never leaves part of a key at the key's path,
  * and two processes never write over each other's. A key others could read, or
  * that isn't Ed25519, is refused. The public half beside it is written again
- * whenever it's missing, unreadable, or another key's.
+ * whenever it's missing, unreadable, or another key's; `publicWhy` says why it
+ * isn't, when it couldn't be. Before a key is handed out to sign, its folder is
+ * synced, so the key outlasts a power loss that the records it signs outlast.
  * @param {string} dir
- * @param {{ create?: boolean, write?: (fd: number, buf: Buffer, offset: number, length: number) => number }} [o]
- *        `write` writes part of a buffer, as `writeSync` does, and answers how much: a test's faults
- * @returns {{ ok: true, key: KeyObject, keyid: string, created: boolean } | { ok: false, why: string }}
+ * @param {{ create?: boolean, write?: (fd: number, buf: Buffer, offset: number, length: number) => number,
+ *           syncDir?: (dir: string) => void }} [o]
+ *        `write` writes part of a buffer, as `writeSync` does, and answers how much, and `syncDir` syncs
+ *        a folder: a test's faults
+ * @returns {{ ok: true, key: KeyObject, keyid: string, created: boolean, publicWhy: string | null }
+ *         | { ok: false, why: string, missing?: boolean }}
  */
-export function signingKey(dir, { create = false, write = (fd, buf, offset, length) => writeSync(fd, buf, offset, length) } = {}) {
+export function signingKey(dir, { create = false, write = (fd, buf, offset, length) => writeSync(fd, buf, offset, length),
+                                  syncDir = syncFolder } = {}) {
   const path = join(dir, KEY_FILE);
   let created = false;
   try {
     if (!existsSync(path)) {
-      if (!create) return { ok: false, why: `there is no signing key at ${path}` };
+      if (!create) return { ok: false, why: `there is no signing key at ${path}`, missing: true };
       mkdirSync(dir, { recursive: true, mode: 0o700 });
       const { privateKey } = generateKeyPairSync("ed25519");
       const temp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
@@ -121,15 +127,27 @@ export function signingKey(dir, { create = false, write = (fd, buf, offset, leng
     // A public half that can't be written now is written the next time; the key
     // signs either way, and its records check against the published copy. One
     // that's another key's, made before this one replaced it, is kept under its
-    // own id, as what still checks the records that key signed.
+    // own id first, as what still checks the records that key signed, and left
+    // in its slot when it can't be.
     const pubPath = join(dir, PUBLIC_FILE);
+    let publicWhy = null;
     if (publicIdAt(pubPath) !== keyid) {
       const old = publicKeyAt(pubPath);
-      const kept = !old || existsSync(join(dir, archivedPublic(keyIdOf(old))))
-        || (() => { try { renameSync(pubPath, join(dir, archivedPublic(keyIdOf(old)))); return true; } catch { return false; } })();
-      if (kept) { try { writePublic(dir, pub, write); } catch { /* next time */ } }
+      publicWhy = old ? keepReplaced(dir, pubPath, keyIdOf(old), syncDir) : null;
+      if (!publicWhy) {
+        try { writePublic(dir, pub, write); }
+        catch (err) { publicWhy = `its public half couldn't be written at ${pubPath}: ${/** @type {Error} */ (err).message}`; }
+      }
     }
-    return { ok: true, key, keyid, created };
+    // A record signed by a key whose file a power loss took could never be
+    // checked, and the store keeps that record.
+    if (create) {
+      try { syncDir(dir); }
+      catch (err) {
+        return { ok: false, why: `the signing key's folder ${dir} couldn't be synced, so the key might not outlast a power loss: ${/** @type {Error} */ (err).message}` };
+      }
+    }
+    return { ok: true, key, keyid, created, publicWhy };
   } catch (err) {
     return { ok: false, why: `the signing key couldn't be read or made: ${/** @type {Error} */ (err).message}` };
   }
@@ -173,6 +191,37 @@ function publicIdAt(path) {
 
 /** Where a replaced key's public half is kept, by its id. @param {string} keyid */
 const archivedPublic = (keyid) => `signing-ed25519.${keyid}.pub`;
+
+/**
+ * Keep the public half in `pubPath`, key `oldId`'s, which this key replaced,
+ * under that key's id, before its slot is written over. A copy already there
+ * counts only if it holds that key: a file there that doesn't is never taken for
+ * it, or written over. It's linked, so nothing is written over, and the folder is
+ * synced, so it's kept before the slot changes. Null once it's kept; otherwise
+ * why the slot is left as it is.
+ * @param {string} dir @param {string} pubPath @param {string} oldId
+ * @param {(dir: string) => void} syncDir
+ */
+function keepReplaced(dir, pubPath, oldId, syncDir) {
+  const archive = join(dir, archivedPublic(oldId));
+  const said = `the public half at ${pubPath} is key ${oldId.slice(0, 12)}'s, which this key replaced`;
+  try {
+    if (publicIdAt(archive) !== oldId) {
+      if (existsSync(archive)) return `${said}, and ${archive}, where it would be kept, holds something else: move that aside, and reeve keeps it there`;
+      linkSync(pubPath, archive);
+    }
+    syncDir(dir);
+    return null;
+  } catch (err) {
+    return `${said}, and it couldn't be kept at ${archive}: ${/** @type {Error} */ (err).message}`;
+  }
+}
+
+/** Sync the folder `dir`, so the names made in it outlast a power loss. @param {string} dir */
+function syncFolder(dir) {
+  const fd = openSync(dir, "r");
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
 
 /**
  * The public half, written whole to a file of its own and renamed into place.

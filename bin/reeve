@@ -914,10 +914,22 @@ switch (cmd) {
     const kept = [...knownKeys({ local: dir }).entries()].filter(([, v]) => v.where !== "this host's");
     const also = kept.length ? `\nkept from keys it replaced, to publish too: ${kept.map(([id, v]) => `${id} at ${v.path}`).join(", ")}` : "";
     if (!k.ok) {
-      console.log(`no signing key yet at ${dir}: reeve makes one the first time it keeps a decision record${also}`);
-      process.exit(3);
+      if (k.missing) {
+        console.log(`no signing key yet at ${dir}: reeve makes one the first time it keeps a decision record${also}`);
+        process.exit(3);
+      }
+      // One that's there but can't be used is never replaced, so it's said.
+      console.error(`reeve signing-key: ${k.why}. reeve won't sign with it, or replace it, so decision records are kept unsigned until it's fixed: ` +
+                    `if only its mode is wrong, make it readable only by its owner; otherwise move it aside, and reeve makes a new key the next time it keeps a record${also}`);
+      process.exit(1);
     }
     const id = k.keyid;
+    if (k.publicWhy) {
+      console.log(`key id ${id}`);
+      console.error(`reeve signing-key: the key's public half isn't beside it: ${k.publicWhy}. Once that's fixed, run reeve signing-key again; ` +
+                    `until then, what this key signs reads here as signed by a key reeve doesn't know${also}`);
+      process.exit(1);
+    }
     const published = knownKeys({ published: join(ROOT, "deploy", "signing-keys") }).has(id);
     console.log(`key id ${id}
 public key ${join(dir, PUBLIC_FILE)}

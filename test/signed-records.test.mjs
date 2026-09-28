@@ -6,7 +6,7 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, st
 import { join } from "node:path";
 import { createPublicKey, generateKeyPairSync } from "node:crypto";
 import { signingKey, fileSigner, signDecision, checkSignature, knownKeys, keyIdOf, decisionStatement, baselineStatement,
-         KEY_FILE, PUBLIC_FILE, PAYLOAD_TYPE } from "../src/signing.mjs";
+         KEY_FILE, PUBLIC_FILE, PAYLOAD_TYPE, BASELINE_PREDICATE } from "../src/signing.mjs";
 import { decisionRecord, digestOf } from "../src/evidence.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 import { open } from "../src/db/ops.mjs";
@@ -460,6 +460,7 @@ test("a public half whose writing fails leaves nothing behind, and signing goes 
   const k = signingKey(dir, { write: full });
   assert.equal(k.ok, true, "the key still signs");
   assert.deepEqual(readdirSync(dir).filter(f => f.endsWith(".tmp")), [], "no half-written public file left beside it");
+  assert.match(k.ok ? String(k.publicWhy) : "", /couldn't be written at .*no space left on device/, "and it says why its public half isn't there");
 });
 
 
@@ -536,4 +537,134 @@ test("why says which record is latest comes from the store's own order, which is
   const shown = explainDecision(db, 42, { keys: knownKeys({ local: dir }) });
   db.close();
   assert.match(String(shown), /the latest of its 2 records by the store's own order, which isn't signed/);
+});
+
+// ── from #271's fifth review ─────────────────────────────────────────────────
+
+/** The id of the public key in `path`, or null. */
+const idAt = (path) => { try { return keyIdOf(createPublicKey(readFileSync(path, "utf8"))); } catch { return null; } };
+
+test("a key is in its folder for good before it signs: the folder is synced once the key and its public half are there", () => {
+  const dir = credentials();
+  const seen = [];
+  const syncDir = (d) => seen.push({ d, key: existsSync(join(d, KEY_FILE)), pub: existsSync(join(d, PUBLIC_FILE)) });
+  const k = signingKey(dir, { create: true, syncDir });
+  assert.equal(k.ok, true, "control: a key was made");
+  assert.ok(seen.some((x) => x.d === dir && x.key && x.pub), JSON.stringify(seen));
+});
+
+test("a replaced key's public half is kept for good before its slot is written over", () => {
+  const dir = credentials();
+  const old = signingKey(dir, { create: true });
+  assert.equal(old.ok, true, "control: a key was made");
+  const oldId = old.ok ? old.keyid : "";
+  rmSync(join(dir, KEY_FILE));
+  const archive = join(dir, `signing-ed25519.${oldId}.pub`);
+  const seen = [];
+  const made = signingKey(dir, { create: true, syncDir: () => seen.push({ kept: idAt(archive) === oldId, slot: idAt(join(dir, PUBLIC_FILE)) }) });
+  assert.equal(made.ok, true, "control: a new key was made");
+  const first = seen.find((x) => x.kept);
+  assert.ok(first && first.slot !== (made.ok ? made.keyid : ""), `synced once it was kept, before the slot held the new key: ${JSON.stringify(seen)}`);
+});
+
+test("a key whose folder can't be synced isn't used to sign, and says why", () => {
+  const dir = credentials();
+  const k = signingKey(dir, { create: true, syncDir: () => { throw Object.assign(new Error("input/output error"), { code: "EIO" }); } });
+  assert.equal(k.ok, false);
+  assert.match(k.ok ? "" : k.why, /input\/output error/);
+});
+
+test("a kept public half that doesn't hold the replaced key isn't taken for it, so the only copy isn't written over", () => {
+  const dir = credentials();
+  const old = signingKey(dir, { create: true });
+  assert.equal(old.ok, true, "control: a key was made");
+  const oldId = old.ok ? old.keyid : "";
+  rmSync(join(dir, KEY_FILE));
+  const archive = join(dir, `signing-ed25519.${oldId}.pub`);
+  writeFileSync(archive, "cut short");
+  const made = signingKey(dir, { create: true });
+  assert.equal(made.ok, true, "a new key still signs");
+  assert.ok(knownKeys({ local: dir }).has(oldId), "the replaced key's public half is still on the host");
+  assert.equal(readFileSync(archive, "utf8"), "cut short", "and what was kept there is left as it was");
+  assert.match(made.ok ? String(made.publicWhy) : "", /holds something else/);
+});
+
+test("reeve signing-key says when the key's public half couldn't be written, and never points at another key's", () => {
+  const home = tempDir("reeve-signing-unwritten-cli-");
+  const dir = join(home, "credentials");
+  mkdirSync(dir, { mode: 0o700 });
+  const old = signingKey(dir, { create: true });
+  assert.equal(old.ok, true, "control: a key was made");
+  rmSync(join(dir, KEY_FILE));
+  writeFileSync(join(dir, `signing-ed25519.${old.ok ? old.keyid : ""}.pub`), "cut short");
+  const made = signingKey(dir, { create: true });
+  assert.equal(made.ok, true, "control: a new key was made");
+  const r = spawnSync(process.execPath, [REEVE, "signing-key"], { encoding: "utf8", env: { ...offlineEnv(), REEVE_HOME: home } });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout + r.stderr, new RegExp(`key id ${made.ok ? made.keyid : "none"}`));
+  assert.match(r.stderr, /holds something else/);
+  assert.ok(!r.stdout.includes(`public key ${join(dir, PUBLIC_FILE)}`), "never the slot, which holds another key's");
+});
+
+test("reeve signing-key says why a key that's there can't be used, not that there's none", () => {
+  const home = tempDir("reeve-signing-unusable-cli-");
+  const dir = join(home, "credentials");
+  mkdirSync(dir, { mode: 0o700 });
+  assert.equal(signingKey(dir, { create: true }).ok, true, "control: a key was made");
+  chmodSync(join(dir, KEY_FILE), 0o644);
+  const r = spawnSync(process.execPath, [REEVE, "signing-key"], { encoding: "utf8", env: { ...offlineEnv(), REEVE_HOME: home } });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.doesNotMatch(r.stdout + r.stderr, /no signing key yet/);
+  assert.match(r.stderr, /can be read by others/);
+  assert.match(r.stderr, /kept unsigned until/);
+});
+
+test("records kept while a store's baseline couldn't be signed stay unsigned, so the baseline made later vouches for them", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)]);
+  const good = fileSigner(dir);
+  let failed = false;
+  const flaky = (s) => {
+    if (!failed && s.predicateType === BASELINE_PREDICATE) { failed = true; return { unsigned: "the disk was busy" }; }
+    return good(s);
+  };
+  await run({ evaluate: () => at(B), dbPath, signer: flaky });
+  assert.ok(failed, "control: the first baseline failed");
+  await run({ evaluate: () => at(B, "RED"), dbPath, signer: flaky });
+  const db = open(dbPath);
+  const replayed = replayDecisions(db, { pr: 42 }, { keys: knownKeys({ local: dir }) });
+  const baselines = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n;
+  db.close();
+  assert.equal(baselines, 1, "the baseline was made once it could be");
+  assert.ok(replayed.length >= 3, `control: every record replayed: ${JSON.stringify(replayed)}`);
+  assert.deepEqual(replayed.filter((r) => r.outcome !== "same").map((r) => r.why), [], "none left untrusted");
+});
+
+test("records kept while a store's baseline couldn't be written stay unsigned too", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)]);
+  let db = open(dbPath);
+  db.exec(`CREATE TRIGGER no_baseline BEFORE INSERT ON event WHEN NEW.op = 'signing.baseline' BEGIN SELECT RAISE(ABORT, 'the store is locked'); END`);
+  db.close();
+  const first = await run({ evaluate: () => at(B), dbPath, signer: fileSigner(dir) });
+  assert.match(first.log, /the store is locked/, "control: the baseline couldn't be written");
+  db = open(dbPath);
+  db.exec("DROP TRIGGER no_baseline");
+  db.close();
+  await run({ evaluate: () => at(B, "RED"), dbPath, signer: fileSigner(dir) });
+  db = open(dbPath);
+  const replayed = replayDecisions(db, { pr: 42 }, { keys: knownKeys({ local: dir }) });
+  db.close();
+  assert.ok(replayed.length >= 3, `control: every record replayed: ${JSON.stringify(replayed)}`);
+  assert.deepEqual(replayed.filter((r) => r.outcome !== "same").map((r) => r.why), [], "none left untrusted");
+});
+
+test("a tick whose records are kept unsigned says why in the log, once", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)], { signer: fileSigner(dir) });
+  const r = await run({ openPrs: () => [42, 43], evaluate: () => at(A, "RED"), dbPath,
+                        signer: () => ({ unsigned: "the signing key at /k can be read by others (mode 644), so it isn't used" }) });
+  const said = r.log.split("\n").filter((l) => /signing: records are kept unsigned/.test(l));
+  assert.equal(said.length, 1, r.log);
+  assert.match(said[0], /can be read by others/);
 });

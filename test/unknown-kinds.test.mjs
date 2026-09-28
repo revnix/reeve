@@ -147,7 +147,7 @@ test("a clause only a person can settle goes to one by its own reason, even past
 });
 
 test("the base's rules a run settles without anyone are marked so, and the rest aren't", () => {
-  const rules = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "ops/merge-policy", integration_id: 1 }] } },
+  const rules = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "merge-policy", integration_id: 1 }] } },
     { type: "required_deployments", parameters: { required_deployment_environments: ["preview"] } }, { type: "workflows" }, { type: "code_scanning" },
     { type: "required_signatures" }, { type: "merge_queue" }, { type: "some_future_rule" }];
   const gh = args => {

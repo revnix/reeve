@@ -23,7 +23,7 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
 }
 {
   const live = structuredClone(fixture);
-  live.rulesetRequiredChecks = [...live.rulesetRequiredChecks, "ops/merge-policy"];
+  live.rulesetRequiredChecks = [...live.rulesetRequiredChecks, "merge-policy"];
   const d = diffBaseline(live, fixture);
   check(d.drifted === true && /required checks/.test(d.lines.join(" ")),
     "a new required check is drift, and is named", JSON.stringify(d.lines));

@@ -15,6 +15,8 @@
 // an UNKNOWN silently rendered as PASS: an absent gate script read as a pass, a
 // rate-limited reviewer reporting state=success, a fork PR with zero check runs.
 
+import { POLICY_CONTEXT, LEGACY_CONTEXTS } from "./github/reconciler.mjs";
+
 export const PASS = "PASS";
 export const BLOCK = "BLOCK";
 export const UNKNOWN = "UNKNOWN";
@@ -103,6 +105,8 @@ export function computeVerdict(i) {
   // A base that requires reeve's shadow check is gated by a result that never
   // fails: the shadow result passes the rule whatever reeve found.
   else if (i.checks?.shadowRequired) add("ci", BLOCK, "the base requires reeve's shadow check, whose result passes the rule whatever reeve finds");
+  else if (i.checks?.legacyRequired)
+    add("ci", BLOCK, `the base requires ${LEGACY_CONTEXTS.join(" or ")}, a name reeve published under before, whose old results pass the rule whatever reeve finds; require ${POLICY_CONTEXT} instead`);
   else if (!i.checks) add("ci", UNKNOWN, "no check reading", "retry", "read the head's checks again");
   // A read that failed is not a set still settling: only reading again settles it.
   else if (i.checks.readable === false) add("ci", UNKNOWN, i.checks.why ?? "the head's checks couldn't be read", "retry", "read the head's checks again");
@@ -355,7 +359,7 @@ export function renderVerdict(v) {
  * bindable as a required context, and a required context that never reports
  * BLOCKS rather than merges — which is the fail-closed primitive.
  */
-export function publishArgs(v, { nwo, context = "ops/merge-policy", asApp = false }) {
+export function publishArgs(v, { nwo, context = POLICY_CONTEXT, asApp = false }) {
   const conclusion = v.state === PASS ? "success" : v.state === BLOCK ? "failure" : "action_required";
   if (asApp) {
     return {

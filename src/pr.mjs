@@ -13,7 +13,7 @@ import { rootCause } from "./ci-rootcause.mjs";
 import { computeVerdict, renderVerdict, coversHead, PASS, BLOCK, UNKNOWN } from "./verdict.mjs";
 // The builder App's name has one home already; the classifier reads it rather
 // than restating it.
-import { POLICY_APP, POLICY_CONTEXT } from "./github/reconciler.mjs";
+import { POLICY_APP, POLICY_CONTEXT, LEGACY_CONTEXTS } from "./github/reconciler.mjs";
 import { reviewState } from "./review/derive.mjs";
 import { compare } from "./review/shadow.mjs";
 import { authenticate, apiAsInstallation, loadAppCredentials } from "./github/app.mjs";
@@ -183,7 +183,7 @@ export function evaluateQueueEntry({ nwo, entry, input, baseRef, profile, db = n
     ? { ...r, reviewedHead: entry.sha, coveredAt: r.reviewedHead } : r));
   const queued = { ...input, reviewers, head: entry.sha,
     checks: { verdict: s.verdict, settled: s.settled, why: s.why, readable: c.readable !== false, failing: c.failing, inherited: [],
-              impostors: got?.impostors ?? [], shadowRequired: req.shadowRequired },
+              impostors: got?.impostors ?? [], shadowRequired: req.shadowRequired, legacyRequired: req.legacyRequired },
     base: { verdict: base.verdict, readable: base.readable !== false } };
   return { ok: true, input: queued, verdict: computeVerdict(queued) };
 }
@@ -278,6 +278,11 @@ function requiredCheckState(rows, { context, app, besideOwn = false }, now = Dat
  * rows are never evidence, and so are reviewers' statuses, which the review
  * clauses read. `known` is false when the base's couldn't be read.
  *
+ * `legacyRequired` says the base requires a name reeve published under before
+ * (`ops/merge-policy`), bound where reeve's App could meet it: its old results
+ * there pass the rule whatever reeve finds now, so that's a rule to change, not
+ * a check to meet (#242).
+ *
  * `shadowRequired` says the base requires reeve's shadow check where reeve's
  * own result could meet the rule. That's no requirement to meet but one to
  * refuse: a shadow result never fails, so it passes the rule whatever reeve
@@ -290,17 +295,19 @@ export function requiredChecksOf({ nwo, baseRef, profile = /** @type {CiProfile}
   const base = baseRef ? requirements({ nwo, base: baseRef, gh }) : null;
   const shadow = shadowContextOf(POLICY_CONTEXT);
   const reviewers = new Set(profile.ci?.reviewerStatusContexts ?? []);
-  const reeveMeets = (c) => c.context === shadow && (c.app == null || appId == null || String(c.app) === String(appId));
+  const reeveCould = (c) => c.app == null || appId == null || String(c.app) === String(appId);
+  const reeveMeets = (c) => c.context === shadow && reeveCould(c);
+  const legacyMeets = (c) => LEGACY_CONTEXTS.includes(c.context) && reeveCould(c);
   // A reviewer's status is aside, but a check bound to an App under the same
   // name is a check run, and required like any other.
-  const aside = (c) => c.context === POLICY_CONTEXT || reeveMeets(c) || (c.app == null && reviewers.has(c.context));
+  const aside = (c) => c.context === POLICY_CONTEXT || reeveMeets(c) || legacyMeets(c) || (c.app == null && reviewers.has(c.context));
   const all = [...(profile.ci?.requiredChecks ?? []).map((context) => ({ context, app: null, origin: "profile" })),
                ...(base ?? []).filter((c) => !aside(c)).map((c) => ({ ...c, origin: "base" }))];
   // One entry per check. Where the profile and the base both name it, the base
   // wins: its requirement may be any App's, and settles only when it reports.
   const required = all.filter((c, i) => all.findIndex((d) => d.context === c.context && d.app === c.app) === i)
     .map((c) => (all.some((d) => d.context === c.context && d.app === c.app && d.origin === "base") ? { ...c, origin: "base" } : c));
-  return { required, known: Array.isArray(base), shadowRequired: (base ?? []).some(reeveMeets) };
+  return { required, known: Array.isArray(base), shadowRequired: (base ?? []).some(reeveMeets), legacyRequired: (base ?? []).some(legacyMeets) };
 }
 
 /**
@@ -846,7 +853,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     // waiting for the checks to settle never does.
     checks: { verdict: s.verdict, settled: s.settled, why: s.why, readable: c.readable !== false, failing: c.failing, inherited: c.inherited,
               // Another App's check under reeve's own name: kept, never dropped.
-              impostors: read.impostors ?? [], shadowRequired: req.shadowRequired },
+              impostors: read.impostors ?? [], shadowRequired: req.shadowRequired, legacyRequired: req.legacyRequired },
     base: { verdict: base.verdict, readable: base.readable !== false },
     reviewers, rounds, threads, cleared: facts.cleared,
     bodyFindings: facts.bodyFindings, unreadableBodies: facts.unreadableBodies,
@@ -1115,7 +1122,7 @@ export const requiredOnBase = (args) => requirementsOnBase(args).own;
  * requires the enforcement check, every pull request is blocked until reeve
  * enforces: that comes back as `held`, for the daemon to raise.
  */
-export async function publishVerdict({ nwo, verdict, shadow = true, context = "ops/merge-policy", base = null, queue = false,
+export async function publishVerdict({ nwo, verdict, shadow = true, context = POLICY_CONTEXT, base = null, queue = false,
                                       auth: authenticateAs = authenticate, api = apiAsInstallation }) {
   const auth = await authenticateAs(nwo);
   if (!auth.ok) return { ok: false, why: auth.why };

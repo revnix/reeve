@@ -77,7 +77,8 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
   const gate = f.find(x => x.id.startsWith("H-4:"));
   check(gate?.classification === "unsafe-authority", "a ruleset that does not require the bound check is unsafe authority", JSON.stringify(gate));
 
-  db.exec(`UPDATE repo_gate_state SET ruleset_requires_check=1, bound_app_id=42, app_installed='pass' WHERE repo_id=1`);
+  db.exec(`UPDATE repo_gate_state SET ruleset_requires_check=1, bound_app_id=42, app_installed='pass',
+           ruleset_snapshot='{"required_status_checks":[{"context":"merge-policy","integration_id":42}]}' WHERE repo_id=1`);
   f = hubFindings(db, { root: "/b", now: NOW, snapshotFor: () => null });
   check(f.find(x => x.id.startsWith("H-4:"))?.severity === "pass", "control: a ruleset requiring the bound app passes");
 

@@ -933,16 +933,18 @@ function standingAt(db, pr) {
 
 /**
  * Every PASS reeve has standing and hasn't taken back, one per pull request and
- * check name. A publication whose record can't be read may be a PASS, so it's
- * listed too, as `{ pr, unread }`, until a later record at that pull request
- * stands in its place. Throws when the log can't be read at all.
+ * check name. A publication whose record can't be read may be a PASS under any
+ * name at any head, so it's listed too, as `{ pr, unread }`, until a merge ends
+ * everything standing there: a later record under some name at some head says
+ * nothing of what the unreadable one was (#242). Throws when the log can't be
+ * read at all.
  */
 export function standingPasses(db) {
   const field = (t, k) => `CASE WHEN json_valid(${t}.payload) THEN json_extract(${t}.payload, '$.${k}') END`;
   return db.prepare(`SELECT e.subject, e.payload FROM event e WHERE e.op = 'pr.published'
                        AND NOT EXISTS (SELECT 1 FROM event f WHERE f.subject = e.subject AND f.seq > e.seq AND ${STANDING}
-                         AND (f.op = 'pr.merged' OR NOT json_valid(e.payload)
-                              OR (${field("f", "name")} IS ${field("e", "name")} AND ${field("f", "head")} IS ${field("e", "head")})))`).all()
+                         AND (f.op = 'pr.merged'
+                              OR (json_valid(e.payload) AND ${field("f", "name")} IS ${field("e", "name")} AND ${field("f", "head")} IS ${field("e", "head")})))`).all()
     .map((r) => {
       const pr = Number(String(r.subject).slice(3));
       try { return { ...JSON.parse(r.payload), pr }; } catch (err) { return { pr, unread: err.message }; }

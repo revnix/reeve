@@ -2033,8 +2033,8 @@ export const STUBS = [
     expectRed: "asking about another repository from inside this one is refused, not answered",
     edits: [{
       file: "bin/reeve",
-      find: "    const declared = profile?.identity?.key;\n    if (declared && declared !== nwo)",
-      replace: "    const declared = null;\n    if (declared && declared !== nwo)",
+      find: "    if (key !== nwo) {",
+      replace: "    if (false) {",
     }],
   },
 
@@ -9966,5 +9966,23 @@ export const STUBS = [
     edits: [{ file: "src/daemon.mjs",
               find: "      if (e.verdict.state !== PASS || (at ?? []).some((x) => x.op === \"pr.published\" && x.state === PASS && unwritten(x)))",
               replace: "      if (e.verdict.state !== PASS)" }],
+  },
+  {
+    name: "profile-used-only-for-its-repository",
+    why: "apply whatever profile is found, whichever repository it names. A command about one repository, run inside another's checkout, then judges it by the other's rules",
+    test: "test/profile-per-repo.test.mjs",
+    expectRed: "a profile in the working directory for another repository is refused, not applied, and the refusal names both",
+    edits: [{ file: "bin/reeve",
+              find: "    if (key !== nwo) {",
+              replace: "    if (false) {" }],
+  },
+  {
+    name: "profile-mismatch-said",
+    why: "leave out why a command that goes on without a profile has none. The operator then can't tell a missing profile from another repository's",
+    test: "test/profile-per-repo.test.mjs",
+    expectRed: "a command that goes on without a profile goes on without another repository's, and says so",
+    edits: [{ file: "bin/reeve",
+              find: "      if (orNull) { console.error(msg); return null; }",
+              replace: "      if (orNull) return null;" }],
   },
 ];

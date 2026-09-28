@@ -838,5 +838,7 @@ test("a public-key file that isn't a file, a pipe say, isn't read, and is writte
   const k = signingKeyWithin(dir, { create: true });
   assert.ok(k.answered, `it answered: ${k.why}`);
   assert.equal(k.out?.ok, true);
+  // Read only once it's a file: reading a pipe here would hold this test up in its place.
+  assert.ok(lstatSync(join(dir, PUBLIC_FILE)).isFile(), "the slot is a file again, written over the pipe");
   assert.equal(idAt(join(dir, PUBLIC_FILE)), first.ok ? first.keyid : "", "the slot holds this key's public half again");
 });

@@ -88,7 +88,7 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
                     carriedReleases, carriedCooldowns, providerBind,
                     resolveRepoIdFn, project, keepDir = false, seams = null,
                     haltMarker, openPrs, containment, ticks = 1, dbPath, evaluate, treeOf, code, codeVersion,
-                    readQueue, evaluateQueue, publish, withdraw, signer, anchor, keys } = {}) => {
+                    readQueue, evaluateQueue, publish, withdraw, signer, anchor, keys, durably } = {}) => {
   const dir = tempDir("reeve-prov-");
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
@@ -200,6 +200,7 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     // The host's anchor and the keys the signed order is checked with (#274).
     ...(anchor ? { anchor } : {}),
     ...(keys ? { keys } : {}),
+    ...(durably ? { durably } : {}),
     spawnWorker: spawnWorker ?? (async a => { spawned.push(a); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }; }),
     ...(heartbeatMs != null ? { heartbeatMs } : {}),
     ...(providerHeartbeat ? { providerHeartbeat } : {}),

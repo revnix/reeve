@@ -9,8 +9,8 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { fileSigner, knownKeys, latestStatement, signStatement, signingKey } from "../src/signing.mjs";
 import { fileAnchor, readAnchor, anchorPath } from "../src/anchor.mjs";
-import { open } from "../src/db/ops.mjs";
-import { explainDecision, replayDecisions, signedOrder } from "../src/decisions.mjs";
+import { open, durably } from "../src/db/ops.mjs";
+import { explainDecision, replayDecisions, signedOrder, anchorForStore } from "../src/decisions.mjs";
 import { computeVerdict } from "../src/verdict.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 import { offlineEnv } from "./fixtures/offline-github.mjs";
@@ -53,6 +53,8 @@ async function ticks(evals, ctx, dbPath = null) {
 }
 /** The host's anchor, as `why` and `replay` are given it. */
 const anchorOf = (dir) => { try { return { anchor: readAnchor(dir, REPO), why: null }; } catch (e) { return { anchor: null, why: e.message }; } };
+/** The same, checked against the store it's read beside, as bin/reeve gives it. */
+const anchorFor = (db, dir) => anchorForStore(db, anchorOf(dir), REPO);
 /** The digests of #42's records, oldest first. */
 const digestsOf = (db) => db.prepare("SELECT digest FROM decision WHERE pr = ? ORDER BY first_seq").all(PR).map((r) => r.digest);
 
@@ -67,7 +69,9 @@ test("each change of a pull request's latest decision is a numbered, signed entr
   assert.deepEqual(order, { top: 2, digest: red, digests: new Set([green, red]) }, "one entry per change, none for a decision seen again");
   assert.match(String(shown), /the latest by its signed order, entry 2/);
   assert.doesNotMatch(String(shown), /can't be trusted/);
-  assert.deepEqual(readAnchor(dir, REPO), { began: true, latest: new Map([[PR, 2]]) }, "and the host's anchor holds its top");
+  const anchor = readAnchor(dir, REPO);
+  assert.deepEqual({ began: anchor?.began, latest: anchor?.latest }, { began: true, latest: new Map([[PR, 2]]) }, "and the host's anchor holds its top");
+  assert.match(String(anchor?.store), /^[0-9a-f]{32}$/, "and is this store's");
 });
 
 test("an older record raised in the store's own order can't be trusted as the latest", async () => {
@@ -125,7 +129,7 @@ test("the host's anchor is written whole, its folder and every folder made for i
   assert.equal(anchor.note(REPO, 7, 1), true, "control: it was written");
   const file = anchorPath(dir, REPO);
   for (const d of [dirname(file), dirname(dirname(file)), dir]) assert.ok(seen.includes(d), `${d} synced: ${JSON.stringify(seen)}`);
-  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { began: true, latest: { 7: 1 } });
+  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { began: true, latest: { 7: 1 }, store: null });
 });
 
 test("the host's anchor only moves forward", () => {
@@ -134,7 +138,7 @@ test("the host's anchor only moves forward", () => {
   anchor.note(REPO, 7, 3);
   anchor.note(REPO, 7, 2);
   anchor.note(REPO, 9, 1);
-  assert.deepEqual(readAnchor(dir, REPO), { began: true, latest: new Map([[7, 3], [9, 1]]) });
+  assert.deepEqual(readAnchor(dir, REPO), { began: true, latest: new Map([[7, 3], [9, 1]]), store: null });
 });
 
 test("an anchor that can't be read vouches for nothing, and isn't written over", async () => {
@@ -151,7 +155,7 @@ test("an anchor that can't be read vouches for nothing, and isn't written over",
   assert.ok(replayed.some((r) => r.outcome === "unreplayable" && /anchor for o\/r can't be read/.test(String(r.why))), JSON.stringify(replayed));
   const r = await run({ evaluate: () => at(A, "RED"), dbPath, ...host(dir) });
   assert.equal(readFileSync(file, "utf8"), "cut sho", "a tick leaves it as it was");
-  assert.match(r.log, /#42: the host's anchor for o\/r can't be read: it isn't JSON, so its signed order isn't extended/);
+  assert.match(r.log, /the host's anchor for o\/r can't be read: it isn't JSON, so no signed order is extended/);
   db = open(dbPath);
   assert.equal(signedOrder(db, REPO, PR, keys).top, 1, "nor is the order extended, as whether it was cut short can't be told");
   db.close();
@@ -275,12 +279,13 @@ test("an anchor that isn't one, or isn't a file, is never read as one", () => {
   const dir = credentials();
   const file = anchorPath(dir, REPO);
   mkdirSync(dirname(file), { recursive: true });
-  for (const text of ['{"began":"yes","latest":{}}', '{"began":true,"latest":{"7":"x"}}', '{"began":true,"latest":{"-1":2}}', '{"began":true,"latest":[]}']) {
+  for (const text of ['{"began":"yes","latest":{}}', '{"began":true,"latest":{"7":"x"}}', '{"began":true,"latest":{"-1":2}}', '{"began":true,"latest":[]}',
+                      '{"began":true,"latest":{},"store":"not a store"}']) {
     writeFileSync(file, text);
     assert.throws(() => readAnchor(dir, REPO), /can't be read: it isn't an anchor/, text);
   }
   writeFileSync(file, '{"began":true,"latest":{"7":2}}');
-  assert.deepEqual(readAnchor(dir, REPO), { began: true, latest: new Map([[7, 2]]) }, "control: an anchor reads as one");
+  assert.deepEqual(readAnchor(dir, REPO), { began: true, latest: new Map([[7, 2]]), store: null }, "control: an anchor reads as one");
 });
 
 test("an anchor that's a pipe is refused before it's opened, so reading it can't wait for ever", () => {
@@ -558,4 +563,143 @@ test("an anchor whose folder is a link is never read", () => {
   mkdirSync(dirname(owner), { recursive: true });
   symlinkSync(elsewhere, owner);
   assert.throws(() => readAnchor(dir, REPO), /is a link/);
+});
+
+// ── from #278's third review ─────────────────────────────────────────────────
+
+test("an order's entries commit synced to disk before the host's anchor moves to them", async () => {
+  const dir = credentials();
+  const seen = [];
+  const count = (db, op) => db.prepare("SELECT count(*) AS n FROM event WHERE op = ?").get(op).n;
+  const watched = (db, fn) => durably(db, () => {
+    const level = db.prepare("PRAGMA synchronous").get().synchronous;
+    const before = { baseline: count(db, "signing.baseline"), entries: count(db, "decision.latest") };
+    const r = fn();
+    seen.push({ level, baseline: count(db, "signing.baseline") > before.baseline, entry: count(db, "decision.latest") > before.entries });
+    return r;
+  });
+  const dbPath = await ticks([at(A)], { ...host(dir), durably: watched });
+  const db = open(dbPath);
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  const after = db.prepare("PRAGMA synchronous").get().synchronous;
+  db.close();
+  assert.equal("top" in order && order.top, 1, "control: an entry was made");
+  assert.ok(seen.some((x) => x.entry && x.level === 2), `the entry committed at FULL, which syncs the WAL at each commit: ${JSON.stringify(seen)}`);
+  assert.ok(seen.some((x) => x.baseline && x.level === 2), `and the baseline too, before the anchor says the store began: ${JSON.stringify(seen)}`);
+  assert.equal(after, 1, "and a store opened again runs as it's set to");
+});
+
+test("durably runs its work at FULL, and puts the store back as it was", () => {
+  const db = open(join(tempDir("reeve-order-durably-"), "s.db"));
+  const before = db.prepare("PRAGMA synchronous").get().synchronous;
+  const inside = durably(db, () => db.prepare("PRAGMA synchronous").get().synchronous);
+  const after = db.prepare("PRAGMA synchronous").get().synchronous;
+  assert.throws(() => durably(db, () => { throw new Error("stop"); }), /stop/);
+  const afterThrow = db.prepare("PRAGMA synchronous").get().synchronous;
+  db.close();
+  assert.deepEqual({ before, inside, after, afterThrow }, { before: 1, inside: 2, after: 1, afterThrow: 1 });
+});
+
+test("a pull request held at the same queue commit adds no entry tick after tick", async () => {
+  const dir = credentials();
+  const QUEUED = "c".repeat(40);
+  const readQueue = () => ({ ok: true, queue: true, entries: [{ pr: PR, sha: QUEUED, baseSha: "f".repeat(40), state: "AWAITING_CHECKS", prHead: A }] });
+  const evaluateQueue = ({ entry, input: i }) => { const q = { ...i, head: entry.sha }; return { ok: true, input: q, verdict: computeVerdict(q) }; };
+  const dbPath = join(tempDir("reeve-order-queued-"), "s.db");
+  open(dbPath).close();
+  await run({ evaluate: () => at(A), readQueue, evaluateQueue, dbPath, ticks: 3, ...host(dir) });
+  const db = open(dbPath);
+  const entries = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n;
+  const latest = db.prepare("SELECT digest FROM decision WHERE pr = ? ORDER BY last_seq DESC LIMIT 1").get(PR)?.digest;
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  db.close();
+  assert.equal(entries, 1, "one entry: the latest at the end of the first tick, and nothing changed since");
+  assert.equal("digest" in order && order.digest, latest, "and it names the store's latest");
+});
+
+test("the host's anchor is one store's: another store of the repository extends no signed order, and why can't vouch for its latest", async () => {
+  const dir = credentials();
+  await ticks([at(A)], host(dir));
+  const second = await ticks([at(A), at(A, "RED")], host(dir));
+  const db = open(second);
+  const entries = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n;
+  const shown = explainDecision(db, PR, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorFor(db, dir) });
+  db.close();
+  assert.equal(entries, 0, "no entry, whose number the first store's order may already have taken");
+  assert.match(String(shown), /can't be trusted as the latest: the host's anchor for o\/r is another store's/);
+});
+
+test("an entry committed before the host's anchor could be moved to it is noted at the next tick", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)], host(dir));
+  // The anchor's write fails before it's renamed into place: the entry is
+  // committed, and the anchor stays at the entry before, as it would were the
+  // process to stop between the two.
+  const stuck = { ...host(dir), anchor: fileAnchor(dir, { write: () => { throw new Error("no space left on device"); } }) };
+  const r = await run({ evaluate: () => at(A, "RED"), dbPath, ...stuck });
+  assert.match(r.log, /the host's anchor couldn't be moved to entry 2 of its order/, "control: the note failed");
+  assert.equal(readAnchor(dir, REPO)?.latest.get(PR), 1, "control: the anchor stayed behind");
+  const next = await run({ evaluate: () => at(A, "RED"), dbPath, ...host(dir) });
+  const db = open(dbPath);
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  db.close();
+  assert.ok("top" in order && order.top >= 2, JSON.stringify(order));
+  assert.equal(readAnchor(dir, REPO)?.latest.get(PR), order.top, "the anchor caught up with the order");
+  assert.doesNotMatch(next.log, /isn't extended/, "and the order wasn't refused");
+});
+
+test("a store whose identity was taken away, once the host's anchor is bound to it, extends no signed order", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)], host(dir));
+  let db = open(dbPath);
+  db.prepare("DELETE FROM event WHERE op = 'store.identity'").run();
+  db.close();
+  const r = await run({ evaluate: () => at(A, "RED"), dbPath, ...host(dir) });
+  db = open(dbPath);
+  const entries = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n;
+  db.close();
+  assert.equal(entries, 1, "no entry signed as though it were the store the anchor holds");
+  assert.match(r.log, /the host's anchor for o\/r is another store's, so this store's signed orders aren't extended/);
+});
+
+test("a tick that halts after keeping its records orders them all the same", async () => {
+  const dir = credentials();
+  const marker = join(tempDir("reeve-order-halt-"), "HALT");
+  const dbPath = join(tempDir("reeve-order-halted-"), "s.db");
+  open(dbPath).close();
+  const r = await run({ evaluate: () => { writeFileSync(marker, ""); return at(A); }, dbPath, haltMarker: marker, ...host(dir) });
+  const db = open(dbPath);
+  const kept = db.prepare("SELECT count(*) AS n FROM decision WHERE pr = ?").get(PR).n;
+  const entries = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n;
+  db.close();
+  assert.match(r.log, /HALTED/, "control: it halted");
+  assert.equal(kept, 1, "control: its record was kept");
+  assert.equal(entries, 1);
+});
+
+test("a queue commit's record is ordered though its pull request's own record couldn't be kept", async () => {
+  const dir = credentials();
+  const QUEUED = "c".repeat(40);
+  const readQueue = () => ({ ok: true, queue: true, entries: [{ pr: PR, sha: QUEUED, baseSha: "f".repeat(40), state: "AWAITING_CHECKS", prHead: A }] });
+  const evaluateQueue = ({ entry, input: i }) => { const q = { ...i, head: entry.sha }; return { ok: true, input: q, verdict: computeVerdict(q) }; };
+  // The head's tree can't be read, so its record isn't kept; the queue commit's is.
+  const treeOf = (_nwo, sha) => { if (sha === A) throw new Error("the tree couldn't be read"); return "d".repeat(40); };
+  const dbPath = join(tempDir("reeve-order-queue-only-"), "s.db");
+  open(dbPath).close();
+  await run({ evaluate: () => at(A), readQueue, evaluateQueue, treeOf, dbPath, ...host(dir) });
+  const db = open(dbPath);
+  const heads = db.prepare("SELECT head FROM decision WHERE pr = ?").all(PR).map((x) => x.head);
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  db.close();
+  assert.deepEqual(heads, [QUEUED], "control: only the queue commit's record was kept");
+  assert.ok("top" in order && order.top === 1, JSON.stringify(order));
+});
+
+test("the host's anchor, once bound to a store, is never bound to another", () => {
+  const dir = credentials();
+  const anchor = fileAnchor(dir);
+  assert.equal(anchor.bind(REPO, "a".repeat(32)), true);
+  assert.equal(anchor.bind(REPO, "a".repeat(32)), true, "the same store again");
+  assert.equal(anchor.bind(REPO, "b".repeat(32)), false);
+  assert.equal(readAnchor(dir, REPO)?.store, "a".repeat(32));
 });

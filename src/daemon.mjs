@@ -35,7 +35,7 @@ import { hubSession, NO_HUB } from "./build/hubsession.mjs";
 import { resolveRepoId } from "./build/repoid.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify, printable } from "./notify.mjs";
-import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects, reap, canonical } from "./db/ops.mjs";
+import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects, reap, canonical, durably } from "./db/ops.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
 import { drainOutbox } from "./outbox/drain.mjs";
 import { HANDLERS, permittedHandlers } from "./outbox/effects.mjs";
@@ -55,7 +55,7 @@ import { resolveHome } from "./home.mjs";
 import { codeVersion, policyOf, recordsFor } from "./evidence.mjs";
 import { saveDecision } from "./db/records.mjs";
 import { decisionStatement, baselineStatement, latestStatement } from "./signing.mjs";
-import { BASELINE_OP, LATEST_OP } from "./db/records.mjs";
+import { BASELINE_OP, LATEST_OP, STORE_ID_OP, latestDecision, storeIdentity } from "./db/records.mjs";
 import { signedOrder } from "./decisions.mjs";
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -848,7 +848,7 @@ function openPrs(nwo, limit = 20) {   // bounded; the caller LOGS when the bound
  * Record what a tick decided, so the dashboard and `reeve why` can answer without
  * re-deriving anything, and so a restart knows how long a clause has been UNKNOWN.
  */
-function record(db, { pr, head, verdict, decision, effects = [], retire = new Map(), kept = null, inTx = null }) {
+function record(db, { pr, head, verdict, decision, effects = [], retire = new Map(), kept = null }) {
   try {
     // ONE transaction, and that is the outbox's whole reason for existing. The
     // decision and the side effect it implies have to become durable together or
@@ -869,9 +869,6 @@ function record(db, { pr, head, verdict, decision, effects = [], retire = new Ma
       // that names it, so neither stands without the other, and under that
       // event's seq, which orders decisions where seconds tie (#165).
       if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr, head, ...kept });
-      // And what goes with the record under the same lock: its pull request's
-      // signed order (#274).
-      if (kept) inTx?.();
       // `enqueue` returns null for a key it already holds, which is success: the
       // effect is durable, it was simply made durable by an earlier tick.
       let queued = 0, known = 0, dropped = 0;
@@ -1409,7 +1406,11 @@ export async function tick(ctx) {
     try { return fn(true); } finally { lock.release(); }
   };
   const begun = ctx.signer ? withOrderLock((held) => {
-    const b = beginSigning(db, signWith, logPath, ctx.anchor ?? null, nwo);
+    // Synced to disk before the anchor says the store began: a baseline a power
+    // loss took would leave the anchor saying it began, and the store never
+    // given one again.
+    const b = held ? (ctx.durably ?? durably)(db, () => beginSigning(db, signWith, logPath, ctx.anchor ?? null, nwo))
+      : beginSigning(db, signWith, logPath, ctx.anchor ?? null, nwo);
     // Said on the host's anchor once the store has committed it, where a store
     // restored from before can't take it back.
     if (held && b.began && !ctx.anchor.began(nwo)) log(logPath, "signing: the host's anchor couldn't say this store began signing; it's said again next tick");
@@ -1425,17 +1426,16 @@ export async function tick(ctx) {
   };
   // Each change of a pull request's latest decision, a numbered, signed entry of
   // its order (#274), so which record is latest isn't read from the store's own
-  // order alone. Made inside the decision's transaction, under the store's write
-  // lock and the host's lock on the repository's anchor. Extended only from an
-  // order that checks whole, with the host's own keys, and never from a number a
-  // store edit put there. The top it answers is noted on the anchor once the
-  // transaction has committed; 0 for none.
+  // order alone: the store's latest as the tick leaves it, entered in its own
+  // transaction, under the host's lock on the repository's anchor. Extended only
+  // from an order that checks whole, with the host's own keys, and never from a
+  // number a store edit put there. The top it answers is noted on the anchor once
+  // the transaction has committed; 0 for none.
   /** @type {Map<string, any> | null | undefined} */ let orderKeys;
-  const extendOrder = (pr, decision) => {
-    if (!begun.began) return 0;
-    if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
-    if (!orderKeys) return 0;
-    const order = signedOrder(db, nwo, pr, orderKeys);
+  const extendOrder = (pr) => {
+    const decision = latestDecision(db, pr);
+    if (!decision) return 0;
+    const order = signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys));
     if ("corrupt" in order) { log(logPath, `signing: #${pr}: its signed order doesn't hold, so it isn't extended — ${order.corrupt}`); return 0; }
     // Nor one cut short of what the host signed: an entry signed now would take
     // a number the host already signed, and two entries under one number would
@@ -1464,6 +1464,52 @@ export async function tick(ctx) {
   const noteAnchor = (pr, top) => {
     if (top && !ctx.anchor.note(nwo, pr, top))
       log(logPath, `signing: #${pr}: the host's anchor couldn't be moved to entry ${top} of its order, so it lags until a later tick`);
+  };
+  // Pull requests with a record kept this tick. Their orders are extended once,
+  // at its end or where it halts, to the store's latest then: not as its passes
+  // went by, as a pull request in the merge queue is judged at its head and at
+  // the queue's commit every tick, and would add both, tick after tick.
+  const touched = new Set();
+  // The host's anchor is one store's (#274), bound to the first that extends an
+  // order under it: another store of the repository never extends one, as it
+  // could sign a number the first had taken and not yet noted. Each entry is
+  // committed synced to disk, and only then noted on the anchor.
+  const orderTouched = () => {
+    const prs = [...touched];
+    touched.clear();
+    if (!ordering || !begun.began || !prs.length) return;
+    withOrderLock((held) => {
+      if (!held) return;
+      if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
+      if (!orderKeys) return;
+      (ctx.durably ?? durably)(db, () => {
+        let id = null, bound = null;
+        try {
+          // The store's identity, kept the first time it's needed.
+          id = tx(db, () => {
+            if (db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(STORE_ID_OP)) return storeIdentity(db);
+            const made = randomBytes(16).toString("hex");
+            db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`).run(now(), "daemon", STORE_ID_OP, "store", canonical({ id: made }));
+            return made;
+          });
+          bound = ctx.anchor.read(nwo)?.store ?? null;
+        } catch (err) { log(logPath, `signing: ${err.message}, so no signed order is extended`); return; }
+        if (!id || (bound && bound !== id)) {
+          log(logPath, `signing: the host's anchor for ${nwo} is another store's, so this store's signed orders aren't extended`);
+          return;
+        }
+        if (!bound && !ctx.anchor.bind(nwo, id)) {
+          log(logPath, `signing: the host's anchor for ${nwo} couldn't be bound to this store, so its signed orders aren't extended`);
+          return;
+        }
+        for (const pr of prs) {
+          let top = 0;
+          try { top = tx(db, () => extendOrder(pr)); }
+          catch (err) { log(logPath, `signing: #${pr}: its signed order couldn't be extended — ${err.message}`); continue; }
+          noteAnchor(pr, top);
+        }
+      });
+    });
   };
   // What each base requires is read afresh every tick. Kept across ticks, a rule
   // added between them went unseen for as long as the reading was kept.
@@ -2040,6 +2086,8 @@ export async function tick(ctx) {
    */
   const haltStop = (why) => {
     log(logPath, why);
+    // What this tick kept is ordered all the same.
+    orderTouched();
     if (repoId != null) {
       for (const row of readQueuedNow()) {
         try {
@@ -2451,13 +2499,9 @@ export async function tick(ctx) {
         log(logPath, `  #${pr}: what this verdict was judged from could not be recorded — ${err.message}`);
       }
     }
-    const decided = withOrderLock((held) => {
-      let ordered = 0;
-      const d = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire, kept,
-                             inTx: kept && held ? () => { ordered = extendOrder(pr, kept.decision); } : null });
-      if (d.ok && ordered) noteAnchor(pr, ordered);
-      return d;
-    });
+    const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire, kept });
+    // Its signed order is extended at the tick's end, to its latest then.
+    if (decided.ok && kept) touched.add(pr);
     if (effects.length && !decided.ok) {
       log(logPath, `  #${pr}: REQUEST_REVIEW — the decision and its ${effects.length} effect(s) could NOT be recorded: ${decided.why}`);
       // Escalated, not merely logged. Nothing else covers this: no worker is
@@ -2667,21 +2711,17 @@ export async function tick(ctx) {
           log(logPath, `  ${at}: what this verdict was judged from could not be recorded — ${err.message}`);
         }
         try {
-          withOrderLock((held) => {
-            let ordered = 0;
-            tx(db, () => {
-              const decided = db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
-                .run(now(), "daemon", "queue.decided", `pr:${entry.pr}`, JSON.stringify({
-                  head: sha, base: entry.baseSha, state: j.verdict.state, summary: j.verdict.summary,
-                  clauses: j.verdict.clauses.map((c) => ({ id: c.id, state: c.state })),
-                  record: kept?.decision.digest ?? null,
-                }));
-              if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr: entry.pr, head: sha, ...kept });
-              if (kept && held) ordered = extendOrder(entry.pr, kept.decision);
-            });
-            // Only once the store has committed it.
-            noteAnchor(entry.pr, ordered);
+          tx(db, () => {
+            const decided = db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
+              .run(now(), "daemon", "queue.decided", `pr:${entry.pr}`, JSON.stringify({
+                head: sha, base: entry.baseSha, state: j.verdict.state, summary: j.verdict.summary,
+                clauses: j.verdict.clauses.map((c) => ({ id: c.id, state: c.state })),
+                record: kept?.decision.digest ?? null,
+              }));
+            if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr: entry.pr, head: sha, ...kept });
           });
+          // Its signed order is extended at the tick's end, to its latest then.
+          if (kept) touched.add(entry.pr);
         } catch (err) {
           log(logPath, `  ${at}: the verdict could not be kept — ${err.message}`);
         }
@@ -2761,6 +2801,9 @@ export async function tick(ctx) {
       if (queuePassAt(n, (x) => !held.has(x.head)))
         await takeBack(n, "the merge queue no longer holds this commit", (x) => x.queue === true && !held.has(x.head));
   }
+  // Every record this tick keeps is kept by now: each touched pull request's
+  // signed order is extended, to its latest.
+  orderTouched();
   // And one that arrived during the last publication there.
   if (await haltedNow()) return haltStop("HALTED after the merge queue was checked");
 

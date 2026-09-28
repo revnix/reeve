@@ -10,7 +10,7 @@
 import { computeVerdict } from "./verdict.mjs";
 import { joinEvidence, asJson, policyOf } from "./evidence.mjs";
 import { canonical } from "./db/ops.mjs";
-import { latestDecision, decisionsFor, evidenceBy, policyRecord, BASELINE_OP, LATEST_OP } from "./db/records.mjs";
+import { latestDecision, decisionsFor, evidenceBy, policyRecord, storeIdentity, BASELINE_OP, LATEST_OP } from "./db/records.mjs";
 import { checkSignature, checkEnvelope, baselineStatement, latestStatement } from "./signing.mjs";
 
 /** @typedef {import("node:sqlite").DatabaseSync} Db */
@@ -97,6 +97,20 @@ export function signedOrder(db, repo, pr, keys) {
 }
 
 /**
+ * The host's anchor as it bears on `db`: as read, where it's this store's or no
+ * store's yet, and otherwise one that vouches for nothing here (#274). The
+ * anchor is bound to one store per repository, and another store's order and
+ * records can't be checked against what that one signed.
+ * @param {Db} db @param {AnchorRead | null} anchor @param {string | null} repo
+ * @returns {AnchorRead | null}
+ */
+export function anchorForStore(db, anchor, repo) {
+  const bound = anchor?.anchor?.store;
+  if (!bound || storeIdentity(db) === bound) return anchor;
+  return { anchor: null, why: `the host's anchor for ${repo} is another store's, so this store can't be checked against it` };
+}
+
+/**
  * What a pull request's signed order, and the host's anchor, say of which
  * record is its latest (#274): why `digest` can't be trusted as that, or null
  * when it can. `order` null is no order read, when the repository isn't known.
@@ -155,7 +169,8 @@ export function trustOf(row, keys, state, repo = null) {
  * @param {{ head?: string | null, keys?: Keys | null, repo?: string | null, anchor?: AnchorRead | null }} [o]
  *        `repo`: the repository asked about; `anchor`: the host's anchor for it
  */
-export function explainDecision(db, pr, { head = null, keys = null, repo = null, anchor = null } = {}) {
+export function explainDecision(db, pr, { head = null, keys = null, repo = null, anchor: read = null } = {}) {
+  const anchor = anchorForStore(db, read, repo);
   const d = latestDecision(db, pr, { head });
   // Which record is latest, by the pull request's signed order and the host's
   // anchor: read whether or not the store still holds any record of it.
@@ -279,7 +294,8 @@ function clauseDiffs(was, now) {
  *        `repo`: the repository whose store it is, when known; `anchor`: the host's anchor for it (#274)
  * @returns {Replayed[]}
  */
-export function replayDecisions(db, which = {}, { code = null, profile = null, compute = computeVerdict, keys = null, repo = null, anchor = null } = {}) {
+export function replayDecisions(db, which = {}, { code = null, profile = null, compute = computeVerdict, keys = null, repo = null, anchor: read = null } = {}) {
+  const anchor = anchorForStore(db, read, repo);
   /** @type {Replayed[]} */
   const results = [];
   const state = keys ? signingState(db, keys, anchor) : null;

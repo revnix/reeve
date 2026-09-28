@@ -62,6 +62,21 @@ export function saveDecision(db, { at, seq, pr, head, policy, evidence, decision
 export const BASELINE_OP = "signing.baseline";
 /** The event for each entry of a pull request's signed order of decisions (#274). */
 export const LATEST_OP = "decision.latest";
+/** The event that names a store, kept once, so the host's anchor is one store's (#274). */
+export const STORE_ID_OP = "store.identity";
+
+/**
+ * The store's identity, as it keeps it, or null where it keeps none that reads
+ * as one. Its first, only: a later one is never taken for it.
+ * @param {Db} db
+ * @returns {string | null}
+ */
+export function storeIdentity(db) {
+  const row = /** @type {any} */ (db.prepare(`SELECT payload FROM event WHERE op = ? ORDER BY seq LIMIT 1`).get(STORE_ID_OP));
+  if (!row) return null;
+  try { const id = JSON.parse(row.payload)?.id; return typeof id === "string" && /^[0-9a-f]{32}$/.test(id) ? id : null; }
+  catch { return null; }
+}
 
 /**
  * @typedef {{ digest: string, pr: number, head: string, record: Record<string, any>, corrupt: string | null,

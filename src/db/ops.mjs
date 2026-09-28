@@ -286,6 +286,20 @@ export function open(path) {
   return db;
 }
 
+/**
+ * `fn`, with the store syncing its log at every commit, and the store put back
+ * as it was after (#274). It runs at NORMAL, which may lose its last
+ * transactions to a power loss: what's then noted outside it, on the host's
+ * anchor, must never be ahead of what a power loss leaves in it.
+ * @param {import("node:sqlite").DatabaseSync} db @template T @param {() => T} fn @returns {T}
+ */
+export function durably(db, fn) {
+  const was = Number(/** @type {any} */ (db.prepare("PRAGMA synchronous").get()).synchronous);
+  db.exec("PRAGMA synchronous = FULL");
+  try { return fn(); }
+  finally { try { db.exec(`PRAGMA synchronous = ${was}`); } catch { /* it goes on as it was opened */ } }
+}
+
 // One helper so every mutation is BEGIN IMMEDIATE + event + projection.
 export function tx(db, fn) {
   db.exec("BEGIN IMMEDIATE");

@@ -21,9 +21,11 @@
 // Nor is one read or written through a link, or with another name: what that
 // leads to may lie outside the folder that's kept from workers.
 //
-// One daemon at a time extends a repository's signed order and notes it here,
-// however many stores it's watched through: each holds the host's lock on the
-// repository's anchor across reading it, extending the order and noting it.
+// One daemon at a time extends a repository's signed order and notes it here:
+// each holds the host's lock on the repository's anchor across reading it,
+// extending the order and noting it. And the anchor is one store's, bound to
+// the first that extends an order under it: another store of the repository
+// never extends one, as it could sign a number the first had taken.
 
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
@@ -35,7 +37,7 @@ import { writeAll, syncFolder, running } from "./signing.mjs";
 /** The anchors' folder in the credentials folder: a file per repository, under its owner. */
 export const ANCHOR_DIR = "signing-anchors";
 
-/** @typedef {{ began: boolean, latest: Map<number, number> }} Anchor */
+/** @typedef {{ began: boolean, latest: Map<number, number>, store: string | null }} Anchor */
 
 /**
  * Where the host's anchor for `repo` is kept, in the credentials folder `dir`.
@@ -71,9 +73,10 @@ export function readAnchor(dir, repo) {
   try { a = JSON.parse(text); } catch { throw new Error(`the host's anchor for ${repo} can't be read: it isn't JSON`); }
   const latest = a?.latest;
   if (typeof a?.began !== "boolean" || !latest || typeof latest !== "object" || Array.isArray(latest)
-      || Object.entries(latest).some(([pr, n]) => !/^[1-9]\d*$/.test(pr) || !Number.isInteger(n) || n < 1))
+      || Object.entries(latest).some(([pr, n]) => !/^[1-9]\d*$/.test(pr) || !Number.isInteger(n) || n < 1)
+      || !(a.store == null || (typeof a.store === "string" && /^[0-9a-f]{32}$/.test(a.store))))
     throw new Error(`the host's anchor for ${repo} can't be read: it isn't an anchor`);
-  return { began: a.began, latest: new Map(Object.entries(latest).map(([pr, n]) => [Number(pr), Number(n)])) };
+  return { began: a.began, latest: new Map(Object.entries(latest).map(([pr, n]) => [Number(pr), Number(n)])), store: a.store ?? null };
 }
 
 /**
@@ -146,7 +149,8 @@ function reap(folder) {
 
 /**
  * The daemon's writer of the host's anchors, in the credentials folder `dir`.
- * `began(repo)` says the repository's store began signing, and `note(repo, pr, n)`
+ * `began(repo)` says the repository's store began signing, `bind(repo, id)` that
+ * the anchor is store `id`'s, where it's no store's yet, and `note(repo, pr, n)`
  * that entry `n` of a pull request's signed order was kept. Each only moves the
  * anchor forward, and answers whether it holds that now, durably: false when it
  * couldn't be read, written or synced, which leaves it as it was, or not yet
@@ -161,7 +165,7 @@ export function fileAnchor(dir, { write = (fd, buf, offset, length) => writeSync
     try {
       const path = anchorPath(dir, repo);
       const folder = dirname(path);
-      const a = readAnchor(dir, repo) ?? { began: false, latest: new Map() };
+      const a = readAnchor(dir, repo) ?? { began: false, latest: new Map(), store: null };
       if (change(a)) {
         mkdirSync(folder, { recursive: true, mode: 0o700 });
         reap(folder);
@@ -169,7 +173,7 @@ export function fileAnchor(dir, { write = (fd, buf, offset, length) => writeSync
         try {
           const fd = openSync(temp, "wx", 0o600);
           try {
-            writeAll(fd, canonical({ began: a.began, latest: Object.fromEntries([...a.latest].map(([pr, n]) => [String(pr), n])) }), write);
+            writeAll(fd, canonical({ began: a.began, latest: Object.fromEntries([...a.latest].map(([pr, n]) => [String(pr), n])), store: a.store }), write);
             fsyncSync(fd);
           } finally { closeSync(fd); }
           renameSync(temp, path);
@@ -190,6 +194,13 @@ export function fileAnchor(dir, { write = (fd, buf, offset, length) => writeSync
     lock: (repo) => anchorLock(dir, repo),
     /** @param {string} repo */
     began: (repo) => update(repo, (a) => (a.began ? false : ((a.began = true), true))),
+    /** @param {string} repo @param {string} id */
+    bind: (repo, id) => update(repo, (a) => {
+      if (a.store === id) return false;
+      if (a.store) throw new Error(`the host's anchor for ${repo} is another store's`);
+      a.store = id;
+      return true;
+    }),
     /** @param {string} repo @param {number} pr @param {number} n */
     note: (repo, pr, n) => update(repo, (a) => {
       if ((a.latest.get(pr) ?? 0) >= n) return false;

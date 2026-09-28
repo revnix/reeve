@@ -3,7 +3,7 @@
 // short, or restored from before, doesn't pass for the one the host kept.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, linkSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -247,7 +247,7 @@ test("a store that began signing before the host's anchor has it said there at i
 
 test("an anchor is kept only where a repository's name can go", () => {
   const dir = credentials();
-  for (const bad of ["../../x", "o/r/../s", "o", ".o/r", "o/.r", "o/r/s"]) assert.throws(() => anchorPath(dir, bad), /not a repository/, bad);
+  for (const bad of ["../../x", "o/r/../s", "o", ".o/r", "o/.", "o/..", "o/r/s"]) assert.throws(() => anchorPath(dir, bad), /not a repository/, bad);
   assert.equal(anchorPath(dir, "O/R"), anchorPath(dir, "o/r"), "GitHub's names don't tell case apart");
 });
 
@@ -709,4 +709,38 @@ test("the host's anchor, once bound to a store, is never bound to another", () =
   assert.equal(anchor.bind(REPO, "a".repeat(32)), true, "the same store again");
   assert.equal(anchor.bind(REPO, "b".repeat(32)), false);
   assert.equal(readAnchor(dir, REPO)?.store, "a".repeat(32));
+});
+
+// ── from #278's fourth review ────────────────────────────────────────────────
+
+test("a pull request whose order a tick couldn't extend, as another held the lock, is ordered by the next, though never judged again", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)], host(dir));
+  const other = fileAnchor(dir).lock(REPO);
+  assert.ok(other && "release" in other, "control: the lock was taken");
+  try { await run({ evaluate: () => at(A, "RED"), dbPath, ...host(dir) }); } finally { other.release(); }
+  // Gone from the open list, merged, and never judged again.
+  await run({ openPrs: () => [], evaluate: () => at(A), dbPath, prState: () => "MERGED", prIsFinished: () => true, ...host(dir) });
+  const db = open(dbPath);
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  const latest = db.prepare("SELECT digest FROM decision WHERE pr = ? ORDER BY last_seq DESC LIMIT 1").get(PR)?.digest;
+  db.close();
+  assert.ok("digest" in order && order.top === 2 && order.digest === latest, JSON.stringify(order));
+  assert.equal(readAnchor(dir, REPO)?.latest.get(PR), 2);
+});
+
+test("the anchor's lock makes nothing through a link on its way", () => {
+  const dir = credentials();
+  const outside = tempDir("reeve-order-outside-");
+  symlinkSync(outside, join(dir, "signing-anchors"));
+  const lock = fileAnchor(dir).lock(REPO);
+  assert.ok(lock && "why" in lock, "it's refused");
+  assert.match(lock.why, /is a link/);
+  assert.deepEqual(readdirSync(outside), [], "and nothing was made where the link leads");
+});
+
+test("a repository whose name starts with a dot keeps an anchor", () => {
+  const dir = credentials();
+  assert.equal(fileAnchor(dir).note("o/.github", 7, 1), true);
+  assert.equal(readAnchor(dir, "o/.github")?.latest.get(7), 1);
 });

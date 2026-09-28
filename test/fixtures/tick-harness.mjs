@@ -88,7 +88,7 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
                     carriedReleases, carriedCooldowns, providerBind,
                     resolveRepoIdFn, project, keepDir = false, seams = null,
                     haltMarker, openPrs, containment, ticks = 1, dbPath, evaluate, treeOf, code, codeVersion,
-                    readQueue, evaluateQueue, publish, withdraw, signer, anchor, keys, durably } = {}) => {
+                    readQueue, evaluateQueue, publish, withdraw, signer, anchor, keys, durably, prState, prIsFinished } = {}) => {
   const dir = tempDir("reeve-prov-");
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
@@ -201,6 +201,10 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     ...(anchor ? { anchor } : {}),
     ...(keys ? { keys } : {}),
     ...(durably ? { durably } : {}),
+    // What GitHub says of a pull request gone from the open list, where a test
+    // has one leave it.
+    ...(prState ? { prState } : {}),
+    ...(prIsFinished ? { prIsFinished } : {}),
     spawnWorker: spawnWorker ?? (async a => { spawned.push(a); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }; }),
     ...(heartbeatMs != null ? { heartbeatMs } : {}),
     ...(providerHeartbeat ? { providerHeartbeat } : {}),

@@ -46,7 +46,9 @@ export const ANCHOR_DIR = "signing-anchors";
  */
 export function anchorPath(dir, repo) {
   const [owner, name, ...rest] = String(repo).toLowerCase().split("/");
-  if (rest.length || !/^[\w.-]+$/.test(owner ?? "") || !/^[\w.-]+$/.test(name ?? "") || owner.startsWith(".") || name.startsWith("."))
+  // A repository's name may start with a dot, as `.github` does, and an owner's
+  // may not; neither is ever `.` or `..`, which would lead out of the folder.
+  if (rest.length || !/^[\w.-]+$/.test(owner ?? "") || !/^[\w.-]+$/.test(name ?? "") || owner.startsWith(".") || name === "." || name === "..")
     throw new Error(`not a repository: ${JSON.stringify(repo)}`);
   return join(dir, ANCHOR_DIR, owner, `${name}.json`);
 }
@@ -112,6 +114,9 @@ export function anchorLock(dir, repo) {
   /** @type {DatabaseSync | null} */ let lock = null;
   try {
     const path = anchorPath(dir, repo);
+    // Checked before anything is made on the way, so nothing is made through a
+    // link, and again once it's there.
+    unlinked(dir, path);
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     unlinked(dir, path);
     const lockPath = `${path}.lock`;

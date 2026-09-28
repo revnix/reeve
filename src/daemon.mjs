@@ -1465,19 +1465,24 @@ export async function tick(ctx) {
     if (top && !ctx.anchor.note(nwo, pr, top))
       log(logPath, `signing: #${pr}: the host's anchor couldn't be moved to entry ${top} of its order, so it lags until a later tick`);
   };
-  // Pull requests with a record kept this tick. Their orders are extended once,
-  // at its end or where it halts, to the store's latest then: not as its passes
-  // went by, as a pull request in the merge queue is judged at its head and at
-  // the queue's commit every tick, and would add both, tick after tick.
-  const touched = new Set();
+  // The pull requests whose latest record came after their order's last entry,
+  // read from the store: work a tick couldn't do, as another daemon held the
+  // lock, or it stopped or halted first, is done by the next, though the pull
+  // request is never judged again. Extended once a tick, at its end or where it
+  // halts, to the store's latest then: not as its passes went by, as a pull
+  // request in the merge queue is judged at its head and at the queue's commit
+  // every tick, and would add both, tick after tick.
+  const pendingOrders = () => db.prepare(
+    `SELECT d.pr FROM decision d
+      WHERE d.last_seq = (SELECT max(e.last_seq) FROM decision e WHERE e.pr = d.pr)
+        AND d.last_seq > coalesce((SELECT max(v.seq) FROM event v WHERE v.op = ? AND v.subject = 'pr:' || d.pr), 0)
+      ORDER BY d.pr`).all(LATEST_OP).map((r) => Number(r.pr));
   // The host's anchor is one store's (#274), bound to the first that extends an
   // order under it: another store of the repository never extends one, as it
   // could sign a number the first had taken and not yet noted. Each entry is
   // committed synced to disk, and only then noted on the anchor.
-  const orderTouched = () => {
-    const prs = [...touched];
-    touched.clear();
-    if (!ordering || !begun.began || !prs.length) return;
+  const orderPending = () => {
+    if (!ordering || !begun.began) return;
     withOrderLock((held) => {
       if (!held) return;
       if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
@@ -1502,7 +1507,7 @@ export async function tick(ctx) {
           log(logPath, `signing: the host's anchor for ${nwo} couldn't be bound to this store, so its signed orders aren't extended`);
           return;
         }
-        for (const pr of prs) {
+        for (const pr of pendingOrders()) {
           let top = 0;
           try { top = tx(db, () => extendOrder(pr)); }
           catch (err) { log(logPath, `signing: #${pr}: its signed order couldn't be extended — ${err.message}`); continue; }
@@ -2087,7 +2092,7 @@ export async function tick(ctx) {
   const haltStop = (why) => {
     log(logPath, why);
     // What this tick kept is ordered all the same.
-    orderTouched();
+    orderPending();
     if (repoId != null) {
       for (const row of readQueuedNow()) {
         try {
@@ -2499,9 +2504,8 @@ export async function tick(ctx) {
         log(logPath, `  #${pr}: what this verdict was judged from could not be recorded — ${err.message}`);
       }
     }
-    const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire, kept });
     // Its signed order is extended at the tick's end, to its latest then.
-    if (decided.ok && kept) touched.add(pr);
+    const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire, kept });
     if (effects.length && !decided.ok) {
       log(logPath, `  #${pr}: REQUEST_REVIEW — the decision and its ${effects.length} effect(s) could NOT be recorded: ${decided.why}`);
       // Escalated, not merely logged. Nothing else covers this: no worker is
@@ -2720,8 +2724,6 @@ export async function tick(ctx) {
               }));
             if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr: entry.pr, head: sha, ...kept });
           });
-          // Its signed order is extended at the tick's end, to its latest then.
-          if (kept) touched.add(entry.pr);
         } catch (err) {
           log(logPath, `  ${at}: the verdict could not be kept — ${err.message}`);
         }
@@ -2801,9 +2803,9 @@ export async function tick(ctx) {
       if (queuePassAt(n, (x) => !held.has(x.head)))
         await takeBack(n, "the merge queue no longer holds this commit", (x) => x.queue === true && !held.has(x.head));
   }
-  // Every record this tick keeps is kept by now: each touched pull request's
-  // signed order is extended, to its latest.
-  orderTouched();
+  // Every record this tick keeps is kept by now: each pull request's signed
+  // order that its latest record came after is extended, to that record.
+  orderPending();
   // And one that arrived during the last publication there.
   if (await haltedNow()) return haltStop("HALTED after the merge queue was checked");
 

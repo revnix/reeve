@@ -620,12 +620,19 @@ test("a pull request held at the same queue commit adds no entry tick after tick
 test("the host's anchor is one store's: another store of the repository extends no signed order, and why can't vouch for its latest", async () => {
   const dir = credentials();
   await ticks([at(A)], host(dir));
-  const second = await ticks([at(A), at(A, "RED")], host(dir));
+  // The second store judges a pull request the first hasn't: nothing on the
+  // anchor for it yet, so only the anchor's store tells the two apart.
+  const second = join(tempDir("reeve-order-second-"), "s.db");
+  open(second).close();
+  const r = await run({ openPrs: () => [43], evaluate: () => ({ ...at(A), pr: 43 }), dbPath: second, ...host(dir) });
   const db = open(second);
+  const kept = db.prepare("SELECT count(*) AS n FROM decision WHERE pr = 43").get().n;
   const entries = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n;
-  const shown = explainDecision(db, PR, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorFor(db, dir) });
+  const shown = explainDecision(db, 43, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorFor(db, dir) });
   db.close();
-  assert.equal(entries, 0, "no entry, whose number the first store's order may already have taken");
+  assert.equal(kept, 1, "control: the second store kept its record");
+  assert.equal(entries, 0, "no entry, whose number the first store might yet take");
+  assert.match(r.log, /the host's anchor for o\/r is another store's, so this store's signed orders aren't extended/);
   assert.match(String(shown), /can't be trusted as the latest: the host's anchor for o\/r is another store's/);
 });
 

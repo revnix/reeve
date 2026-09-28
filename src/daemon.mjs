@@ -1583,12 +1583,12 @@ export async function tick(ctx) {
           return;
         }
         // A record the store's baseline vouches for, kept before it began
-        // signing, that it no longer holds and no order names: taken away before
-        // an order could name it. The baseline says no pull request, so it's no
-        // order's work, and it's said every tick.
+        // signing, that it doesn't hold as it was kept and no order names: taken
+        // away or changed before an order could name it. The baseline says no
+        // pull request, so it's no order's work, and it's said every tick.
         const lost = baselineLost(db, nwo, /** @type {any} */ (orderKeys), id);
-        if (lost.length) log(logPath, `signing: the store's baseline names ${lost.length} record(s) kept before it began signing that it no longer holds, ` +
-                                      `and no signed order names: ${lost.map((d) => d.slice(0, 12)).join(", ")}; they were taken away`);
+        if (lost.length) log(logPath, `signing: the store's baseline names ${lost.length} record(s) kept before it began signing that it doesn't hold as they were kept, ` +
+                                      `and no signed order names: ${lost.map((b) => `${b.digest.slice(0, 12)} (${b.why})`).join(", ")}`);
         // Bound only by a store with an order to extend: one that judges nothing,
         // named by --db say, would otherwise take the anchor from the store that
         // has one. It began signing, or nothing is ordered, and the binding says
@@ -1601,6 +1601,14 @@ export async function tick(ctx) {
         const other = bound ? null : otherRepository(db, nwo);
         if (other !== null) {
           log(logPath, `signing: this store holds records of ${other}, not only of ${nwo}, so the host's anchor for ${nwo} isn't bound to it`);
+          return;
+        }
+        // Nor to one holding an order that doesn't check: of another repository,
+        // or another store, or edited, its entries say it isn't the one the
+        // anchor should hold, records or none.
+        const broken = bound ? null : pending.map((pr) => ({ pr, order: signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), id) })).find((x) => "corrupt" in x.order);
+        if (broken) {
+          log(logPath, `signing: #${broken.pr}'s signed order in this store doesn't hold, so the host's anchor for ${nwo} isn't bound to it — ${"corrupt" in broken.order ? broken.order.corrupt : ""}`);
           return;
         }
         if (!bound && !ctx.anchor.bind(nwo, id)) {

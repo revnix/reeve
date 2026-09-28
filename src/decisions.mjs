@@ -135,19 +135,39 @@ export function strayEntry(db) {
 }
 
 /**
- * The records the store's signed baseline names, kept before it began signing,
- * that it no longer holds and no signed order that checks names (#274): taken
- * away before an order could name them, and found by nothing else, as the
- * baseline says no pull request. Sorted; none where its baseline doesn't check,
- * which vouches for nothing.
- * @param {Db} db @param {string} repo @param {Keys} keys @param {string | null} [store]
- * @returns {string[]}
+ * A decision row as `decisionOf` reads it, or, where its record can't be read,
+ * one said not to hold: never thrown, as that's the damage replay reports.
+ * @param {any} row @returns {{ pr: number, corrupt: string | null }}
  */
-export function baselineLost(db, repo, keys, store = storeIdentity(db)) {
+const readDecision = (row) => {
+  try { return decisionOf(row); }
+  catch (err) { return { pr: Number(row.pr), corrupt: `its record can't be read: ${/** @type {Error} */ (err).message}` }; }
+};
+
+/**
+ * The records the store's signed baseline names, kept before it began signing,
+ * that it doesn't hold as they were kept, and no signed order that checks names
+ * (#274): taken away, or changed in place, before an order could name them, and
+ * found by nothing else, as the baseline says no pull request. Each with why,
+ * by digest; none where its baseline doesn't check, which vouches for nothing.
+ * `skip` is those checked already, as the records a replay replayed.
+ * @param {Db} db @param {string} repo @param {Keys} keys @param {string | null} [store] @param {Set<string>} [skip]
+ * @returns {{ digest: string, why: string }[]}
+ */
+export function baselineLost(db, repo, keys, store = storeIdentity(db), skip = new Set()) {
   const { baseline } = signingState(db, keys);
   if (!baseline?.size) return [];
-  const held = db.prepare(`SELECT 1 FROM decision WHERE digest = ? LIMIT 1`);
-  const unheld = [...baseline].filter((d) => !held.get(d));
+  const rowOf = db.prepare(`SELECT * FROM decision WHERE digest = ?`);
+  /** @type {{ digest: string, why: string }[]} */ const unheld = [];
+  for (const digest of [...baseline].sort()) {
+    if (skip.has(digest)) continue;
+    // Its row, whole: one kept under the digest's name but changed since, its
+    // record, pull request or commit, is no more held than one taken away.
+    const row = rowOf.get(digest);
+    const d = row ? readDecision(row) : null;
+    const lost = !d ? "the store no longer holds it" : d.corrupt ? `the store's copy of it doesn't hold: ${d.corrupt}` : null;
+    if (lost) unheld.push({ digest, why: lost });
+  }
   if (!unheld.length) return [];
   // One an order names is its order's to report, as replay does.
   /** @type {Set<string>} */ const named = new Set();
@@ -155,7 +175,7 @@ export function baselineLost(db, repo, keys, store = storeIdentity(db)) {
     const order = signedOrder(db, repo, Number(String(r.subject).slice(3)), keys, store);
     if ("digests" in order) for (const d of order.digests) named.add(d);
   }
-  return unheld.filter((d) => !named.has(d)).sort();
+  return unheld.filter((u) => !named.has(u.digest));
 }
 
 /**
@@ -467,7 +487,7 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
     for (const digest of order.digests) {
       if (checked.has(`${pr} ${digest}`)) continue;
       const row = rowOf.get(digest);
-      const d = row ? decisionOf(row) : null;
+      const d = row ? readDecision(row) : null;
       const why = !d ? "the store no longer holds it"
         : d.corrupt ? `the store's copy of it doesn't hold: ${d.corrupt}`
         : d.pr !== pr ? `the store holds it as pull request ${d.pr}'s`
@@ -475,12 +495,12 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
       if (why) out.push(fault(pr, digest, `its signed order names this record, but ${why}`));
     }
   }
-  // And each record the store's signed baseline names that it no longer holds,
-  // and no order names: taken away before its first entry, it's found by
-  // nothing else. The baseline says no pull request, so it's read replaying the
-  // whole store, or since a date, which a rollback would have matched.
-  if (which.pr == null) for (const d of baselineLost(db, repo, keys, store))
-    out.push(fault(0, d, "the store's baseline names this record, kept before it began signing, but the store no longer holds it, and no signed order names it: it was taken away"));
+  // And each record the store's signed baseline names that it doesn't hold as it
+  // was kept, and no order names: taken away or changed before its first entry,
+  // it's found by nothing else, unless replayed above. The baseline says no pull
+  // request, so it's read replaying the whole store, or since a date.
+  if (which.pr == null) for (const lost of baselineLost(db, repo, keys, store, new Set(replayed.map((r) => r.digest))))
+    out.push(fault(0, lost.digest, `the store's baseline names this record, kept before it began signing, and no signed order names it, but ${lost.why}`));
   return out;
 }
 

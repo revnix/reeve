@@ -20,7 +20,8 @@ import { execFileSync } from "node:child_process";
 // `linkSync` is the snapshot PUBLISH: it is atomic AND exclusive, where
 // `renameSync` is atomic but REPLACES an existing destination -- so two
 // same-second writers would both believe they won.
-import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync, linkSync, renameSync, openSync, closeSync, statSync } from "node:fs";
+import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync, linkSync, renameSync, openSync, closeSync, statSync, fsyncSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { join, dirname } from "node:path";
 import { open as openStore, exportJsonl, storeLock } from "./db/ops.mjs";
 // Task 8's subset. `tablesAt` and `HUB_TABLES` are what a snapshot's table set
@@ -540,7 +541,7 @@ export function latestSnapshot(root, nwo, { deep = false } = {}) {
   return null;
 }
 
-export function restore(snapshotPath, dbPath, { overwrite = false, force = false, isDaemonRunning = daemonRunning } = {}) {
+export function restore(snapshotPath, dbPath, { overwrite = false, force = false, isDaemonRunning = daemonRunning, copy = copyFileSync } = {}) {
   if (!existsSync(snapshotPath)) return { ok: false, why: `no snapshot at ${snapshotPath}` };
   if (existsSync(dbPath) && !overwrite)
     return { ok: false, why: `${dbPath} exists; pass overwrite to replace it, which discards anything newer than the snapshot` };
@@ -576,11 +577,18 @@ export function restore(snapshotPath, dbPath, { overwrite = false, force = false
                                          : `the lock on ${dbPath} couldn't be taken, so it isn't restored over: ${lock.why}` };
     held = lock;
   }
+  // Copied to a file of its own beside the store, its bytes on disk, and renamed
+  // into place whole: a reeve starting on a store that's gone, lost with a disk
+  // say, finds none until it's all there, and never opens a part of one.
+  const temp = `${dbPath}.${process.pid}.${randomBytes(4).toString("hex")}.restoring`;
   try {
+    copy(snapshotPath, temp);
+    const fd = openSync(temp, "r");
+    try { fsyncSync(fd); } finally { closeSync(fd); }
     for (const s of ["-wal", "-shm"]) { try { rmSync(dbPath + s, { force: true }); } catch {} }
-    copyFileSync(snapshotPath, dbPath);
+    renameSync(temp, dbPath);
   } catch (e) { return { ok: false, why: `could not restore: ${e.message}` }; }
-  finally { held?.release(); }
+  finally { try { rmSync(temp, { force: true }); } catch {} held?.release(); }
   return { ok: true, why: null };
 }
 

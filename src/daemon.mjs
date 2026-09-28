@@ -14,7 +14,8 @@
 //     it WOULD do. Shipping a loop that acts before its decisions have been
 //     watched is how an unattended run becomes an incident.
 
-import { evaluatePr, publishVerdict, withdrawVerdict, prAnchor, isBuilderPr, clearRequirements, shadowContextOf, treeOf } from "./pr.mjs";
+import { evaluatePr, publishVerdict, withdrawVerdict, prAnchor, isBuilderPr, clearRequirements, shadowContextOf, treeOf,
+         readMergeQueue, evaluateQueueEntry } from "./pr.mjs";
 import { PASS } from "./verdict.mjs";
 import { nextAction, describe, ACTIONS, ESCALATIONS } from "./watcher.mjs";
 import { POLICY_CONTEXT, reconcilePr } from "./github/reconciler.mjs";
@@ -1301,6 +1302,8 @@ export async function tick(ctx) {
   // or evaluated: a checkout that moves during the tick's reads doesn't change
   // what this process loaded (#165).
   const code = ctx.code ?? (ctx.codeVersion ?? runningCode)();
+  // Which tick this is, for what counts only in a row.
+  const tickNo = ctx.tickNo = (ctx.tickNo ?? 0) + 1;
   const { nwo, profile, db, execute = false, shadow = true } = ctx;
   // Absolute, once, before ANYTHING derives from it. A relative `--log` made
   // every state path relative — the run dir, the worker's tmp, its git config and
@@ -2367,16 +2370,21 @@ export async function tick(ctx) {
       // row are for a person, in words that stay the same from tick to tick.
       failures.set(pr, (failures.get(pr) ?? 0) + 1);
       if (failures.get(pr) >= 3) raise(`#${pr}: reeve couldn't publish its verdict on 3 ticks in a row`);
-      // A PASS published at this head stands until something writes over it.
-      if (e.verdict.state !== PASS)
-        await takeBack(pr, "the merge policy couldn't publish its new verdict here", (x) => x.head === e.head);
+      // A PASS published at this head stands until something writes over it. So
+      // what this publication couldn't write over is taken back: any PASS when
+      // the new verdict isn't one, and one under another name, such as an
+      // enforcing PASS a shadow publication couldn't supersede.
+      const unwritten = (x) => x.head === e.head && (e.verdict.state !== PASS || x.name !== name);
+      if (e.verdict.state !== PASS || (at ?? []).some((x) => x.op === "pr.published" && x.state === PASS && unwritten(x)))
+        await takeBack(pr, "the merge policy couldn't publish its new verdict here", unwritten);
     }
     // A PASS left at an earlier head stays on that commit, and a push back to it
     // makes it the pull request's again, to merge on a result nothing re-checked.
     // So it's withdrawn once the pull request moves on, and again each tick until
     // it is; a stop or HALT withdraws it too while it stands.
-    if ((at ?? []).some((x) => x.op === "pr.published" && x.state === PASS && x.head !== e.head))
-      await takeBack(pr, "this pull request has moved to a newer commit", (x) => x.head !== e.head);
+    // A queue commit's PASS isn't one of these: the queue step below looks after it.
+    if ((at ?? []).some((x) => x.op === "pr.published" && x.state === PASS && x.head !== e.head && !x.queue))
+      await takeBack(pr, "this pull request has moved to a newer commit", (x) => x.head !== e.head && !x.queue);
     // A rule requires the enforcement check, which shadow mode never publishes,
     // so every pull request on that branch is blocked. A person has to choose:
     // enforce, or stop requiring the check. One escalation, not one per PR.
@@ -2426,6 +2434,169 @@ export async function tick(ctx) {
     announce();
     return haltStop("HALTED after the pull requests were checked");
   }
+
+  // ── the merge queue (#163) ──────────────────────────────────────────────────
+  // A queue merges the commit it builds for each pull request, not the pull
+  // request's head, and waits for its required checks there. Measured, a verdict
+  // at the head counts for nothing in the queue, and a queue commit nothing
+  // answers is dropped at the queue's timeout. So each queued pull request's
+  // commit is judged here, from what this tick found at its head, and the
+  // verdict is published on that commit and kept with its evidence.
+  //
+  // A PASS there is merge authority, like one at a head: the queue merges on it
+  // once its other required checks finish, which may be well after reeve spoke.
+  // So it's noted before it's published, as a head's is, marked `queue`, and a
+  // halt, a stop, or a pull request reeve couldn't read takes it back. Marked,
+  // it isn't taken back as a head the pull request moved on from. Once the
+  // queue no longer holds its commit, it's taken back.
+  const evaluatedHere = new Map(decisions.map(({ e }) => [e.pr, e]));
+  const queueBases = new Set([...evaluatedHere.values()].map((e) => e.baseRef ?? profile.identity?.defaultBranch).filter(Boolean));
+  const queuePassAt = (n, which) => {
+    let st;
+    try { st = standingAt(db, n); } catch { return true; }   // unread: takeBack reads again, and raises
+    return st.some((x) => x.op === "pr.published" && x.state === PASS && x.queue === true && which(x));
+  };
+  const onBase = (base) => [...evaluatedHere].filter(([, e]) => (e.baseRef ?? profile.identity?.defaultBranch) === base).map(([n]) => n);
+  // A HALT that arrives while the queue is judged: nothing more is published
+  // there, and what stands is taken back at once, as after the pull requests.
+  const haltedNow = async () => {
+    if (!halted(ctx.haltMarker)) return false;
+    await takeBackAll("the merge policy is halted");
+    announce();
+    return true;
+  };
+  // Failures to publish on a queue commit, counted in a row by commit: a count
+  // the last tick didn't add to is over, so one after a gap, or on a commit the
+  // queue rebuilt, starts again.
+  const failed = (ctx.queuePublishFailures ??= new Map());
+  for (const [sha, f] of failed) if (f.tick < tickNo - 1) failed.delete(sha);
+  const RANK = { PASS: 0, UNKNOWN: 1, BLOCK: 2 };
+  const KINDS = ["waiting", "retry", "missing", "person"];
+  for (const base of queueBases) {
+    let q;
+    try { q = (ctx.readQueue ?? readMergeQueue)(nwo, base); }
+    catch (err) { q = { ok: false, why: err.message }; }
+    if (!q.ok) {
+      log(logPath, `  merge queue for ${base}: could not read — ${q.why}`);
+      // A queue PASS reeve can't re-check is taken back, failing closed.
+      for (const n of onBase(base))
+        if (queuePassAt(n, () => true)) await takeBack(n, "the merge queue couldn't be read, so its commit can't be re-checked", (x) => x.queue === true);
+      continue;
+    }
+    // The queue may batch several pull requests onto one commit, and a check
+    // there speaks for all of them. So each is judged and kept on its own, and
+    // the commit is published on once, with the worst of their verdicts.
+    const onCommit = new Map();
+    for (const entry of q.entries) if (entry.sha) onCommit.set(entry.sha, [...(onCommit.get(entry.sha) ?? []), entry]);
+    for (const [sha, entries] of onCommit) {
+      const judged = [];
+      for (const entry of entries) {
+        const at = `#${entry.pr} queued at ${sha.slice(0, 10)}`;
+        const e = evaluatedHere.get(entry.pr);
+        if (!e?.input) { log(logPath, `  ${at}: not judged — the pull request wasn't evaluated this tick`); continue; }
+        let j;
+        try { j = (ctx.evaluateQueue ?? evaluateQueueEntry)({ nwo, entry, input: e.input, baseRef: base, profile, db }); }
+        catch (err) { j = { ok: false, why: err.message }; }
+        if (!j.ok) { log(logPath, `  ${at}: not judged — ${j.why}`); continue; }
+        let kept = null;
+        try {
+          kept = recordsFor({ nwo, pr: entry.pr, head: sha, tree: (ctx.treeOf ?? treeOf)(nwo, sha), input: j.input,
+                              verdict: j.verdict, policy: policyFor(profile), code,
+                              observedAt: new Date(now() * 1000).toISOString() });
+        } catch (err) {
+          log(logPath, `  ${at}: what this verdict was judged from could not be recorded — ${err.message}`);
+        }
+        try {
+          tx(db, () => {
+            const decided = db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
+              .run(now(), "daemon", "queue.decided", `pr:${entry.pr}`, JSON.stringify({
+                head: sha, base: entry.baseSha, state: j.verdict.state, summary: j.verdict.summary,
+                clauses: j.verdict.clauses.map((c) => ({ id: c.id, state: c.state })),
+                record: kept?.decision.digest ?? null,
+              }));
+            if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr: entry.pr, head: sha, ...kept });
+          });
+        } catch (err) {
+          log(logPath, `  ${at}: the verdict could not be kept — ${err.message}`);
+        }
+        log(logPath, `  ${at}: ${j.verdict.state}`);
+        judged.push({ pr: entry.pr, verdict: j.verdict });
+      }
+      const prs = entries.map((x) => x.pr);
+      const at = `queue commit ${sha.slice(0, 10)} (${prs.map((n) => `#${n}`).join(", ")})`;
+      // Only when every pull request on it was judged this tick: a PASS there
+      // would merge the one nothing judged. Otherwise nothing is published, and
+      // a PASS standing there is taken back.
+      if (judged.length < entries.length) {
+        log(logPath, `  ${at}: not published — not every pull request on it was judged this tick`);
+        for (const n of prs)
+          if (queuePassAt(n, (x) => x.head === sha))
+            await takeBack(n, "not every pull request on this queue commit could be judged", (x) => x.queue === true && x.head === sha);
+        continue;
+      }
+      if (await haltedNow()) return haltStop("HALTED while the merge queue was checked");
+      // The worst: a block, else the UNKNOWN of the most serious kind, else a pass.
+      const worst = judged.reduce((a, b) => {
+        const d = (RANK[b.verdict.state] ?? 1) - (RANK[a.verdict.state] ?? 1);
+        if (d) return d > 0 ? b : a;
+        return KINDS.indexOf(b.verdict.kind) > KINDS.indexOf(a.verdict.kind) ? b : a;
+      });
+      const verdict = prs.length === 1 ? worst.verdict
+        : { ...worst.verdict, summary: `queued together: ${prs.map((n) => `#${n}`).join(", ")}. #${worst.pr}: ${worst.verdict.summary}` };
+      const name = shadow ? shadowContextOf(POLICY_CONTEXT) : POLICY_CONTEXT;
+      const standing = new Map(prs.map((n) => {
+        let st;
+        try { st = standingAt(db, n); } catch { st = null; }
+        return [n, st?.find((x) => x.name === name && x.head === sha) ?? null];
+      }));
+      const noteQueued = (n, left) => {
+        const was = standing.get(n);
+        return (was?.op === "pr.published" && was.state === left.state && was.id === left.id)
+          || notePublication(db, n, "pr.published", { ...left, head: sha, name: left.name ?? name, queue: true });
+      };
+      let pub;
+      if (verdict.state === PASS && !prs.every((n) => noteQueued(n, { state: PASS, id: standing.get(n)?.id ?? null })))
+        pub = { ok: false, why: "its PASS couldn't be written down first, so it isn't published" };
+      else {
+        try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict, shadow, base, queue: true }); }
+        catch (thrown) { pub = { ok: false, why: thrown.message }; }
+      }
+      // An enforcing PASS a shadow publication superseded here is cancelled, so
+      // it's written down as withdrawn, as at a head.
+      if (pub.superseded && name !== POLICY_CONTEXT)
+        for (const n of prs) {
+          let st;
+          try { st = standingAt(db, n); } catch { st = null; }
+          const enforced = st?.find((x) => x.op === "pr.published" && x.name === POLICY_CONTEXT && x.head === sha);
+          if (enforced) notePublication(db, n, "pr.withdrawn", { head: sha, name: POLICY_CONTEXT, id: enforced.id ?? null, why: "superseded by a shadow result" });
+        }
+      if (pub.ok) {
+        failed.delete(sha);
+        for (const n of prs) noteQueued(n, { state: verdict.state, name: pub.name ?? name, id: pub.id ?? null });
+        continue;
+      }
+      log(logPath, `  ${at}: could not publish ${verdict.state} — ${pub.why}`);
+      const was = failed.get(sha);
+      failed.set(sha, { n: (was?.n ?? 0) + 1, tick: tickNo });
+      for (const n of prs) {
+        if (failed.get(sha).n >= 3) raise(`#${n}: reeve couldn't publish its verdict on the merge queue's commit on 3 ticks in a row`);
+        // What it couldn't write over is taken back, as at a head. Only when a PASS
+        // stands there: a take-back that finds nothing clears the pull request's
+        // stuck-PASS cause, which another step may have raised.
+        const unwritten = (x) => x.queue === true && x.head === sha && (verdict.state !== PASS || x.name !== name);
+        if (queuePassAt(n, unwritten))
+          await takeBack(n, "the merge policy couldn't publish its new verdict on this queue commit", unwritten);
+      }
+    }
+    // A PASS on a commit the queue no longer holds is taken back, whether the
+    // queue merged it, dropped it, or rebuilt it. Only when the queue was read.
+    const held = new Set(q.entries.map((x) => x.sha).filter(Boolean));
+    for (const n of onBase(base))
+      if (queuePassAt(n, (x) => !held.has(x.head)))
+        await takeBack(n, "the merge queue no longer holds this commit", (x) => x.queue === true && !held.has(x.head));
+  }
+  // And one that arrived during the last publication there.
+  if (await haltedNow()) return haltStop("HALTED after the merge queue was checked");
 
   // A PASS left at a pull request this tick didn't list (#161), asked of GitHub
   // rather than read from the absence. One that merged under it keeps it: it's

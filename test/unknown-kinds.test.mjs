@@ -159,7 +159,7 @@ test("the base's rules a run settles without anyone are marked so, and the rest 
   const parts = readMergeParts("o/r", "kinds-base", { mergeState: "BLOCKED", mergeable: "MERGEABLE", reviewDecision: null, readable: true, unresolved: 0 },
                                { gh, appId: "1", rows: [] });
   assert.equal(parts.ownCheckRequired, true, "control: the rules were read");
-  assert.deepEqual(parts.unevaluated, ["rule required_deployments", "rule workflows", "rule code_scanning", "rule required_signatures", "rule merge_queue", "rule some_future_rule"]);
+  assert.deepEqual(parts.unevaluated, ["rule required_deployments", "rule workflows", "rule code_scanning", "rule required_signatures", "rule some_future_rule"]);
   assert.deepEqual(parts.settlesAlone, ["rule required_deployments", "rule workflows", "rule code_scanning"]);
 });
 

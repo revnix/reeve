@@ -201,7 +201,7 @@ const partsOf = (base, threads, rows = []) => readMergeParts("o/r", `base-${++ba
     { type: "pull_request", parameters: { required_approving_review_count: 1 } },
     { type: "required_deployments", parameters: { required_deployment_environments: ["preview"] } }, { type: "merge_queue" }, { type: "some_future_rule" }];
   const parts = partsOf(baseOf({ rules }), {});
-  check(JSON.stringify(parts.unevaluated) === JSON.stringify(["rule required_deployments", "rule merge_queue", "rule some_future_rule"]),
+  check(JSON.stringify(parts.unevaluated) === JSON.stringify(["rule required_deployments", "rule some_future_rule"]),
     "rules reeve doesn't evaluate are named, a new kind included; reviews, and rules that can't stop a merge, aren't", JSON.stringify(parts.unevaluated));
 }
 {

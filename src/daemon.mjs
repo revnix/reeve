@@ -35,7 +35,7 @@ import { hubSession, NO_HUB } from "./build/hubsession.mjs";
 import { resolveRepoId } from "./build/repoid.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify, printable } from "./notify.mjs";
-import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects, reap } from "./db/ops.mjs";
+import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects, reap, canonical } from "./db/ops.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
 import { drainOutbox } from "./outbox/drain.mjs";
 import { HANDLERS, permittedHandlers } from "./outbox/effects.mjs";
@@ -54,8 +54,9 @@ import { randomBytes } from "node:crypto";
 import { resolveHome } from "./home.mjs";
 import { codeVersion, policyOf, recordsFor } from "./evidence.mjs";
 import { saveDecision } from "./db/records.mjs";
-import { decisionStatement, baselineStatement } from "./signing.mjs";
-import { BASELINE_OP } from "./db/records.mjs";
+import { decisionStatement, baselineStatement, latestStatement } from "./signing.mjs";
+import { BASELINE_OP, LATEST_OP } from "./db/records.mjs";
+import { signedOrder } from "./decisions.mjs";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -847,7 +848,7 @@ function openPrs(nwo, limit = 20) {   // bounded; the caller LOGS when the bound
  * Record what a tick decided, so the dashboard and `reeve why` can answer without
  * re-deriving anything, and so a restart knows how long a clause has been UNKNOWN.
  */
-function record(db, { pr, head, verdict, decision, effects = [], retire = new Map(), kept = null }) {
+function record(db, { pr, head, verdict, decision, effects = [], retire = new Map(), kept = null, inTx = null }) {
   try {
     // ONE transaction, and that is the outbox's whole reason for existing. The
     // decision and the side effect it implies have to become durable together or
@@ -868,6 +869,9 @@ function record(db, { pr, head, verdict, decision, effects = [], retire = new Ma
       // that names it, so neither stands without the other, and under that
       // event's seq, which orders decisions where seconds tie (#165).
       if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr, head, ...kept });
+      // And what goes with the record under the same lock: its pull request's
+      // signed order (#274).
+      if (kept) inTx?.();
       // `enqueue` returns null for a key it already holds, which is success: the
       // effect is durable, it was simply made durable by an earlier tick.
       let queued = 0, known = 0, dropped = 0;
@@ -938,15 +942,39 @@ function standingAt(db, pr) {
  * unsigned, once. Not once any record is signed: a list made then would vouch for
  * records left unsigned since. A signing that fails is tried again next tick.
  * Whether the store has begun, and if not, why.
+ *
+ * The host's anchor (#274) says so too, where a store restored from before can't
+ * take it back. And where it says the store began though the store shows no
+ * sign of it, its baseline and every signature were taken away, or it was
+ * restored from before: no baseline is made over what it holds, which would
+ * vouch for whatever was rewritten there, and its unsigned records aren't
+ * trusted. One holding no record at all begins again, as that vouches for none.
  * @returns {{ began: boolean, why?: string }}
  */
-function beginSigning(db, sign, logPath) {
+function beginSigning(db, sign, logPath, anchor = null, nwo = null) {
+  // Said on the host's anchor under the store's write lock, as every write of
+  // it is, so two daemons on one store never write it over each other.
+  const saidBegun = () => {
+    if (anchor && !anchor.began(nwo)) log(logPath, "signing: the host's anchor couldn't say this store began signing; it's said again next tick");
+    return { began: true };
+  };
   try {
     // Under the store's write lock, so a second daemon on the store can't list
     // and sign between this one's checks and its insert.
     return tx(db, () => {
-      if (db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(BASELINE_OP)) return { began: true };
-      if (db.prepare(`SELECT 1 FROM decision WHERE envelope IS NOT NULL LIMIT 1`).get()) return { began: true };
+      if (db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(BASELINE_OP)) return saidBegun();
+      if (db.prepare(`SELECT 1 FROM decision WHERE envelope IS NOT NULL LIMIT 1`).get()) return saidBegun();
+      let hostSays = false;
+      if (anchor) {
+        // One that can't be read might say so: taken as saying it.
+        try { hostSays = Boolean(anchor.read(nwo)?.began); }
+        catch (err) { hostSays = true; log(logPath, `signing: ${err.message}, so it's taken to say this store began signing`); }
+      }
+      if (hostSays && db.prepare(`SELECT 1 FROM decision LIMIT 1`).get()) {
+        log(logPath, "signing: the host's anchor says this store began signing, though it holds no baseline or signed record: " +
+                     "they were taken away, or the store restored from before. No baseline is made over what it holds, and its unsigned records aren't trusted");
+        return { began: true };
+      }
       const digests = db.prepare(`SELECT digest FROM decision ORDER BY digest`).all().map((r) => r.digest);
       const s = sign(baselineStatement(digests));
       if (!s?.envelope) {
@@ -955,7 +983,7 @@ function beginSigning(db, sign, logPath) {
       }
       db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
         .run(now(), "daemon", BASELINE_OP, "store", JSON.stringify({ digests: baselineStatement(digests).predicate.digests, envelope: s.envelope }));
-      return { began: true };
+      return saidBegun();
     });
   } catch (err) {
     log(logPath, `signing: the records kept before signing couldn't be listed and signed — ${err.message}`);
@@ -1362,7 +1390,7 @@ export async function tick(ctx) {
   // that isn't signed, or whose signature was stripped, isn't one of them. Until
   // that list is made, records are kept unsigned: one signed first would stop it
   // being made, and every record kept before would be untrusted for good.
-  const begun = ctx.signer ? beginSigning(db, signWith, logPath) : { began: true };
+  const begun = ctx.signer ? beginSigning(db, signWith, logPath, ctx.anchor ?? null, nwo) : { began: true };
   let unsignedSaid = false;
   const signed = (decision) => {
     if (!begun.began) return { unsigned: `this store hasn't begun signing, as the records it kept before couldn't be signed: ${begun.why}` };
@@ -1370,6 +1398,32 @@ export async function tick(ctx) {
     // Said once a tick: records kept unsigned otherwise go unnoticed.
     if (ctx.signer && s?.unsigned && !unsignedSaid) { unsignedSaid = true; log(logPath, `signing: records are kept unsigned — ${s.unsigned}`); }
     return s;
+  };
+  // Each change of a pull request's latest decision, a numbered, signed entry of
+  // its order (#274), so which record is latest isn't read from the store's own
+  // order alone. Made inside the decision's transaction, under the store's write
+  // lock, so two daemons on one store never number an entry alike. Extended only
+  // from an order that checks whole, with the host's own keys, and the host's
+  // anchor moved to its top under the same lock: never from a number a store
+  // edit put there, and a write of it that failed, or never ran, is made good on
+  // a later tick.
+  /** @type {Map<string, any> | null | undefined} */ let orderKeys;
+  const advanceOrder = (pr, decision) => {
+    if (!ctx.signer || !begun.began) return;
+    if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
+    if (!orderKeys) return;
+    const order = signedOrder(db, nwo, pr, orderKeys);
+    if ("corrupt" in order) { log(logPath, `signing: #${pr}: its signed order doesn't hold, so it isn't extended — ${order.corrupt}`); return; }
+    let top = order.top;
+    if (order.digest !== decision.digest) {
+      const s = signWith(latestStatement({ repo: nwo, pr, n: top + 1, digest: decision.digest }));
+      if (!s?.envelope) return;
+      db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
+        .run(now(), "daemon", LATEST_OP, `pr:${pr}`, canonical({ repo: nwo, n: top + 1, digest: decision.digest, envelope: s.envelope }));
+      top += 1;
+    }
+    if (ctx.anchor && top && !ctx.anchor.note(nwo, pr, top))
+      log(logPath, `signing: #${pr}: the host's anchor couldn't be moved to entry ${top} of its order, so it lags until a later tick`);
   };
   // What each base requires is read afresh every tick. Kept across ticks, a rule
   // added between them went unseen for as long as the reading was kept.
@@ -2357,7 +2411,8 @@ export async function tick(ctx) {
         log(logPath, `  #${pr}: what this verdict was judged from could not be recorded — ${err.message}`);
       }
     }
-    const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire, kept });
+    const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire, kept,
+                                 inTx: kept ? () => advanceOrder(pr, kept.decision) : null });
     if (effects.length && !decided.ok) {
       log(logPath, `  #${pr}: REQUEST_REVIEW — the decision and its ${effects.length} effect(s) could NOT be recorded: ${decided.why}`);
       // Escalated, not merely logged. Nothing else covers this: no worker is
@@ -2575,6 +2630,7 @@ export async function tick(ctx) {
                 record: kept?.decision.digest ?? null,
               }));
             if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr: entry.pr, head: sha, ...kept });
+            if (kept) advanceOrder(entry.pr, kept.decision);
           });
         } catch (err) {
           log(logPath, `  ${at}: the verdict could not be kept — ${err.message}`);

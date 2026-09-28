@@ -16,6 +16,7 @@ import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick, measuredContainment, withdrawStanding, tellStuck, runningCode } from "../src/daemon.mjs";
 import { replayDecisions, renderReplay } from "../src/decisions.mjs";
 import { knownKeys, fileSigner, signingKey, PUBLIC_FILE } from "../src/signing.mjs";
+import { fileAnchor, readAnchor } from "../src/anchor.mjs";
 import { SelectorError } from "../src/db/records.mjs";
 import { readState, render as renderStatus, statusline, why, cleanMergeRate } from "../src/status.mjs";
 import { init } from "../src/init.mjs";
@@ -454,6 +455,13 @@ const HOME = resolveHome(opt("home"));
 // The keys a decision record may be signed by (#165): those this checkout
 // publishes, and this host's own.
 const signingKeys = () => knownKeys({ published: join(ROOT, "deploy", "signing-keys"), local: join(HOME, "credentials") });
+// The host's anchor for the repository asked about (#274): none where it isn't
+// known, and one that can't be read says so, which vouches for nothing.
+const anchorFor = (/** @type {string | null} */ nwo) => {
+  if (!nwo) return null;
+  try { return { anchor: readAnchor(join(HOME, "credentials"), nwo), why: null }; }
+  catch (e) { return { anchor: null, why: e.message }; }
+};
 // And WRITTEN BACK, before any route runs. `--home` used to change only this
 // constant, so `credentialPaths()` still denied the state root named by the
 // ENVIRONMENT and the canary still wrote its decoy under `~/.reeve` -- a
@@ -956,7 +964,7 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     let results;
     try {
       results = replayDecisions(open(dbPath), { pr: pr == null ? null : Number(pr), since: sinceAt, digest: opt("record") ?? null },
-                                { code: runningCode(), profile, keys: signingKeys(), repo: nwo });
+                                { code: runningCode(), profile, keys: signingKeys(), repo: nwo, anchor: anchorFor(nwo) });
     } catch (e) {
       // A record named by a start that isn't hexadecimal, or that more than one
       // shares, is refused rather than replayed as a pattern.
@@ -1004,7 +1012,7 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     if (cmd === "why") {
       const target = positionals.find(a => /^#?\d+$/.test(a) || a.startsWith("pr:"));
       if (!target) { console.error("reeve why <pr-number>"); process.exit(1); }
-      console.log(why(db, target, { head: opt("head") ?? null, keys: signingKeys(), repo: nwo }));
+      console.log(why(db, target, { head: opt("head") ?? null, keys: signingKeys(), repo: nwo, anchor: anchorFor(nwo) }));
       process.exit(0);
     }
 
@@ -2419,6 +2427,10 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       // Each decision record is signed with the host's key, made on first use in
       // the credentials folder, which no worker may read (#165).
       signer: fileSigner(join(HOME, "credentials")),
+      // And what it signed last, kept beside the key, outside every store; with
+      // the keys its entries are checked with (#274).
+      anchor: fileAnchor(join(HOME, "credentials")),
+      keys: signingKeys,
       // Execution is opt-in. A loop that acts before its decisions have been
       // watched is how an unattended run becomes an incident.
       execute: flag("execute"),

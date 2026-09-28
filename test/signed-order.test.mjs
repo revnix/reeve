@@ -1,0 +1,396 @@
+// The signed order of each pull request's decisions, and the host's anchor
+// (#274): which record is a pull request's latest is signed too, and a store cut
+// short, or restored from before, doesn't pass for the one the host kept.
+import test from "node:test";
+import assert from "node:assert/strict";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { fileSigner, knownKeys, latestStatement, signStatement, signingKey } from "../src/signing.mjs";
+import { fileAnchor, readAnchor, anchorPath } from "../src/anchor.mjs";
+import { open } from "../src/db/ops.mjs";
+import { explainDecision, replayDecisions, signedOrder } from "../src/decisions.mjs";
+import { computeVerdict } from "../src/verdict.mjs";
+import { tempDir } from "./fixtures/temp.mjs";
+import { offlineEnv } from "./fixtures/offline-github.mjs";
+import { run, EVAL } from "./fixtures/tick-harness.mjs";
+
+const REEVE = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "reeve");
+const REPO = "o/r", PR = 42;
+const A = "a".repeat(40), B = "b".repeat(40);
+
+/** A credentials folder, made as reeve's home makes it. */
+const credentials = () => { const d = join(tempDir("reeve-order-"), "credentials"); mkdirSync(d, { mode: 0o700 }); return d; };
+const input = (head) => ({
+  head,
+  checks: { verdict: "GREEN", settled: true, why: null, readable: true, failing: [], inherited: [], impostors: [], shadowRequired: false },
+  base: { verdict: "GREEN", readable: true },
+  reviewers: [],
+  rounds: { n: 1, softCap: 5, hardCap: 10, unspilledCritical: 0 },
+  threads: { unresolved: 0, total: 0, readable: true },
+  cleared: { readable: true, uncleared: 0, reviewers: [] },
+  bodyFindings: { readable: true, open: 0, reviewers: [] },
+  unreadableBodies: { readable: true, open: 0, reviewers: [] },
+  ledgerBlockers: 0,
+  mergeState: "CLEAN",
+});
+/** #42 at `head`, evaluated with its CI `ci` ("GREEN" passes it, "RED" blocks it). */
+const at = (head, ci = "GREEN") => {
+  const i = { ...input(head), checks: { ...input(head).checks, verdict: ci, failing: ci === "RED" ? [{ name: "unit", id: "1" }] : [] } };
+  return { ...EVAL, head, input: i, verdict: computeVerdict(i) };
+};
+/** What the host's reeve is given: its signer, its keys and its anchor, over the credentials folder `dir`. */
+const host = (dir) => ({ signer: fileSigner(dir), keys: () => knownKeys({ local: dir }), anchor: fileAnchor(dir) });
+/** Ticks over one store, each with its own evaluation of #42, as `host` gives. Answers the store's path. */
+async function ticks(evals, ctx, dbPath = null) {
+  const path = dbPath ?? join(tempDir("reeve-order-ticks-"), "s.db");
+  open(path).close();
+  // By tick, not by call: a tick may evaluate a pull request more than once.
+  let tick = 0;
+  await run({ openPrs: () => { tick++; return [PR]; }, evaluate: () => evals[Math.min(tick, evals.length) - 1], dbPath: path, ticks: evals.length, ...ctx });
+  return path;
+}
+/** The host's anchor, as `why` and `replay` are given it. */
+const anchorOf = (dir) => { try { return { anchor: readAnchor(dir, REPO), why: null }; } catch (e) { return { anchor: null, why: e.message }; } };
+/** The digests of #42's records, oldest first. */
+const digestsOf = (db) => db.prepare("SELECT digest FROM decision WHERE pr = ? ORDER BY first_seq").all(PR).map((r) => r.digest);
+
+test("each change of a pull request's latest decision is a numbered, signed entry of its order, and why names it", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED"), at(A, "RED")], host(dir)));
+  const keys = knownKeys({ local: dir });
+  const order = signedOrder(db, REPO, PR, keys);
+  const [green, red] = digestsOf(db);
+  const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.deepEqual(order, { top: 2, digest: red, digests: new Set([green, red]) }, "one entry per change, none for a decision seen again");
+  assert.match(String(shown), /the latest by its signed order, entry 2/);
+  assert.doesNotMatch(String(shown), /can't be trusted/);
+  assert.deepEqual(readAnchor(dir, REPO), { began: true, latest: new Map([[PR, 2]]) }, "and the host's anchor holds its top");
+});
+
+test("an older record raised in the store's own order can't be trusted as the latest", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], host(dir)));
+  const [green, red] = digestsOf(db);
+  db.prepare("UPDATE decision SET last_seq = 1000000 WHERE digest = ?").run(green);
+  const shown = explainDecision(db, PR, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.match(String(shown), new RegExp(`can't be trusted as the latest: its signed order ends at record ${red.slice(0, 12)}`));
+});
+
+test("a store whose newest records were taken away reads as cut short against the host's anchor", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], host(dir)));
+  const [, red] = digestsOf(db);
+  db.prepare("DELETE FROM decision WHERE digest = ?").run(red);
+  db.prepare("DELETE FROM event WHERE op = 'decision.latest' AND json_extract(payload, '$.n') = 2").run();
+  const keys = knownKeys({ local: dir });
+  const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: anchorOf(dir) });
+  const replayed = replayDecisions(db, { pr: PR }, { keys, repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.match(String(shown), /can't be trusted as the latest: its signed order ends at entry 1, though this host signed up to entry 2/);
+  assert.ok(replayed.some((r) => r.outcome === "unreplayable" && /ends at entry 1, though this host signed up to entry 2/.test(String(r.why))), JSON.stringify(replayed));
+});
+
+test("a pull request whose every record was taken away still shows, by the host's anchor", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], host(dir)));
+  db.prepare("DELETE FROM decision WHERE pr = ?").run(PR);
+  db.prepare("DELETE FROM event WHERE subject = ?").run(`pr:${PR}`);
+  const keys = knownKeys({ local: dir });
+  const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: anchorOf(dir) });
+  const replayed = replayDecisions(db, {}, { keys, repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.match(String(shown), /the store holds no decision record for it, though this host signed up to entry 2 of its order/);
+  assert.ok(replayed.some((r) => r.pr === PR && r.outcome === "unreplayable" && /though this host signed up to entry 2/.test(String(r.why))), JSON.stringify(replayed));
+});
+
+test("a record the signed order names that the store no longer holds is reported by replay", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], host(dir)));
+  const [green] = digestsOf(db);
+  db.prepare("DELETE FROM decision WHERE digest = ?").run(green);
+  const replayed = replayDecisions(db, { pr: PR }, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.deepEqual(replayed.filter((r) => r.outcome === "unreplayable").map((r) => [r.digest, r.why]),
+                   [[green, "its signed order names this record, but the store no longer holds it"]]);
+});
+
+test("the host's anchor is written whole, its folder and every folder made for it synced", () => {
+  const dir = credentials();
+  const seen = [];
+  const anchor = fileAnchor(dir, { syncDir: (d) => seen.push(d) });
+  assert.equal(anchor.note(REPO, 7, 1), true, "control: it was written");
+  const file = anchorPath(dir, REPO);
+  for (const d of [dirname(file), dirname(dirname(file)), dir]) assert.ok(seen.includes(d), `${d} synced: ${JSON.stringify(seen)}`);
+  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { began: true, latest: { 7: 1 } });
+});
+
+test("the host's anchor only moves forward", () => {
+  const dir = credentials();
+  const anchor = fileAnchor(dir);
+  anchor.note(REPO, 7, 3);
+  anchor.note(REPO, 7, 2);
+  anchor.note(REPO, 9, 1);
+  assert.deepEqual(readAnchor(dir, REPO), { began: true, latest: new Map([[7, 3], [9, 1]]) });
+});
+
+test("an anchor that can't be read vouches for nothing, and isn't written over", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)], host(dir));
+  const file = anchorPath(dir, REPO);
+  writeFileSync(file, "cut sho");
+  const keys = knownKeys({ local: dir });
+  let db = open(dbPath);
+  const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: anchorOf(dir) });
+  const replayed = replayDecisions(db, { pr: PR }, { keys, repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.match(String(shown), /can't be trusted as the latest: the host's anchor for o\/r can't be read/);
+  assert.ok(replayed.some((r) => r.outcome === "unreplayable" && /anchor for o\/r can't be read/.test(String(r.why))), JSON.stringify(replayed));
+  const r = await run({ evaluate: () => at(A, "RED"), dbPath, ...host(dir) });
+  assert.equal(readFileSync(file, "utf8"), "cut sho", "a tick leaves it as it was");
+  assert.match(r.log, /the host's anchor couldn't be moved to entry 2/);
+  db = open(dbPath);
+  assert.equal(signedOrder(db, REPO, PR, keys).top, 2, "control: the order went on");
+  db.close();
+});
+
+test("the order is extended only from entries that check, so a number a store edit put there never moves the anchor", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)], host(dir));
+  let db = open(dbPath);
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
+    .run(2, "daemon", "decision.latest", `pr:${PR}`, JSON.stringify({ repo: REPO, n: 1000, digest: "f".repeat(64), envelope: "{}" }));
+  db.close();
+  const r = await run({ evaluate: () => at(A, "RED"), dbPath, ...host(dir) });
+  db = open(dbPath);
+  const entries = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n;
+  db.close();
+  assert.equal(entries, 2, "no entry signed on top of one that doesn't check");
+  assert.match(r.log, /#42: its signed order doesn't hold, so it isn't extended/);
+  assert.deepEqual(readAnchor(dir, REPO)?.latest, new Map([[PR, 1]]), "and the host's anchor stays where the order last checked");
+});
+
+test("replay checks each entry of the signed order, and reports one that doesn't hold", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], host(dir)));
+  db.prepare("UPDATE event SET payload = json_set(payload, '$.digest', ?) WHERE op = 'decision.latest' AND json_extract(payload, '$.n') = 1")
+    .run("f".repeat(64));
+  const keys = knownKeys({ local: dir });
+  const replayed = replayDecisions(db, { pr: PR }, { keys, repo: REPO, anchor: anchorOf(dir) });
+  const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.ok(replayed.some((r) => r.outcome === "unreplayable" && /entry 1 of its signed order doesn't hold/.test(String(r.why))), JSON.stringify(replayed));
+  assert.match(String(shown), /can't be trusted as the latest: entry 1 of its signed order doesn't hold/);
+});
+
+test("an entry of another repository's order doesn't pass for this one's", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A)], host(dir)));
+  const k = signingKey(dir);
+  assert.equal(k.ok, true, "control: the host's key");
+  const digest = digestsOf(db)[0];
+  const s = signStatement(latestStatement({ repo: "x/y", pr: PR, n: 2, digest }), /** @type {any} */ (k));
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
+    .run(3, "daemon", "decision.latest", `pr:${PR}`, JSON.stringify({ repo: "x/y", n: 2, digest, envelope: "envelope" in s ? s.envelope : null }));
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  db.close();
+  assert.deepEqual(order, { corrupt: "entry 2 of its signed order is of x/y, not of o/r" });
+});
+
+test("a store stripped of its baseline and every signature still began signing, by the host's anchor, and no baseline is made again", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A), at(B)], host(dir));
+  let db = open(dbPath);
+  db.prepare("DELETE FROM event WHERE op IN ('signing.baseline', 'decision.latest')").run();
+  db.prepare("UPDATE decision SET envelope = NULL").run();
+  const keys = knownKeys({ local: dir });
+  const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: anchorOf(dir) });
+  const replayed = replayDecisions(db, { pr: PR }, { keys, repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.match(String(shown), /can't be trusted: it's unsigned, though it was kept after this store began signing.*the host's anchor says this store began signing/);
+  assert.ok(replayed.length >= 2 && replayed.every((x) => x.outcome === "unreplayable"), `none of its records is replayed as trusted: ${JSON.stringify(replayed)}`);
+  const r = await run({ evaluate: () => at(B, "RED"), dbPath, ...host(dir) });
+  db = open(dbPath);
+  const baselines = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n;
+  db.close();
+  assert.equal(baselines, 0, "none made over records that may have been rewritten");
+  assert.match(r.log, /the host's anchor says this store began signing, though it holds no baseline or signed record/);
+});
+
+test("a store holding no record begins signing again, though the host's anchor says it began", async () => {
+  const dir = credentials();
+  fileAnchor(dir).began(REPO);
+  const dbPath = await ticks([at(A)], host(dir));
+  const db = open(dbPath);
+  const baselines = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n;
+  const signed = db.prepare("SELECT count(*) AS n FROM decision WHERE envelope IS NOT NULL").get().n;
+  db.close();
+  assert.equal(baselines, 1, "a baseline over nothing vouches for nothing");
+  assert.ok(signed > 0, "and its records are signed");
+});
+
+test("a store that began signing before the host's anchor has it said there at its next tick", async () => {
+  const dir = credentials();
+  // Began with the signer alone, as #271's reeve did, with no anchor.
+  const dbPath = await ticks([at(A)], { signer: fileSigner(dir) });
+  assert.equal(readAnchor(dir, REPO), null, "control: no anchor yet");
+  await run({ evaluate: () => at(A), dbPath, ...host(dir) });
+  assert.equal(readAnchor(dir, REPO)?.began, true);
+});
+
+test("an anchor is kept only where a repository's name can go", () => {
+  const dir = credentials();
+  for (const bad of ["../../x", "o/r/../s", "o", ".o/r", "o/.r", "o/r/s"]) assert.throws(() => anchorPath(dir, bad), /not a repository/, bad);
+  assert.equal(anchorPath(dir, "O/R"), anchorPath(dir, "o/r"), "GitHub's names don't tell case apart");
+});
+
+test("reeve why and reeve replay read the host's anchor for the repository asked about", async () => {
+  const home = tempDir("reeve-order-cli-");
+  const dir = join(home, "credentials");
+  mkdirSync(dir, { mode: 0o700 });
+  const dbPath = await ticks([at(A), at(A, "RED")], host(dir));
+  const db = open(dbPath);
+  db.prepare("DELETE FROM event WHERE op = 'decision.latest' AND json_extract(payload, '$.n') = 2").run();
+  db.close();
+  const env = { ...offlineEnv(), REEVE_HOME: home };
+  const shown = spawnSync(process.execPath, [REEVE, "why", REPO, String(PR), "--db", dbPath], { encoding: "utf8", env });
+  assert.match(shown.stdout, /its signed order ends at entry 1, though this host signed up to entry 2/, shown.stdout + shown.stderr);
+  const replayed = spawnSync(process.execPath, [REEVE, "replay", REPO, "--db", dbPath], { encoding: "utf8", env });
+  assert.equal(replayed.status, 1, replayed.stdout + replayed.stderr);
+  assert.match(replayed.stdout, /#42 \(record [0-9a-f]{12}\): could not be replayed: its signed order ends at entry 1, though this host signed up to entry 2/);
+});
+
+test("the daemon run by reeve is given the host's anchor and keys", () => {
+  const src = readFileSync(REEVE, "utf8");
+  assert.match(src, /anchor: fileAnchor\(join\(HOME, "credentials"\)\),\n\s+keys: signingKeys,/);
+  assert.ok(existsSync(REEVE), "control");
+});
+
+// ── each guard's own case ────────────────────────────────────────────────────
+
+test("an anchor that isn't one, or isn't a file, is never read as one", () => {
+  const dir = credentials();
+  const file = anchorPath(dir, REPO);
+  mkdirSync(dirname(file), { recursive: true });
+  for (const text of ['{"began":"yes","latest":{}}', '{"began":true,"latest":{"7":"x"}}', '{"began":true,"latest":{"-1":2}}', '{"began":true,"latest":[]}']) {
+    writeFileSync(file, text);
+    assert.throws(() => readAnchor(dir, REPO), /can't be read: it isn't an anchor/, text);
+  }
+  writeFileSync(file, '{"began":true,"latest":{"7":2}}');
+  assert.deepEqual(readAnchor(dir, REPO), { began: true, latest: new Map([[7, 2]]) }, "control: an anchor reads as one");
+});
+
+test("an anchor that's a pipe is refused before it's opened, so reading it can't wait for ever", () => {
+  const dir = credentials();
+  const file = anchorPath(dir, REPO);
+  mkdirSync(dirname(file), { recursive: true });
+  assert.equal(spawnSync("mkfifo", [file]).status, 0, "control: a pipe was made where the anchor goes");
+  const at = JSON.stringify(new URL("../src/anchor.mjs", import.meta.url).href);
+  const src = `import(${at}).then((m) => { try { m.readAnchor(${JSON.stringify(dir)}, ${JSON.stringify(REPO)}); process.stdout.write("read"); } catch (e) { process.stdout.write("refused: " + e.message); } })`;
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", src], { encoding: "utf8", timeout: 5000 });
+  assert.equal(r.signal, null, `it answered: ${r.error?.message ?? ""}`);
+  assert.match(r.stdout, /^refused: .*it isn't a file/);
+});
+
+test("an entry taken out of the middle of the signed order leaves it missing, and one named twice is refused", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], host(dir)));
+  const keys = knownKeys({ local: dir });
+  const second = db.prepare("SELECT at, actor, op, subject, payload FROM event WHERE op = 'decision.latest' AND json_extract(payload, '$.n') = 2").get();
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(second.at, second.actor, second.op, second.subject, second.payload);
+  const twice = signedOrder(db, REPO, PR, keys);
+  db.close();
+  assert.deepEqual(twice, { corrupt: "its signed order names entry 2 twice" });
+  const db2 = open(await ticks([at(A), at(A, "RED")], host(dir)));
+  db2.prepare("DELETE FROM event WHERE op = 'decision.latest' AND json_extract(payload, '$.n') = 1").run();
+  const gap = signedOrder(db2, REPO, PR, knownKeys({ local: dir }));
+  db2.close();
+  assert.deepEqual(gap, { corrupt: "its signed order is missing entry 1" });
+});
+
+test("where the host's anchor can't be read, a store's unsigned records aren't vouched for, whatever the store shows", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)], {});
+  mkdirSync(dirname(anchorPath(dir, REPO)), { recursive: true });
+  writeFileSync(anchorPath(dir, REPO), "{");
+  const db = open(dbPath);
+  const keys = knownKeys({ local: dir });
+  const blind = explainDecision(db, PR, { keys, repo: REPO, anchor: anchorOf(dir) });
+  const none = explainDecision(db, PR, { keys, repo: REPO, anchor: { anchor: null, why: null } });
+  db.close();
+  assert.match(String(none), /unsigned: this run was given no signing key/, "control: with no anchor, a store that never signed reads as unsigned");
+  assert.match(String(blind), /can't be trusted: it's unsigned, though it was kept after this store began signing .*anchor for o\/r can't be read/);
+});
+
+test("a store that holds a signed order began signing, though its baseline and signatures were taken away", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], host(dir)));
+  db.prepare("DELETE FROM event WHERE op = 'signing.baseline'").run();
+  db.prepare("UPDATE decision SET envelope = NULL").run();
+  const shown = explainDecision(db, PR, { keys: knownKeys({ local: dir }), repo: REPO, anchor: null });
+  db.close();
+  assert.match(String(shown), /can't be trusted: it's unsigned, though it was kept after this store began signing/);
+});
+
+test("replay of the whole store reads the order of a pull request whose records are all gone", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], host(dir)));
+  const [green, red] = digestsOf(db);
+  db.prepare("DELETE FROM decision WHERE pr = ?").run(PR);
+  const replayed = replayDecisions(db, {}, { keys: knownKeys({ local: dir }), repo: REPO, anchor: null });
+  db.close();
+  assert.deepEqual(replayed.map((r) => r.digest).sort(), [green, red].sort(), JSON.stringify(replayed));
+  assert.ok(replayed.every((r) => r.outcome === "unreplayable" && /the store no longer holds it/.test(String(r.why))));
+});
+
+test("a queue commit's record takes its place in the pull request's signed order", async () => {
+  const dir = credentials();
+  const QUEUED = "c".repeat(40);
+  const readQueue = () => ({ ok: true, queue: true, entries: [{ pr: PR, sha: QUEUED, baseSha: "f".repeat(40), state: "AWAITING_CHECKS", prHead: A }] });
+  const evaluateQueue = ({ entry, input: i }) => { const q = { ...i, head: entry.sha }; return { ok: true, input: q, verdict: computeVerdict(q) }; };
+  const dbPath = join(tempDir("reeve-order-queue-"), "s.db");
+  open(dbPath).close();
+  await run({ evaluate: () => at(A), readQueue, evaluateQueue, dbPath, ...host(dir) });
+  const db = open(dbPath);
+  const queued = db.prepare("SELECT digest FROM decision WHERE head = ?").get(QUEUED)?.digest;
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  db.close();
+  assert.ok(queued, "control: the queue commit's record was kept");
+  assert.ok("digests" in order && order.digests.has(queued), JSON.stringify(order));
+});
+
+test("a tick says on the host's anchor that its store began signing, though it judges nothing", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)], { signer: fileSigner(dir) });
+  await run({ openPrs: () => [], evaluate: () => at(A), dbPath, ...host(dir) });
+  assert.equal(readAnchor(dir, REPO)?.began, true);
+});
+
+test("a store stripped of its baseline and signatures isn't given one again where the host's anchor can't be read", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)], host(dir));
+  let db = open(dbPath);
+  db.prepare("DELETE FROM event WHERE op IN ('signing.baseline', 'decision.latest')").run();
+  db.prepare("UPDATE decision SET envelope = NULL").run();
+  db.close();
+  writeFileSync(anchorPath(dir, REPO), "{");
+  const r = await run({ evaluate: () => at(B), dbPath, ...host(dir) });
+  db = open(dbPath);
+  const baselines = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n;
+  db.close();
+  assert.equal(baselines, 0);
+  assert.match(r.log, /anchor for o\/r can't be read: it isn't JSON, so it's taken to say this store began signing/);
+});
+
+test("reeve why says when the host's anchor for the repository can't be read", async () => {
+  const home = tempDir("reeve-order-cli-blind-");
+  const dir = join(home, "credentials");
+  mkdirSync(dir, { mode: 0o700 });
+  const dbPath = await ticks([at(A)], host(dir));
+  writeFileSync(anchorPath(dir, REPO), "{");
+  const shown = spawnSync(process.execPath, [REEVE, "why", REPO, String(PR), "--db", dbPath], { encoding: "utf8", env: { ...offlineEnv(), REEVE_HOME: home } });
+  assert.match(shown.stdout, /can't be trusted as the latest: the host's anchor for o\/r can't be read/, shown.stdout + shown.stderr);
+});

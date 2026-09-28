@@ -60,6 +60,8 @@ export function saveDecision(db, { at, seq, pr, head, policy, evidence, decision
 
 /** The event that says a store began signing, with its baseline (#165). */
 export const BASELINE_OP = "signing.baseline";
+/** The event for each entry of a pull request's signed order of decisions (#274). */
+export const LATEST_OP = "decision.latest";
 
 /**
  * @typedef {{ digest: string, pr: number, head: string, record: Record<string, any>, corrupt: string | null,

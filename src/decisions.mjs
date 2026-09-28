@@ -11,8 +11,10 @@ import { computeVerdict } from "./verdict.mjs";
 import { joinEvidence, asJson, policyOf } from "./evidence.mjs";
 import { canonical } from "./db/ops.mjs";
 import { latestDecision, decisionsFor, evidenceBy, policyRecord } from "./db/records.mjs";
+import { checkSignature } from "./signing.mjs";
 
 /** @typedef {import("node:sqlite").DatabaseSync} Db */
+/** @typedef {Map<string, { key: import("node:crypto").KeyObject, where: string }>} Keys */
 
 /** @param {number} s */
 const when = s => new Date(s * 1000).toISOString().replace("T", " ").slice(0, 19);
@@ -25,20 +27,25 @@ const span = (a, b) => (a === b ? when(a) : `${when(a)} to ${when(b)}`);
  * The latest decision for a pull request, or for one of its commits, as `reeve
  * why` shows it: the verdict and every clause with its detail, the evidence it
  * was judged from and when that was seen, and the policy and code that judged.
- * Null when the store holds no record for it.
+ * With `keys`, whether it's signed, and by which (#165). Null when the store
+ * holds no record for it.
  * @param {Db} db
  * @param {number} pr
- * @param {{ head?: string | null }} [o]
+ * @param {{ head?: string | null, keys?: Keys | null }} [o]
  */
-export function explainDecision(db, pr, { head = null } = {}) {
+export function explainDecision(db, pr, { head = null, keys = null } = {}) {
   const d = latestDecision(db, pr, { head });
   if (!d) return null;
   const r = d.record;
   /** @type {{ id: string, state: string, detail?: string, kind?: string, next?: string }[]} */
   const clauses = r.verdict.clauses ?? [];
   const out = [];
+  const sig = keys ? checkSignature(d, keys) : null;
   if (d.corrupt) out.push(`  this record can't be trusted: ${d.corrupt} (record ${short(d.digest)}); it was changed after it was kept`);
+  else if (sig?.state === "corrupt") out.push(`  this record can't be trusted: ${sig.why} (record ${short(d.digest)}); it was changed after it was signed`);
   out.push(`${r.verdict.state} at ${short(r.subject.head)}, tree ${short(r.subject.tree)}, judged ${span(d.first_at, d.last_at)} (record ${short(d.digest)})`);
+  if (sig?.state === "signed") out.push(`  signed by key ${short(sig.keyid)}, ${sig.where}`);
+  else if (sig?.state === "unsigned") out.push(`  unsigned: ${sig.why}`);
   if (r.verdict.summary) out.push(`  ${r.verdict.summary}`);
   const w = Math.max(0, ...clauses.map(c => c.id.length));
   // An UNKNOWN clause says what kind it is and what happens next (#165).
@@ -117,12 +124,14 @@ function clauseDiffs(was, now) {
  * Recompute recorded verdicts with the code that's running, and compare each to
  * what was recorded. A decision whose evidence or policy the store no longer
  * holds, or whose verdict can't be recomputed, is unreplayable: never "same".
+ * With `keys`, so is one whose signature doesn't hold (#165).
  * @param {Db} db
  * @param {{ digest?: string | null, pr?: number | null, since?: number | null }} [which]
- * @param {{ code?: Record<string, unknown> | null, profile?: Record<string, any> | null, compute?: typeof computeVerdict }} [now]
+ * @param {{ code?: Record<string, unknown> | null, profile?: Record<string, any> | null, compute?: typeof computeVerdict,
+ *           keys?: Keys | null }} [now]
  * @returns {Replayed[]}
  */
-export function replayDecisions(db, which = {}, { code = null, profile = null, compute = computeVerdict } = {}) {
+export function replayDecisions(db, which = {}, { code = null, profile = null, compute = computeVerdict, keys = null } = {}) {
   /** @type {Replayed[]} */
   const results = [];
   for (const d of decisionsFor(db, which)) {
@@ -135,6 +144,8 @@ export function replayDecisions(db, which = {}, { code = null, profile = null, c
     // A record, evidence or policy that doesn't match its digest is not the one
     // its key names, so what it would replay to proves nothing either way.
     if (d.corrupt) { results.push({ ...base, outcome: "unreplayable", why: d.corrupt }); continue; }
+    const sig = keys ? checkSignature(d, keys) : null;
+    if (sig?.state === "corrupt") { results.push({ ...base, outcome: "unreplayable", why: sig.why }); continue; }
     const { found, missing, corrupt } = evidenceBy(db, Object.values(r.evidence));
     const policy = policyRecord(db, r.policy);
     const why = missing.length ? `${missing.length} piece(s) of its evidence are missing`

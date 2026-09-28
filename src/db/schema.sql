@@ -596,6 +596,11 @@ CREATE TABLE IF NOT EXISTS decision (
   -- The seq of the first and the latest `pr.decided` event naming it. Seconds
   -- can tie; the event log's order can't, so "latest" is read from here.
   first_seq INTEGER NOT NULL,
-  last_seq  INTEGER NOT NULL
+  last_seq  INTEGER NOT NULL,
+  -- The DSSE envelope that signs it (#165). Null for a record kept before
+  -- records were signed, and for one whose signing failed, when `unsigned`
+  -- says why.
+  envelope  TEXT,
+  unsigned  TEXT
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS decision_by_pr ON decision(pr, last_seq);

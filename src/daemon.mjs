@@ -1313,6 +1313,16 @@ export async function tick(ctx) {
   // filtered to absolute paths. (Codex #4f-[1].)
   const logPath = ctx.logPath ? resolve(ctx.logPath) : ctx.logPath;
   if (logPath !== ctx.logPath) ctx = { ...ctx, logPath };
+  // Each decision record is signed with the signer its run was given (#165). A
+  // run given none, or a signing that fails, keeps the record unsigned, with
+  // the reason: a verdict isn't lost because it couldn't be signed.
+  const signed = (decision) => {
+    if (!ctx.signer) return { unsigned: "this run was given no signing key" };
+    let s;
+    try { s = ctx.signer(decision); } catch (err) { return { unsigned: `it couldn't be signed: ${err.message}` }; }
+    if (s?.created) log(logPath, `made this host's signing key, ${s.created}: publish its public half, as reeve signing-key says`);
+    return s;
+  };
   // What each base requires is read afresh every tick. Kept across ticks, a rule
   // added between them went unseen for as long as the reading was kept.
   clearRequirements();
@@ -2294,6 +2304,7 @@ export async function tick(ctx) {
         kept = recordsFor({ nwo, pr, head: e.head, tree: (ctx.treeOf ?? treeOf)(nwo, e.head), input: e.input,
                             verdict: e.verdict, policy: policyFor(profile), code,
                             observedAt: new Date(now() * 1000).toISOString() });
+        kept = { ...kept, signed: signed(kept.decision) };
       } catch (err) {
         log(logPath, `  #${pr}: what this verdict was judged from could not be recorded — ${err.message}`);
       }
@@ -2503,6 +2514,7 @@ export async function tick(ctx) {
           kept = recordsFor({ nwo, pr: entry.pr, head: sha, tree: (ctx.treeOf ?? treeOf)(nwo, sha), input: j.input,
                               verdict: j.verdict, policy: policyFor(profile), code,
                               observedAt: new Date(now() * 1000).toISOString() });
+          kept = { ...kept, signed: signed(kept.decision) };
         } catch (err) {
           log(logPath, `  ${at}: what this verdict was judged from could not be recorded — ${err.message}`);
         }

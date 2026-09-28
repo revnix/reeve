@@ -279,11 +279,11 @@ export function statusline(db, { nwo } = {}) {
  * and the evidence it was judged from (#165); then the decision trail, newest
  * first.
  */
-export function why(db, id, { limit = 12, head = null, keys = null, anchor = null } = {}) {
+export function why(db, id, { limit = 12, head = null, keys = null } = {}) {
   const subject = id.startsWith("pr:") ? id : `pr:${String(id).replace(/^#/, "")}`;
   const pr = Number(subject.slice(3));
   let latest = null, refused = null;
-  try { latest = Number.isInteger(pr) ? explainDecision(db, pr, { head, keys, anchor }) : null; }
+  try { latest = Number.isInteger(pr) ? explainDecision(db, pr, { head, keys }) : null; }
   catch (e) {
     // A commit named by a start that isn't hexadecimal, or that more than one
     // shares, is refused and says so, rather than explaining another commit.

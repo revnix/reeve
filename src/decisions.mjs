@@ -10,12 +10,11 @@
 import { computeVerdict } from "./verdict.mjs";
 import { joinEvidence, asJson, policyOf } from "./evidence.mjs";
 import { canonical } from "./db/ops.mjs";
-import { latestDecision, decisionsFor, evidenceBy, policyRecord, BASELINE_OP, LATEST_OP } from "./db/records.mjs";
-import { checkSignature, checkEnvelope, baselineStatement, latestStatement } from "./signing.mjs";
+import { latestDecision, decisionsFor, evidenceBy, policyRecord, BASELINE_OP } from "./db/records.mjs";
+import { checkSignature, checkEnvelope, baselineStatement } from "./signing.mjs";
 
 /** @typedef {import("node:sqlite").DatabaseSync} Db */
 /** @typedef {Map<string, { key: import("node:crypto").KeyObject, where: string }>} Keys */
-/** @typedef {{ began: Set<string>, latest: Map<string, number> }} Anchor */
 
 /** @param {number} s */
 const when = s => new Date(s * 1000).toISOString().replace("T", " ").slice(0, 19);
@@ -28,16 +27,13 @@ const span = (a, b) => (a === b ? when(a) : `${when(a)} to ${when(b)}`);
  * Whether a store began signing its decision records (#165), and the records its
  * signed baseline vouches for, kept before it did. Only its first baseline: a
  * later one could list a record signed since, and so launder it once stripped.
- * It began once it holds a baseline, a signed record or a signed entry of a
- * latest decision, whether or not these check: a baseline that doesn't vouches
- * for nothing.
- * The host's anchor, when given, says so too, for a store that no longer shows it.
+ * It began once it holds a baseline or a signed record, whether or not these
+ * check: a baseline that doesn't vouches for nothing.
  * @param {Db} db
  * @param {Keys} keys
- * @param {Anchor | null} [anchor]
  * @returns {{ began: boolean, baseline: Set<string> | null, why: string | null }}
  */
-export function signingState(db, keys, anchor = null) {
+export function signingState(db, keys) {
   /** @type {Set<string> | null} */ let baseline = null;
   let why = null, began = false;
   for (const r of /** @type {any[]} */ (db.prepare(`SELECT payload FROM event WHERE op = ? ORDER BY seq LIMIT 1`).all(BASELINE_OP))) {
@@ -50,11 +46,7 @@ export function signingState(db, keys, anchor = null) {
     if (sig.state === "signed") baseline = new Set(digests);
     else why = `its baseline doesn't hold: ${"why" in sig ? sig.why : ""}`;
   }
-  if (!began) began = Boolean(db.prepare(`SELECT 1 FROM decision WHERE envelope IS NOT NULL LIMIT 1`).get())
-                   || Boolean(db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(LATEST_OP));
-  if (!began && anchor?.began.size)
-    began = /** @type {any[]} */ (db.prepare(`SELECT DISTINCT json_extract(record, '$.subject.repo') AS repo FROM decision`).all())
-      .some((r) => anchor.began.has(r.repo));
+  if (!began) began = Boolean(db.prepare(`SELECT 1 FROM decision WHERE envelope IS NOT NULL LIMIT 1`).get());
   return { began, baseline, why };
 }
 
@@ -77,42 +69,6 @@ export function trustOf(row, keys, state) {
 }
 
 /**
- * The latest decision for a pull request as its signed order says (#165): the
- * digest its highest entry names, each checked as this repository's. Null when
- * it has none, and `corrupt` when an entry doesn't check, or one is missing or
- * named twice.
- * With the host's anchor, an order that ends below the entry this host signed
- * last was cut short: its newest entries were taken away, or the store restored
- * from before them.
- * @param {Db} db
- * @param {number} pr
- * @param {string} repo
- * @param {Keys} keys
- * @param {Anchor | null} [anchor]
- * @returns {{ digest: string, n: number } | { corrupt: string } | null}
- */
-export function signedLatest(db, pr, repo, keys, anchor = null) {
-  const anchored = anchor?.latest.get(`${repo}#${pr}`) ?? 0;
-  const rows = /** @type {any[]} */ (db.prepare(`SELECT payload FROM event WHERE op = ? AND subject = ? ORDER BY seq`).all(LATEST_OP, `pr:${pr}`));
-  if (!rows.length)
-    return anchored ? { corrupt: `the store holds no signed order of its decisions, though this host signed up to entry ${anchored}` } : null;
-  /** @type {Map<number, string>} */ const byN = new Map();
-  for (const r of rows) {
-    let p;
-    try { p = JSON.parse(r.payload); } catch { return { corrupt: "an entry in the signed order of its decisions can't be read" }; }
-    const sig = typeof p?.envelope === "string" ? checkEnvelope(p.envelope, latestStatement({ repo, pr, n: p.n, digest: p.digest }), keys, "order")
-      : { state: "corrupt", why: "it isn't signed" };
-    if (sig.state !== "signed") return { corrupt: `an entry in the signed order of its decisions doesn't hold: ${"why" in sig ? sig.why : ""}` };
-    if (byN.has(p.n)) return { corrupt: `the signed order of its decisions names entry ${p.n} twice` };
-    byN.set(p.n, String(p.digest));
-  }
-  const top = Math.max(...byN.keys());
-  for (let n = 1; n <= top; n++) if (!byN.has(n)) return { corrupt: `the signed order of its decisions is missing entry ${n}` };
-  if (top < anchored) return { corrupt: `the signed order of its decisions ends at entry ${top}, though this host signed up to entry ${anchored}` };
-  return { digest: /** @type {string} */ (byN.get(top)), n: top };
-}
-
-/**
  * The latest decision for a pull request, or for one of its commits, as `reeve
  * why` shows it: the verdict and every clause with its detail, the evidence it
  * was judged from and when that was seen, and the policy and code that judged.
@@ -120,26 +76,25 @@ export function signedLatest(db, pr, repo, keys, anchor = null) {
  * holds no record for it.
  * @param {Db} db
  * @param {number} pr
- * @param {{ head?: string | null, keys?: Keys | null, anchor?: Anchor | null }} [o]
+ * @param {{ head?: string | null, keys?: Keys | null }} [o]
  */
-export function explainDecision(db, pr, { head = null, keys = null, anchor = null } = {}) {
+export function explainDecision(db, pr, { head = null, keys = null } = {}) {
   const d = latestDecision(db, pr, { head });
   if (!d) return null;
   const r = d.record;
   /** @type {{ id: string, state: string, detail?: string, kind?: string, next?: string }[]} */
   const clauses = r.verdict.clauses ?? [];
   const out = [];
-  const sig = keys ? trustOf(d, keys, signingState(db, keys, anchor)) : null;
+  const sig = keys ? trustOf(d, keys, signingState(db, keys)) : null;
   if (d.corrupt) out.push(`  this record can't be trusted: ${d.corrupt} (record ${short(d.digest)}); it was changed after it was kept`);
   else if (sig?.state === "corrupt") out.push(`  this record can't be trusted: ${sig.why} (record ${short(d.digest)})`);
-  // Which is latest, against the signed order, when no commit was named.
-  const order = keys && head === null ? signedLatest(db, pr, r.subject?.repo, keys, anchor) : null;
-  if (order && "corrupt" in order) out.push(`  this record can't be trusted as the latest: ${order.corrupt}`);
-  else if (order && "digest" in order && order.digest !== d.digest)
-    out.push(`  this record can't be trusted as the latest: the signed order of this pull request's decisions ends at record ${short(order.digest)}`);
   out.push(`${r.verdict.state} at ${short(r.subject.head)}, tree ${short(r.subject.tree)}, judged ${span(d.first_at, d.last_at)} (record ${short(d.digest)})`);
   if (sig?.state === "signed") out.push(`  signed by key ${short(sig.keyid)}, ${sig.where}`);
   else if (sig?.state === "unsigned") out.push(`  unsigned: ${sig.why}`);
+  // A signature covers a record, not which record is latest: that is the
+  // store's own order, and said so when more than one could be.
+  const kept = head === null ? Number(/** @type {any} */ (db.prepare(`SELECT count(*) AS n FROM decision WHERE pr = ?`).get(pr))?.n ?? 0) : 0;
+  if (sig && kept > 1) out.push(`  the latest of its ${kept} records by the store's own order, which isn't signed`);
   if (r.verdict.summary) out.push(`  ${r.verdict.summary}`);
   const w = Math.max(0, ...clauses.map(c => c.id.length));
   // An UNKNOWN clause says what kind it is and what happens next (#165).
@@ -222,13 +177,13 @@ function clauseDiffs(was, now) {
  * @param {Db} db
  * @param {{ digest?: string | null, pr?: number | null, since?: number | null }} [which]
  * @param {{ code?: Record<string, unknown> | null, profile?: Record<string, any> | null, compute?: typeof computeVerdict,
- *           keys?: Keys | null, anchor?: Anchor | null }} [now]
+ *           keys?: Keys | null }} [now]
  * @returns {Replayed[]}
  */
-export function replayDecisions(db, which = {}, { code = null, profile = null, compute = computeVerdict, keys = null, anchor = null } = {}) {
+export function replayDecisions(db, which = {}, { code = null, profile = null, compute = computeVerdict, keys = null } = {}) {
   /** @type {Replayed[]} */
   const results = [];
-  const state = keys ? signingState(db, keys, anchor) : null;
+  const state = keys ? signingState(db, keys) : null;
   for (const d of decisionsFor(db, which)) {
     const r = d.record;
     const base = { digest: d.digest, pr: d.pr, head: d.head, recorded: r.verdict.state,
@@ -259,27 +214,6 @@ export function replayDecisions(db, which = {}, { code = null, profile = null, c
     }
     if (canonical(now) === canonical(r.verdict)) results.push({ ...base, outcome: "same" });
     else results.push({ ...base, outcome: "differs", now: now.state, diffs: clauseDiffs(r.verdict, now) });
-  }
-  // What the signed order of each pull request's decisions names, the store has
-  // to hold too: a record deleted from the store, adverse perhaps, is reported,
-  // never passed over. Not when one record was asked for by its digest.
-  if (keys && which.digest == null) {
-    const held = new Set(results.map((x) => x.digest));
-    const unheld = db.prepare(`SELECT 1 FROM decision WHERE digest = ? LIMIT 1`);
-    const where = [`op = ?`], args = [/** @type {string | number} */ (LATEST_OP)];
-    if (which.pr != null) { where.push(`subject = ?`); args.push(`pr:${which.pr}`); }
-    if (which.since != null) { where.push(`at >= ?`); args.push(which.since); }
-    /** @type {Set<string>} */ const seen = new Set();
-    for (const e of /** @type {any[]} */ (db.prepare(`SELECT subject, payload FROM event WHERE ${where.join(" AND ")} ORDER BY seq`).all(...args))) {
-      let p;
-      try { p = JSON.parse(e.payload); } catch { continue; }
-      const digest = String(p?.digest ?? "");
-      if (!digest || seen.has(digest) || held.has(digest)) continue;
-      seen.add(digest);
-      if (unheld.get(digest)) continue;
-      results.push({ digest, pr: Number(String(e.subject).slice(3)), head: "", recorded: "unknown", outcome: "unreplayable",
-                     why: "the signed order of its decisions names this record, but the store no longer holds it", codeChanged: null, policyChanged: null });
-    }
   }
   return results;
 }

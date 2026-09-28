@@ -58,9 +58,8 @@ export function saveDecision(db, { at, seq, pr, head, policy, evidence, decision
     .run(decision.digest, pr, head, canonical(decision.record), at, at, seq, seq, envelope, unsigned);
 }
 
-/** The events that say a store began signing, and each change of a pull request's latest decision (#165). */
+/** The event that says a store began signing, with its baseline (#165). */
 export const BASELINE_OP = "signing.baseline";
-export const LATEST_OP = "decision.latest";
 
 /**
  * @typedef {{ digest: string, pr: number, head: string, record: Record<string, any>, corrupt: string | null,

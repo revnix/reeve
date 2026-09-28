@@ -15,7 +15,7 @@ import { snapshot, restore, latestSnapshot, exportEvents,
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick, measuredContainment, withdrawStanding, tellStuck, runningCode } from "../src/daemon.mjs";
 import { replayDecisions, renderReplay } from "../src/decisions.mjs";
-import { knownKeys, fileSigner, fileAnchor, readAnchor, signingKey, PUBLIC_FILE } from "../src/signing.mjs";
+import { knownKeys, fileSigner, signingKey, PUBLIC_FILE } from "../src/signing.mjs";
 import { SelectorError } from "../src/db/records.mjs";
 import { readState, render as renderStatus, statusline, why, cleanMergeRate } from "../src/status.mjs";
 import { init } from "../src/init.mjs";
@@ -895,20 +895,21 @@ switch (cmd) {
   // THE HOST'S SIGNING KEY (#165): its id and public half, to publish under
   // deploy/signing-keys/. Only the public half is read.
   case "signing-key": {
-    const pub = join(HOME, "credentials", PUBLIC_FILE);
+    const dir = join(HOME, "credentials");
     // The public half is written again from the key first, if it's missing or
     // isn't the key's: what this points at must never hold the key itself.
-    signingKey(join(HOME, "credentials"));
-    const keys = knownKeys({ local: join(HOME, "credentials") });
-    const [id] = [...keys.keys()];
-    if (!id) {
-      console.log(`no signing key yet at ${join(HOME, "credentials")}: reeve makes one the first time it keeps a decision record`);
+    const k = signingKey(dir);
+    const kept = [...knownKeys({ local: dir }).entries()].filter(([, v]) => v.where !== "this host's");
+    const also = kept.length ? `\nkept from keys it replaced, to publish too: ${kept.map(([id, v]) => `${id} at ${v.path}`).join(", ")}` : "";
+    if (!k.ok) {
+      console.log(`no signing key yet at ${dir}: reeve makes one the first time it keeps a decision record${also}`);
       process.exit(3);
     }
+    const id = k.keyid;
     const published = knownKeys({ published: join(ROOT, "deploy", "signing-keys") }).has(id);
     console.log(`key id ${id}
-public key ${pub}
-${published ? "published in deploy/signing-keys/" : `not published yet: copy it to deploy/signing-keys/${id}.pub`}`);
+public key ${join(dir, PUBLIC_FILE)}
+${published ? "published in deploy/signing-keys/" : `not published yet: copy it to deploy/signing-keys/${id}.pub`}${also}`);
     process.exit(0);
   }
 
@@ -930,7 +931,7 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     let results;
     try {
       results = replayDecisions(open(dbPath), { pr: pr == null ? null : Number(pr), since: sinceAt, digest: opt("record") ?? null },
-                                { code: runningCode(), profile, keys: signingKeys(), anchor: readAnchor(join(HOME, "credentials")) });
+                                { code: runningCode(), profile, keys: signingKeys() });
     } catch (e) {
       // A record named by a start that isn't hexadecimal, or that more than one
       // shares, is refused rather than replayed as a pattern.
@@ -978,7 +979,7 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     if (cmd === "why") {
       const target = positionals.find(a => /^#?\d+$/.test(a) || a.startsWith("pr:"));
       if (!target) { console.error("reeve why <pr-number>"); process.exit(1); }
-      console.log(why(db, target, { head: opt("head") ?? null, keys: signingKeys(), anchor: readAnchor(join(HOME, "credentials")) }));
+      console.log(why(db, target, { head: opt("head") ?? null, keys: signingKeys() }));
       process.exit(0);
     }
 
@@ -2408,8 +2409,6 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       // Each decision record is signed with the host's key, made on first use in
       // the credentials folder, which no worker may read (#165).
       signer: fileSigner(join(HOME, "credentials")),
-      // And what it signed last, kept beside the key, outside every store.
-      anchor: fileAnchor(join(HOME, "credentials")),
       // Execution is opt-in. A loop that acts before its decisions have been
       // watched is how an unattended run becomes an incident.
       execute: flag("execute"),

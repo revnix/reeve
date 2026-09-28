@@ -16,21 +16,18 @@
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, sign, verify } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync,
          unlinkSync, writeSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { canonical } from "./db/ops.mjs";
 import { STATEMENT_TYPE } from "./evidence.mjs";
 
 /** The DSSE payload type for an in-toto statement. */
 export const PAYLOAD_TYPE = "application/vnd.in-toto+json";
 export const DECISION_PREDICATE = "https://revnix.com/reeve/decision/v1";
-/** The records a store held unsigned when it began signing, and each change of a pull request's latest decision. */
+/** The records a store held unsigned when it began signing. */
 export const BASELINE_PREDICATE = "https://revnix.com/reeve/unsigned-baseline/v1";
-export const LATEST_PREDICATE = "https://revnix.com/reeve/latest-decision/v1";
 /** The private key's file in the credentials folder, and its public half's. */
 export const KEY_FILE = "signing-ed25519.pem";
 export const PUBLIC_FILE = "signing-ed25519.pub";
-/** What the host signed last, kept beside the key, outside every store: a file per repository. */
-export const ANCHOR_DIR = "signing-anchors";
 
 /** @typedef {import("node:crypto").KeyObject} KeyObject */
 /** @typedef {{ payloadType: string, payload: string, signatures: { keyid: string, sig: string }[] }} Envelope */
@@ -84,20 +81,6 @@ export function baselineStatement(digests) {
 }
 
 /**
- * A change of a pull request's latest decision, numbered from 1, so which one is
- * latest is signed too, not read from the store's own order.
- * @param {{ repo: string, pr: number, n: number, digest: string }} l
- */
-export function latestStatement({ repo, pr, n, digest }) {
-  return {
-    _type: STATEMENT_TYPE,
-    subject: [{ name: `${repo}#${pr}`, digest: { sha256: digest } }],
-    predicateType: LATEST_PREDICATE,
-    predicate: { repo, pr, n, digest },
-  };
-}
-
-/**
  * The signing key in `dir`, the credentials folder. With `create`, one is made
  * when there's none, readable only by its owner. It's written whole to a file of
  * its own first, then linked into place, which fails if a key is already there:
@@ -106,10 +89,11 @@ export function latestStatement({ repo, pr, n, digest }) {
  * that isn't Ed25519, is refused. The public half beside it is written again
  * whenever it's missing, unreadable, or another key's.
  * @param {string} dir
- * @param {{ create?: boolean, write?: (fd: number, text: string) => void }} [o]  `write` for a test's faults
+ * @param {{ create?: boolean, write?: (fd: number, buf: Buffer, offset: number, length: number) => number }} [o]
+ *        `write` writes part of a buffer, as `writeSync` does, and answers how much: a test's faults
  * @returns {{ ok: true, key: KeyObject, keyid: string, created: boolean } | { ok: false, why: string }}
  */
-export function signingKey(dir, { create = false, write = (fd, text) => { writeSync(fd, text); } } = {}) {
+export function signingKey(dir, { create = false, write = (fd, buf, offset, length) => writeSync(fd, buf, offset, length) } = {}) {
   const path = join(dir, KEY_FILE);
   let created = false;
   try {
@@ -120,7 +104,7 @@ export function signingKey(dir, { create = false, write = (fd, text) => { writeS
       const temp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
       const fd = openSync(temp, "wx", 0o600);
       try {
-        try { write(fd, String(privateKey.export({ type: "pkcs8", format: "pem" }))); fsyncSync(fd); } finally { closeSync(fd); }
+        try { writeAll(fd, String(privateKey.export({ type: "pkcs8", format: "pem" })), write); fsyncSync(fd); } finally { closeSync(fd); }
         try { linkSync(temp, path); created = true; }
         catch (err) {
           // Another process made it first: that one is the key.
@@ -152,6 +136,21 @@ export function signingKey(dir, { create = false, write = (fd, text) => { writeS
 }
 
 /**
+ * All of `text`, however little each write takes: a short write is written on
+ * from where it stopped, never taken for the whole.
+ * @param {number} fd @param {string} text
+ * @param {(fd: number, buf: Buffer, offset: number, length: number) => number} write
+ */
+function writeAll(fd, text, write) {
+  const buf = Buffer.from(text);
+  for (let at = 0; at < buf.length;) {
+    const n = write(fd, buf, at, buf.length - at);
+    if (!(n > 0)) throw new Error(`a write took nothing, at byte ${at} of ${buf.length}`);
+    at += n;
+  }
+}
+
+/**
  * The Ed25519 public key in `path`, or null when there's none to read. A file
  * that holds a private key is never read as a public one: the key can be derived
  * from it, but a file meant to be published must never hold it.
@@ -178,98 +177,17 @@ const archivedPublic = (keyid) => `signing-ed25519.${keyid}.pub`;
 /**
  * The public half, written whole to a file of its own and renamed into place.
  * Its own file is gone afterwards, whatever failed.
- * @param {string} dir @param {KeyObject} publicKey @param {(fd: number, text: string) => void} write
+ * @param {string} dir @param {KeyObject} publicKey
+ * @param {(fd: number, buf: Buffer, offset: number, length: number) => number} write
  */
 function writePublic(dir, publicKey, write) {
   const path = join(dir, PUBLIC_FILE);
   const temp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   try {
     const fd = openSync(temp, "wx", 0o644);
-    try { write(fd, String(publicKey.export({ type: "spki", format: "pem" }))); fsyncSync(fd); } finally { closeSync(fd); }
+    try { writeAll(fd, String(publicKey.export({ type: "spki", format: "pem" })), write); fsyncSync(fd); } finally { closeSync(fd); }
     renameSync(temp, path);
   } finally { try { unlinkSync(temp); } catch { /* renamed, or gone */ } }
-}
-
-/**
- * Where the host's anchor for `repo` is kept, in the credentials folder.
- * @param {string} dir @param {string} repo  owner/name
- */
-export function anchorPath(dir, repo) {
-  const [owner, name] = String(repo).split("/");
-  if (!/^[\w.-]+$/.test(owner ?? "") || !/^[\w.-]+$/.test(name ?? "")) throw new Error(`not a repository: ${JSON.stringify(repo)}`);
-  return join(dir, ANCHOR_DIR, owner, `${name}.json`);
-}
-
-/**
- * The host's anchor (#165): what it signed last, kept beside the key, where
- * whoever can change a store, or restore an older one, can't. A file per
- * repository, so one repository's daemon never writes over another's: whether
- * its store began signing, and each pull request's highest entry of the signed
- * order. It only moves forward, and is written whole and renamed into place. The
- * daemon writes it under its store's write lock, so two daemons on one store
- * don't either. Each write says whether it landed; one that didn't leaves the
- * anchor behind, which reads as nothing taken away, until the next tick.
- * @param {string} dir  the credentials folder
- * @param {{ write?: (fd: number, text: string) => void }} [o]  `write` for a test's faults
- */
-export function fileAnchor(dir, { write = (fd, text) => { writeSync(fd, text); } } = {}) {
-  const update = (/** @type {string} */ repo, /** @type {(a: { began: boolean, latest: Record<string, number> }) => boolean} */ change) => {
-    try {
-      const path = anchorPath(dir, repo);
-      const a = anchorAt(path);
-      if (!change(a)) return true;
-      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-      const temp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-      try {
-        const fd = openSync(temp, "wx", 0o600);
-        try { write(fd, canonical(a)); fsyncSync(fd); } finally { closeSync(fd); }
-        renameSync(temp, path);
-      } finally { try { unlinkSync(temp); } catch { /* renamed, or gone */ } }
-      return true;
-    } catch { return false; }
-  };
-  return {
-    /** @param {string} repo */
-    began: (repo) => update(repo, (a) => (a.began ? false : ((a.began = true), true))),
-    /** @param {string} repo @param {number} pr @param {number} n */
-    note: (repo, pr, n) => update(repo, (a) => {
-      if ((a.latest[String(pr)] ?? 0) >= n) return false;
-      a.latest[String(pr)] = n;
-      a.began = true;
-      return true;
-    }),
-  };
-}
-
-/** The anchor in `path`, or an empty one when there's none. Throws when it can't be read. @param {string} path */
-function anchorAt(path) {
-  if (!existsSync(path)) return { began: false, latest: {} };
-  const a = JSON.parse(readFileSync(path, "utf8"));
-  return { began: a?.began === true, latest: { ...(a?.latest ?? {}) } };
-}
-
-/**
- * The host's anchors, to check stores against. Empty when there are none; one
- * that can't be read tells nothing, and takes nothing away.
- * @param {string} dir  the credentials folder
- * @returns {{ began: Set<string>, latest: Map<string, number> }}
- */
-export function readAnchor(dir) {
-  const out = { began: new Set(), latest: new Map() };
-  let owners = [];
-  try { owners = readdirSync(join(dir, ANCHOR_DIR)); } catch { return out; }
-  for (const owner of owners) {
-    let files = [];
-    try { files = readdirSync(join(dir, ANCHOR_DIR, owner)).filter((f) => f.endsWith(".json")); } catch { continue; }
-    for (const f of files) {
-      const repo = `${owner}/${f.slice(0, -".json".length)}`;
-      let a;
-      try { a = anchorAt(join(dir, ANCHOR_DIR, owner, f)); } catch { continue; }
-      if (a.began) out.began.add(repo);
-      for (const [pr, n] of Object.entries(a.latest)) if (Number.isInteger(n)) out.latest.set(`${repo}#${pr}`, n);
-    }
-  }
-  return out;
 }
 
 /**
@@ -321,14 +239,14 @@ export function signStatement(statement, { key, keyid }) {
  * host's own, from `local`, the credentials folder. A file that isn't an Ed25519
  * public key is skipped.
  * @param {{ published?: string | null, local?: string | null }} where
- * @returns {Map<string, { key: KeyObject, where: string }>}
+ * @returns {Map<string, { key: KeyObject, where: string, path: string }>}
  */
 export function knownKeys({ published = null, local = null } = {}) {
-  /** @type {Map<string, { key: KeyObject, where: string }>} */
+  /** @type {Map<string, { key: KeyObject, where: string, path: string }>} */
   const keys = new Map();
   const add = (/** @type {string} */ path, /** @type {string} */ where) => {
     const key = publicKeyAt(path);
-    if (key && !keys.has(keyIdOf(key))) keys.set(keyIdOf(key), { key, where });
+    if (key && !keys.has(keyIdOf(key))) keys.set(keyIdOf(key), { key, where, path });
   };
   if (published) {
     let names = [];

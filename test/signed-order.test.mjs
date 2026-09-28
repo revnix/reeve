@@ -44,7 +44,7 @@ const at = (head, ci = "GREEN") => {
   return { ...EVAL, head, input: i, verdict: computeVerdict(i) };
 };
 /** What the host's reeve is given: its signer, its keys and its anchor, over the credentials folder `dir`. */
-const host = (dir) => ({ signer: fileSigner(dir), keys: () => knownKeys({ local: dir }), anchor: fileAnchor(dir), hostKeys: () => knownKeys({ local: dir }) });
+const host = (dir) => ({ signer: fileSigner(dir), keys: () => knownKeys({ local: dir }), anchor: fileAnchor(dir) });
 /** Ticks over one store, each with its own evaluation of #42, as `host` gives. Answers the store's path. */
 async function ticks(evals, ctx, dbPath = null) {
   const path = dbPath ?? join(tempDir("reeve-order-ticks-"), "s.db");
@@ -289,7 +289,6 @@ test("reeve why and reeve replay read the host's anchor for the repository asked
 test("the daemon run by reeve is given the host's anchor and keys", () => {
   const src = readFileSync(REEVE, "utf8");
   assert.match(src, /anchor: fileAnchor\(join\(HOME, "credentials"\)\),\n\s+keys: signingKeys,/);
-  assert.match(src, /\n\s+hostKeys: \(\) => knownKeys\(\{ local: join\(HOME, "credentials"\) \}\),/, "and this host's own keys");
   assert.ok(existsSync(REEVE), "control");
 });
 
@@ -746,9 +745,12 @@ test("a pull request whose order a tick couldn't extend, as another held the loc
   await run({ openPrs: () => [], evaluate: () => at(A), dbPath, prState: () => "MERGED", prIsFinished: () => true, ...host(dir) });
   const db = open(dbPath);
   const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
-  const latest = db.prepare("SELECT digest FROM decision WHERE pr = ? ORDER BY last_seq DESC LIMIT 1").get(PR)?.digest;
+  const [first, left] = digestsOf(db);
   db.close();
-  assert.ok("digest" in order && order.top === 2 && order.digest === latest, JSON.stringify(order));
+  // Named, so it can't be taken away unseen; and not signed as the latest by a
+  // reeve that didn't keep it, as a record put in the store could be.
+  assert.ok("digests" in order && order.top === 2 && order.digests.has(left), JSON.stringify(order));
+  assert.equal("digest" in order && order.digest, first, "the latest stays where this host signed it");
   assert.equal(readAnchor(dir, REPO)?.latest.get(PR), 2);
 });
 
@@ -1403,4 +1405,39 @@ test("an order goes on across a change of this host's key, the reeve still runni
   assert.equal(new Set(envelopes).size, 2, `control: its entries were signed by two keys: ${JSON.stringify(envelopes)}`);
   assert.equal("top" in order && order.top, 2, JSON.stringify(order));
   assert.doesNotMatch(r.log, /its signed order doesn't hold/);
+});
+
+// ── from #278's twelfth review ───────────────────────────────────────────────
+
+test("after a restart, a record copied in from another store of this host isn't signed as the latest", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A, "RED")], host(dir));
+  // Another store of the repository, on this host: it keeps records, signed with this host's key, and orders none.
+  const alternate = await ticks([at(B, "RED")], host(dir), join(tempDir("reeve-order-alternate-"), "s.db"));
+  const alt = open(alternate);
+  const rec = alt.prepare("SELECT * FROM decision WHERE pr = ?").get(PR);
+  alt.close();
+  let db = open(dbPath);
+  const [ours] = digestsOf(db);
+  // Copied in by a store edit, as this store's latest, the one record no entry names.
+  const cols = Object.keys(rec);
+  db.prepare(`INSERT INTO decision(${cols.join(",")}) VALUES(${cols.map(() => "?").join(",")})`).run(...cols.map((c) => (c === "last_seq" ? 1000000 : rec[c])));
+  db.close();
+  await closedTick(dbPath, host(dir));
+  db = open(dbPath);
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  db.close();
+  assert.ok(rec && "digests" in order && order.digests.has(rec.digest), `control: it's named, as a record the store holds: ${JSON.stringify(order)}`);
+  assert.equal("digest" in order && order.digest, ours, "the order's latest stays the record this store kept");
+});
+
+test("a rollback that takes a pull request's every record and entry away is said by the daemon's next tick", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A), at(A, "RED")], host(dir));
+  const db = open(dbPath);
+  db.prepare("DELETE FROM decision WHERE pr = ?").run(PR);
+  db.prepare("DELETE FROM event WHERE op = 'decision.latest'").run();
+  db.close();
+  const r = await closedTick(dbPath, host(dir));
+  assert.match(r.log, /#42: its signed order ends at entry 0, though this host signed up to entry 2, so it isn't extended/);
 });

@@ -54,7 +54,7 @@ import { randomBytes } from "node:crypto";
 import { resolveHome } from "./home.mjs";
 import { codeVersion, policyOf, recordsFor } from "./evidence.mjs";
 import { saveDecision } from "./db/records.mjs";
-import { decisionStatement, baselineStatement, latestStatement, checkSignature } from "./signing.mjs";
+import { decisionStatement, baselineStatement, latestStatement } from "./signing.mjs";
 import { BASELINE_OP, LATEST_OP, STORE_ID_OP, latestDecision, storeIdentity } from "./db/records.mjs";
 import { signedOrder, strayEntry } from "./decisions.mjs";
 
@@ -1433,9 +1433,6 @@ export async function tick(ctx) {
   // number a store edit put there. The top it answers is noted on the anchor once
   // the transaction has committed; 0 for none.
   /** @type {Map<string, any> | null | undefined} */ let orderKeys;
-  // This host's own keys, the ones its own records are signed with: of all the
-  // keys an order is checked with, only these vouch that this host kept a record.
-  /** @type {Map<string, any> | null | undefined} */ let orderHostKeys;
   // What this reeve kept for each pull request as it runs, and hasn't ordered
   // yet: the record it kept last, where in the store's sequence of events it
   // kept it, and every one it kept. The latest is signed from this, not from the
@@ -1476,17 +1473,18 @@ export async function tick(ctx) {
     for (const d of order.digests) unnamed.delete(d);
     // Its latest, and where in the store's sequence it was seen: the record this
     // reeve kept last, unless the order's latest was seen after it, as another
-    // reeve on the store signed it. Where this one kept none as it runs, the
-    // store's own order is taken only for a first entry, as nothing else says,
-    // or where it has as the latest the one record no entry names yet, signed by
-    // this host, not by another whose key is published: kept since the order's
-    // last entry by a tick that stopped before ordering it. Never an older record
-    // raised over it.
+    // reeve on the store signed it. Where this one kept none as it runs, as after
+    // a restart, the store's own order is taken only for a first entry, as
+    // nothing else says; never over an order's latest, as a record could be put
+    // in the store and raised there, another store's say, signed by this host
+    // too. A record kept by a reeve that stopped before ordering it is named by
+    // the next entry, and the latest stays where this host signed it until a
+    // reeve judges the pull request again. Stopping finishes the tick, orders
+    // included, so only a reeve that died leaves one.
     const stored = latestDecision(db, pr);
     /** @type {[string | null, number | null]} */
     const [digest, seq] = own ? (order.seq == null || own.seq > order.seq ? [own.latest, own.seq] : [order.digest, order.seq])
       : !order.top ? [stored?.digest ?? null, stored ? Number(stored.last_seq) : null]
-      : stored && unnamed.size === 1 && unnamed.has(stored.digest) && checkSignature(stored, /** @type {any} */ (orderHostKeys ?? new Map())).state === "signed" ? [stored.digest, Number(stored.last_seq)]
       : [order.digest, order.seq];
     if (!digest) return { top: order.top, named: true };
     unnamed.delete(digest);
@@ -1542,6 +1540,10 @@ export async function tick(ctx) {
     const named = (/** @type {number} */ pr, /** @type {string} */ d) => { const o = orders.get(pr); return Boolean(o && "digests" in o && o.digests.has(d)); };
     /** @type {Set<number>} */ const prs = new Set();
     for (const [pr, o] of orders) if ("corrupt" in o || o.top > (a.latest.get(pr) ?? 0)) prs.add(pr);
+    // And every one the host's anchor holds an entry of whose order is short of
+    // it, none left in the store included: cut short, or restored from before,
+    // it's said every tick, though its pull request is never judged again.
+    for (const [pr, n] of a.latest) { const o = orders.get(pr); if (!o || ("top" in o && o.top < n)) prs.add(pr); }
     for (const r of /** @type {any[]} */ (db.prepare(`SELECT pr, digest FROM decision`).all())) if (!named(Number(r.pr), String(r.digest))) prs.add(Number(r.pr));
     for (const [pr, k] of orderKept) {
       const o = orders.get(pr);
@@ -1559,7 +1561,6 @@ export async function tick(ctx) {
     withOrderLock((held) => {
       if (!held) return;
       if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
-      if (orderHostKeys === undefined) orderHostKeys = ctx.hostKeys?.() ?? null;
       if (!orderKeys) return;
       (ctx.durably ?? durably)(db, () => {
         let id = null, a = null;

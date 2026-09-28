@@ -2447,8 +2447,6 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       // the keys its entries are checked with (#274).
       anchor: fileAnchor(join(HOME, "credentials")),
       keys: signingKeys,
-      // This host's own keys, public halves only: what vouches that it kept a record.
-      hostKeys: () => knownKeys({ local: join(HOME, "credentials") }),
       // Execution is opt-in. A loop that acts before its decisions have been
       // watched is how an unattended run becomes an incident.
       execute: flag("execute"),

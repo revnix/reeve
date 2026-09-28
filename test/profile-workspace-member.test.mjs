@@ -318,3 +318,83 @@ test("a pattern ending in /** reaches the folder itself as each manager does", (
   assert.deepEqual(inheritors(["bar/**"], { "yarn.lock": "" }, { packageManager: "yarn@1.22.22" }).members, ["bar"], "yarn 1: the pattern lists bar");
   assert.deepEqual(inheritors(["bar/**"], { "bun.lockb": "" }).members, ["bar"], "bun: the pattern lists bar");
 });
+
+// ── from #266's post-ready review, measured later on 2026-09-27 ───────────────
+
+test("yarn 4 reaches a folder through a trailing /** unless the folder is the pattern's literal base", () => {
+  const yarn4 = patterns => inheritors(patterns, { "yarn.lock": "" }, { packageManager: "yarn@4.14.1" }).members;
+  assert.deepEqual(yarn4(["*/**"]), ["foo", "bar"]);
+  assert.deepEqual(yarn4(["b*/**"]), ["bar"]);
+  assert.deepEqual(yarn4(["bar/**"]), [], "control: bar is the base `bar/**` walks from");
+});
+
+test("yarn 2 and 3, which read a trailing /** by a rule not measured, leave the folder it reaches unknown", () => {
+  const { root, members } = inheritors(["*/**"], { "yarn.lock": "" }, { packageManager: "yarn@3.8.7" });
+  assert.deepEqual(members, []);
+  assert.ok(untold(root, "bar"));
+  assert.deepEqual(inheritors(["bar/**"], { "yarn.lock": "" }, { packageManager: "yarn@3.8.7" }).members, [],
+                   "control: the pattern's own base, measured, isn't listed");
+});
+
+test("a leading !( is an extglob to yarn 4, not an exclusion", () => {
+  const yarn4 = patterns => inheritors(patterns, { "yarn.lock": "" }, { packageManager: "yarn@4.14.1" }).members;
+  assert.deepEqual(yarn4(["!(foo)"]), ["bar"]);
+  assert.deepEqual(yarn4(["*", "!(foo)"]), ["foo", "bar"]);
+  assert.deepEqual(inheritors(["!(foo)"], { "yarn.lock": "" }, { packageManager: "yarn@1.22.22" }).members, [], "control: yarn 1 reads no pattern with a bang");
+});
+
+test("yarn 2 and 3, which read a leading !( as an exclusion of a group, and pnpm, as an extglob, leave it unknown", () => {
+  const yarn3 = inheritors(["*", "!(foo)"], { "yarn.lock": "" }, { packageManager: "yarn@3.8.7" });
+  assert.deepEqual(yarn3.members, []);
+  assert.ok(untold(yarn3.root, "foo"));
+  const pnpm = pnpmWorkspace("packages:\n  - '!(foo)'\n");
+  assert.deepEqual(pnpm.members, []);
+  assert.ok(untold(pnpm.root, "bar"));
+});
+
+test("a negated character class, which pnpm 10 and 12 each read their own way, leaves pnpm's answer unknown", () => {
+  for (const cls of ["b[!x]r", "b[^x]r"]) {
+    const { root, members } = pnpmWorkspace(`packages:\n  - '${cls}'\n`);
+    assert.deepEqual(members, [], cls);
+    assert.ok(untold(root, "bar"), cls);
+  }
+  assert.deepEqual(pnpmWorkspace("packages:\n  - 'b[ax]r'\n").members, ["bar"], "control: a class without negation");
+});
+
+test("a .yarnrc.yml of comments only names no yarn, and one with settings leaves yarn 1's lockfile open", () => {
+  const v1 = { "yarn.lock": "# yarn lockfile v1\n" };
+  assert.deepEqual(inheritors(["*", "!bar"], { ...v1, ".yarnrc.yml": "# settings go here\n\n" }).members, ["foo", "bar"],
+                   "yarn 1, as its lockfile says, reads no exclusion");
+  const both = inheritors(["*", "!bar"], { ...v1, ".yarnrc.yml": "nodeLinker: node-modules\n" });
+  assert.deepEqual(both.members, ["foo"]);
+  assert.ok(untold(both.root, "bar"), "yarn 1 lists bar, and yarn 2 to 4 don't");
+});
+
+// ── from #270's first review ─────────────────────────────────────────────────
+
+/** Whether yarn 4 gives folder `id` the root's yarn, with folders `ids` and workspaces `patterns`. */
+function yarn4Folder(patterns, ids, id) {
+  const files = { "package.json": { name: "root", workspaces: patterns, packageManager: "yarn@4.14.1", scripts, devDependencies }, "yarn.lock": "" };
+  for (const f of ids) files[`${f}/package.json`] = { name: f.replace(/[^a-z]/g, "") || "x", scripts, devDependencies };
+  const root = checkout(files);
+  return { root, member: unit(root, id).packageManager !== null };
+}
+
+test("to yarn 4, a leading !( is never an exclusion, so a folder named like its group isn't excluded", () => {
+  assert.equal(yarn4Folder(["*", "!(foo)"], ["(foo)", "bar"], "(foo)").member, true);
+});
+
+test("yarn 4 reaches a folder through a trailing /** only after the wildcards it was measured with, and leaves other forms unknown", () => {
+  for (const pattern of ["???/**", "!(foo)/**", "{bar,baz}/**", "b[a]r/**"]) {
+    const { root, member } = yarn4Folder([pattern], ["bar"], "bar");
+    assert.equal(member, false, pattern);
+    assert.ok(untold(root, "bar"), pattern);
+  }
+  assert.equal(yarn4Folder(["b*/**"], ["bar"], "bar").member, true, "control: a measured form");
+});
+
+test("yarn 4's literal base keeps punctuation that isn't a glob, so a folder named with it is still the base", () => {
+  const { root, member } = yarn4Folder(["foo+bar/**"], ["foo+bar"], "foo+bar");
+  assert.equal(member, false);
+  assert.ok(!untold(root, "foo+bar"), "measured: the base isn't listed");
+});

@@ -179,16 +179,18 @@ export function baselineLost(db, repo, keys, store = storeIdentity(db), skip = n
 }
 
 /**
- * A repository other than `repo` that a decision record the store holds is of,
- * or null where there's none (#274): the store of another repository, named by
- * --db say, or one holding another's records beside its own.
+ * What the store holds besides records of `repo`, or null where it holds
+ * nothing else (#274): records of another repository, the store of another,
+ * named by --db say, or one holding another's beside its own; or a record
+ * whose repository can't be read, which can't be told to be this one's.
  * @param {Db} db @param {string} repo
  * @returns {string | null}
  */
 export function otherRepository(db, repo) {
   const r = /** @type {any} */ (db.prepare(`SELECT name FROM (SELECT CASE WHEN json_valid(record) THEN json_extract(record, '$.subject.repo') END AS name FROM decision)
-    WHERE name IS NOT NULL AND lower(name) <> lower(?) LIMIT 1`).get(String(repo)));
-  return r ? String(r.name) : null;
+    WHERE name IS NULL OR lower(name) <> lower(?) LIMIT 1`).get(String(repo)));
+  if (!r) return null;
+  return r.name == null ? "a record whose repository can't be read" : `records of ${r.name}`;
 }
 
 /**

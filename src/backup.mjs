@@ -24,6 +24,7 @@ import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync
 import { randomBytes } from "node:crypto";
 import { join, dirname } from "node:path";
 import { open as openStore, exportJsonl, storeLock } from "./db/ops.mjs";
+import { syncFolder } from "./signing.mjs";
 // Task 8's subset. `tablesAt` and `HUB_TABLES` are what a snapshot's table set
 // is validated against; Task 9 adds the locks, replay and hubEvent imports when
 // `restoreHub` needs them, and not before -- ESM resolves at instantiation, so
@@ -541,7 +542,8 @@ export function latestSnapshot(root, nwo, { deep = false } = {}) {
   return null;
 }
 
-export function restore(snapshotPath, dbPath, { overwrite = false, force = false, isDaemonRunning = daemonRunning, copy = copyFileSync } = {}) {
+export function restore(snapshotPath, dbPath, { overwrite = false, force = false, isDaemonRunning = daemonRunning, copy = copyFileSync,
+                                                 syncDir = syncFolder } = {}) {
   if (!existsSync(snapshotPath)) return { ok: false, why: `no snapshot at ${snapshotPath}` };
   if (existsSync(dbPath) && !overwrite)
     return { ok: false, why: `${dbPath} exists; pass overwrite to replace it, which discards anything newer than the snapshot` };
@@ -587,6 +589,11 @@ export function restore(snapshotPath, dbPath, { overwrite = false, force = false
     try { fsyncSync(fd); } finally { closeSync(fd); }
     for (const s of ["-wal", "-shm"]) { try { rmSync(dbPath + s, { force: true }); } catch {} }
     renameSync(temp, dbPath);
+    // Its folder synced too, before it's said to be restored: the rename, and the
+    // old log's removal, are names in it that a power loss could otherwise undo,
+    // bringing back the store as it was, or none, or a stale log beside it.
+    try { syncDir(dirname(dbPath)); }
+    catch (e) { return { ok: false, why: `${dbPath} is restored, but its folder couldn't be synced to disk, so a power loss could undo it: ${e.message}` }; }
   } catch (e) { return { ok: false, why: `could not restore: ${e.message}` }; }
   finally { try { rmSync(temp, { force: true }); } catch {} held?.release(); }
   return { ok: true, why: null };

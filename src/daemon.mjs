@@ -1595,12 +1595,12 @@ export async function tick(ctx) {
         // so too.
         const pending = pendingOrders(a, id);
         if (!pending.length) return;
-        // And only to a store of this repository: one of another, named by --db
-        // say, would take the anchor for good, and the repository's own store be
-        // refused as another store's.
+        // And only to a store of this repository, every record read as one of its:
+        // one of another, named by --db say, would take the anchor for good, and
+        // the repository's own store be refused as another store's.
         const other = bound ? null : otherRepository(db, nwo);
         if (other !== null) {
-          log(logPath, `signing: this store holds records of ${other}, not only of ${nwo}, so the host's anchor for ${nwo} isn't bound to it`);
+          log(logPath, `signing: this store holds ${other}, so it isn't taken as ${nwo}'s own, and the host's anchor for ${nwo} isn't bound to it`);
           return;
         }
         // Nor to one holding an order that doesn't check: of another repository,

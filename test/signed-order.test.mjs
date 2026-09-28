@@ -1578,7 +1578,7 @@ test("a store holding another repository's records doesn't bind the host's ancho
   f.close();
   const r = await closedTick(foreign, host(dir));
   assert.equal(readAnchor(dir, REPO)?.store ?? null, null, "the host's anchor for o/r isn't bound to it");
-  assert.match(r.log, /this store holds records of x\/y, not only of o\/r, so the host's anchor for o\/r isn't bound to it/);
+  assert.match(r.log, /this store holds records of x\/y, so it isn't taken as o\/r's own, and the host's anchor for o\/r isn't bound to it/);
   const db = open(await ticks([at(A)], host(dir)));
   const id = identityOf(db);
   db.close();
@@ -1649,4 +1649,40 @@ test("replay since a date reports a record its order names whose row can't be re
   assert.equal(threw, null, `replay stopped: ${threw?.message}`);
   assert.ok(replayed?.some((x) => x.digest === green && /its signed order names this record, but the store's copy of it doesn't hold: its record can't be read/.test(String(x.why))),
             JSON.stringify(replayed));
+});
+
+// ── from #278's sixteenth review ─────────────────────────────────────────────
+
+test("a store holding a record whose repository can't be read doesn't bind the host's anchor, so the repository's own store still can", async () => {
+  const dir = credentials();
+  // A record that isn't JSON, and one that names no repository.
+  for (const record of ["{", JSON.stringify({ subject: { pr: 43, head: A } })]) {
+    const other = join(tempDir("reeve-order-unreadable-"), "s.db");
+    const f = open(other);
+    f.prepare("INSERT INTO decision(digest, pr, head, record, first_at, last_at, first_seq, last_seq, envelope, unsigned) VALUES(?,?,?,?,?,?,?,?,?,?)")
+      .run("e".repeat(64), 43, A, record, 1, 1, 1, 1, null, "kept before signing");
+    f.close();
+    const r = await closedTick(other, host(dir));
+    assert.equal(readAnchor(dir, REPO)?.store ?? null, null, `the host's anchor for o/r isn't bound to a store holding ${record}`);
+    assert.match(r.log, /this store holds a record whose repository can't be read, so it isn't taken as o\/r's own, and the host's anchor for o\/r isn't bound to it/);
+  }
+  const db = open(await ticks([at(A)], host(dir)));
+  const id = identityOf(db);
+  db.close();
+  assert.equal(readAnchor(dir, REPO)?.store, id, "and o/r's own store binds it");
+});
+
+test("reeve restore syncs the store's folder once the store is in place, before it says it's restored", () => {
+  const dir = tempDir("reeve-order-restore-sync-");
+  const dbPath = join(dir, "s.db"), snap = join(dir, "snap.db");
+  open(dbPath).close();
+  copyFileSync(dbPath, snap);
+  const synced = [];
+  const r = restore(snap, dbPath, { overwrite: true, isDaemonRunning: () => null,
+                                    syncDir: (d) => synced.push({ d, placed: !readdirSync(d).some((n) => n.endsWith(".restoring")) }) });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.deepEqual(synced, [{ d: dir, placed: true }], "its folder synced, once the copy was renamed into place");
+  const failed = restore(snap, dbPath, { overwrite: true, isDaemonRunning: () => null, syncDir: () => { throw new Error("EIO: i/o error"); } });
+  assert.equal(failed.ok, false, "and a store whose folder couldn't be synced isn't said to be restored");
+  assert.match(String(failed.why), /couldn't be synced to disk/);
 });

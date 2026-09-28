@@ -88,7 +88,8 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
                     carriedReleases, carriedCooldowns, providerBind,
                     resolveRepoIdFn, project, keepDir = false, seams = null,
                     haltMarker, openPrs, containment, ticks = 1, dbPath, evaluate, treeOf, code, codeVersion,
-                    readQueue, evaluateQueue, publish, withdraw, signer, anchor, keys, durably, prState, prIsFinished } = {}) => {
+                    readQueue, evaluateQueue, publish, withdraw, signer, anchor, keys, durably, prState, prIsFinished,
+                    afterTick } = {}) => {
   const dir = tempDir("reeve-prov-");
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
@@ -278,6 +279,9 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     if (!containmentThrows) ctx.containment = verdictFor(i);
     r = await tick(ctx);
     all.push(r);
+    // Between this process's ticks, what another does: another reeve's tick on
+    // the same store, say (#274).
+    if (afterTick) await afterTick(i);
   }
   const out = { r, all, claims, releases, spawned, ctx,
                 esc: [...(r.escalations?.keys?.() ?? [])].join(" | "),

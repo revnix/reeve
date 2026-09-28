@@ -87,16 +87,18 @@ export function baselineStatement(digests) {
  * became its latest decision then, numbered from 1, so which record is latest is
  * signed too, not read from the store's own order. With every other record kept
  * for the pull request since the entry before, or, for its first, before it, so
- * none of them can be taken away unseen; and the store it's of, so an entry of
- * another store, another host's say, never passes for one of this store's.
- * @param {{ repo: string, pr: number, n: number, digest: string, records?: string[], store?: string | null }} entry
+ * none of them can be taken away unseen; the store it's of, so an entry of
+ * another store, another host's say, never passes for one of this store's; and
+ * where in the store's sequence of events its latest was seen, as the reeve that
+ * signed it saw it, so a reeve never signs a record it saw earlier over it.
+ * @param {{ repo: string, pr: number, n: number, digest: string, records?: string[], store?: string | null, seq?: number | null }} entry
  */
-export function latestStatement({ repo, pr, n, digest, records = [], store = null }) {
+export function latestStatement({ repo, pr, n, digest, records = [], store = null, seq = null }) {
   return {
     _type: STATEMENT_TYPE,
     subject: [{ name: `${repo}#${pr}`, digest: { sha256: digest } }],
     predicateType: LATEST_PREDICATE,
-    predicate: { repo, pr, n, digest, records: [...records].sort(), store },
+    predicate: { repo, pr, n, digest, records: [...records].sort(), store, seq },
   };
 }
 

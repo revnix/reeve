@@ -894,7 +894,7 @@ function record(db, { pr, head, verdict, decision, effects = [], retire = new Ma
         // on this pull request at ANY head, and `keep` spares the one just made.
         (enqueue(db, eff) !== null ? queued++ : known++);
       }
-      return { ok: true, queued, known, dropped };
+      return { ok: true, queued, known, dropped, seq: Number(decided.lastInsertRowid) };
     });
   } catch (err) {
     // A store that cannot record must not stop the loop -- but it must not report
@@ -1434,16 +1434,18 @@ export async function tick(ctx) {
   // the transaction has committed; 0 for none.
   /** @type {Map<string, any> | null | undefined} */ let orderKeys;
   // What this reeve kept for each pull request as it runs, and hasn't ordered
-  // yet: the record it kept last, and every one it kept. The latest is signed
-  // from this, not from the store's own order, which is only what a store edit
-  // left there: an older record raised there would be signed as the one this
-  // host kept last. Across ticks, so work a tick couldn't finish is finished by
-  // the next, and let go once ordered.
-  /** @type {Map<number, { latest: string, since: Set<string> }>} */
+  // yet: the record it kept last, where in the store's sequence of events it
+  // kept it, and every one it kept. The latest is signed from this, not from the
+  // store's own order, which is only what a store edit left there: an older
+  // record raised there would be signed as the one this host kept last. Across
+  // ticks, so work a tick couldn't finish is finished by the next, and let go
+  // once ordered.
+  /** @type {Map<number, { latest: string, seq: number, since: Set<string> }>} */
   const orderKept = (ctx.orderKept ??= new Map());
-  const keptFor = (/** @type {number} */ pr, /** @type {string} */ digest) => {
-    const k = orderKept.get(pr) ?? { latest: digest, since: new Set() };
+  const keptFor = (/** @type {number} */ pr, /** @type {string} */ digest, /** @type {number} */ seq) => {
+    const k = orderKept.get(pr) ?? { latest: digest, seq, since: new Set() };
     k.latest = digest;
+    k.seq = seq;
     k.since.add(digest);
     orderKept.set(pr, k);
   };
@@ -1469,26 +1471,29 @@ export async function tick(ctx) {
     const unnamed = new Set([.../** @type {any[]} */ (db.prepare(`SELECT digest FROM decision WHERE pr = ?`).all(pr)).map((r) => String(r.digest)),
                              ...(own?.since ?? [])]);
     for (const d of order.digests) unnamed.delete(d);
-    // Its latest: the record this reeve kept last. Where it kept none as it
-    // runs, the store's own order is taken only for a first entry, as nothing
-    // else says, or where it has as the latest the one record no entry names
-    // yet, signed by this host: kept since the order's last entry by a tick
-    // that stopped before ordering it. Never an older record raised over it.
+    // Its latest, and where in the store's sequence it was seen: the record this
+    // reeve kept last, unless the order's latest was seen after it, as another
+    // reeve on the store signed it. Where this one kept none as it runs, the
+    // store's own order is taken only for a first entry, as nothing else says,
+    // or where it has as the latest the one record no entry names yet, signed by
+    // this host: kept since the order's last entry by a tick that stopped before
+    // ordering it. Never an older record raised over it.
     const stored = latestDecision(db, pr);
-    const digest = own ? own.latest
-      : !order.top ? stored?.digest ?? null
-      : stored && unnamed.size === 1 && unnamed.has(stored.digest) && checkSignature(stored, /** @type {any} */ (orderKeys)).state === "signed" ? stored.digest
-      : order.digest;
+    /** @type {[string | null, number | null]} */
+    const [digest, seq] = own ? (order.seq == null || own.seq > order.seq ? [own.latest, own.seq] : [order.digest, order.seq])
+      : !order.top ? [stored?.digest ?? null, stored ? Number(stored.last_seq) : null]
+      : stored && unnamed.size === 1 && unnamed.has(stored.digest) && checkSignature(stored, /** @type {any} */ (orderKeys)).state === "signed" ? [stored.digest, Number(stored.last_seq)]
+      : [order.digest, order.seq];
     if (!digest) return { top: order.top, named: true };
     unnamed.delete(digest);
     const records = [...unnamed].sort();
     let top = order.top;
     if (order.digest !== digest || records.length) {
-      const entry = { repo: nwo, pr, n: top + 1, digest, records, store };
+      const entry = { repo: nwo, pr, n: top + 1, digest, records, store, seq };
       const s = signWith(latestStatement(entry));
       if (!s?.envelope) return { top, named: false };
       db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
-        .run(now(), "daemon", LATEST_OP, `pr:${pr}`, canonical({ repo: nwo, n: top + 1, digest, records, store, envelope: s.envelope }));
+        .run(now(), "daemon", LATEST_OP, `pr:${pr}`, canonical({ repo: nwo, n: top + 1, digest, records, store, seq, envelope: s.envelope }));
       top += 1;
     }
     return { top, named: true };
@@ -2583,7 +2588,7 @@ export async function tick(ctx) {
     }
     // Its signed order is extended at the tick's end, to its latest then.
     const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire, kept });
-    if (decided.ok && kept) keptFor(pr, kept.decision.digest);
+    if (decided.ok && kept) keptFor(pr, kept.decision.digest, decided.seq);
     if (effects.length && !decided.ok) {
       log(logPath, `  #${pr}: REQUEST_REVIEW — the decision and its ${effects.length} effect(s) could NOT be recorded: ${decided.why}`);
       // Escalated, not merely logged. Nothing else covers this: no worker is
@@ -2793,7 +2798,7 @@ export async function tick(ctx) {
           log(logPath, `  ${at}: what this verdict was judged from could not be recorded — ${err.message}`);
         }
         try {
-          tx(db, () => {
+          const seq = tx(db, () => {
             const decided = db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
               .run(now(), "daemon", "queue.decided", `pr:${entry.pr}`, JSON.stringify({
                 head: sha, base: entry.baseSha, state: j.verdict.state, summary: j.verdict.summary,
@@ -2801,8 +2806,9 @@ export async function tick(ctx) {
                 record: kept?.decision.digest ?? null,
               }));
             if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr: entry.pr, head: sha, ...kept });
+            return Number(decided.lastInsertRowid);
           });
-          if (kept) keptFor(entry.pr, kept.decision.digest);
+          if (kept) keptFor(entry.pr, kept.decision.digest, seq);
         } catch (err) {
           log(logPath, `  ${at}: the verdict could not be kept — ${err.message}`);
         }

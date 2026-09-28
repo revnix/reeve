@@ -68,7 +68,9 @@ test("each change of a pull request's latest decision is a numbered, signed entr
   const [green, red] = digestsOf(db);
   const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: anchorOf(dir) });
   db.close();
-  assert.deepEqual(order, { top: 2, digest: red, digests: new Set([green, red]) }, "one entry per change, none for a decision seen again");
+  assert.deepEqual("top" in order && { top: order.top, digest: order.digest, digests: order.digests }, { top: 2, digest: red, digests: new Set([green, red]) },
+                   "one entry per change, none for a decision seen again");
+  assert.ok("seq" in order && Number.isInteger(order.seq) && order.seq > 0, `and where its latest was seen: ${JSON.stringify(order)}`);
   assert.match(String(shown), /the latest by its signed order, entry 2/);
   assert.doesNotMatch(String(shown), /can't be trusted/);
   const anchor = readAnchor(dir, REPO);
@@ -161,6 +163,11 @@ test("an anchor that can't be read vouches for nothing, and isn't written over",
   db = open(dbPath);
   assert.equal(signedOrder(db, REPO, PR, keys).top, 1, "nor is the order extended, as whether it was cut short can't be told");
   db.close();
+  // Nor is it by a write of the anchor itself: each says it doesn't hold what it would say.
+  const anchor = fileAnchor(dir);
+  assert.equal(anchor.note(REPO, PR, 5), false, "a note isn't made over it");
+  assert.equal(anchor.bind(REPO, "a".repeat(32)), false, "nor a binding");
+  assert.equal(readFileSync(file, "utf8"), "cut sho", "and it's left as it was");
 });
 
 test("the order is extended only from entries that check, so a number a store edit put there never moves the anchor", async () => {
@@ -1147,4 +1154,73 @@ test("an order that doesn't check is said not to hold, though its pull request's
   db.close();
   const r = await closedTick(dbPath, host(dir));
   assert.match(r.log, /#42: its signed order doesn't hold, so it isn't extended/);
+});
+
+// ── from #278's ninth review ─────────────────────────────────────────────────
+
+test("a reeve doesn't sign what it kept as the latest over a record another reeve on the store kept after it", async () => {
+  const dir = credentials();
+  const C = "c".repeat(40);
+  const dbPath = await ticks([at(A, "RED")], host(dir));
+  let tick = 0, lock = null;
+  // The first reeve keeps a record and can't order it, as another holds the
+  // lock. Before its next tick, a second reeve keeps a newer one and orders both.
+  await run({ ticks: 2, dbPath, ...host(dir), prState: () => "CLOSED", prIsFinished: () => true,
+              evaluate: () => at(B, "RED"),
+              openPrs: () => {
+                tick++;
+                if (tick === 1) { lock = fileAnchor(dir).lock(REPO); return [PR]; }
+                return [];
+              },
+              afterTick: async (i) => {
+                if (i !== 0) return;
+                lock?.release?.();
+                await run({ evaluate: () => at(C, "RED"), dbPath, ...host(dir) });
+              } });
+  const db = open(dbPath);
+  const first = db.prepare("SELECT digest FROM decision WHERE head = ?").get(B)?.digest;
+  const second = db.prepare("SELECT digest FROM decision WHERE head = ?").get(C)?.digest;
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  db.close();
+  assert.ok(first && second, "control: each reeve kept a record");
+  assert.ok("digests" in order && order.digests.has(first), `control: the first reeve's record is named: ${JSON.stringify(order)}`);
+  assert.equal("digest" in order && order.digest, second, "the order ends at the record kept last, the second reeve's");
+});
+
+test("a home made on the way to the host's anchor is synced into the folder that holds it, by writes until it holds", () => {
+  for (const how of ["lock", "write", "retry"]) {
+    const top = tempDir("reeve-order-new-home-");
+    const dir = join(top, "home", "credentials");
+    const seen = [];
+    let failing = how === "retry";
+    const anchor = fileAnchor(dir, { syncDir: (d) => { if (failing && d === top) throw new Error("input/output error"); seen.push(d); } });
+    if (how === "lock") {
+      const lock = anchor.lock(REPO);
+      assert.ok(lock && "release" in lock, "control: the lock was taken, making the folders on its way");
+      lock.release();
+    }
+    const first = anchor.note(REPO, 7, 1);
+    if (how === "retry") {
+      assert.equal(first, false, "control: the sync of the folder holding the home failed");
+      failing = false;
+      assert.equal(anchor.note(REPO, 7, 1), true, "control: a later write, changing nothing, holds");
+    } else assert.equal(first, true, "control: the anchor was written");
+    assert.ok(seen.includes(top), `${how}: the folder holding the home made there was synced: ${JSON.stringify(seen)}`);
+  }
+});
+
+test("an entry whose latest isn't placed in the store's sequence by a whole number isn't one", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A)], host(dir)));
+  const k = signingKey(dir);
+  const [digest] = digestsOf(db);
+  // Signed as it says: only what it says is wrong.
+  const entry = { repo: REPO, pr: PR, n: 2, digest, records: [], store: identityOf(db), seq: -1 };
+  const s = signStatement(latestStatement(entry), /** @type {any} */ (k));
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
+    .run(3, "daemon", "decision.latest", `pr:${PR}`, JSON.stringify({ ...entry, pr: undefined, envelope: "envelope" in s ? s.envelope : null }));
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  db.close();
+  assert.equal(k.ok, true, "control: the host's key");
+  assert.deepEqual(order, { corrupt: "an entry of its signed order isn't one" });
 });

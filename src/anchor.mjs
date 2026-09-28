@@ -103,21 +103,34 @@ function unlinked(dir, path) {
 }
 
 /**
+ * Make `folder` and the folders on the way to it, and owe a sync to the folder
+ * that holds each one made: a name made in a folder outlasts a power loss only
+ * once that folder is synced, and the one holding the highest folder made, a
+ * home made here say, is synced by nothing else.
+ * @param {string} folder @param {(dir: string) => void} owe
+ */
+function makeFolders(folder, owe) {
+  const made = mkdirSync(folder, { recursive: true, mode: 0o700 });
+  if (made) for (let d = resolve(folder); d !== dirname(d); d = dirname(d)) { owe(dirname(d)); if (d === resolve(made)) break; }
+}
+
+/**
  * The host's lock on `repo`'s anchor, in the credentials folder `dir`: SQLite's
  * exclusive lock on a file beside the anchor, which the operating system holds
  * for the process and drops when it ends, however it ends. `why` when it
  * couldn't be taken, and `busy` when that's because another process holds it.
  * @param {string} dir @param {string} repo
+ * @param {(dir: string) => void} [owe]  given each folder owed a sync for one made on the way: synced here unless given
  * @returns {{ release: () => void } | { why: string, busy: boolean }}
  */
-export function anchorLock(dir, repo) {
+export function anchorLock(dir, repo, owe = syncFolder) {
   /** @type {DatabaseSync | null} */ let lock = null;
   try {
     const path = anchorPath(dir, repo);
     // Checked before anything is made on the way, so nothing is made through a
     // link, and again once it's there.
     unlinked(dir, path);
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    makeFolders(dirname(path), owe);
     unlinked(dir, path);
     const lockPath = `${path}.lock`;
     let st = null;
@@ -166,6 +179,11 @@ function reap(folder) {
  *        `write` and `syncDir` as `signingKey` takes them: a test's faults
  */
 export function fileAnchor(dir, { write = (fd, buf, offset, length) => writeSync(fd, buf, offset, length), syncDir = syncFolder } = {}) {
+  // The folders owed a sync for one made on the way to an anchor, by its lock or
+  // a write: synced on every write until they hold, as a sync that failed, or one
+  // never made, would otherwise leave that folder to be lost to a power loss.
+  /** @type {Set<string>} */ const owed = new Set();
+  const owe = (/** @type {string} */ f) => { owed.add(f); };
   /** @param {string} repo @param {(a: Anchor) => boolean} change  true when it changed the anchor */
   const update = (repo, change) => {
     try {
@@ -173,7 +191,7 @@ export function fileAnchor(dir, { write = (fd, buf, offset, length) => writeSync
       const folder = dirname(path);
       const a = readAnchor(dir, repo) ?? { began: false, latest: new Map(), store: null };
       if (change(a)) {
-        mkdirSync(folder, { recursive: true, mode: 0o700 });
+        makeFolders(folder, owe);
         reap(folder);
         const temp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
         try {
@@ -189,6 +207,8 @@ export function fileAnchor(dir, { write = (fd, buf, offset, length) => writeSync
       // saying it, and only syncing again makes it outlast a power loss. Its own
       // folder holds its name, and each folder above, to the one that holds the
       // credentials folder, holds the name of the one below, made here perhaps.
+      for (const f of owed) syncDir(f);
+      owed.clear();
       if (existsSync(folder)) for (const f of [folder, dirname(folder), resolve(dir), dirname(resolve(dir))]) syncDir(f);
       return true;
     } catch { return false; }
@@ -197,7 +217,7 @@ export function fileAnchor(dir, { write = (fd, buf, offset, length) => writeSync
     /** The anchor for `repo`, as `readAnchor` reads it. @param {string} repo */
     read: (repo) => readAnchor(dir, repo),
     /** The host's lock on `repo`'s anchor, as `anchorLock` takes it. @param {string} repo */
-    lock: (repo) => anchorLock(dir, repo),
+    lock: (repo) => anchorLock(dir, repo, owe),
     /** Only where the anchor is bound to store `id`: said by a store it isn't, it would be said of the one it is. @param {string} repo @param {string | null} id */
     began: (repo, id) => update(repo, (a) => (a.began || !id || a.store !== id ? false : ((a.began = true), true))),
     /** @param {string} repo @param {string} id */

@@ -12,6 +12,8 @@ import { fileAnchor, readAnchor, anchorPath } from "../src/anchor.mjs";
 import { open, durably } from "../src/db/ops.mjs";
 import { explainDecision, replayDecisions, signedOrder, anchorForStore } from "../src/decisions.mjs";
 import { computeVerdict } from "../src/verdict.mjs";
+import { recordsFor, policyOf } from "../src/evidence.mjs";
+import { saveDecision } from "../src/db/records.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 import { offlineEnv } from "./fixtures/offline-github.mjs";
 import { run, EVAL } from "./fixtures/tick-harness.mjs";
@@ -198,7 +200,7 @@ test("an entry of another repository's order doesn't pass for this one's", async
   const digest = digestsOf(db)[0];
   const s = signStatement(latestStatement({ repo: "x/y", pr: PR, n: 2, digest }), /** @type {any} */ (k));
   db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
-    .run(3, "daemon", "decision.latest", `pr:${PR}`, JSON.stringify({ repo: "x/y", n: 2, digest, envelope: "envelope" in s ? s.envelope : null }));
+    .run(3, "daemon", "decision.latest", `pr:${PR}`, JSON.stringify({ repo: "x/y", n: 2, digest, records: [], store: null, envelope: "envelope" in s ? s.envelope : null }));
   const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
   db.close();
   assert.deepEqual(order, { corrupt: "entry 2 of its signed order is of x/y, not of o/r" });
@@ -743,4 +745,113 @@ test("a repository whose name starts with a dot keeps an anchor", () => {
   const dir = credentials();
   assert.equal(fileAnchor(dir).note("o/.github", 7, 1), true);
   assert.equal(readAnchor(dir, "o/.github")?.latest.get(7), 1);
+});
+
+// ── from #278's fifth review ─────────────────────────────────────────────────
+
+test("an order that ran ahead of the host's anchor is noted there by a later tick, though its pull request is never judged again", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)], host(dir));
+  const stuck = { ...host(dir), anchor: fileAnchor(dir, { write: () => { throw new Error("no space left on device"); } }) };
+  await run({ evaluate: () => at(A, "RED"), dbPath, ...stuck });
+  assert.equal(readAnchor(dir, REPO)?.latest.get(PR), 1, "control: the anchor stayed behind the order");
+  await run({ openPrs: () => [], evaluate: () => at(A), dbPath, prState: () => "CLOSED", prIsFinished: () => true, ...host(dir) });
+  assert.equal(readAnchor(dir, REPO)?.latest.get(PR), 2);
+});
+
+test("the first entry of a pull request's order names every record kept for it before, so none can be taken away unseen", async () => {
+  const dir = credentials();
+  // A store that began signing before orders did: two records of #42, and no entry.
+  const dbPath = await ticks([at(A), at(B, "RED")], { signer: fileSigner(dir) });
+  await run({ evaluate: () => at(B, "RED"), dbPath, ...host(dir) });
+  const db = open(dbPath);
+  const [older] = digestsOf(db);
+  db.prepare("DELETE FROM decision WHERE digest = ?").run(older);
+  const replayed = replayDecisions(db, { pr: PR }, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.ok(replayed.some((r) => r.digest === older && /names this record, but the store no longer holds it/.test(String(r.why))), JSON.stringify(replayed));
+});
+
+test("a record superseded within the tick that kept it is named by the order's entry", async () => {
+  const dir = credentials();
+  const QUEUED = "c".repeat(40);
+  const readQueue = () => ({ ok: true, queue: true, entries: [{ pr: PR, sha: QUEUED, baseSha: "f".repeat(40), state: "AWAITING_CHECKS", prHead: A }] });
+  const evaluateQueue = ({ entry, input: i }) => { const q = { ...i, head: entry.sha }; return { ok: true, input: q, verdict: computeVerdict(q) }; };
+  const dbPath = join(tempDir("reeve-order-superseded-"), "s.db");
+  open(dbPath).close();
+  await run({ evaluate: () => at(A), readQueue, evaluateQueue, dbPath, ...host(dir) });
+  const db = open(dbPath);
+  const head = db.prepare("SELECT digest FROM decision WHERE head = ?").get(A)?.digest;
+  assert.ok(head, "control: the head's record was kept");
+  db.prepare("DELETE FROM decision WHERE digest = ?").run(head);
+  const replayed = replayDecisions(db, { pr: PR }, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.ok(replayed.some((r) => r.digest === head && /no longer holds it/.test(String(r.why))), JSON.stringify(replayed));
+});
+
+test("a pull request never judged again once orders begin still has its records named", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A), at(B, "RED")], { signer: fileSigner(dir) });
+  // The tick that begins orders judges another pull request only.
+  await run({ openPrs: () => [43], evaluate: () => ({ ...at(A), pr: 43 }), prState: () => "CLOSED", prIsFinished: () => true, dbPath, ...host(dir) });
+  const db = open(dbPath);
+  const [older] = digestsOf(db);
+  db.prepare("DELETE FROM decision WHERE digest = ?").run(older);
+  const replayed = replayDecisions(db, {}, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.ok(replayed.some((r) => r.digest === older && /no longer holds it/.test(String(r.why))), JSON.stringify(replayed));
+});
+
+test("an entry of another host's order, of the same repository, doesn't pass for one of this store's", async () => {
+  const dir = credentials(), otherDir = credentials();
+  const ours = await ticks([at(A)], host(dir));
+  const theirs = await ticks([at(A, "RED")], host(otherDir));
+  // Their entry 1, and the record it names, put in this store in place of its own.
+  const t = open(theirs);
+  const entry = t.prepare("SELECT at, actor, op, subject, payload FROM event WHERE op = 'decision.latest'").get();
+  const rec = t.prepare("SELECT * FROM decision WHERE pr = ?").get(PR);
+  t.close();
+  assert.ok(entry && rec, "control: the other host signed an entry");
+  const db = open(ours);
+  db.prepare("DELETE FROM event WHERE op = 'decision.latest'").run();
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(entry.at, entry.actor, entry.op, entry.subject, entry.payload);
+  const cols = Object.keys(rec);
+  db.prepare(`INSERT OR REPLACE INTO decision(${cols.join(",")}) VALUES(${cols.map(() => "?").join(",")})`).run(...cols.map((c) => rec[c]));
+  // Both hosts' keys are known: the other's published, as it would be.
+  const published = tempDir("reeve-order-published-");
+  for (const [id, v] of knownKeys({ local: otherDir })) writeFileSync(join(published, `${id}.pub`), readFileSync(v.path));
+  const keys = knownKeys({ published, local: dir });
+  const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: anchorOf(dir) });
+  const replayed = replayDecisions(db, { pr: PR }, { keys, repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.match(String(shown), /can't be trusted as the latest: entry 1 of its signed order is another store's/);
+  assert.ok(replayed.some((r) => /entry 1 of its signed order is another store's/.test(String(r.why))), JSON.stringify(replayed));
+});
+
+test("a record kept while its pull request's latest stays the same is named by a new entry", async () => {
+  const dir = credentials();
+  const dbPath = join(tempDir("reeve-order-side-"), "s.db");
+  open(dbPath).close();
+  const SIDE = "e".repeat(40);
+  let tick = 0, side = null;
+  await run({ openPrs: () => { tick++; return [PR]; }, dbPath, ticks: 2, ...host(dir),
+              evaluate: () => {
+                if (tick === 2 && !side) {
+                  // A record of another commit, kept beside the latest, which stays the same.
+                  const store = open(dbPath);
+                  const i = input(SIDE);
+                  const k = recordsFor({ nwo: REPO, pr: PR, head: SIDE, input: i, verdict: computeVerdict(i), policy: policyOf({ identity: { key: REPO } }),
+                                         code: { commit: "d".repeat(40), tree: "e".repeat(40), dirty: false, diff: null }, observedAt: new Date(0).toISOString() });
+                  saveDecision(store, { at: 1, seq: 1, pr: PR, head: SIDE, ...k });
+                  store.close();
+                  side = k.decision.digest;
+                }
+                return at(A);
+              } });
+  assert.ok(side, "control: the side record was kept");
+  const db = open(dbPath);
+  db.prepare("DELETE FROM decision WHERE digest = ?").run(side);
+  const replayed = replayDecisions(db, { pr: PR }, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.ok(replayed.some((r) => r.digest === side && /no longer holds it/.test(String(r.why))), JSON.stringify(replayed));
 });

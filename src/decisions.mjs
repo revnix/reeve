@@ -68,32 +68,40 @@ export function signingState(db, keys, anchor = null) {
 
 /**
  * A pull request's signed order of decisions (#274), as its store holds it, each
- * entry checked: of this repository, signed by a known key over exactly its pull
- * request, number and record, and numbered from 1 with none missing and none
- * named twice. `top` is its highest entry and `digest` the record that names;
- * 0 and null when the store holds none. `digests` is every record it names.
- * @param {Db} db @param {string} repo @param {number} pr @param {Keys} keys
+ * entry checked: of this repository and of `store` where that's given, signed by
+ * a known key over exactly its pull request, number and records, and numbered
+ * from 1 with none missing and none named twice. `top` is its highest entry and
+ * `digest` the record that names as latest; 0 and null when the store holds
+ * none. `digests` is every record it names, as latest or kept.
+ * @param {Db} db @param {string} repo @param {number} pr @param {Keys} keys @param {string | null} [store]
  * @returns {{ top: number, digest: string | null, digests: Set<string> } | { corrupt: string }}
  */
-export function signedOrder(db, repo, pr, keys) {
+export function signedOrder(db, repo, pr, keys, store = null) {
   /** @type {Map<number, string>} */ const byN = new Map();
+  /** @type {Set<string>} */ const named = new Set();
   for (const r of /** @type {any[]} */ (db.prepare(`SELECT payload FROM event WHERE op = ? AND subject = ? ORDER BY seq`).all(LATEST_OP, `pr:${pr}`))) {
     let p;
     try { p = JSON.parse(r.payload); } catch { return { corrupt: "an entry of its signed order can't be read" }; }
     const n = p?.n;
-    if (!Number.isInteger(n) || n < 1 || typeof p?.digest !== "string" || typeof p?.repo !== "string")
+    if (!Number.isInteger(n) || n < 1 || typeof p?.digest !== "string" || typeof p?.repo !== "string"
+        || !Array.isArray(p?.records) || p.records.some((/** @type {unknown} */ d) => typeof d !== "string") || !(p.store == null || typeof p.store === "string"))
       return { corrupt: "an entry of its signed order isn't one" };
     // GitHub's names don't tell case apart; the entry is checked as it was signed.
     if (p.repo.toLowerCase() !== String(repo).toLowerCase()) return { corrupt: `entry ${n} of its signed order is of ${p.repo}, not of ${repo}` };
-    const sig = typeof p.envelope === "string" ? checkEnvelope(p.envelope, latestStatement({ repo: p.repo, pr, n, digest: p.digest }), keys, "entry")
+    // Another store's, however well signed: another host's, say, whose key is published.
+    if (store && p.store !== store) return { corrupt: `entry ${n} of its signed order is another store's` };
+    const sig = typeof p.envelope === "string"
+      ? checkEnvelope(p.envelope, latestStatement({ repo: p.repo, pr, n, digest: p.digest, records: p.records, store: p.store ?? null }), keys, "entry")
       : { state: "corrupt", why: "it isn't signed" };
     if (sig.state !== "signed") return { corrupt: `entry ${n} of its signed order doesn't hold: ${"why" in sig ? sig.why : ""}` };
     if (byN.has(n)) return { corrupt: `its signed order names entry ${n} twice` };
     byN.set(n, p.digest);
+    named.add(p.digest);
+    for (const d of p.records) named.add(d);
   }
   const top = byN.size ? Math.max(...byN.keys()) : 0;
   for (let n = 1; n <= top; n++) if (!byN.has(n)) return { corrupt: `its signed order is missing entry ${n}` };
-  return { top, digest: top ? /** @type {string} */ (byN.get(top)) : null, digests: new Set(byN.values()) };
+  return { top, digest: top ? /** @type {string} */ (byN.get(top)) : null, digests: named };
 }
 
 /**
@@ -109,6 +117,14 @@ export function anchorForStore(db, anchor, repo) {
   if (!bound || storeIdentity(db) === bound) return anchor;
   return { anchor: null, why: `the host's anchor for ${repo} is another store's, so this store can't be checked against it` };
 }
+
+/**
+ * The store whose entries an order of `db` must be: the one the host's anchor is
+ * bound to, or, with none, the one the store names itself. Null where neither
+ * says, and then any store's entries are taken.
+ * @param {Db} db @param {AnchorRead | null} anchor
+ */
+const orderStore = (db, anchor) => anchor?.anchor?.store ?? storeIdentity(db);
 
 /**
  * What a pull request's signed order, and the host's anchor, say of which
@@ -174,7 +190,7 @@ export function explainDecision(db, pr, { head = null, keys = null, repo = null,
   const d = latestDecision(db, pr, { head });
   // Which record is latest, by the pull request's signed order and the host's
   // anchor: read whether or not the store still holds any record of it.
-  const order = keys && repo && head === null ? signedOrder(db, repo, pr, keys) : null;
+  const order = keys && repo && head === null ? signedOrder(db, repo, pr, keys, orderStore(db, anchor)) : null;
   const anchored = anchor?.anchor?.latest.get(pr) ?? 0;
   if (!d) {
     if (head !== null || !keys) return null;
@@ -361,8 +377,9 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
   }
   const held = db.prepare(`SELECT 1 FROM decision WHERE digest = ? LIMIT 1`);
   /** @type {Replayed[]} */ const out = [];
+  const store = orderStore(db, anchor);
   for (const pr of [...prs].sort((a, b) => a - b)) {
-    const order = signedOrder(db, repo, pr, keys);
+    const order = signedOrder(db, repo, pr, keys, store);
     if ("corrupt" in order) { out.push(fault(pr, "", order.corrupt)); continue; }
     const anchored = anchor?.anchor?.latest.get(pr) ?? 0;
     if (order.top < anchored)

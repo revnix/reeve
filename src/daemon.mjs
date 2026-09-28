@@ -1432,10 +1432,10 @@ export async function tick(ctx) {
   // number a store edit put there. The top it answers is noted on the anchor once
   // the transaction has committed; 0 for none.
   /** @type {Map<string, any> | null | undefined} */ let orderKeys;
-  const extendOrder = (pr, anchored) => {
+  const extendOrder = (pr, anchored, store) => {
     const decision = latestDecision(db, pr);
     if (!decision) return 0;
-    const order = signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys));
+    const order = signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), store);
     if ("corrupt" in order) { log(logPath, `signing: #${pr}: its signed order doesn't hold, so it isn't extended — ${order.corrupt}`); return 0; }
     // Nor one cut short of what the host signed: an entry signed now would take
     // a number the host already signed, and two entries under one number would
@@ -1445,11 +1445,17 @@ export async function tick(ctx) {
       return 0;
     }
     let top = order.top;
-    if (order.digest !== decision.digest) {
-      const s = signWith(latestStatement({ repo: nwo, pr, n: top + 1, digest: decision.digest }));
+    // Every record kept for it that no entry names yet: all of them, for its
+    // first, those kept before orders began included, and for a later one, any
+    // kept since, a record superseded within the tick that kept it among them.
+    const records = /** @type {any[]} */ (db.prepare(`SELECT digest FROM decision WHERE pr = ?`).all(pr))
+      .map((r) => String(r.digest)).filter((d) => d !== decision.digest && !order.digests.has(d)).sort();
+    if (order.digest !== decision.digest || records.length) {
+      const entry = { repo: nwo, pr, n: top + 1, digest: decision.digest, records, store };
+      const s = signWith(latestStatement(entry));
       if (!s?.envelope) return top;
       db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
-        .run(now(), "daemon", LATEST_OP, `pr:${pr}`, canonical({ repo: nwo, n: top + 1, digest: decision.digest, envelope: s.envelope }));
+        .run(now(), "daemon", LATEST_OP, `pr:${pr}`, canonical({ repo: nwo, n: top + 1, digest: decision.digest, records, store, envelope: s.envelope }));
       top += 1;
     }
     return top;
@@ -1469,11 +1475,21 @@ export async function tick(ctx) {
   // halts, to the store's latest then: not as its passes went by, as a pull
   // request in the merge queue is judged at its head and at the queue's commit
   // every tick, and would add both, tick after tick.
-  const pendingOrders = () => db.prepare(
-    `SELECT d.pr FROM decision d
-      WHERE d.last_seq = (SELECT max(e.last_seq) FROM decision e WHERE e.pr = d.pr)
-        AND d.last_seq > coalesce((SELECT max(v.seq) FROM event v WHERE v.op = ? AND v.subject = 'pr:' || d.pr), 0)
-      ORDER BY d.pr`).all(LATEST_OP).map((r) => Number(r.pr));
+  // And those whose order ran ahead of the anchor, an entry committed and its
+  // note never made: noted, though the pull request is never judged again.
+  const pendingOrders = (/** @type {import("./anchor.mjs").Anchor} */ a) => {
+    const prs = new Set(/** @type {any[]} */ (db.prepare(
+      `SELECT d.pr FROM decision d
+        WHERE d.last_seq = (SELECT max(e.last_seq) FROM decision e WHERE e.pr = d.pr)
+          AND d.last_seq > coalesce((SELECT max(v.seq) FROM event v WHERE v.op = ? AND v.subject = 'pr:' || d.pr), 0)`).all(LATEST_OP))
+      .map((r) => Number(r.pr)));
+    for (const r of /** @type {any[]} */ (db.prepare(
+      `SELECT subject, max(json_extract(payload, '$.n')) AS n FROM event WHERE op = ? AND json_valid(payload) GROUP BY subject`).all(LATEST_OP))) {
+      const pr = Number(String(r.subject).slice(3));
+      if (Number(r.n) > (a.latest.get(pr) ?? 0)) prs.add(pr);
+    }
+    return [...prs].sort((x, y) => x - y);
+  };
   // The host's anchor is one store's (#274), bound to the first that extends an
   // order under it: another store of the repository never extends one, as it
   // could sign a number the first had taken and not yet noted. Each entry is
@@ -1508,9 +1524,9 @@ export async function tick(ctx) {
           log(logPath, `signing: the host's anchor for ${nwo} couldn't be bound to this store, so its signed orders aren't extended`);
           return;
         }
-        for (const pr of pendingOrders()) {
+        for (const pr of pendingOrders(a)) {
           let top = 0;
-          try { top = tx(db, () => extendOrder(pr, a.latest.get(pr) ?? 0)); }
+          try { top = tx(db, () => extendOrder(pr, a.latest.get(pr) ?? 0, id)); }
           catch (err) { log(logPath, `signing: #${pr}: its signed order couldn't be extended — ${err.message}`); continue; }
           noteAnchor(pr, top);
         }

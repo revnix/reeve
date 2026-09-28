@@ -3,7 +3,7 @@
 // short, or restored from before, doesn't pass for the one the host kept.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -1342,6 +1342,12 @@ test("one reeve runs on a store at a time: its lock is held by one, a link to th
   symlinkSync(join(tempDir("reeve-order-running-elsewhere-"), "x"), `${other}.running`);
   const linked = storeLock(other);
   assert.ok(linked && "why" in linked && /isn't a file of its own/.test(linked.why), JSON.stringify(linked));
+  // A store with another name, a hard link, isn't run on at all: each name's lock would be its own.
+  const named = join(tempDir("reeve-order-running-named-"), "s.db");
+  open(named).close();
+  linkSync(named, join(dirname(named), "also.db"));
+  const twice = storeLock(named);
+  assert.ok(twice && "why" in twice && /has another name besides this one, a hard link/.test(twice.why), JSON.stringify(twice));
 });
 
 test("reeve tick doesn't run on a store another reeve is running on", () => {
@@ -1363,4 +1369,38 @@ test("reeve tick doesn't run on a store another reeve is running on", () => {
   finally { other.release(); }
   assert.equal(r.status, 1, r.stdout + r.stderr);
   assert.match(r.stderr, /another reeve is running on .*s\.db; one runs on a store at a time/);
+});
+
+// ── from #278's eleventh review ──────────────────────────────────────────────
+
+test("an entry filed under a number past what reeve writes is a stray, though it's spelled as one", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], host(dir)));
+  // Past the largest whole number JavaScript holds exactly: read back, it would name another.
+  db.prepare("UPDATE event SET subject = 'pr:9007199254740993' WHERE op = 'decision.latest' AND json_extract(payload, '$.n') = 2").run();
+  const keys = knownKeys({ local: dir });
+  const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: null });
+  const replayed = replayDecisions(db, {}, { keys, repo: REPO, anchor: null });
+  db.close();
+  assert.match(String(shown), /can't be trusted as the latest: an entry of a signed order in this store is filed under "pr:9007199254740993"/);
+  assert.ok(replayed.some((x) => x.outcome === "unreplayable" && /filed under "pr:9007199254740993"/.test(String(x.why))), JSON.stringify(replayed));
+});
+
+test("an order goes on across a change of this host's key, the reeve still running", async () => {
+  const dir = credentials();
+  const dbPath = join(tempDir("reeve-order-rotated-"), "s.db");
+  open(dbPath).close();
+  let tick = 0;
+  const r = await run({ ticks: 3, dbPath, ...host(dir),
+                        evaluate: () => (tick === 1 ? at(A) : at(A, "RED")),
+                        openPrs: () => { tick++; return [PR]; },
+                        // After the first tick, the key is moved aside, as when it's lost: the next signature makes another.
+                        afterTick: async (i) => { if (i === 0) renameSync(join(dir, "signing-ed25519.pem"), join(dir, "moved-aside.pem")); } });
+  const db = open(dbPath);
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  const envelopes = db.prepare("SELECT payload FROM event WHERE op = 'decision.latest' ORDER BY seq").all().map((x) => JSON.parse(JSON.parse(x.payload).envelope).signatures[0].keyid);
+  db.close();
+  assert.equal(new Set(envelopes).size, 2, `control: its entries were signed by two keys: ${JSON.stringify(envelopes)}`);
+  assert.equal("top" in order && order.top, 2, JSON.stringify(order));
+  assert.doesNotMatch(r.log, /its signed order doesn't hold/);
 });

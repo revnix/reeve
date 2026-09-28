@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { CHECK_ACCOUNTING } from "../github/reconciler.mjs";
 import { hostname } from "node:os";
 import { createHash } from "node:crypto";
@@ -1370,16 +1370,21 @@ export function workerContractFor(db, runId) {
  * One reeve runs on a store at a time (#274): SQLite's exclusive lock on a file
  * beside the store, which the operating system holds for the process and drops
  * when it ends, however it ends. Named by the store's real path, so a link to
- * the store is the same store. `why` when it couldn't be taken, and `busy` when
- * that's because another process holds it. A second reeve on a store another is
- * running on would keep records whose signed order neither knows whole.
+ * the store is the same store, and a store with another name, a hard link, is
+ * refused: a reeve on each name would take a lock of its own, and SQLite keeps a
+ * write-ahead log beside each name, which can corrupt the store. `why` when it
+ * couldn't be taken, and `busy` when that's because another process holds it. A
+ * second reeve on a store another is running on would keep records whose signed
+ * order neither knows whole.
  * @param {string} dbPath
  * @returns {{ release: () => void } | { why: string, busy: boolean }}
  */
 export function storeLock(dbPath) {
   /** @type {DatabaseSync | null} */ let lock = null;
   try {
-    const path = `${realpathSync(dbPath)}.running`;
+    const real = realpathSync(dbPath);
+    if (statSync(real).nlink > 1) throw new Error(`${real} has another name besides this one, a hard link, so no reeve runs on it: each name would be locked apart, and SQLite could corrupt it`);
+    const path = `${real}.running`;
     let st = null;
     try { st = lstatSync(path); } catch { /* made here */ }
     if (st && !st.isFile()) throw new Error(`${path} isn't a file of its own`);

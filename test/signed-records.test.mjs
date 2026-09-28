@@ -267,7 +267,10 @@ test("a tick whose run was given no signer keeps its records unsigned, and says 
 });
 
 test("a record the tick couldn't sign is still kept, unsigned, with the reason", async () => {
-  const r = await run({ evaluate: evaluated, signer: () => { throw new Error("the disk is full"); }, keepDir: true });
+  // Its store's baseline signed, so the record's own signing is what fails.
+  const good = fileSigner(credentials());
+  const signer = (s) => { if (s.predicateType === BASELINE_PREDICATE) return good(s); throw new Error("the disk is full"); };
+  const r = await run({ evaluate: evaluated, signer, keepDir: true });
   const rows = rowsOf(r.dbPath);
   assert.ok(rows.length > 0, "the verdict's record is kept");
   for (const x of rows) assert.match(String(x.unsigned), /the disk is full/);

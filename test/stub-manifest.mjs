@@ -9982,7 +9982,7 @@ export const STUBS = [
     test: "test/signed-records.test.mjs",
     expectRed: "no signing key is made unless asked",
     edits: [{ file: "src/signing.mjs",
-              find: "      if (!create) return { ok: false, why: `there is no signing key at ${path}` };\n",
+              find: "      if (!create) return { ok: false, why: `there is no signing key at ${path}`, missing: true };\n",
               replace: "" }],
   },
   {
@@ -10153,8 +10153,8 @@ export const STUBS = [
     test: "test/signed-records.test.mjs",
     expectRed: "reeve signing-key names the host's key by its id, and says whether it's published",
     edits: [{ file: "bin/reeve",
-              find: "      console.log(`no signing key yet at ${dir}: reeve makes one the first time it keeps a decision record${also}`);\n      process.exit(3);",
-              replace: "      console.log(`no signing key yet at ${dir}: reeve makes one the first time it keeps a decision record${also}`);\n      process.exit(0);" }],
+              find: "        console.log(`no signing key yet at ${dir}: reeve makes one the first time it keeps a decision record${also}`);\n        process.exit(3);",
+              replace: "        console.log(`no signing key yet at ${dir}: reeve makes one the first time it keeps a decision record${also}`);\n        process.exit(0);" }],
   },
   {
     name: "tick-signs-records",
@@ -10189,8 +10189,8 @@ export const STUBS = [
     test: "test/signed-records.test.mjs",
     expectRed: "a record the tick couldn't sign is still kept, unsigned, with the reason",
     edits: [{ file: "src/daemon.mjs",
-              find: "    try { s = ctx.signer(decision); } catch (err) { return { unsigned: `it couldn't be signed: ${err.message}` }; }",
-              replace: "    s = ctx.signer(decision);" }],
+              find: "    try { s = ctx.signer(statement); } catch (err) { return { unsigned: `it couldn't be signed: ${err.message}` }; }",
+              replace: "    s = ctx.signer(statement);" }],
   },
   {
     name: "tick-says-key-made",
@@ -10243,8 +10243,8 @@ export const STUBS = [
     test: "test/signed-records.test.mjs",
     expectRed: "records a store kept before it began signing are vouched for by its signed baseline, and read as unsigned",
     edits: [{ file: "src/daemon.mjs",
-              find: "  if (ctx.signer) beginSigning(db, signed, logPath);\n",
-              replace: "" }],
+              find: "  const begun = ctx.signer ? beginSigning(db, signWith, logPath) : { began: true };\n",
+              replace: "  const begun = { began: true };\n" }],
   },
   {
     name: "baseline-not-made-late",
@@ -10252,7 +10252,7 @@ export const STUBS = [
     test: "test/signed-records.test.mjs",
     expectRed: "a baseline isn't made once a store holds signed records, so it can't vouch for one stripped since",
     edits: [{ file: "src/daemon.mjs",
-              find: "    if (db.prepare(`SELECT 1 FROM decision WHERE envelope IS NOT NULL LIMIT 1`).get()) return;\n",
+              find: "      if (db.prepare(`SELECT 1 FROM decision WHERE envelope IS NOT NULL LIMIT 1`).get()) return { began: true };\n",
               replace: "" }],
   },
   {
@@ -10315,8 +10315,8 @@ export const STUBS = [
     test: "test/signed-records.test.mjs",
     expectRed: "a public half whose writing fails leaves nothing behind, and signing goes on",
     edits: [{ file: "src/signing.mjs",
-              find: "      if (kept) { try { writePublic(dir, pub, write); } catch { /* next time */ } }",
-              replace: "      if (kept) writePublic(dir, pub, write);" }],
+              find: "        try { writePublic(dir, pub, write); }\n        catch (err) { publicWhy =",
+              replace: "        writePublic(dir, pub, write);\n        if (false) { publicWhy =" }],
   },
   {
     name: "public-temp-removed",
@@ -10351,8 +10351,8 @@ export const STUBS = [
     test: "test/signed-records.test.mjs",
     expectRed: "a key made in place of a lost one keeps the lost one's public half, so what it signed still checks",
     edits: [{ file: "src/signing.mjs",
-              find: "        || (() => { try { renameSync(pubPath, join(dir, archivedPublic(keyIdOf(old)))); return true; } catch { return false; } })();",
-              replace: "        || true;" }],
+              find: "      publicWhy = old ? keepReplaced(dir, pubPath, keyIdOf(old), syncDir) : null;",
+              replace: "      publicWhy = null;" }],
   },
   {
     name: "archived-keys-known",

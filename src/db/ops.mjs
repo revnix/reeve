@@ -61,6 +61,10 @@ const ADDED_COLUMNS = [
   // build rather than assumed, because the failure would appear on a populated
   // store at open() time and not in any test that starts from an empty one.
   ["outbox", "depends_on", "INTEGER REFERENCES outbox(id)"],
+  // A decision's signature (#165). Nullable: a record kept before records were
+  // signed has none, and reads as unsigned, never as signed.
+  ["decision", "envelope", "TEXT"],
+  ["decision", "unsigned", "TEXT"],
 ];
 
 /**

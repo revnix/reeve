@@ -15,6 +15,7 @@ import { snapshot, restore, latestSnapshot, exportEvents,
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick, measuredContainment, withdrawStanding, tellStuck, runningCode } from "../src/daemon.mjs";
 import { replayDecisions, renderReplay } from "../src/decisions.mjs";
+import { knownKeys, fileSigner, signingKey, PUBLIC_FILE } from "../src/signing.mjs";
 import { SelectorError } from "../src/db/records.mjs";
 import { readState, render as renderStatus, statusline, why, cleanMergeRate } from "../src/status.mjs";
 import { init } from "../src/init.mjs";
@@ -450,6 +451,9 @@ if (inert)
 // AFTER the parser, so `--home` can feed it. Order matters: this used to sit
 // above `argv` and could therefore only ever read the environment.
 const HOME = resolveHome(opt("home"));
+// The keys a decision record may be signed by (#165): those this checkout
+// publishes, and this host's own.
+const signingKeys = () => knownKeys({ published: join(ROOT, "deploy", "signing-keys"), local: join(HOME, "credentials") });
 // And WRITTEN BACK, before any route runs. `--home` used to change only this
 // constant, so `credentialPaths()` still denied the state root named by the
 // ENVIRONMENT and the canary still wrote its decoy under `~/.reeve` -- a
@@ -900,6 +904,40 @@ switch (cmd) {
     process.exit(0);
   }
 
+  // THE HOST'S SIGNING KEY (#165): its id and public half, to publish under
+  // deploy/signing-keys/. Only those are shown: the key is read only to derive
+  // them, and to write its public half again where it's missing.
+  case "signing-key": {
+    const dir = join(HOME, "credentials");
+    // The public half is written again from the key first, if it's missing or
+    // isn't the key's: what this points at must never hold the key itself.
+    const k = signingKey(dir);
+    const kept = [...knownKeys({ local: dir }).entries()].filter(([, v]) => v.where !== "this host's");
+    const also = kept.length ? `\nkept from keys it replaced, to publish too: ${kept.map(([id, v]) => `${id} at ${v.path}`).join(", ")}` : "";
+    if (!k.ok) {
+      if (k.missing) {
+        console.log(`no signing key yet at ${dir}: reeve makes one the first time it keeps a decision record${also}`);
+        process.exit(3);
+      }
+      // One that's there but can't be used is never replaced, so it's said.
+      console.error(`reeve signing-key: ${k.why}. reeve won't sign with it, or replace it, so decision records are kept unsigned until it's fixed: ` +
+                    `if only its mode is wrong, make it readable only by its owner; otherwise move it aside, and reeve makes a new key the next time it keeps a record${also}`);
+      process.exit(1);
+    }
+    const id = k.keyid;
+    if (k.publicWhy) {
+      console.log(`key id ${id}`);
+      console.error(`reeve signing-key: the key's public half isn't beside it: ${k.publicWhy}. Once that's fixed, run reeve signing-key again; ` +
+                    `until then, what this key signs reads here as signed by a key reeve doesn't know${also}`);
+      process.exit(1);
+    }
+    const published = knownKeys({ published: join(ROOT, "deploy", "signing-keys") }).has(id);
+    console.log(`key id ${id}
+public key ${join(dir, PUBLIC_FILE)}
+${published ? "published in deploy/signing-keys/" : `not published yet: copy it to deploy/signing-keys/${id}.pub`}${also}`);
+    process.exit(0);
+  }
+
   // RECOMPUTE RECORDED VERDICTS (#165), with this code, from the evidence and
   // policy each decision recorded. The current profile's hash only says whether
   // the policy has changed since. Nothing to replay is not a pass: it exits 3.
@@ -918,7 +956,7 @@ switch (cmd) {
     let results;
     try {
       results = replayDecisions(open(dbPath), { pr: pr == null ? null : Number(pr), since: sinceAt, digest: opt("record") ?? null },
-                                { code: runningCode(), profile });
+                                { code: runningCode(), profile, keys: signingKeys(), repo: nwo });
     } catch (e) {
       // A record named by a start that isn't hexadecimal, or that more than one
       // shares, is refused rather than replayed as a pattern.
@@ -966,7 +1004,7 @@ switch (cmd) {
     if (cmd === "why") {
       const target = positionals.find(a => /^#?\d+$/.test(a) || a.startsWith("pr:"));
       if (!target) { console.error("reeve why <pr-number>"); process.exit(1); }
-      console.log(why(db, target, { head: opt("head") ?? null }));
+      console.log(why(db, target, { head: opt("head") ?? null, keys: signingKeys(), repo: nwo }));
       process.exit(0);
     }
 
@@ -2378,6 +2416,9 @@ switch (cmd) {
       dbPath,
       logPath: resolve(opt("log") ?? join(HOME, "reeve.log")),
       haltMarker: opt("halt") ?? join(HOME, "HALT"),
+      // Each decision record is signed with the host's key, made on first use in
+      // the credentials folder, which no worker may read (#165).
+      signer: fileSigner(join(HOME, "credentials")),
       // Execution is opt-in. A loop that acts before its decisions have been
       // watched is how an unattended run becomes an incident.
       execute: flag("execute"),
@@ -2515,6 +2556,8 @@ function usage() {
   replay [owner/repo]   recompute recorded verdicts with this code and compare them
                         (--pr <n>, --since <date>, --record <digest>;
                          0 all the same · 1 one differs or can't be replayed · 3 none)
+  signing-key           the id and public half of the key decision records are signed with
+                        (0 there is one · 3 none yet)
   statusline            one line for the terminal statusline; reads state only
   dash                  write the one-page view  (--health, --out <path>, --open)
   shadow [owner/repo]   compare what reeve would have decided against what happened

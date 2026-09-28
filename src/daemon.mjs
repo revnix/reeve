@@ -54,6 +54,8 @@ import { randomBytes } from "node:crypto";
 import { resolveHome } from "./home.mjs";
 import { codeVersion, policyOf, recordsFor } from "./evidence.mjs";
 import { saveDecision } from "./db/records.mjs";
+import { decisionStatement, baselineStatement } from "./signing.mjs";
+import { BASELINE_OP } from "./db/records.mjs";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -932,6 +934,36 @@ function standingAt(db, pr) {
 }
 
 /**
+ * Begin signing a store (#165): sign the list of the decision records it holds
+ * unsigned, once. Not once any record is signed: a list made then would vouch for
+ * records left unsigned since. A signing that fails is tried again next tick.
+ * Whether the store has begun, and if not, why.
+ * @returns {{ began: boolean, why?: string }}
+ */
+function beginSigning(db, sign, logPath) {
+  try {
+    // Under the store's write lock, so a second daemon on the store can't list
+    // and sign between this one's checks and its insert.
+    return tx(db, () => {
+      if (db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(BASELINE_OP)) return { began: true };
+      if (db.prepare(`SELECT 1 FROM decision WHERE envelope IS NOT NULL LIMIT 1`).get()) return { began: true };
+      const digests = db.prepare(`SELECT digest FROM decision ORDER BY digest`).all().map((r) => r.digest);
+      const s = sign(baselineStatement(digests));
+      if (!s?.envelope) {
+        log(logPath, `signing: the records kept before signing couldn't be signed — ${s?.unsigned}`);
+        return { began: false, why: String(s?.unsigned) };
+      }
+      db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
+        .run(now(), "daemon", BASELINE_OP, "store", JSON.stringify({ digests: baselineStatement(digests).predicate.digests, envelope: s.envelope }));
+      return { began: true };
+    });
+  } catch (err) {
+    log(logPath, `signing: the records kept before signing couldn't be listed and signed — ${err.message}`);
+    return { began: false, why: err.message };
+  }
+}
+
+/**
  * Every PASS reeve has standing and hasn't taken back, one per pull request and
  * check name. A publication whose record can't be read may be a PASS under any
  * name at any head, so it's listed too, as `{ pr, unread }`, until a merge ends
@@ -1315,6 +1347,30 @@ export async function tick(ctx) {
   // filtered to absolute paths. (Codex #4f-[1].)
   const logPath = ctx.logPath ? resolve(ctx.logPath) : ctx.logPath;
   if (logPath !== ctx.logPath) ctx = { ...ctx, logPath };
+  // Each decision record is signed with the signer its run was given (#165). A
+  // run given none, or a signing that fails, keeps the record unsigned, with
+  // the reason: a verdict isn't lost because it couldn't be signed.
+  const signWith = (statement) => {
+    if (!ctx.signer) return { unsigned: "this run was given no signing key" };
+    let s;
+    try { s = ctx.signer(statement); } catch (err) { return { unsigned: `it couldn't be signed: ${err.message}` }; }
+    if (s?.created) log(logPath, `made this host's signing key, ${s.created}: publish its public half, as reeve signing-key says`);
+    return s;
+  };
+  // A store begins signing with a signed list of the records it already held
+  // unsigned, made once and before its first signed record: after it, a record
+  // that isn't signed, or whose signature was stripped, isn't one of them. Until
+  // that list is made, records are kept unsigned: one signed first would stop it
+  // being made, and every record kept before would be untrusted for good.
+  const begun = ctx.signer ? beginSigning(db, signWith, logPath) : { began: true };
+  let unsignedSaid = false;
+  const signed = (decision) => {
+    if (!begun.began) return { unsigned: `this store hasn't begun signing, as the records it kept before couldn't be signed: ${begun.why}` };
+    const s = signWith(decision);
+    // Said once a tick: records kept unsigned otherwise go unnoticed.
+    if (ctx.signer && s?.unsigned && !unsignedSaid) { unsignedSaid = true; log(logPath, `signing: records are kept unsigned — ${s.unsigned}`); }
+    return s;
+  };
   // What each base requires is read afresh every tick. Kept across ticks, a rule
   // added between them went unseen for as long as the reading was kept.
   clearRequirements();
@@ -2296,6 +2352,7 @@ export async function tick(ctx) {
         kept = recordsFor({ nwo, pr, head: e.head, tree: (ctx.treeOf ?? treeOf)(nwo, e.head), input: e.input,
                             verdict: e.verdict, policy: policyFor(profile), code,
                             observedAt: new Date(now() * 1000).toISOString() });
+        kept = { ...kept, signed: signed(decisionStatement(kept.decision)) };
       } catch (err) {
         log(logPath, `  #${pr}: what this verdict was judged from could not be recorded — ${err.message}`);
       }
@@ -2505,6 +2562,7 @@ export async function tick(ctx) {
           kept = recordsFor({ nwo, pr: entry.pr, head: sha, tree: (ctx.treeOf ?? treeOf)(nwo, sha), input: j.input,
                               verdict: j.verdict, policy: policyFor(profile), code,
                               observedAt: new Date(now() * 1000).toISOString() });
+          kept = { ...kept, signed: signed(decisionStatement(kept.decision)) };
         } catch (err) {
           log(logPath, `  ${at}: what this verdict was judged from could not be recorded — ${err.message}`);
         }

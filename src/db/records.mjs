@@ -33,25 +33,38 @@ function hexStart(typed, what, max) {
  * `pr.decided` event that names it. Call it inside that event's transaction, so
  * neither stands without the other. A record already held is seen again: its
  * first sighting stays, and its last moves on.
+ *
+ * `signed` is its signature (#165), or why it has none. A record held unsigned
+ * that is signed when seen again keeps that signature, which is over exactly
+ * what it says; one held signed keeps the signature it has.
  * @param {Db} db
  * @param {{ at: number, seq: number, pr: number, head: string, policy: { hash: string, body: unknown },
  *           evidence: { kind: string, digest: string, statement: unknown }[],
- *           decision: { digest: string, record: unknown } }} r
+ *           decision: { digest: string, record: unknown },
+ *           signed?: { envelope?: string, unsigned?: string } }} r
  */
-export function saveDecision(db, { at, seq, pr, head, policy, evidence, decision }) {
+export function saveDecision(db, { at, seq, pr, head, policy, evidence, decision, signed = {} }) {
   db.prepare(`INSERT INTO policy(hash, body, first_seen) VALUES(?,?,?) ON CONFLICT(hash) DO NOTHING`)
     .run(policy.hash, canonical(policy.body), at);
   const put = db.prepare(`INSERT INTO evidence(digest, kind, statement, first_seen, last_seen) VALUES(?,?,?,?,?)
                           ON CONFLICT(digest) DO UPDATE SET last_seen = excluded.last_seen`);
   for (const e of evidence) put.run(e.digest, e.kind, canonical(e.statement), at, at);
-  db.prepare(`INSERT INTO decision(digest, pr, head, record, first_at, last_at, first_seq, last_seq) VALUES(?,?,?,?,?,?,?,?)
-              ON CONFLICT(digest) DO UPDATE SET last_at = excluded.last_at, last_seq = excluded.last_seq`)
-    .run(decision.digest, pr, head, canonical(decision.record), at, at, seq, seq);
+  const envelope = signed.envelope ?? null;
+  const unsigned = envelope ? null : (signed.unsigned ?? "no signature was made for it");
+  db.prepare(`INSERT INTO decision(digest, pr, head, record, first_at, last_at, first_seq, last_seq, envelope, unsigned) VALUES(?,?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(digest) DO UPDATE SET last_at = excluded.last_at, last_seq = excluded.last_seq,
+                envelope = COALESCE(decision.envelope, excluded.envelope),
+                unsigned = CASE WHEN COALESCE(decision.envelope, excluded.envelope) IS NULL THEN excluded.unsigned END`)
+    .run(decision.digest, pr, head, canonical(decision.record), at, at, seq, seq, envelope, unsigned);
 }
+
+/** The event that says a store began signing, with its baseline (#165). */
+export const BASELINE_OP = "signing.baseline";
 
 /**
  * @typedef {{ digest: string, pr: number, head: string, record: Record<string, any>, corrupt: string | null,
- *             first_at: number, last_at: number, first_seq: number, last_seq: number }} Decision
+ *             first_at: number, last_at: number, first_seq: number, last_seq: number,
+ *             envelope: string | null, unsigned: string | null }} Decision
  */
 
 /**

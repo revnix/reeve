@@ -97,8 +97,8 @@ const fingerprint = createHash("sha256").update(body ?? "").digest("hex").slice(
 // counts as a check just change? If yes, bump CHECK_ACCOUNTING and paste the new
 // fingerprint. If no — a rename, a refactor with identical behaviour — paste the
 // fingerprint and leave the version alone.
-const PINNED_ACCOUNTING = 5;
-const PINNED_FINGERPRINT = "05b28c0c8f76f9cc";
+const PINNED_ACCOUNTING = 6;
+const PINNED_FINGERPRINT = "4e0e008788e363cf";
 
 check(CHECK_ACCOUNTING === PINNED_ACCOUNTING,
   "CHECK_ACCOUNTING matches the version this fingerprint was taken under",

@@ -26,6 +26,7 @@ import { resolveHome } from "./home.mjs";
 // `hubFindings`'s healthy-snapshot path evaluates HUB_SCHEMA_VERSION; without
 // this import that branch throws a ReferenceError on a working installation.
 import { HUB_SCHEMA_VERSION } from "./build/hubdb.mjs";
+import { GATE_CHECK } from "./build/gatestate.mjs";
 
 const BROKEN = "BROKEN";
 const DEGRADED = "DEGRADED";
@@ -1165,6 +1166,18 @@ export function render({ verdict, checks }, nwo) {
 }
 
 /**
+ * Whether the ruleset a gate-state row read requires `check`, bound to `app`.
+ * False when what it read can't be told.
+ * @param {string | null} snapshot @param {string} check @param {number | null} app
+ */
+function rulesetRequires(snapshot, check, app) {
+  try {
+    const read = JSON.parse(snapshot ?? "null");
+    return (read?.required_status_checks ?? []).some((c) => c?.context === check && String(c?.integration_id ?? "") === String(app ?? ""));
+  } catch { return false; }
+}
+
+/**
  * The hub half of doctor. Reads only.
  *
  * Every finding is classified, because a flat list of sixteen problems is not
@@ -1260,7 +1273,10 @@ export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), sna
   for (const r of have.values()) {
     if (projectsKnown && !registered.has(r.nwo_snapshot)) continue;
     const stale = now - r.verified_at > freshMinutes * 60;
-    const bound = r.ruleset_requires_check === 1 && r.bound_app_id != null && r.bound_app_id === r.expected_app_id;
+    // What the row read, not only its flag: a row written before the check was
+    // renamed (#242) says the ruleset required the name as it was then.
+    const requires = r.ruleset_requires_check === 1 && rulesetRequires(r.ruleset_snapshot, GATE_CHECK, r.bound_app_id);
+    const bound = requires && r.bound_app_id != null && r.bound_app_id === r.expected_app_id;
     const installed = r.app_installed === "pass";
     if (stale) {
       out.push({ id: `H-4:${r.nwo_snapshot}`, severity: "warn", classification: "stale-evidence",
@@ -1274,7 +1290,7 @@ export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), sna
         // name the right app and still record a missing permission, or that the
         // read failed. Both are unsafe authority, and leaving them out of the
         // predicate let a drifted installation report PASS.
-        detail: `requires=${r.ruleset_requires_check} bound_app=${r.bound_app_id} expected=${r.expected_app_id} ` +
+        detail: `requires=${r.ruleset_requires_check} requires_${GATE_CHECK}=${requires ? 1 : 0} bound_app=${r.bound_app_id} expected=${r.expected_app_id} ` +
                 `installed=${r.app_installed} permission_diff=${r.permission_diff ?? "none"} error=${r.error ?? "none"}`,
         action: "merge stays dark until the ruleset requires merge-policy from the expected app" });
     } else {

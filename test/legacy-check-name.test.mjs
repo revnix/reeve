@@ -8,12 +8,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { POLICY_CONTEXT } from "../src/github/reconciler.mjs";
+import { POLICY_CONTEXT, excludeOwnPolicy } from "../src/github/reconciler.mjs";
 import { clearRequirements, evaluatePr, evaluateQueueEntry, publishVerdict, requiredChecksOf, shadowContextOf } from "../src/pr.mjs";
 import { computeVerdict, publishArgs, CLAUSE_IDS } from "../src/verdict.mjs";
 import { ACTIONS, ESCALATIONS, nextAction } from "../src/watcher.mjs";
 import { GATE_CHECK } from "../src/build/gatestate.mjs";
 import { open } from "../src/db/ops.mjs";
+import { openHub } from "../src/build/hubdb.mjs";
+import { hubFindings } from "../src/doctor.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 
 const OLD = "ops/merge-policy", OLD_SHADOW = "ops/merge-policy (shadow)";
@@ -107,20 +109,25 @@ test("a queue commit whose base requires an old name is blocked too", () => {
   assert.match(ci.detail, /a name reeve published under before/);
 });
 
-test("through evaluatePr, a base that requires an old name blocks", () => {
+/**
+ * The CI clause for a head evaluated three times, as the daemon's ticks would,
+ * against a fake GitHub whose base requires `required`, and whose head has the
+ * check runs `runs`, as [name, conclusion], and the commit statuses `statuses`,
+ * as [context, state].
+ */
+function ciThroughEvaluatePr({ required = ["CI Gate"], runs = [["CI Gate", "success"]], statuses = [] } = {}) {
   const runJson = (name, conclusion) =>
     JSON.stringify({ name, status: "completed", conclusion, id: 1, completed_at: new Date().toISOString(), app: { slug: "github-actions", id: 1 } });
   const page = JSON.stringify({ data: { repository: { pullRequest: { mergeStateStatus: "CLEAN", mergeable: "MERGEABLE", reviewDecision: null,
     reviews: { totalCount: 0 }, reviewThreads: { totalCount: 0, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } } });
   const db = open(join(tempDir("reeve-legacy-db-"), "s.db"));
   const profile = { ci: { requiredChecks: [], reviewerStatusContexts: [] }, reviewers: [] };
-  let pr = 0;
-  // Three ticks, as the daemon takes them, so a green reading can settle.
-  const ci = (required) => {
-    const bin = join(tempDir("reeve-legacy-gh-"), "bin");
-    mkdirSync(bin);
-    const rules = JSON.stringify({ type: "required_status_checks", parameters: { required_status_checks: required.map((context) => ({ context })) } });
-    writeFileSync(join(bin, "gh"), `#!/bin/sh
+  const bin = join(tempDir("reeve-legacy-gh-"), "bin");
+  mkdirSync(bin);
+  const rules = JSON.stringify({ type: "required_status_checks", parameters: { required_status_checks: required.map((context) => ({ context })) } });
+  const status = statuses.map(([context, state]) => `echo '${JSON.stringify({ context, state })}'`).join("; ") || ":";
+  const run = runs.map(([name, conclusion]) => `echo '${runJson(name, conclusion)}'`).join("; ") || ":";
+  writeFileSync(join(bin, "gh"), `#!/bin/sh
 for a in "$@"; do case "$a" in repos/*|graphql) p="$a";; esac; done
 case "$p" in
   graphql) echo '${page}';;
@@ -129,28 +136,63 @@ case "$p" in
   */check-suites*) echo '[{"app":{"slug":"github-actions"},"status":"completed"}]';;
   */rules/branches/*) echo '${rules}';;
   */branches/main) echo '{"protected":true,"protection":{"enabled":false}}';;
-  */commits/${HEAD}/check-runs*) echo '${runJson("CI Gate", "success")}';;
-  */commits/${HEAD}/status*) ;;
+  */commits/${HEAD}/check-runs*) ${run};;
+  */commits/${HEAD}/status*) ${status};;
   *) ;;
 esac
 `, { mode: 0o755 });
-    writeFileSync(join(bin, "git"), `#!/bin/sh\n[ "$1" = ls-remote ] && printf '%s\\trefs/heads/main\\n' ${BASE}\nexit 0\n`, { mode: 0o755 });
-    const path = process.env.PATH;
-    process.env.PATH = `${bin}:${path}`;
-    try {
-      clearRequirements();
-      pr++;
-      const anchor = { ok: true, headRef: "feature", baseRef: "main", state: "OPEN", title: "t", updatedAt: "2026-09-28T00:00:00Z",
-                       head: HEAD, pin: { ok: true, sha: HEAD }, authorLogin: "someone" };
-      let r;
-      for (let k = 0; k < 3; k++) r = evaluatePr({ nwo: "o/r", pr, profile, db, anchor });
-      return r.ok ? r.verdict.clauses.find((c) => c.id === "ci") : { state: "none", detail: r.why };
-    } finally { process.env.PATH = path; }
-  };
-  const control = ci(["CI Gate"]);
-  const held = ci(["CI Gate", OLD]);
-  db.close();
+  writeFileSync(join(bin, "git"), `#!/bin/sh\n[ "$1" = ls-remote ] && printf '%s\\trefs/heads/main\\n' ${BASE}\nexit 0\n`, { mode: 0o755 });
+  const path = process.env.PATH;
+  process.env.PATH = `${bin}:${path}`;
+  try {
+    clearRequirements();
+    const anchor = { ok: true, headRef: "feature", baseRef: "main", state: "OPEN", title: "t", updatedAt: "2026-09-28T00:00:00Z",
+                     head: HEAD, pin: { ok: true, sha: HEAD }, authorLogin: "someone" };
+    let r;
+    for (let k = 0; k < 3; k++) r = evaluatePr({ nwo: "o/r", pr: 1, profile, db, anchor });
+    return r.ok ? r.verdict.clauses.find((c) => c.id === "ci") : { state: "none", detail: r.why };
+  } finally { process.env.PATH = path; db.close(); }
+}
+
+test("through evaluatePr, a base that requires an old name blocks", () => {
+  const control = ciThroughEvaluatePr({ required: ["CI Gate"] });
+  const held = ciThroughEvaluatePr({ required: ["CI Gate", OLD] });
   assert.equal(control.state, "PASS", `control: the same head passes CI where no old name is required: ${JSON.stringify(control)}`);
   assert.equal(held.state, "BLOCK", JSON.stringify(held));
   assert.match(held.detail, /a name reeve published under before/);
+});
+
+// ── from #273's review ───────────────────────────────────────────────────────
+
+test("an old commit status under a name reeve published under before is never CI evidence, while another App's check run under it is", () => {
+  const status = { name: OLD, source: "status", state: "completed", conclusion: "success" };
+  const shadowStatus = { name: OLD_SHADOW, source: "status", state: "completed", conclusion: "success" };
+  const theirs = { name: OLD, source: "check_run", state: "completed", conclusion: "success", app: "someone-else" };
+  const r = excludeOwnPolicy([status, shadowStatus, theirs]);
+  assert.deepEqual(r.rows, [theirs]);
+  assert.deepEqual(r.impostors, [], "and none is an impostor: neither name is reeve's now");
+});
+
+test("through evaluatePr, an old status of reeve's own verdict doesn't pass CI where nothing else is required", () => {
+  const control = ciThroughEvaluatePr({ required: [], runs: [], statuses: [["lint", "success"]] });
+  const stale = ciThroughEvaluatePr({ required: [], runs: [], statuses: [[OLD, "success"]] });
+  assert.equal(control.state, "PASS", `control: a head whose one status passes, with nothing required, passes CI: ${JSON.stringify(control)}`);
+  assert.notEqual(stale.state, "PASS", JSON.stringify(stale));
+});
+
+test("a gate-state row counts only if the ruleset it read requires merge-policy: one read before the rename doesn't", () => {
+  const db = openHub(join(tempDir("reeve-legacy-hub-"), "h.db"));
+  const NOW = 1_800_000_000;
+  const gateFor = (context) => {
+    db.prepare(`INSERT OR REPLACE INTO repo_gate_state(repo_id, nwo_snapshot, ruleset_requires_check, bound_app_id, expected_app_id,
+                                                      app_installed, ruleset_snapshot, verified_at)
+                VALUES(1, 'o/r', 1, 42, 42, 'pass', ?, ?)`)
+      .run(JSON.stringify({ required_status_checks: [{ context, integration_id: 42 }] }), NOW - 60);
+    return hubFindings(db, { root: "/b", now: NOW, snapshotFor: () => null }).find((x) => x.id === "H-4:o/r");
+  };
+  const current = gateFor(POLICY_CONTEXT), old = gateFor(OLD);
+  db.close();
+  assert.equal(current?.severity, "pass", `control: a row whose ruleset required merge-policy passes: ${JSON.stringify(current)}`);
+  assert.equal(old?.severity, "fail", JSON.stringify(old));
+  assert.equal(old?.classification, "unsafe-authority");
 });

@@ -893,3 +893,80 @@ test("a pull request whose latest is seen again, already named, isn't extended o
   await ticks([at(A), at(A), at(A)], { ...host(dir), anchor: counted });
   assert.equal(notes, 1, "noted once, when its entry was made");
 });
+
+// ── from #278's seventh review ───────────────────────────────────────────────
+
+test("replay --pr reports a record its order names that was moved to another pull request", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], host(dir)));
+  const [green] = digestsOf(db);
+  // Out of what --pr 42 reads, though the store still holds a row under its key.
+  db.prepare("UPDATE decision SET pr = 43 WHERE digest = ?").run(green);
+  const replayed = replayDecisions(db, { pr: PR }, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.ok(!replayed.some((r) => r.pr === 43), "control: the filter leaves the moved record out");
+  assert.ok(replayed.some((r) => r.pr === PR && r.digest === green && r.outcome === "unreplayable" &&
+                                 /names this record, but the store's copy of it doesn't hold: its row names pull request 43/.test(String(r.why))),
+            JSON.stringify(replayed));
+});
+
+test("replay --since reports a record its order names that was changed in place before the date", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], host(dir)));
+  const [green] = digestsOf(db);
+  db.prepare("UPDATE decision SET last_at = 1, record = json_set(record, '$.verdict.summary', 'all clear') WHERE digest = ?").run(green);
+  const replayed = replayDecisions(db, { since: 2 }, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.ok(replayed.some((r) => r.outcome === "same"), "control: the date takes the newer record");
+  assert.ok(replayed.some((r) => r.pr === PR && r.digest === green && /names this record, but the store's copy of it doesn't hold: its record doesn't match its digest/.test(String(r.why))),
+            JSON.stringify(replayed));
+});
+
+test("replay reports a record an order names that the store holds as another pull request's", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)], host(dir));
+  await run({ openPrs: () => [43], evaluate: () => ({ ...at(B), pr: 43 }), prState: () => "CLOSED", prIsFinished: () => true, dbPath, ...host(dir) });
+  const db = open(dbPath);
+  const [ours] = digestsOf(db);
+  const theirs = db.prepare("SELECT digest FROM decision WHERE pr = 43").get()?.digest;
+  const store = db.prepare("SELECT json_extract(payload, '$.id') AS id FROM event WHERE op = 'store.identity'").get()?.id;
+  const k = signingKey(dir);
+  assert.ok(theirs && store && k.ok, "control: #43's record, the store's identity and the host's key");
+  // Entry 2 of #42's order, signed, names #43's record as one of #42's.
+  const entry = { repo: REPO, pr: PR, n: 2, digest: ours, records: [theirs], store };
+  const s = signStatement(latestStatement(entry), /** @type {any} */ (k));
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
+    .run(3, "daemon", "decision.latest", `pr:${PR}`, JSON.stringify({ ...entry, pr: undefined, envelope: "envelope" in s ? s.envelope : null }));
+  const replayed = replayDecisions(db, {}, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.ok(replayed.some((r) => r.pr === 43 && r.digest === theirs && r.outcome === "same"), "control: #43's record replays as its own");
+  assert.ok(replayed.some((r) => r.pr === PR && r.digest === theirs && /names this record, but the store holds it as pull request 43's/.test(String(r.why))),
+            JSON.stringify(replayed));
+});
+
+test("a tick that can't list the repository's pull requests still notes an order that ran ahead of the host's anchor", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)], host(dir));
+  const stuck = { ...host(dir), anchor: fileAnchor(dir, { write: () => { throw new Error("no space left on device"); } }) };
+  await run({ evaluate: () => at(A, "RED"), dbPath, ...stuck });
+  assert.equal(readAnchor(dir, REPO)?.latest.get(PR), 1, "control: the anchor stayed behind the order");
+  const r = await run({ openPrs: () => null, evaluate: () => at(A), dbPath, ...host(dir) });
+  assert.match(r.log, /could not list PRs for o\/r/, "control: the list couldn't be read");
+  assert.equal(readAnchor(dir, REPO)?.latest.get(PR), 2);
+});
+
+test("a store with no order to extend doesn't bind the host's anchor, so the store that has one still can", async () => {
+  const dir = credentials();
+  // Another store of the repository, named by --db, say: it judges nothing.
+  const idle = join(tempDir("reeve-order-idle-store-"), "s.db");
+  open(idle).close();
+  await run({ openPrs: () => [], evaluate: () => at(A), dbPath: idle, ...host(dir) });
+  assert.equal(readAnchor(dir, REPO)?.store ?? null, null, "the idle store didn't bind it");
+  const dbPath = await ticks([at(A)], host(dir));
+  const db = open(dbPath);
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  const store = db.prepare("SELECT json_extract(payload, '$.id') AS id FROM event WHERE op = 'store.identity'").get()?.id;
+  db.close();
+  assert.ok("top" in order && order.top === 1, JSON.stringify(order));
+  assert.equal(readAnchor(dir, REPO)?.store, store, "the store with an order to extend bound it");
+});

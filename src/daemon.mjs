@@ -1530,11 +1530,16 @@ export async function tick(ctx) {
           log(logPath, `signing: the host's anchor for ${nwo} is another store's, so this store's signed orders aren't extended`);
           return;
         }
+        // Bound only by a store with an order to extend: one that judges nothing,
+        // named by --db say, would otherwise take the anchor from the store that
+        // has one.
+        const pending = pendingOrders(a);
+        if (!pending.length) return;
         if (!bound && !ctx.anchor.bind(nwo, id)) {
           log(logPath, `signing: the host's anchor for ${nwo} couldn't be bound to this store, so its signed orders aren't extended`);
           return;
         }
-        for (const pr of pendingOrders(a)) {
+        for (const pr of pending) {
           let top = 0;
           try { top = tx(db, () => extendOrder(pr, a.latest.get(pr) ?? 0, id)); }
           catch (err) { log(logPath, `signing: #${pr}: its signed order couldn't be extended — ${err.message}`); continue; }
@@ -2202,6 +2207,11 @@ export async function tick(ctx) {
     // not list pull requests" must not also mean "nobody is told the queue lost
     // something".
     announce();
+    // What earlier ticks left to order is ordered all the same (#274), once
+    // what's owed above is done: an entry committed and never noted on the
+    // host's anchor would otherwise stay unnoted for as long as the repository
+    // can't be listed.
+    orderPending();
     return { decisions, escalations, halted: false, unreadable: true };
   }
   // A cap that does not say it capped reads as "covered everything". The portfolio

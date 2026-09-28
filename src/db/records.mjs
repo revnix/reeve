@@ -90,7 +90,7 @@ export function storeIdentity(db) {
  * outside the digest, must be the ones its record names.
  * @param {any} row @returns {Decision}
  */
-const decisionOf = row => {
+export const decisionOf = row => {
   const record = JSON.parse(row.record);
   const subject = record?.subject ?? {};
   const corrupt = digestOf(record) !== row.digest ? "its record doesn't match its digest"

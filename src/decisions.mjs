@@ -10,7 +10,7 @@
 import { computeVerdict } from "./verdict.mjs";
 import { joinEvidence, asJson, policyOf } from "./evidence.mjs";
 import { canonical } from "./db/ops.mjs";
-import { latestDecision, decisionsFor, evidenceBy, policyRecord, storeIdentity, BASELINE_OP, LATEST_OP } from "./db/records.mjs";
+import { latestDecision, decisionsFor, decisionOf, evidenceBy, policyRecord, storeIdentity, BASELINE_OP, LATEST_OP } from "./db/records.mjs";
 import { checkSignature, checkEnvelope, baselineStatement, latestStatement } from "./signing.mjs";
 
 /** @typedef {import("node:sqlite").DatabaseSync} Db */
@@ -354,7 +354,8 @@ export function replayDecisions(db, which = {}, { code = null, profile = null, c
  * What each pull request's signed order says the store should hold, and the
  * host's anchor (#274), as replay results: an order that doesn't hold, one cut
  * short of what the host signed, and each record it names that the store no
- * longer holds, a record taken away, adverse perhaps. Never passed over.
+ * longer holds as it was kept, a record taken away, changed or moved to another
+ * pull request, adverse perhaps. Never passed over.
  * Every pull request with records replayed, an order or an anchor entry is
  * read, whatever `since` says, or only the one asked for.
  * @param {Db} db @param {Replayed[]} replayed
@@ -375,7 +376,12 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
     for (const r of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ?`).all(LATEST_OP))) prs.add(Number(String(r.subject).slice(3)));
     for (const pr of anchor?.anchor?.latest.keys() ?? []) prs.add(pr);
   }
-  const held = db.prepare(`SELECT 1 FROM decision WHERE digest = ? LIMIT 1`);
+  // Each record an order names, as the store holds it: a row that isn't that
+  // record, or is another pull request's, is no more held than one taken away,
+  // though what was asked for left it out of the replay. One replayed above as
+  // this pull request's was checked whole there.
+  const rowOf = db.prepare(`SELECT * FROM decision WHERE digest = ?`);
+  const checked = new Set(replayed.map((r) => `${r.pr} ${r.digest}`));
   /** @type {Replayed[]} */ const out = [];
   const store = orderStore(db, anchor);
   for (const pr of [...prs].sort((a, b) => a - b)) {
@@ -385,8 +391,16 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
     if (order.top < anchored)
       out.push(fault(pr, order.digest ?? "", `its signed order ends at entry ${order.top}, though this host signed up to entry ${anchored}: ` +
                                              "newer records were taken away, or the store restored from before"));
-    for (const digest of order.digests)
-      if (!held.get(digest)) out.push(fault(pr, digest, "its signed order names this record, but the store no longer holds it"));
+    for (const digest of order.digests) {
+      if (checked.has(`${pr} ${digest}`)) continue;
+      const row = rowOf.get(digest);
+      const d = row ? decisionOf(row) : null;
+      const why = !d ? "the store no longer holds it"
+        : d.corrupt ? `the store's copy of it doesn't hold: ${d.corrupt}`
+        : d.pr !== pr ? `the store holds it as pull request ${d.pr}'s`
+        : null;
+      if (why) out.push(fault(pr, digest, `its signed order names this record, but ${why}`));
+    }
   }
   return out;
 }

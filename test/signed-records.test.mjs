@@ -803,3 +803,40 @@ test("a signing key with another name besides its own isn't used: a worker could
   assert.equal(k.ok, false);
   assert.match(k.ok ? "" : k.why, /another name/);
 });
+
+// ── from #271's ninth review ─────────────────────────────────────────────────
+
+/**
+ * `signingKey(dir, o)` in a process of its own, given `limitMs` to answer: a
+ * read that waits for ever fails the test instead of holding it up.
+ */
+function signingKeyWithin(dir, o, limitMs = 5000) {
+  const at = JSON.stringify(new URL("../src/signing.mjs", import.meta.url).href);
+  const src = `import(${at}).then((m) => { const k = m.signingKey(${JSON.stringify(dir)}, ${JSON.stringify(o)});
+    process.stdout.write(JSON.stringify(k.ok ? { ok: true, keyid: k.keyid, publicWhy: k.publicWhy } : k)); })`;
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", src], { encoding: "utf8", timeout: limitMs });
+  let out = null;
+  try { out = JSON.parse(r.stdout); } catch { /* it didn't answer */ }
+  return { answered: r.status === 0 && !r.signal && out !== null, out, why: r.error?.message ?? r.stderr };
+}
+
+test("a signing key that isn't a file, a pipe say, isn't read, so a tick can't wait on it for ever", () => {
+  const dir = credentials();
+  assert.equal(spawnSync("mkfifo", ["-m", "600", join(dir, KEY_FILE)]).status, 0, "control: a pipe was made where the key goes");
+  const k = signingKeyWithin(dir, { create: true });
+  assert.ok(k.answered, `it answered: ${k.why}`);
+  assert.equal(k.out?.ok, false);
+  assert.match(String(k.out?.why), /isn't a file/);
+});
+
+test("a public-key file that isn't a file, a pipe say, isn't read, and is written again from the key", () => {
+  const dir = credentials();
+  const first = signingKey(dir, { create: true });
+  assert.equal(first.ok, true, "control: a key was made");
+  rmSync(join(dir, PUBLIC_FILE));
+  assert.equal(spawnSync("mkfifo", [join(dir, PUBLIC_FILE)]).status, 0, "control: a pipe was made where the public half goes");
+  const k = signingKeyWithin(dir, { create: true });
+  assert.ok(k.answered, `it answered: ${k.why}`);
+  assert.equal(k.out?.ok, true);
+  assert.equal(idAt(join(dir, PUBLIC_FILE)), first.ok ? first.keyid : "", "the slot holds this key's public half again");
+});

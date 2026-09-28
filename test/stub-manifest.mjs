@@ -10696,4 +10696,22 @@ export const STUBS = [
               find: "      const old = publicKeyAt(pubPath) ?? derivedPublicAt(pubPath);",
               replace: "      const old = publicKeyAt(pubPath);" }],
   },
+  {
+    name: "signing-key-not-a-file-refused",
+    why: "read a signing key that isn't a file. A pipe there holds the read, and every tick with it, for ever",
+    test: "test/signed-records.test.mjs",
+    expectRed: "a signing key that isn't a file, a pipe say, isn't read, so a tick can't wait on it for ever",
+    edits: [{ file: "src/signing.mjs",
+              find: "    if (!own.isFile()) return {",
+              replace: "    if (false) return {" }],
+  },
+  {
+    name: "public-read-files-only",
+    why: "read a public-key file that isn't a file. A pipe there holds a tick, why or replay up for ever",
+    test: "test/signed-records.test.mjs",
+    expectRed: "a public-key file that isn't a file, a pipe say, isn't read, and is written again from the key",
+    edits: [{ file: "src/signing.mjs",
+              find: "  if (!statSync(path).isFile()) throw new Error(",
+              replace: "  if (false) throw new Error(" }],
+  },
 ];

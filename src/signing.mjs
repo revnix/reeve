@@ -127,6 +127,8 @@ export function signingKey(dir, { create = false, write = (fd, buf, offset, leng
     // file, may lie outside what workers are kept from reading.
     const own = lstatSync(path);
     if (own.isSymbolicLink()) return { ok: false, why: `the signing key at ${path} is a link, so it isn't used: a worker could read what it points at` };
+    // A pipe or a device there would hold a read up for ever, and every tick with it.
+    if (!own.isFile()) return { ok: false, why: `the signing key at ${path} isn't a file, so it isn't used: reading it could wait for ever` };
     if (own.nlink > 1) return { ok: false, why: `the signing key at ${path} has another name besides this one, so it isn't used: a worker could read it there` };
     const mode = statSync(path).mode & 0o777;
     if (mode & 0o077) return { ok: false, why: `the signing key at ${path} can be read by others (mode ${mode.toString(8)}), so it isn't used` };
@@ -189,11 +191,21 @@ function writeAll(fd, text, write) {
  */
 function publicKeyAt(path) {
   try {
-    const text = readFileSync(path, "utf8");
+    const text = readFile(path);
     if (/PRIVATE KEY/.test(text)) return null;
     const key = createPublicKey(text);
     return key.asymmetricKeyType === "ed25519" ? key : null;
   } catch { return null; }
+}
+
+/**
+ * What the file at `path` holds. Anything that isn't a file, a pipe or a device,
+ * is refused before it's opened: reading one could wait for ever.
+ * @param {string} path
+ */
+function readFile(path) {
+  if (!statSync(path).isFile()) throw new Error(`${path} isn't a file`);
+  return readFileSync(path, "utf8");
 }
 
 /**
@@ -203,7 +215,7 @@ function publicKeyAt(path) {
  */
 function derivedPublicAt(path) {
   try {
-    const text = readFileSync(path, "utf8");
+    const text = readFile(path);
     if (!/PRIVATE KEY/.test(text)) return null;
     const key = createPublicKey(createPrivateKey(text));
     return key.asymmetricKeyType === "ed25519" ? key : null;

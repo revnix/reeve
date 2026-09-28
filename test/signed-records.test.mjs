@@ -2,7 +2,7 @@
 // no longer passes for the one reeve kept.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { createPublicKey, generateKeyPairSync } from "node:crypto";
 import { signingKey, fileSigner, signDecision, checkSignature, knownKeys, keyIdOf, decisionStatement, baselineStatement,
@@ -690,11 +690,12 @@ test("a key's temporaries left by a process that's gone are removed, and a runni
   const dir = credentials();
   const gone = spawnSync(process.execPath, ["-e", ""]).pid;
   const left = join(dir, `${KEY_FILE}.${gone}.deadbeef.tmp`), publicLeft = join(dir, `${PUBLIC_FILE}.${gone}.0badf00d.tmp`);
+  const keptLeft = join(dir, `signing-ed25519.${"a".repeat(64)}.pub.${gone}.cafebabe.tmp`);
   const live = join(dir, `${KEY_FILE}.${process.ppid}.feedface.tmp`);
-  for (const f of [left, publicLeft, live]) writeFileSync(f, "partway", { mode: 0o600 });
+  for (const f of [left, publicLeft, keptLeft, live]) writeFileSync(f, "partway", { mode: 0o600 });
   assert.equal(signingKey(dir, { create: true }).ok, true, "control: a key was made");
-  assert.deepEqual({ left: existsSync(left), publicLeft: existsSync(publicLeft), live: existsSync(live) },
-                   { left: false, publicLeft: false, live: true });
+  assert.deepEqual({ left: existsSync(left), publicLeft: existsSync(publicLeft), keptLeft: existsSync(keptLeft), live: existsSync(live) },
+                   { left: false, publicLeft: false, keptLeft: false, live: true });
 });
 
 /** A record of #7 in another repository, x/y, signed by this host and put in `db`, with its evidence and policy. */
@@ -734,4 +735,36 @@ test("reeve why and reeve replay take a record as the repository's only if it na
   const replayed = spawnSync(process.execPath, [REEVE, "replay", "o/r", "--db", dbPath], { encoding: "utf8", env });
   assert.equal(replayed.status, 1, replayed.stdout + replayed.stderr);
   assert.match(replayed.stdout, /could not be replayed: it's a record of x\/y, not of o\/r/);
+});
+
+// ── from #271's seventh review ───────────────────────────────────────────────
+
+test("a kept public half that's a link to the slot isn't taken for a kept copy, so the only copy isn't written over", () => {
+  const dir = credentials();
+  const old = signingKey(dir, { create: true });
+  assert.equal(old.ok, true, "control: a key was made");
+  const oldId = old.ok ? old.keyid : "";
+  rmSync(join(dir, KEY_FILE));
+  symlinkSync(PUBLIC_FILE, join(dir, `signing-ed25519.${oldId}.pub`));
+  const made = signingKey(dir, { create: true });
+  assert.equal(made.ok, true, "a new key still signs");
+  assert.equal(idAt(join(dir, PUBLIC_FILE)), oldId, "the slot still holds the replaced key's public half, its only copy");
+  assert.match(made.ok ? String(made.publicWhy) : "", /holds something else/);
+});
+
+test("a replaced key's public half is kept as a file of its own, whatever the slot was a link to", () => {
+  const dir = credentials();
+  const old = signingKey(dir, { create: true });
+  assert.equal(old.ok, true, "control: a key was made");
+  const oldId = old.ok ? old.keyid : "";
+  rmSync(join(dir, KEY_FILE));
+  const target = join(dir, "..", "copy-elsewhere.pub");
+  renameSync(join(dir, PUBLIC_FILE), target);
+  symlinkSync(target, join(dir, PUBLIC_FILE));
+  const made = signingKey(dir, { create: true });
+  assert.equal(made.ok ? made.publicWhy : "no key", null, "control: the new key's public half is in its slot");
+  writeFileSync(target, "changed since");
+  const archive = join(dir, `signing-ed25519.${oldId}.pub`);
+  assert.equal(idAt(archive), oldId, "the replaced key's public half is still kept, whatever became of what the slot pointed at");
+  assert.ok(lstatSync(archive).isFile(), "as a file of its own");
 });

@@ -14,7 +14,7 @@
 // with the reason: a verdict isn't lost because it couldn't be signed.
 
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, sign, verify } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync,
+import { closeSync, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync,
          unlinkSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { canonical } from "./db/ops.mjs";
@@ -138,7 +138,7 @@ export function signingKey(dir, { create = false, write = (fd, buf, offset, leng
     let publicWhy = null;
     if (publicIdAt(pubPath) !== keyid) {
       const old = publicKeyAt(pubPath);
-      publicWhy = old ? keepReplaced(dir, pubPath, keyIdOf(old), syncDir) : null;
+      publicWhy = old ? keepReplaced(dir, pubPath, old, syncDir, write) : null;
       if (!publicWhy) {
         try { writePublic(dir, pub, write); }
         catch (err) { publicWhy = `its public half couldn't be written at ${pubPath}: ${/** @type {Error} */ (err).message}`; }
@@ -198,28 +198,52 @@ function publicIdAt(path) {
 const archivedPublic = (keyid) => `signing-ed25519.${keyid}.pub`;
 
 /**
- * Keep the public half in `pubPath`, key `oldId`'s, which this key replaced,
+ * Keep the public half in `pubPath`, key `old`'s, which this key replaced,
  * under that key's id, before its slot is written over. A copy already there
- * counts only if it holds that key: a file there that doesn't is never taken for
- * it, or written over. It's linked, so nothing is written over, and the folder is
- * synced, so it's kept before the slot changes. Null once it's kept; otherwise
- * why the slot is left as it is.
- * @param {string} dir @param {string} pubPath @param {string} oldId
+ * counts only if it's a file of its own holding that key: anything else there,
+ * a link to the slot included, is never taken for it, or written over. It's
+ * written from the key read, whole, to a file of its own and linked into place,
+ * never as a second name for what the slot holds, which could be a link that
+ * follows the slot; and the folder is synced, so it's kept before the slot
+ * changes. Null once it's kept; otherwise why the slot is left as it is.
+ * @param {string} dir @param {string} pubPath @param {KeyObject} old
  * @param {(dir: string) => void} syncDir
+ * @param {(fd: number, buf: Buffer, offset: number, length: number) => number} write
  */
-function keepReplaced(dir, pubPath, oldId, syncDir) {
+function keepReplaced(dir, pubPath, old, syncDir, write) {
+  const oldId = keyIdOf(old);
   const archive = join(dir, archivedPublic(oldId));
   const said = `the public half at ${pubPath} is key ${oldId.slice(0, 12)}'s, which this key replaced`;
   try {
-    if (publicIdAt(archive) !== oldId) {
+    if (!keptAt(archive, oldId)) {
       if (existsSync(archive)) return `${said}, and ${archive}, where it would be kept, holds something else: move that aside, and reeve keeps it there`;
-      linkSync(pubPath, archive);
+      linkWhole(archive, String(old.export({ type: "spki", format: "pem" })), 0o644, write);
     }
     syncDir(dir);
     return null;
   } catch (err) {
     return `${said}, and it couldn't be kept at ${archive}: ${/** @type {Error} */ (err).message}`;
   }
+}
+
+/** Whether `path` is a file of its own, not a link, holding the public key `keyid`. @param {string} path @param {string} keyid */
+function keptAt(path, keyid) {
+  try { return lstatSync(path).isFile() && publicIdAt(path) === keyid; } catch { return false; }
+}
+
+/**
+ * `text`, written whole to a file of its own and linked into place at `path`,
+ * which fails if anything is there. Its own file is gone afterwards.
+ * @param {string} path @param {string} text @param {number} mode
+ * @param {(fd: number, buf: Buffer, offset: number, length: number) => number} write
+ */
+function linkWhole(path, text, mode, write) {
+  const temp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  try {
+    const fd = openSync(temp, "wx", mode);
+    try { writeAll(fd, text, write); fsyncSync(fd); } finally { closeSync(fd); }
+    linkSync(temp, path);
+  } finally { try { unlinkSync(temp); } catch { /* gone */ } }
 }
 
 /**
@@ -234,7 +258,7 @@ function reapTemporaries(dir) {
   let names = [];
   try { names = readdirSync(dir); } catch { return; }
   for (const n of names) {
-    const m = /^signing-ed25519\.(?:pem|pub)\.(\d+)\.[0-9a-f]{8}\.tmp$/.exec(n);
+    const m = /^signing-ed25519\.(?:[0-9a-f]{64}\.)?(?:pem|pub)\.(\d+)\.[0-9a-f]{8}\.tmp$/.exec(n);
     if (!m || running(Number(m[1]))) continue;
     try { unlinkSync(join(dir, n)); } catch { /* gone already, or not this user's to remove */ }
   }

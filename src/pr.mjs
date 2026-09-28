@@ -13,7 +13,7 @@ import { rootCause } from "./ci-rootcause.mjs";
 import { computeVerdict, renderVerdict, coversHead, PASS, BLOCK, UNKNOWN } from "./verdict.mjs";
 // The builder App's name has one home already; the classifier reads it rather
 // than restating it.
-import { POLICY_APP, POLICY_CONTEXT } from "./github/reconciler.mjs";
+import { POLICY_APP, POLICY_CONTEXT, LEGACY_CONTEXTS } from "./github/reconciler.mjs";
 import { reviewState } from "./review/derive.mjs";
 import { compare } from "./review/shadow.mjs";
 import { authenticate, apiAsInstallation, loadAppCredentials } from "./github/app.mjs";
@@ -28,8 +28,8 @@ import { execFileSync } from "node:child_process";
  * @typedef {{ reviewState?: typeof reviewState, compare?: typeof compare, foldPrecedesEvaluation?: boolean }} ReviewIo
  */
 
-function ghJson(args, { maxBuffer = undefined } = {}) {
-  try { return { ok: true, out: execFileSync("gh", ["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer }).trim() }; }
+function ghJson(args) {
+  try { return { ok: true, out: execFileSync("gh", ["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() }; }
   catch (e) { return { ok: false, out: "", err: String(e.stderr || e.message).trim() }; }
 }
 
@@ -141,30 +141,6 @@ export function readMergeQueue(nwo, branch, { gh = ghJson } = {}) {
 }
 
 /**
- * Every pull request reeve's App could have published on, with its head (#242):
- * open, or closed since the App was made, merged or not. A merged one's head can
- * head another pull request later, against another base. An App whose age can't
- * be read limits nothing. Not ok unless the whole list was read.
- */
-export function sweptHeads(nwo, { gh = ghJson } = {}) {
-  const made = gh([`apps/${POLICY_APP}`, "--jq", ".created_at"]);
-  const since = made.ok && /^\d{4}-\d\d-\d\dT/.test(String(made.out).trim()) ? String(made.out).trim() : null;
-  // A long history is read whole: past the default buffer, the read would fail on every retry.
-  const r = gh(["--paginate", `repos/${nwo}/pulls?state=all&per_page=100`, "--jq", ".[] | {pr: .number, head: .head.sha, closed: .closed_at}"],
-               { maxBuffer: 256 * 1024 * 1024 });
-  if (!r.ok) return { ok: false, why: r.err || "the pull requests couldn't be listed" };
-  const prs = [];
-  for (const line of String(r.out ?? "").split("\n").filter(Boolean)) {
-    let x;
-    try { x = JSON.parse(line); } catch { return { ok: false, why: "the list of pull requests couldn't be read" }; }
-    if (!Number.isInteger(x?.pr) || typeof x?.head !== "string") return { ok: false, why: "the list of pull requests named one without its head" };
-    if (since && typeof x.closed === "string" && x.closed < since) continue;
-    prs.push({ pr: x.pr, head: x.head });
-  }
-  return { ok: true, prs };
-}
-
-/**
  * The verdict on the commit a merge queue built for a pull request (#163). The
  * queue merges that commit, not the pull request's head, and waits for its
  * required checks there, so a verdict at the head counts for nothing in the
@@ -207,7 +183,7 @@ export function evaluateQueueEntry({ nwo, entry, input, baseRef, profile, db = n
     ? { ...r, reviewedHead: entry.sha, coveredAt: r.reviewedHead } : r));
   const queued = { ...input, reviewers, head: entry.sha,
     checks: { verdict: s.verdict, settled: s.settled, why: s.why, readable: c.readable !== false, failing: c.failing, inherited: [],
-              impostors: got?.impostors ?? [], shadowRequired: req.shadowRequired },
+              impostors: got?.impostors ?? [], shadowRequired: req.shadowRequired, legacyRequired: req.legacyRequired },
     base: { verdict: base.verdict, readable: base.readable !== false } };
   return { ok: true, input: queued, verdict: computeVerdict(queued) };
 }
@@ -302,6 +278,11 @@ function requiredCheckState(rows, { context, app, besideOwn = false }, now = Dat
  * rows are never evidence, and so are reviewers' statuses, which the review
  * clauses read. `known` is false when the base's couldn't be read.
  *
+ * `legacyRequired` says the base requires a name reeve published under before
+ * (`ops/merge-policy`), bound where reeve's App could meet it: its old results
+ * there pass the rule whatever reeve finds now, so that's a rule to change, not
+ * a check to meet (#242).
+ *
  * `shadowRequired` says the base requires reeve's shadow check where reeve's
  * own result could meet the rule. That's no requirement to meet but one to
  * refuse: a shadow result never fails, so it passes the rule whatever reeve
@@ -314,17 +295,19 @@ export function requiredChecksOf({ nwo, baseRef, profile = /** @type {CiProfile}
   const base = baseRef ? requirements({ nwo, base: baseRef, gh }) : null;
   const shadow = shadowContextOf(POLICY_CONTEXT);
   const reviewers = new Set(profile.ci?.reviewerStatusContexts ?? []);
-  const reeveMeets = (c) => c.context === shadow && (c.app == null || appId == null || String(c.app) === String(appId));
+  const reeveCould = (c) => c.app == null || appId == null || String(c.app) === String(appId);
+  const reeveMeets = (c) => c.context === shadow && reeveCould(c);
+  const legacyMeets = (c) => LEGACY_CONTEXTS.includes(c.context) && reeveCould(c);
   // A reviewer's status is aside, but a check bound to an App under the same
   // name is a check run, and required like any other.
-  const aside = (c) => c.context === POLICY_CONTEXT || reeveMeets(c) || (c.app == null && reviewers.has(c.context));
+  const aside = (c) => c.context === POLICY_CONTEXT || reeveMeets(c) || legacyMeets(c) || (c.app == null && reviewers.has(c.context));
   const all = [...(profile.ci?.requiredChecks ?? []).map((context) => ({ context, app: null, origin: "profile" })),
                ...(base ?? []).filter((c) => !aside(c)).map((c) => ({ ...c, origin: "base" }))];
   // One entry per check. Where the profile and the base both name it, the base
   // wins: its requirement may be any App's, and settles only when it reports.
   const required = all.filter((c, i) => all.findIndex((d) => d.context === c.context && d.app === c.app) === i)
     .map((c) => (all.some((d) => d.context === c.context && d.app === c.app && d.origin === "base") ? { ...c, origin: "base" } : c));
-  return { required, known: Array.isArray(base), shadowRequired: (base ?? []).some(reeveMeets) };
+  return { required, known: Array.isArray(base), shadowRequired: (base ?? []).some(reeveMeets), legacyRequired: (base ?? []).some(legacyMeets) };
 }
 
 /**
@@ -870,7 +853,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     // waiting for the checks to settle never does.
     checks: { verdict: s.verdict, settled: s.settled, why: s.why, readable: c.readable !== false, failing: c.failing, inherited: c.inherited,
               // Another App's check under reeve's own name: kept, never dropped.
-              impostors: read.impostors ?? [], shadowRequired: req.shadowRequired },
+              impostors: read.impostors ?? [], shadowRequired: req.shadowRequired, legacyRequired: req.legacyRequired },
     base: { verdict: base.verdict, readable: base.readable !== false },
     reviewers, rounds, threads, cleared: facts.cleared,
     bodyFindings: facts.bodyFindings, unreadableBodies: facts.unreadableBodies,
@@ -922,7 +905,7 @@ export const shadowContextOf = (context) => `${context} (shadow)`;
  */
 function existingRuns(token, nwo, sha, names, api = apiAsInstallation) {
   const r = api(token, ["--paginate", `repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=latest`,
-    "--jq", ".check_runs[] | {name, id, conclusion, app: .app.slug, title: .output.title, summary: .output.summary}"]);
+    "--jq", ".check_runs[] | {name, id, conclusion, app: .app.slug}"]);
   if (!r.ok) return null;
   const rows = [];
   for (const line of (r.out ?? "").split("\n").filter(Boolean)) { try { rows.push(JSON.parse(line)); } catch { return null; } }
@@ -1139,7 +1122,7 @@ export const requiredOnBase = (args) => requirementsOnBase(args).own;
  * requires the enforcement check, every pull request is blocked until reeve
  * enforces: that comes back as `held`, for the daemon to raise.
  */
-export async function publishVerdict({ nwo, verdict, shadow = true, context = "ops/merge-policy", base = null, queue = false,
+export async function publishVerdict({ nwo, verdict, shadow = true, context = POLICY_CONTEXT, base = null, queue = false,
                                       auth: authenticateAs = authenticate, api = apiAsInstallation }) {
   const auth = await authenticateAs(nwo);
   if (!auth.ok) return { ok: false, why: auth.why };
@@ -1247,7 +1230,7 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = "o
  * The run's text shows on the watched repository's pull requests, so it names
  * the merge policy, never reeve.
  */
-export async function withdrawVerdict({ nwo, head, name, id = null, why, passing = false, keep = null,
+export async function withdrawVerdict({ nwo, head, name, id = null, why,
                                         auth: authenticateAs = authenticate, api = apiAsInstallation }) {
   const auth = await authenticateAs(nwo);
   if (!auth.ok) return { ok: false, why: auth.why };
@@ -1264,10 +1247,6 @@ export async function withdrawVerdict({ nwo, head, name, id = null, why, passing
   const run = runs.mine[name]?.id ?? null;
   // Nothing of reeve's stands there, so there is nothing to take back.
   if (run == null) return { ok: true, id: null };
-  // With `passing`, only a result that could pass the check: a failure can't.
-  if (passing && !PASSING_RUN.has(runs.mine[name]?.conclusion)) return { ok: true, id: null };
-  // With `keep`, what stood there is kept first, and isn't withdrawn unless it was.
-  if (keep && !keep(runs.mine[name])) return { ok: false, why: "what stood there couldn't be kept first, so it wasn't withdrawn" };
   const res = cancel(run);
   if (!res.ok) return { ok: false, why: String(res.err ?? "").split("\n")[0] };
   return { ok: true, id: run };

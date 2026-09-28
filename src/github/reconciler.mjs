@@ -69,9 +69,17 @@ export function pinHead(nwo, branch) {
  * reeve's own verdict check, and the App that publishes it. Defined here, at the
  * lowest layer that reads checks, so the exclusion below cannot be forgotten by a
  * caller and every consumer of readChecks inherits it.
+ *
+ * `merge-policy` since #242. Versions before it published as `ops/merge-policy`,
+ * and those before records were kept (#239) published their shadow results there
+ * as `neutral`, which a required check reads as passing. Under a new name, none
+ * of those can pass a rule that requires reeve's check. The founder chose this
+ * over sweeping them away (2026-09-28).
  */
-export const POLICY_CONTEXT = "ops/merge-policy";
+export const POLICY_CONTEXT = "merge-policy";
 export const POLICY_APP = "merge-policy";
+/** The names reeve published under before, whose old results a rule that still requires one would read as passing. */
+export const LEGACY_CONTEXTS = Object.freeze(["ops/merge-policy", "ops/merge-policy (shadow)"]);
 
 /**
  * What counts as a check, versioned.

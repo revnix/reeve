@@ -1276,7 +1276,7 @@ export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), sna
         // predicate let a drifted installation report PASS.
         detail: `requires=${r.ruleset_requires_check} bound_app=${r.bound_app_id} expected=${r.expected_app_id} ` +
                 `installed=${r.app_installed} permission_diff=${r.permission_diff ?? "none"} error=${r.error ?? "none"}`,
-        action: "merge stays dark until the ruleset requires ops/merge-policy from the expected app" });
+        action: "merge stays dark until the ruleset requires merge-policy from the expected app" });
     } else {
       out.push({ id: `H-4:${r.nwo_snapshot}`, severity: "pass", classification: "unsafe-authority",
         title: `${r.nwo_snapshot} enforces the bound check`, detail: null, action: null });

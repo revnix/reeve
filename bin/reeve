@@ -518,6 +518,18 @@ function loadProfile(nwo, { orNull = false } = {}) {
       process.exit(1);
     }
     for (const w of r.warnings) console.error("  warn:", w);
+    // ONLY FOR THE REPOSITORY IT NAMES (#264). The working directory's profile is
+    // read before the one kept for the repository, and applying another
+    // repository's would judge, notify or withdraw by its rules. Refused rather
+    // than redirected: which of the two the operator meant isn't something this
+    // can know.
+    const key = profile.identity?.key ?? null;
+    if (key !== nwo) {
+      const msg = `reeve: the profile found at ${p} is for ${key ? JSON.stringify(key) : "no repository"}, not ${JSON.stringify(nwo)}, so it isn't used\n` +
+                  `-> run it from ${JSON.stringify(nwo)}'s own checkout, or ask about ${key ? JSON.stringify(key) : "the repository it names"}`;
+      if (orNull) { console.error(msg); return null; }
+      fail("usage", msg, { exit: EXITS.misuse });
+    }
     return { path: p, ...profile };
   }
   return null;
@@ -1027,25 +1039,10 @@ switch (cmd) {
            { exit: EXITS.misuse });
     // A profile is where the channels are declared, so its absence is the answer
     // rather than an error: there is nothing configured to test.
+    // THE PROFILE HAS TO BE THIS REPOSITORY'S, and `loadProfile` refuses one
+    // that isn't (#264): sent through another repository's channels, the test
+    // would report this one's setup healthy without having touched it.
     const profile = loadProfile(nwo) ?? {};
-    // THE PROFILE HAS TO BE THIS REPOSITORY'S. `loadProfile` prefers
-    // `./.ops/profile.json` over the sidecar and does not check whose it is, so
-    // `reeve notify --test owner/B` run inside repository A sent through A's
-    // channels while titling the alert B -- reporting B's setup healthy without
-    // having touched it, and putting an unexpected real alert on somebody's
-    // phone. `task file` already refuses this mismatch; a command whose entire
-    // job is to tell you the truth about a channel must not be the one that
-    // guesses. Refused rather than redirected: which of the two the operator
-    // meant is not something this can know.
-    const declared = profile?.identity?.key;
-    if (declared && declared !== nwo)
-      fail("usage",
-           `reeve notify: the profile found for this command declares identity.key ` +
-           `${JSON.stringify(declared)}, but you asked about ${JSON.stringify(nwo)}.\n` +
-           `-> refusing rather than sending through ${JSON.stringify(declared)}'s channels and ` +
-           `reporting them as ${JSON.stringify(nwo)}'s\n` +
-           `-> run it from ${JSON.stringify(declared)}'s checkout, or ask about ${JSON.stringify(declared)}`,
-           { exit: EXITS.misuse });
     const at = new Date().toISOString();
     const r = notify({ profile, alert: {
       title: `reeve · ${nwo} · TEST`,

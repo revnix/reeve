@@ -68,21 +68,28 @@ export function signingState(db, keys, anchor = null) {
 
 /**
  * A pull request's signed order of decisions (#274), as its store holds it, each
- * entry checked: of this repository and of `store` where that's given, signed by
- * a known key over exactly its pull request, number and records, and numbered
- * from 1 with none missing and none named twice. `top` is its highest entry and
+ * entry checked: of this repository and of `store`, the store's own identity
+ * where that isn't given, signed by a known key over exactly its pull request,
+ * number and records, and numbered from 1 with none missing and none named
+ * twice. With no store to check against, none is taken while the store holds any
+ * entry. `top` is its highest entry and
  * `digest` the record that names as latest; 0 and null when the store holds
  * none. `digests` is every record it names, as latest or kept, and `seq` where
  * in the store's sequence its top entry's latest was seen, null where it doesn't say.
  * @param {Db} db @param {string} repo @param {number} pr @param {Keys} keys @param {string | null} [store]
  * @returns {{ top: number, digest: string | null, digests: Set<string>, seq: number | null } | { corrupt: string }}
  */
-export function signedOrder(db, repo, pr, keys, store = null) {
+export function signedOrder(db, repo, pr, keys, store = storeIdentity(db)) {
   // An entry filed under anything but a pull request's own name is found by no
   // pull request's order: its own would read as shorter than it is. So none is
   // taken as checked while one is.
   const stray = strayEntry(db);
   if (stray !== null) return { corrupt: `an entry of a signed order in this store is filed under ${JSON.stringify(stray)}, not a pull request's name` };
+  // A store keeps its identity from before its first entry, so one that holds an
+  // entry with no store to check it against had its identity taken away: any
+  // store's entries would pass for its own, another host's, its key published, say.
+  if (store == null && db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(LATEST_OP))
+    return { corrupt: "this store holds entries of signed orders, but no identity to check them against: it was taken away" };
   /** @type {Map<number, string>} */ const byN = new Map();
   /** @type {Map<number, number | null>} */ const seqs = new Map();
   /** @type {Set<string>} */ const named = new Set();
@@ -144,7 +151,7 @@ export function anchorForStore(db, anchor, repo) {
 /**
  * The store whose entries an order of `db` must be: the one the host's anchor is
  * bound to, or, with none, the one the store names itself. Null where neither
- * says, and then any store's entries are taken.
+ * says, and then no entry is taken, as a store names itself before its first.
  * @param {Db} db @param {AnchorRead | null} anchor
  */
 const orderStore = (db, anchor) => anchor?.anchor?.store ?? storeIdentity(db);

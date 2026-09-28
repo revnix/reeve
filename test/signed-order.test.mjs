@@ -395,9 +395,10 @@ test("a store the host's anchor is bound to says there that it began signing, th
   const db = open(dbPath);
   const id = db.prepare("SELECT json_extract(payload, '$.id') AS id FROM event WHERE op = 'store.identity'").get()?.id;
   db.close();
-  // Bound to the store and saying nothing more, as a tick that bound it and noted no entry leaves it.
-  rmSync(anchorPath(dir, REPO));
-  assert.equal(fileAnchor(dir).bind(REPO, id), true, "control: bound");
+  // Bound to the store and saying nothing more. Binding says the store began
+  // too, so no reeve leaves it so; whatever did, the next tick says it.
+  writeFileSync(anchorPath(dir, REPO), JSON.stringify({ began: false, latest: {}, store: id }));
+  assert.deepEqual(readAnchor(dir, REPO), { began: false, latest: new Map(), store: id }, "control: bound, and saying nothing more");
   // No keys to check an order with, so none is extended or noted.
   await run({ evaluate: () => at(A), dbPath, ...host(dir), keys: () => null });
   const a = readAnchor(dir, REPO);
@@ -1440,4 +1441,61 @@ test("a rollback that takes a pull request's every record and entry away is said
   db.close();
   const r = await closedTick(dbPath, host(dir));
   assert.match(r.log, /#42: its signed order ends at entry 0, though this host signed up to entry 2, so it isn't extended/);
+});
+
+// ── from #278's thirteenth review ────────────────────────────────────────────
+
+test("binding the host's anchor to a store says there that the store began signing", () => {
+  const dir = credentials();
+  const id = "a".repeat(32);
+  assert.equal(fileAnchor(dir).bind(REPO, id), true, "control: bound");
+  assert.deepEqual(readAnchor(dir, REPO), { began: true, latest: new Map(), store: id });
+});
+
+test("a store stripped while its reeve was down, after a tick that bound the host's anchor and noted no entry, isn't given a baseline again", async () => {
+  const dir = credentials();
+  // The first ordering tick binds the anchor, and its reeve stops before an entry is noted.
+  const h = host(dir);
+  const dbPath = await ticks([at(A)], { ...h, anchor: { ...h.anchor, note: () => false } });
+  const a = readAnchor(dir, REPO);
+  assert.ok(a?.store && a.latest.size === 0, `control: bound, and no entry noted: ${JSON.stringify(a?.store)}, ${a?.latest.size}`);
+  // While it's down, the store is stripped of its baseline, every signature and its order.
+  let db = open(dbPath);
+  db.prepare("DELETE FROM event WHERE op IN ('signing.baseline', 'decision.latest')").run();
+  db.prepare("UPDATE decision SET envelope = NULL").run();
+  db.close();
+  const r = await run({ evaluate: () => at(B), dbPath, ...host(dir) });
+  db = open(dbPath);
+  const baselines = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n;
+  db.close();
+  assert.equal(baselines, 0, "none made over records that may have been rewritten");
+  assert.match(r.log, /the host's anchor says this store began signing, though it holds no baseline or signed record/);
+});
+
+test("a store holding entries of signed orders, its identity taken away, has none taken as checked where no host's anchor says which store it is", async () => {
+  const dir = credentials(), otherDir = credentials();
+  const ours = await ticks([at(A)], host(dir));
+  const theirs = await ticks([at(A, "RED")], host(otherDir));
+  const t = open(theirs);
+  const entry = t.prepare("SELECT at, actor, op, subject, payload FROM event WHERE op = 'decision.latest'").get();
+  const rec = t.prepare("SELECT * FROM decision WHERE pr = ?").get(PR);
+  t.close();
+  assert.ok(entry && rec, "control: the other host signed an entry");
+  // Its records and order replaced with another host's, and its identity taken away.
+  const db = open(ours);
+  db.prepare("DELETE FROM event WHERE op IN ('decision.latest', 'store.identity')").run();
+  db.prepare("DELETE FROM decision").run();
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(entry.at, entry.actor, entry.op, entry.subject, entry.payload);
+  const cols = Object.keys(rec);
+  db.prepare(`INSERT INTO decision(${cols.join(",")}) VALUES(${cols.map(() => "?").join(",")})`).run(...cols.map((c) => rec[c]));
+  // Both hosts' keys known, the other's published, and checked where the host's anchor isn't: on another machine, say.
+  const published = tempDir("reeve-order-published-");
+  for (const [id, v] of knownKeys({ local: otherDir })) writeFileSync(join(published, `${id}.pub`), readFileSync(v.path));
+  const keys = knownKeys({ published, local: dir });
+  const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: null });
+  const replayed = replayDecisions(db, {}, { keys, repo: REPO, anchor: null });
+  db.close();
+  assert.match(String(shown), /can't be trusted as the latest: this store holds entries of signed orders, but no identity to check them against/);
+  assert.doesNotMatch(String(shown), /the latest by its signed order/);
+  assert.ok(replayed.some((x) => x.outcome === "unreplayable" && /no identity to check them against/.test(String(x.why))), JSON.stringify(replayed));
 });

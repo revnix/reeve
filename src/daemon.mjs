@@ -1584,7 +1584,8 @@ export async function tick(ctx) {
         }
         // Bound only by a store with an order to extend: one that judges nothing,
         // named by --db say, would otherwise take the anchor from the store that
-        // has one.
+        // has one. It began signing, or nothing is ordered, and the binding says
+        // so too.
         const pending = pendingOrders(a, id);
         if (!pending.length) return;
         if (!bound && !ctx.anchor.bind(nwo, id)) {

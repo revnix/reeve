@@ -169,7 +169,8 @@ function reap(folder) {
  * The daemon's writer of the host's anchors, in the credentials folder `dir`.
  * `began(repo, id)` says the repository's store began signing, where the anchor
  * is store `id`'s, `bind(repo, id)` that it's store `id`'s, where it's no store's
- * yet, and `note(repo, pr, n)`
+ * yet, and that it began signing, as only a store that has is bound, and
+ * `note(repo, pr, n)`
  * that entry `n` of a pull request's signed order was kept. Each only moves the
  * anchor forward, and answers whether it holds that now, durably: false when it
  * couldn't be read, written or synced, which leaves it as it was, or not yet
@@ -220,11 +221,17 @@ export function fileAnchor(dir, { write = (fd, buf, offset, length) => writeSync
     lock: (repo) => anchorLock(dir, repo, owe),
     /** Only where the anchor is bound to store `id`: said by a store it isn't, it would be said of the one it is. @param {string} repo @param {string | null} id */
     began: (repo, id) => update(repo, (a) => (a.began || !id || a.store !== id ? false : ((a.began = true), true))),
-    /** @param {string} repo @param {string} id */
+    /**
+     * Said with the binding that the store began: a reeve stopped between it and
+     * its first note would otherwise leave the anchor bound to a store it doesn't
+     * say began, and that store, stripped while it's down, given a baseline again.
+     * @param {string} repo @param {string} id
+     */
     bind: (repo, id) => update(repo, (a) => {
       if (a.store === id) return false;
       if (a.store) throw new Error(`the host's anchor for ${repo} is another store's`);
       a.store = id;
+      a.began = true;
       return true;
     }),
     /** @param {string} repo @param {number} pr @param {number} n */

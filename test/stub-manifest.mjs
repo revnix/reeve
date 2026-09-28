@@ -11768,7 +11768,7 @@ export const STUBS = [
     expectRed: "an entry that doesn't check never counts as naming a record, so the order it's in is checked and said not to hold",
     edits: [{ file: "src/daemon.mjs",
               find: "      if (was?.key !== key) orderChecked.set(pr, (was = { key, order: signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), store) }));",
-              replace: "      if (was?.key !== key) orderChecked.set(pr, (was = { key, order: { top: 0, digest: null, digests: new Set(texts.flatMap((t) => { try { const p = JSON.parse(t); return [p.digest, ...(p.records ?? [])]; } catch { return []; } })) } }));" }],
+              replace: "      if (was?.key !== key) orderChecked.set(pr, (was = { key, order: { top: Math.max(0, ...texts.map((t) => { try { const n = JSON.parse(t).n; return Number.isInteger(n) ? n : 0; } catch { return 0; } })), digest: null, digests: new Set(texts.flatMap((t) => { try { const p = JSON.parse(t); return [p.digest, ...(p.records ?? [])]; } catch { return []; } })) } }));" }],
   },
   {
     name: "pending-corrupt-order",
@@ -11997,5 +11997,23 @@ export const STUBS = [
     edits: [{ file: "src/daemon.mjs",
               find: "    for (const [pr, n] of a.latest) { const o = orders.get(pr); if (!o || (\"top\" in o && o.top < n)) prs.add(pr); }",
               replace: "    void a;" }],
+  },
+  {
+    name: "anchor-bind-says-began",
+    why: "bind the host's anchor to a store without saying there that it began signing. A reeve stopped before its first note would leave the store, stripped while it's down, to be given a baseline again",
+    test: "test/signed-order.test.mjs",
+    expectRed: "a store stripped while its reeve was down, after a tick that bound the host's anchor and noted no entry, isn't given a baseline again",
+    edits: [{ file: "src/anchor.mjs",
+              find: "      a.store = id;\n      a.began = true;",
+              replace: "      a.store = id;" }],
+  },
+  {
+    name: "order-needs-store-identity",
+    why: "check a store's orders with no store to check their entries against. A store whose identity was taken away would take another host's entries, its key published, for its own",
+    test: "test/signed-order.test.mjs",
+    expectRed: "a store holding entries of signed orders, its identity taken away, has none taken as checked where no host's anchor says which store it is",
+    edits: [{ file: "src/decisions.mjs",
+              find: "  if (store == null && db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(LATEST_OP))",
+              replace: "  if (false)" }],
   },
 ];

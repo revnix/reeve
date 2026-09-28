@@ -15,7 +15,7 @@ import { snapshot, restore, latestSnapshot, exportEvents,
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick, measuredContainment, withdrawStanding, tellStuck, runningCode } from "../src/daemon.mjs";
 import { replayDecisions, renderReplay } from "../src/decisions.mjs";
-import { knownKeys, fileSigner, fileAnchor, readAnchor, PUBLIC_FILE } from "../src/signing.mjs";
+import { knownKeys, fileSigner, fileAnchor, readAnchor, signingKey, PUBLIC_FILE } from "../src/signing.mjs";
 import { SelectorError } from "../src/db/records.mjs";
 import { readState, render as renderStatus, statusline, why, cleanMergeRate } from "../src/status.mjs";
 import { init } from "../src/init.mjs";
@@ -896,6 +896,9 @@ switch (cmd) {
   // deploy/signing-keys/. Only the public half is read.
   case "signing-key": {
     const pub = join(HOME, "credentials", PUBLIC_FILE);
+    // The public half is written again from the key first, if it's missing or
+    // isn't the key's: what this points at must never hold the key itself.
+    signingKey(join(HOME, "credentials"));
     const keys = knownKeys({ local: join(HOME, "credentials") });
     const [id] = [...keys.keys()];
     if (!id) {

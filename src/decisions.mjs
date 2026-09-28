@@ -260,6 +260,27 @@ export function replayDecisions(db, which = {}, { code = null, profile = null, c
     if (canonical(now) === canonical(r.verdict)) results.push({ ...base, outcome: "same" });
     else results.push({ ...base, outcome: "differs", now: now.state, diffs: clauseDiffs(r.verdict, now) });
   }
+  // What the signed order of each pull request's decisions names, the store has
+  // to hold too: a record deleted from the store, adverse perhaps, is reported,
+  // never passed over. Not when one record was asked for by its digest.
+  if (keys && which.digest == null) {
+    const held = new Set(results.map((x) => x.digest));
+    const unheld = db.prepare(`SELECT 1 FROM decision WHERE digest = ? LIMIT 1`);
+    const where = [`op = ?`], args = [/** @type {string | number} */ (LATEST_OP)];
+    if (which.pr != null) { where.push(`subject = ?`); args.push(`pr:${which.pr}`); }
+    if (which.since != null) { where.push(`at >= ?`); args.push(which.since); }
+    /** @type {Set<string>} */ const seen = new Set();
+    for (const e of /** @type {any[]} */ (db.prepare(`SELECT subject, payload FROM event WHERE ${where.join(" AND ")} ORDER BY seq`).all(...args))) {
+      let p;
+      try { p = JSON.parse(e.payload); } catch { continue; }
+      const digest = String(p?.digest ?? "");
+      if (!digest || seen.has(digest) || held.has(digest)) continue;
+      seen.add(digest);
+      if (unheld.get(digest)) continue;
+      results.push({ digest, pr: Number(String(e.subject).slice(3)), head: "", recorded: "unknown", outcome: "unreplayable",
+                     why: "the signed order of its decisions names this record, but the store no longer holds it", codeChanged: null, policyChanged: null });
+    }
+  }
   return results;
 }
 

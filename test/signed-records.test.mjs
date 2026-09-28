@@ -2,11 +2,11 @@
 // no longer passes for the one reeve kept.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { generateKeyPairSync } from "node:crypto";
+import { createPublicKey, generateKeyPairSync } from "node:crypto";
 import { signingKey, fileSigner, signDecision, checkSignature, knownKeys, keyIdOf, decisionStatement, baselineStatement,
-         fileAnchor, readAnchor, KEY_FILE, PUBLIC_FILE, PAYLOAD_TYPE, ANCHOR_FILE } from "../src/signing.mjs";
+         fileAnchor, readAnchor, anchorPath, KEY_FILE, PUBLIC_FILE, PAYLOAD_TYPE } from "../src/signing.mjs";
 import { decisionRecord, digestOf } from "../src/evidence.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 import { open } from "../src/db/ops.mjs";
@@ -332,10 +332,12 @@ test("a public half that's missing, cut short or another key's is written again 
   const dir = credentials();
   const k = signingKey(dir, { create: true });
   const id = k.ok ? k.keyid : "";
+  const slot = () => { try { return keyIdOf(createPublicKey(readFileSync(join(dir, PUBLIC_FILE), "utf8"))); } catch { return null; } };
   for (const broken of ["-----BEGIN PUBLIC KEY-----\nMCow", String(generateKeyPairSync("ed25519").publicKey.export({ type: "spki", format: "pem" }))]) {
     writeFileSync(join(dir, PUBLIC_FILE), broken);
     assert.equal(signingKey(dir).ok, true);
-    assert.deepEqual([...knownKeys({ local: dir }).keys()], [id]);
+    assert.equal(slot(), id, "the slot holds this key's public half again");
+    assert.equal(knownKeys({ local: dir }).get(id)?.where, "this host's");
   }
 });
 
@@ -549,8 +551,8 @@ test("the host's anchor only moves forward, and is readable only by its owner", 
   const read = readAnchor(dir);
   assert.equal(read.latest.get("o/r#7"), 3);
   assert.equal(read.began.has("o/r"), true);
-  assert.equal(statSync(join(dir, ANCHOR_FILE)).mode & 0o777, 0o600);
-  assert.deepEqual(readdirSync(dir).filter(f => f.endsWith(".tmp")), []);
+  assert.equal(statSync(anchorPath(dir, "o/r")).mode & 0o777, 0o600);
+  assert.deepEqual(readdirSync(dirname(anchorPath(dir, "o/r"))).filter(f => f.endsWith(".tmp")), []);
 });
 
 test("reeve why reads the host's anchor, and says when the store holds less than this host signed", async () => {
@@ -593,5 +595,82 @@ test("an anchor whose writing fails leaves it as it was, and nothing beside it",
   const full = () => { throw Object.assign(new Error("no space left on device"), { code: "ENOSPC" }); };
   assert.equal(fileAnchor(dir, { write: full }).note("o/r", 7, 2), false, "it says the write didn't land");
   assert.equal(readAnchor(dir).latest.get("o/r#7"), 1);
-  assert.deepEqual(readdirSync(dir).filter(f => f.endsWith(".tmp")), []);
+  assert.deepEqual(readdirSync(dirname(anchorPath(dir, "o/r"))).filter(f => f.endsWith(".tmp")), []);
+});
+
+// ── from #271's third review ─────────────────────────────────────────────────
+
+const privatePem = () => String(generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "pem" }));
+
+test("a public-key file holding a private key is never taken for a public key, and is written again from the key", () => {
+  const dir = credentials();
+  const k = signingKey(dir, { create: true });
+  writeFileSync(join(dir, PUBLIC_FILE), privatePem());
+  assert.deepEqual([...knownKeys({ local: dir }).keys()], [], "a private key is never read as a public one");
+  assert.equal(signingKey(dir).ok, true);
+  assert.doesNotMatch(readFileSync(join(dir, PUBLIC_FILE), "utf8"), /PRIVATE KEY/);
+  assert.deepEqual([...knownKeys({ local: dir }).keys()], [k.ok ? k.keyid : ""]);
+});
+
+test("reeve signing-key never points at a file holding a private key", () => {
+  const home = tempDir("reeve-signing-private-cli-");
+  const dir = join(home, "credentials");
+  mkdirSync(dir, { mode: 0o700 });
+  signingKey(dir, { create: true });
+  writeFileSync(join(dir, PUBLIC_FILE), privatePem());
+  const r = spawnSync(process.execPath, [REEVE, "signing-key"], { encoding: "utf8", env: { ...offlineEnv(), REEVE_HOME: home } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(readFileSync(join(dir, PUBLIC_FILE), "utf8"), /PRIVATE KEY/, "what it points at is the public half");
+});
+
+test("a key made in place of a lost one keeps the lost one's public half, so what it signed still checks", () => {
+  const dir = credentials();
+  const d = decision();
+  const signed = fileSigner(dir)(decisionStatement(d));
+  const old = signingKey(dir);
+  rmSync(join(dir, KEY_FILE));
+  const made = signingKey(dir, { create: true });
+  assert.notEqual(made.ok && made.keyid, old.ok && old.keyid);
+  const keys = knownKeys({ local: dir });
+  assert.ok(keys.has(old.ok ? old.keyid : ""), "the old public half is kept");
+  assert.equal(checkSignature(row(d, signed), keys).state, "signed");
+});
+
+test("each repository's anchor is a file of its own, so one repository's write never touches another's", () => {
+  const dir = credentials();
+  const anchor = fileAnchor(dir);
+  anchor.note("o/a", 1, 1);
+  anchor.note("o/b", 2, 1);
+  assert.notEqual(anchorPath(dir, "o/a"), anchorPath(dir, "o/b"));
+  writeFileSync(anchorPath(dir, "o/a"), "{}");
+  assert.equal(readAnchor(dir).latest.get("o/b#2"), 1);
+});
+
+test("an anchor write that failed is made good on a later tick, though the decision didn't change", async () => {
+  const dir = credentials();
+  const real = fileAnchor(dir);
+  let failing = true;
+  const anchor = { began: real.began, note: (...a) => (failing ? ((failing = false), false) : real.note(...a)) };
+  await ticks([at(A), at(A)], { signer: fileSigner(dir), anchor });
+  assert.equal(readAnchor(dir).latest.get("o/r#42"), 1);
+});
+
+test("replay reports a record the signed order names that the store no longer holds", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], { signer: fileSigner(dir), anchor: fileAnchor(dir) }));
+  const older = db.prepare("SELECT digest FROM decision ORDER BY first_seq LIMIT 1").get().digest;
+  db.prepare("DELETE FROM decision WHERE digest = ?").run(older);
+  const replayed = replayDecisions(db, {}, { keys: knownKeys({ local: dir }), anchor: readAnchor(dir) });
+  db.close();
+  assert.ok(replayed.some(r => r.outcome === "unreplayable" && r.digest === older && /no longer holds it/.test(r.why ?? "")), JSON.stringify(replayed));
+});
+
+test("a store that began signing before the host kept an anchor is anchored as begun on its next tick", async () => {
+  const dir = credentials();
+  const dbPath = join(tempDir("reeve-signing-late-anchor-"), "s.db");
+  open(dbPath).close();
+  await run({ openPrs: () => [], signer: fileSigner(dir), dbPath });
+  assert.equal(readAnchor(dir).began.has("o/r"), false, "control: no anchor was kept then");
+  await run({ openPrs: () => [], signer: fileSigner(dir), anchor: fileAnchor(dir), dbPath });
+  assert.equal(readAnchor(dir).began.has("o/r"), true);
 });

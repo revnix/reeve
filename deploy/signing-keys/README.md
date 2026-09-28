@@ -13,10 +13,14 @@ can read the key, and no worker can. Its public half is written beside it, as
 host's own. A record signed by any other key, or whose signature doesn't hold,
 reads as corrupt. One kept before records were signed reads as unsigned.
 
-On the host that signed them, `why` and `replay` also read
-`credentials/signing-anchor.json`, which records what the host signed last:
-whether each store began signing, and each pull request's highest entry of the
-signed order of its decisions. A store holding less than that, restored from an
-older copy or cut short, reads as not to be trusted.
+On the host that signed them, `why` and `replay` also read the host's anchors,
+`credentials/signing-anchors/<owner>/<repo>.json`, which record what the host
+signed last: whether each store began signing, and each pull request's highest
+entry of the signed order of its decisions. A store holding less than that,
+restored from an older copy or cut short, reads as not to be trusted.
+
+A key made in place of one that was lost keeps the lost key's public half
+beside it, as `signing-ed25519.<key id>.pub`, so what that key signed still
+checks. Publish that one here too.
 
 Keep a replaced key's file here, so the records it signed still check.

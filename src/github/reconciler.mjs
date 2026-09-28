@@ -69,9 +69,17 @@ export function pinHead(nwo, branch) {
  * reeve's own verdict check, and the App that publishes it. Defined here, at the
  * lowest layer that reads checks, so the exclusion below cannot be forgotten by a
  * caller and every consumer of readChecks inherits it.
+ *
+ * `merge-policy` since #242. Versions before it published as `ops/merge-policy`,
+ * and those before records were kept (#239) published their shadow results there
+ * as `neutral`, which a required check reads as passing. Under a new name, none
+ * of those can pass a rule that requires reeve's check. The founder chose this
+ * over sweeping them away (2026-09-28).
  */
-export const POLICY_CONTEXT = "ops/merge-policy";
+export const POLICY_CONTEXT = "merge-policy";
 export const POLICY_APP = "merge-policy";
+/** The names reeve published under before, whose old results a rule that still requires one would read as passing. */
+export const LEGACY_CONTEXTS = Object.freeze(["ops/merge-policy", "ops/merge-policy (shadow)"]);
 
 /**
  * What counts as a check, versioned.
@@ -86,7 +94,7 @@ export const POLICY_APP = "merge-policy";
  * Bump this whenever the set of things counted changes. A stored floor recorded
  * under an older number is discarded rather than compared against.
  */
-export const CHECK_ACCOUNTING = 5;
+export const CHECK_ACCOUNTING = 6;
 // 3: reviewer commit-status contexts (ci.reviewerStatusContexts) left the counted
 //    set. Measured the moment it shipped -- nextly #1011 read "only 34 checks
 //    reported where 35 were expected" against a floor stored under accounting 2,
@@ -97,6 +105,10 @@ export const CHECK_ACCOUNTING = 5;
 //    to a page and runs 100, so a head with more counts them all from here on.
 // 5: only a reviewer's commit STATUS leaves the counted set. A check run under a
 //    reviewer's context name counts, since a rule can bind it to its App.
+// 6: reeve's check is `merge-policy` since #242. A commit status under a name it
+//    published under before leaves the counted set, as one of its own old
+//    verdicts; another App's check run under such a name counts, as the name
+//    isn't reeve's now.
 
 /**
  * Remove reeve's own opinion from the evidence.
@@ -112,13 +124,19 @@ export const CHECK_ACCOUNTING = 5;
  * the policy name from some OTHER App is not evidence either, but it is returned
  * separately: something impersonating the gate is worth saying out loud rather
  * than quietly discarding.
+ *
+ * A commit status under a name reeve published under before (#242) is one of
+ * its own old verdicts: a status carries no App to tell it by, and read back as
+ * a pass it would settle CI on reeve's own say. Another App's check run under
+ * such a name is that App's, and counts.
  */
 export function excludeOwnPolicy(rows, context = POLICY_CONTEXT, app = POLICY_APP) {
   const rest = [], excluded = [], impostors = [];
   for (const r of rows) {
     const mine = r.app === app;
     const named = r.name === context;
-    if (!mine && !named) { rest.push(r); continue; }
+    const old = r.source === "status" && LEGACY_CONTEXTS.includes(r.name);
+    if (!mine && !named && !old) { rest.push(r); continue; }
     excluded.push(r);
     if (named && !mine) impostors.push(r);
   }

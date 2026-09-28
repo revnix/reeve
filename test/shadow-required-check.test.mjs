@@ -1,6 +1,6 @@
 // Shadow mode must never satisfy a required check (#160).
 //
-// In shadow mode reeve published `neutral` as ops/merge-policy, and GitHub counts
+// In shadow mode reeve published `neutral` as its own check, and GitHub counts
 // `neutral` as passing a required check. With the check required, or made
 // required after a shadow result was published, a pull request passed the gate
 // unjudged. Shadow results now publish under their own name, which no rule
@@ -11,6 +11,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { publishVerdict, requiredOn, requiredOnBase, requirementsOnBase, shadowContextOf } from "../src/pr.mjs";
+import { POLICY_CONTEXT } from "../src/github/reconciler.mjs";
 import { tick } from "../src/daemon.mjs";
 import { open } from "../src/db/ops.mjs";
 import { OFFLINE_READS } from "./fixtures/offline-github.mjs";
@@ -21,7 +22,8 @@ const check = (ok, name, detail) => {
   if (!ok) { if (detail) console.log("        " + detail); fail++; }
 };
 
-const NWO = "o/r", CONTEXT = "ops/merge-policy", APP = "12345";
+// Reeve's own check, by the name it publishes under now.
+const NWO = "o/r", CONTEXT = POLICY_CONTEXT, APP = "12345";
 const verdict = { state: "BLOCK", summary: "ci: failing", head: "a".repeat(40), clauses: [] };
 const rule = (context, integration_id) => JSON.stringify({ type: "required_status_checks", parameters: { required_status_checks: [{ context, integration_id }] } });
 const RULES_NONE = { ok: true, out: JSON.stringify({ type: "deletion" }) };

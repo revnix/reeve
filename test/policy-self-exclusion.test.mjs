@@ -46,8 +46,8 @@ const row = (name, conclusion, app = "github-actions") =>
 
 // The filter must be exact. Excluding by prefix would blind reeve to real checks.
 {
-  const r = excludeOwnPolicy([row("ops/merge-policy-extra", "failure"), row("ops/merge", "failure")], POLICY_CONTEXT, POLICY_APP);
-  check(r.rows.length === 2, "a similarly-named check from another app is NOT excluded", JSON.stringify(r));
+  const r = excludeOwnPolicy([row(`${POLICY_CONTEXT}-extra`, "failure"), row("merge", "failure"), row(`ci/${POLICY_CONTEXT}`, "failure")], POLICY_CONTEXT, POLICY_APP);
+  check(r.rows.length === 3, "a similarly-named check from another app is NOT excluded", JSON.stringify(r));
 }
 
 // A check carrying reeve's name from someone else's App is not evidence either --

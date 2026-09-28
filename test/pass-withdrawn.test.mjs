@@ -43,7 +43,7 @@ const setup = ({ cap = 20, publish = null, withdraw = null } = {}) => {
     db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"), haltMarker: join(dir, "HALT"),
     execute: false, shadow: false, running: 0,
     openPrs: () => [7, 8], evaluate: ({ pr: n }) => evaluation(n), prState: () => "OPEN",
-    publish: publish ?? (async (args) => { published.push(args); return { ok: true, id: 100 + args.verdict.head.charCodeAt(0), conclusion: "success", name: "ops/merge-policy" }; }),
+    publish: publish ?? (async (args) => { published.push(args); return { ok: true, id: 100 + args.verdict.head.charCodeAt(0), conclusion: "success", name: "merge-policy" }; }),
     withdraw: withdraw ?? (async (args) => { withdrawn.push(args); return { ok: true }; }),
     observe: () => ({ observations: [], incomplete: false, threads: { readable: true, total: 0, unresolved: 0, seen: 0 } }),
     derivePr: () => ({}), reviewState: () => ({ readable: true, total: 0, open: 0, resolved: 0, unspilledCritical: 0, rounds: 1 }),
@@ -76,7 +76,7 @@ test("a halted tick withdraws every PASS reeve has standing, and a second withdr
   const first = await daemon.tick(ctx);
   assert.equal(first.halted, true);
   assert.deepEqual(prsOf(withdrawn), [7, 8], JSON.stringify(withdrawn));
-  assert.ok(withdrawn.every((w) => w.name === "ops/merge-policy" && /halted/.test(w.why)), JSON.stringify(withdrawn));
+  assert.ok(withdrawn.every((w) => w.name === "merge-policy" && /halted/.test(w.why)), JSON.stringify(withdrawn));
   await daemon.tick(ctx);
   assert.equal(withdrawn.length, 2, "nothing is left standing to withdraw");
 });
@@ -141,7 +141,7 @@ test("a PASS is written down before it's published, so no crash in between leave
   const seen = [];
   const { ctx } = setup({ publish: async (args) => {
     seen.push({ pr: Number(args.verdict.head[0]), standing: daemon.standingPasses(ctx.db).map((s) => s.pr) });
-    return { ok: true, id: 1, conclusion: "success", name: "ops/merge-policy" };
+    return { ok: true, id: 1, conclusion: "success", name: "merge-policy" };
   } });
   await daemon.tick(ctx);
   assert.equal(seen.length, 2);
@@ -287,10 +287,12 @@ test("an enforced PASS stays tracked when reeve goes back to shadow and the shad
   await daemon.tick(ctx);
   // In shadow again, and every shadow publication fails before it writes anything.
   const shadowed = { ...ctx, shadow: true, publish: async () => ({ ok: false, why: "no App credentials" }) };
-  await daemon.tick(shadowed);
+  // Taking the enforced PASS back fails too, so it's still standing when HALT
+  // comes: only tracked under its own name does it stay found.
+  await daemon.tick({ ...shadowed, withdraw: async () => ({ ok: false, why: "HTTP 502" }) });
   halt();
   await daemon.tick(shadowed);
-  assert.deepEqual(prsOf(withdrawn.filter((w) => w.name === "ops/merge-policy")), [7, 8], JSON.stringify(withdrawn));
+  assert.deepEqual(prsOf(withdrawn.filter((w) => w.name === "merge-policy")), [7, 8], JSON.stringify(withdrawn));
 
   // And for a pull request reeve then can't re-check: both its results are taken back.
   const unread = setup();
@@ -299,18 +301,18 @@ test("an enforced PASS stays tracked when reeve goes back to shadow and the shad
   await daemon.tick(back);
   await daemon.tick({ ...back, evaluate: ({ pr: n }) => (n === 7 ? { ok: false, why: "GitHub answered 502" } : evaluation(n)) });
   assert.deepEqual(unread.withdrawn.filter((w) => w.head === headOf(7)).map((w) => w.name).sort(),
-    ["ops/merge-policy", "ops/merge-policy (shadow)"], JSON.stringify(unread.withdrawn));
+    ["merge-policy", "merge-policy (shadow)"], JSON.stringify(unread.withdrawn));
 });
 
 test("an enforced PASS a shadow publication superseded is written down as withdrawn, so HALT doesn't cancel it again", async () => {
   const { ctx, withdrawn, halt } = setup();
   await daemon.tick(ctx);
   const shadowed = { ...ctx, shadow: true,
-    publish: async () => ({ ok: true, id: 200, conclusion: "neutral", name: pr.shadowContextOf("ops/merge-policy"), superseded: true }) };
+    publish: async () => ({ ok: true, id: 200, conclusion: "neutral", name: pr.shadowContextOf("merge-policy"), superseded: true }) };
   await daemon.tick(shadowed);
   halt();
   await daemon.tick(shadowed);
-  assert.deepEqual(withdrawn.filter((w) => w.name === "ops/merge-policy"), [], JSON.stringify(withdrawn));
+  assert.deepEqual(withdrawn.filter((w) => w.name === "merge-policy"), [], JSON.stringify(withdrawn));
 });
 
 test("an alert that a PASS couldn't be withdrawn clears when a later tick's retry takes it back, though it can't re-check the pull request", async () => {
@@ -416,17 +418,17 @@ test("a withdrawal the store couldn't record is reported, not taken as done", as
 
 test("a withdrawal cancels reeve's latest run at the head, not only the one on record", async () => {
   const auth = async () => ({ ok: true, token: "t" });
-  const listing = (id) => JSON.stringify({ name: "ops/merge-policy", id, conclusion: "success", app: "merge-policy" });
+  const listing = (id) => JSON.stringify({ name: "merge-policy", id, conclusion: "success", app: "merge-policy" });
   // The record names run 55, and a later publication at the head made run 77.
   const calls = [];
   const api = (_token, args) => { calls.push(args); return args.some((x) => /check-runs\?/.test(x)) ? { ok: true, out: listing(77) } : { ok: true, out: JSON.stringify({ id: 77 }) }; };
-  const r = await pr.withdrawVerdict({ nwo: NWO, head: headOf(7), name: "ops/merge-policy", id: 55, why: "the merge policy stopped", auth, api });
+  const r = await pr.withdrawVerdict({ nwo: NWO, head: headOf(7), name: "merge-policy", id: 55, why: "the merge policy stopped", auth, api });
   assert.equal(r.ok, true);
   assert.ok(calls.some((x) => x.includes("PATCH") && x.includes(`repos/${NWO}/check-runs/77`)), JSON.stringify(calls));
   // The runs can't be read: the one on record is cancelled all the same, and it isn't done.
   const blind = [];
   const api2 = (_token, args) => { blind.push(args); return args.some((x) => /check-runs\?/.test(x)) ? { ok: false, err: "HTTP 502" } : { ok: true, out: JSON.stringify({ id: 55 }) }; };
-  const r2 = await pr.withdrawVerdict({ nwo: NWO, head: headOf(7), name: "ops/merge-policy", id: 55, why: "the merge policy stopped", auth, api: api2 });
+  const r2 = await pr.withdrawVerdict({ nwo: NWO, head: headOf(7), name: "merge-policy", id: 55, why: "the merge policy stopped", auth, api: api2 });
   assert.equal(r2.ok, false);
   assert.ok(blind.some((x) => x.includes("PATCH") && x.includes(`repos/${NWO}/check-runs/55`)), JSON.stringify(blind));
 });
@@ -451,7 +453,7 @@ test("a publish that throws doesn't end the tick: the pull requests after it are
   const published = [];
   const { ctx } = setup({ publish: async (args) => {
     if (args.verdict.head.startsWith("7")) throw new Error("fetch failed");
-    published.push(args); return { ok: true, id: 1, conclusion: "success", name: "ops/merge-policy" };
+    published.push(args); return { ok: true, id: 1, conclusion: "success", name: "merge-policy" };
   } });
   let threw = null;
   try { await daemon.tick(ctx); } catch (err) { threw = err.message; }
@@ -465,14 +467,14 @@ test("a PASS that no longer holds is withdrawn when the new verdict can't be pub
   await daemon.tick(ctx);
   // #7 is now blocked at the same head, and its publication fails.
   const blocked = { ...ctx, evaluate: ({ pr: n }) => evaluation(n, n === 7 ? "BLOCK" : "PASS"),
-    publish: async (args) => (args.verdict.head.startsWith("7") ? { ok: false, why: "HTTP 502" } : { ok: true, id: 1, conclusion: "success", name: "ops/merge-policy" }) };
+    publish: async (args) => (args.verdict.head.startsWith("7") ? { ok: false, why: "HTTP 502" } : { ok: true, id: 1, conclusion: "success", name: "merge-policy" }) };
   await daemon.tick(blocked);
   assert.deepEqual(prsOf(withdrawn), [7], JSON.stringify(withdrawn));
 
   const stuck = setup();
   await daemon.tick(stuck.ctx);
   const t = await daemon.tick({ ...stuck.ctx, evaluate: ({ pr: n }) => evaluation(n, n === 7 ? "BLOCK" : "PASS"),
-    publish: async (args) => (args.verdict.head.startsWith("7") ? { ok: false, why: "HTTP 502" } : { ok: true, id: 1, conclusion: "success", name: "ops/merge-policy" }),
+    publish: async (args) => (args.verdict.head.startsWith("7") ? { ok: false, why: "HTTP 502" } : { ok: true, id: 1, conclusion: "success", name: "merge-policy" }),
     withdraw: async () => ({ ok: false, why: "HTTP 502" }) });
   assert.equal(escalated(t, /#7: .*PASS.*couldn't withdraw/).length, 1, JSON.stringify([...t.escalations.keys()]));
 });
@@ -480,7 +482,7 @@ test("a PASS that no longer holds is withdrawn when the new verdict can't be pub
 test("publishing that keeps failing is raised for a person, and a publication in between starts the count again", async () => {
   // Every publication fails but the third.
   let calls = 0;
-  const { ctx } = setup({ publish: async () => (++calls > 4 && calls <= 6 ? { ok: true, id: 1, conclusion: "success", name: "ops/merge-policy" } : { ok: false, why: "HTTP 502" }) });
+  const { ctx } = setup({ publish: async () => (++calls > 4 && calls <= 6 ? { ok: true, id: 1, conclusion: "success", name: "merge-policy" } : { ok: false, why: "HTTP 502" }) });
   const ticks = [];
   for (let n = 0; n < 6; n++) ticks.push(await daemon.tick(ctx));
   assert.equal(escalated(ticks[1], /couldn't publish/).length, 0, "not after two");
@@ -519,20 +521,20 @@ test("a withdrawal cancels reeve's own run at that head, which a required check 
   const calls = [];
   const api = (_token, args) => {
     calls.push(args);
-    if (args.some((a) => /check-runs\?/.test(a))) return { ok: true, out: JSON.stringify({ name: "ops/merge-policy", id: 55, conclusion: "success", app: "merge-policy" }) };
+    if (args.some((a) => /check-runs\?/.test(a))) return { ok: true, out: JSON.stringify({ name: "merge-policy", id: 55, conclusion: "success", app: "merge-policy" }) };
     return { ok: true, out: JSON.stringify({ id: 55 }) };
   };
   const auth = async () => ({ ok: true, token: "t" });
-  const byId = await pr.withdrawVerdict({ nwo: NWO, head: headOf(7), name: "ops/merge-policy", id: 55, why: "the merge policy is halted", auth, api });
+  const byId = await pr.withdrawVerdict({ nwo: NWO, head: headOf(7), name: "merge-policy", id: 55, why: "the merge policy is halted", auth, api });
   assert.equal(byId.ok, true);
   const patch = calls.find((a) => a.includes("PATCH"));
   assert.ok(patch?.includes(`repos/${NWO}/check-runs/55`) && patch.includes("status=completed") && patch.includes("conclusion=cancelled")
     && patch.some((a) => /^output\[title\]=Withdrawn: the merge policy is halted/.test(a)), JSON.stringify(calls));
   // With no id, reeve's own run under the name at the head is looked up.
   calls.length = 0;
-  const looked = await pr.withdrawVerdict({ nwo: NWO, head: headOf(7), name: "ops/merge-policy", id: null, why: "the merge policy stopped", auth, api });
+  const looked = await pr.withdrawVerdict({ nwo: NWO, head: headOf(7), name: "merge-policy", id: null, why: "the merge policy stopped", auth, api });
   assert.ok(looked.ok && calls.some((a) => a.includes(`repos/${NWO}/check-runs/55`)), JSON.stringify(calls));
-  const failed = await pr.withdrawVerdict({ nwo: NWO, head: headOf(7), name: "ops/merge-policy", id: 55, why: "x", auth, api: () => ({ ok: false, err: "HTTP 502\nmore" }) });
+  const failed = await pr.withdrawVerdict({ nwo: NWO, head: headOf(7), name: "merge-policy", id: 55, why: "x", auth, api: () => ({ ok: false, err: "HTTP 502\nmore" }) });
   assert.deepEqual(failed, { ok: false, why: "HTTP 502" });
 });
 
@@ -544,7 +546,7 @@ test("a withdrawal cancels reeve's own run at that head, which a required check 
 const standPass = (home) => {
   const store = open(statePathFor(home, NWO));
   store.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
-    .run(Math.floor(Date.now() / 1000), "daemon", "pr.published", "pr:7", JSON.stringify({ head: headOf(7), state: "PASS", name: "ops/merge-policy", id: 55 }));
+    .run(Math.floor(Date.now() / 1000), "daemon", "pr.published", "pr:7", JSON.stringify({ head: headOf(7), state: "PASS", name: "merge-policy", id: 55 }));
   store.close?.();
 };
 const scratchHome = ({ standing = true } = {}) => {
@@ -649,7 +651,7 @@ test("reeve withdraw clears the alert a stop raised once nothing is left standin
   const at = Math.floor(Date.now() / 1000);
   // The stop couldn't withdraw #7's PASS and said so; since then it was withdrawn.
   store.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
-    .run(at, "daemon", "pr.withdrawn", "pr:7", JSON.stringify({ head: headOf(7), name: "ops/merge-policy", id: 55, why: "the merge policy stopped" }));
+    .run(at, "daemon", "pr.withdrawn", "pr:7", JSON.stringify({ head: headOf(7), name: "merge-policy", id: 55, why: "the merge policy stopped" }));
   const stuck = "#7: a PASS reeve published may no longer hold, and reeve couldn't withdraw it";
   store.prepare("INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count) VALUES(?,?,?,?,?)").run(stuck, 1, at, at, 1);
   store.close?.();

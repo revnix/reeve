@@ -296,7 +296,7 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hub-"));
            VALUES(1,'bt:1',unixepoch(),'seed',NULL,'SPEC_DRAFT','{}')`);
 
   // The builder never publishes a check run on any production repository; the
-  // guardian is the sole publisher of ops/merge-policy there. That is not a
+  // guardian is the sole publisher of merge-policy there. That is not a
   // convention to remember at the call site -- there is no kind to enqueue.
   const kind = (k) => { try {
     db.prepare(`INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,cancellable,args,created_at,updated_at)

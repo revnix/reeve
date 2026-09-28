@@ -9,7 +9,7 @@ import { hubTx, hubEvent, canonicalHub } from "./hubdb.mjs";
 import { assertWritable } from "./locks.mjs";
 
 /** The check the merge gate is bound to. */
-export const GATE_CHECK = "ops/merge-policy";
+export const GATE_CHECK = "merge-policy";
 
 /**
  * The permissions the bound App must have -- EXACTLY, in both directions.

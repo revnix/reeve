@@ -69,7 +69,7 @@ const EXPECTED = 42;
 const FULL = { actions: "read", administration: "read", checks: "write",
                contents: "write", issues: "write", metadata: "read",
                pull_requests: "write", statuses: "write" };
-const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", integration_id: EXPECTED }] },
+const ok = { ruleset: { required_status_checks: [{ context: "merge-policy", integration_id: EXPECTED }] },
              installation: { permissions: { ...FULL } } };
 
 {
@@ -79,20 +79,20 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
   check(r.verified_at === 100 && r.error === null, "and records when it was verified");
 
   // bound to a DIFFERENT app: the check would be satisfiable by another source
-  r = gateStateFrom({ ruleset: { required_status_checks: [{ context: "ops/merge-policy", integration_id: 99 }] },
+  r = gateStateFrom({ ruleset: { required_status_checks: [{ context: "merge-policy", integration_id: 99 }] },
                       installation: ok.installation, expectedAppId: EXPECTED, repoId: 1, nwo: "o/r", now: 100 });
   check(r.bound_app_id === 99 && r.bound_app_id !== r.expected_app_id,
     "a check bound to another app is recorded as drift, not as a pass", JSON.stringify(r));
 
   // required but bound to NOTHING: any source could satisfy it
-  r = gateStateFrom({ ruleset: { required_status_checks: [{ context: "ops/merge-policy" }] },
+  r = gateStateFrom({ ruleset: { required_status_checks: [{ context: "merge-policy" }] },
                       installation: ok.installation, expectedAppId: EXPECTED, repoId: 1, nwo: "o/r", now: 100 });
   check(r.bound_app_id === null, "a check required from ANY source records a null bound app", JSON.stringify(r));
 
   // the check is not required at all
   r = gateStateFrom({ ruleset: { required_status_checks: [{ context: "CI Gate", integration_id: 7 }] },
                       installation: ok.installation, expectedAppId: EXPECTED, repoId: 1, nwo: "o/r", now: 100 });
-  check(r.ruleset_requires_check === 0, "a ruleset that does not require ops/merge-policy is recorded as such");
+  check(r.ruleset_requires_check === 0, "a ruleset that does not require merge-policy is recorded as such");
 
   // every shape of not-knowing
   for (const [label, input] of [

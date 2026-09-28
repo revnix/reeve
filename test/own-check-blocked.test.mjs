@@ -96,7 +96,7 @@ check(mergeable({ mergeable: "UNKNOWN" }).state === UNKNOWN,
 // A fake GitHub for the base: its rules, the branch as it reports itself, and
 // classic protection's endpoint. Each case reads a base of its own, so the
 // minute-long cache can't carry one case's answer into the next.
-const OWN = { type: "required_status_checks", parameters: { required_status_checks: [{ context: "ops/merge-policy", integration_id: 1 }] } };
+const OWN = { type: "required_status_checks", parameters: { required_status_checks: [{ context: "merge-policy", integration_id: 1 }] } };
 const RULESETS_ONLY = { protected: true, protection: { enabled: false, required_status_checks: { contexts: [], checks: [] } } };
 const baseOf = ({ rules = [OWN], branch = RULESETS_ONLY, protection = { ok: false, err: "gh: Branch not protected (HTTP 404)" } } = {}) => {
   const calls = [];
@@ -127,7 +127,7 @@ const partsOf = (base, threads, rows = []) => readMergeParts("o/r", `base-${++ba
 }
 {
   const rules = [{ type: "required_status_checks", parameters: { required_status_checks: [
-    { context: "ops/merge-policy", integration_id: 1 }, { context: "ci/test" }, { context: "ci/lint", integration_id: 99 },
+    { context: "merge-policy", integration_id: 1 }, { context: "ci/test" }, { context: "ci/lint", integration_id: 99 },
     { context: "deploy/preview" }, { context: "ci/slow" }, { context: "ci/bound-status", integration_id: 7 }, { context: "ci/absent" }] } }];
   const rows = [
     { name: "ci/test", source: "check_run", state: "completed", conclusion: "success", appId: "15368", completedAt: RECENT },
@@ -139,7 +139,7 @@ const partsOf = (base, threads, rows = []) => readMergeParts("o/r", `base-${++ba
   const parts = partsOf(baseOf({ rules }), {}, rows);
   const state = Object.fromEntries((parts.others ?? []).map((c) => [c.context, c.state]));
   check(state["ci/test"] === "passing" && state["deploy/preview"] === "failing" && state["ci/slow"] === "running" && state["ci/absent"] === "missing"
-    && state["ci/lint"] === "missing" && state["ci/bound-status"] === "unknown" && !("ops/merge-policy" in state),
+    && state["ci/lint"] === "missing" && state["ci/bound-status"] === "unknown" && !("merge-policy" in state),
     "each other required check is read at the head: passing, failing, running, never reported, or run by an App other than the one it's bound to",
     JSON.stringify(parts.others));
   // One name reported twice, as a status and as a check run: GitHub holds the
@@ -164,11 +164,11 @@ const partsOf = (base, threads, rows = []) => readMergeParts("o/r", `base-${++ba
 {
   // Reeve's own check required with no App bound: GitHub takes every result
   // under the name, so another's failing result there blocks beside reeve's.
-  const unbound = { type: "required_status_checks", parameters: { required_status_checks: [{ context: "ops/merge-policy" }] } };
-  const foreign = partsOf(baseOf({ rules: [unbound] }), {}, [{ name: "ops/merge-policy", source: "status", state: "completed", conclusion: "failure" }]);
+  const unbound = { type: "required_status_checks", parameters: { required_status_checks: [{ context: "merge-policy" }] } };
+  const foreign = partsOf(baseOf({ rules: [unbound] }), {}, [{ name: "merge-policy", source: "status", state: "completed", conclusion: "failure" }]);
   const alone = partsOf(baseOf({ rules: [unbound] }), {}, []);
   const blocked = mergeable({ ...foreign, readable: true }), clear = mergeable({ ...alone, readable: true });
-  check(foreign.ownCheckRequired === true && blocked.state === BLOCK && /ops\/merge-policy/.test(blocked.detail) && clear.state === PASS,
+  check(foreign.ownCheckRequired === true && blocked.state === BLOCK && /not passing: merge-policy/.test(blocked.detail) && clear.state === PASS,
     "with reeve's check required and no App bound, another's failing result under its name blocks, and none at all is nothing outstanding",
     JSON.stringify({ others: foreign.others, blocked, clear }));
 }
@@ -176,7 +176,7 @@ const partsOf = (base, threads, rows = []) => readMergeParts("o/r", `base-${++ba
   // Branches required up to date, by a rule or by classic protection: how far
   // the head is behind is read, and only then.
   const strictRule = { type: "required_status_checks", parameters: { strict_required_status_checks_policy: true,
-    required_status_checks: [{ context: "ops/merge-policy", integration_id: 1 }] } };
+    required_status_checks: [{ context: "merge-policy", integration_id: 1 }] } };
   const compare = (behind) => (base) => ({ calls: base.calls, gh: (args) => {
     const path = args.find((a) => a.startsWith("repos/"));
     if (!/\/compare\//.test(path)) return base.gh(args);
@@ -187,8 +187,8 @@ const partsOf = (base, threads, rows = []) => readMergeParts("o/r", `base-${++ba
     { gh: base.gh, appId: "1", rows: [], head: "f".repeat(40) });
   const byRule = at(compare(2)(baseOf({ rules: [strictRule] })));
   const unread = at(compare(null)(baseOf({ rules: [strictRule] })));
-  const classic = { protected: true, protection: { enabled: true, required_status_checks: { contexts: ["ops/merge-policy"], checks: [] } } };
-  const byProtection = at(compare(0)(baseOf({ rules: [], branch: classic, protection: { required_status_checks: { strict: true, contexts: ["ops/merge-policy"] } } })));
+  const classic = { protected: true, protection: { enabled: true, required_status_checks: { contexts: ["merge-policy"], checks: [] } } };
+  const byProtection = at(compare(0)(baseOf({ rules: [], branch: classic, protection: { required_status_checks: { strict: true, contexts: ["merge-policy"] } } })));
   const loose = baseOf();
   const plain = at(compare(5)(loose));
   check(byRule.strict === true && byRule.behind === 2 && unread.strict === true && unread.behind === null
@@ -214,7 +214,7 @@ const partsOf = (base, threads, rows = []) => readMergeParts("o/r", `base-${++ba
     "an unresolved conversation blocks where the base requires them resolved, and only there", JSON.stringify([open, done, free, unread].map((p) => p.unresolvedBlocks)));
 }
 {
-  const classic = { protected: true, protection: { enabled: true, required_status_checks: { contexts: ["ops/merge-policy"], checks: [] } } };
+  const classic = { protected: true, protection: { enabled: true, required_status_checks: { contexts: ["merge-policy"], checks: [] } } };
   const settings = (over) => ({ required_signatures: { enabled: false }, lock_branch: { enabled: false }, required_conversation_resolution: { enabled: false },
     required_linear_history: { enabled: true }, allow_force_pushes: { enabled: false }, enforce_admins: { enabled: true }, ...over });
   const plain = baseOf({ rules: [], branch: classic, protection: settings({}) });

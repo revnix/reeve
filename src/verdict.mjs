@@ -106,7 +106,7 @@ export function computeVerdict(i) {
   // fails: the shadow result passes the rule whatever reeve found.
   else if (i.checks?.shadowRequired) add("ci", BLOCK, "the base requires reeve's shadow check, whose result passes the rule whatever reeve finds");
   else if (i.checks?.legacyRequired)
-    add("ci", BLOCK, `the base requires ${LEGACY_CONTEXTS[0]}, the name reeve published under before, whose old results pass the rule whatever reeve finds; require ${POLICY_CONTEXT} instead`);
+    add("ci", BLOCK, `the base requires ${LEGACY_CONTEXTS.join(" or ")}, a name reeve published under before, whose old results pass the rule whatever reeve finds; require ${POLICY_CONTEXT} instead`);
   else if (!i.checks) add("ci", UNKNOWN, "no check reading", "retry", "read the head's checks again");
   // A read that failed is not a set still settling: only reading again settles it.
   else if (i.checks.readable === false) add("ci", UNKNOWN, i.checks.why ?? "the head's checks couldn't be read", "retry", "read the head's checks again");

@@ -168,7 +168,7 @@ const partsOf = (base, threads, rows = []) => readMergeParts("o/r", `base-${++ba
   const foreign = partsOf(baseOf({ rules: [unbound] }), {}, [{ name: "merge-policy", source: "status", state: "completed", conclusion: "failure" }]);
   const alone = partsOf(baseOf({ rules: [unbound] }), {}, []);
   const blocked = mergeable({ ...foreign, readable: true }), clear = mergeable({ ...alone, readable: true });
-  check(foreign.ownCheckRequired === true && blocked.state === BLOCK && /ops\/merge-policy/.test(blocked.detail) && clear.state === PASS,
+  check(foreign.ownCheckRequired === true && blocked.state === BLOCK && /not passing: merge-policy/.test(blocked.detail) && clear.state === PASS,
     "with reeve's check required and no App bound, another's failing result under its name blocks, and none at all is nothing outstanding",
     JSON.stringify({ others: foreign.others, blocked, clear }));
 }

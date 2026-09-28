@@ -19,7 +19,7 @@ test("a publication record reeve can't read stays standing until a merge, whatev
   const put = (op, payload) => db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(1, "daemon", op, "pr:9", payload);
   put("pr.published", "{not json");
   // A later record at #9, under another name: it says nothing of what the unreadable one was.
-  put("pr.withdrawn", JSON.stringify({ head: "d".repeat(40), name: "ops/merge-policy (shadow)", id: 3, why: "moved on" }));
+  put("pr.withdrawn", JSON.stringify({ head: "d".repeat(40), name: "merge-policy (shadow)", id: 3, why: "moved on" }));
   assert.ok(standingPasses(db).some(x => x.pr === 9 && x.unread), JSON.stringify(standingPasses(db)));
   put("pr.merged", JSON.stringify({ head: "d".repeat(40) }));
   assert.ok(!standingPasses(db).some(x => x.pr === 9), "control: a merge ends everything standing there");

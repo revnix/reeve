@@ -671,3 +671,67 @@ test("a tick whose records are kept unsigned says why in the log, once", async (
   assert.equal(said.length, 1, r.log);
   assert.match(said[0], /can be read by others/);
 });
+
+// ── from #271's sixth review ─────────────────────────────────────────────────
+
+test("a folder made for the key is synced into the folders above it, and the one holding the key's folder always is", () => {
+  const home = tempDir("reeve-signing-fresh-");
+  const dir = join(home, "made", "credentials");
+  const seen = [];
+  const k = signingKey(dir, { create: true, syncDir: (d) => seen.push(d) });
+  assert.equal(k.ok, true, "control: a key was made");
+  for (const d of [dir, join(home, "made"), home]) assert.ok(seen.includes(d), `${d} synced: ${JSON.stringify(seen)}`);
+  const again = [];
+  assert.equal(signingKey(dir, { create: true, syncDir: (d) => again.push(d) }).ok, true, "control: the key is used again");
+  assert.ok(again.includes(join(home, "made")), `the folder holding the key's folder, every time: ${JSON.stringify(again)}`);
+});
+
+test("a key's temporaries left by a process that's gone are removed, and a running process's are left", () => {
+  const dir = credentials();
+  const gone = spawnSync(process.execPath, ["-e", ""]).pid;
+  const left = join(dir, `${KEY_FILE}.${gone}.deadbeef.tmp`), publicLeft = join(dir, `${PUBLIC_FILE}.${gone}.0badf00d.tmp`);
+  const live = join(dir, `${KEY_FILE}.${process.ppid}.feedface.tmp`);
+  for (const f of [left, publicLeft, live]) writeFileSync(f, "partway", { mode: 0o600 });
+  assert.equal(signingKey(dir, { create: true }).ok, true, "control: a key was made");
+  assert.deepEqual({ left: existsSync(left), publicLeft: existsSync(publicLeft), live: existsSync(live) },
+                   { left: false, publicLeft: false, live: true });
+});
+
+/** A record of #7 in another repository, x/y, signed by this host and put in `db`, with its evidence and policy. */
+function elsewhere(db, dir) {
+  const head = "f".repeat(40);
+  const i = { ...input(), head };
+  const k = recordsFor({ nwo: "x/y", pr: 7, head, input: i, verdict: computeVerdict(i), policy: policyOf({ identity: { key: "x/y" } }),
+                         code: CODE, observedAt: new Date(0).toISOString() });
+  saveDecision(db, { at: 2, seq: 2, pr: 7, head, ...k, signed: fileSigner(dir)(decisionStatement(k.decision)) });
+  return k;
+}
+
+test("a signed record of another repository, copied into a store, isn't taken for one of its own", () => {
+  const { db, dir } = kept("file");
+  const k = elsewhere(db, dir);
+  const keys = knownKeys({ local: dir });
+  const unbound = replayDecisions(db, { pr: 7 }, { keys });
+  const shown = explainDecision(db, 7, { keys, repo: "o/r" });
+  const bound = replayDecisions(db, { pr: 7 }, { keys, repo: "o/r" });
+  const own = explainDecision(db, 7, { keys, repo: "O/R", head: "a".repeat(8) });
+  db.close();
+  assert.deepEqual(unbound.map((r) => r.outcome), ["same", "same"], "control: both records are whole, and signed by this host");
+  assert.match(String(shown), /can't be trusted: it's a record of x\/y, not of o\/r/);
+  assert.equal(bound.find((r) => r.digest === k.decision.digest)?.why, "it's a record of x/y, not of o/r");
+  assert.equal(bound.find((r) => r.digest !== k.decision.digest)?.outcome, "same", "the store's own record still replays");
+  assert.match(String(own), /signed by key/, "control: its own record is shown");
+  assert.doesNotMatch(String(own), /can't be trusted/, "a repository named in other letters' case is the same one");
+});
+
+test("reeve why and reeve replay take a record as the repository's only if it names that repository", () => {
+  const { db, dbPath, home, dir } = kept("file");
+  elsewhere(db, dir);
+  db.close();
+  const env = { ...offlineEnv(), REEVE_HOME: home };
+  const shown = spawnSync(process.execPath, [REEVE, "why", "o/r", "7", "--db", dbPath], { encoding: "utf8", env });
+  assert.match(shown.stdout, /can't be trusted: it's a record of x\/y, not of o\/r/, shown.stdout + shown.stderr);
+  const replayed = spawnSync(process.execPath, [REEVE, "replay", "o/r", "--db", dbPath], { encoding: "utf8", env });
+  assert.equal(replayed.status, 1, replayed.stdout + replayed.stderr);
+  assert.match(replayed.stdout, /could not be replayed: it's a record of x\/y, not of o\/r/);
+});

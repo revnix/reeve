@@ -16,7 +16,7 @@
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, sign, verify } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync,
          unlinkSync, writeSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { canonical } from "./db/ops.mjs";
 import { STATEMENT_TYPE } from "./evidence.mjs";
 
@@ -102,10 +102,15 @@ export function signingKey(dir, { create = false, write = (fd, buf, offset, leng
                                   syncDir = syncFolder } = {}) {
   const path = join(dir, KEY_FILE);
   let created = false;
+  // The folders synced before the key signs: its own, which holds its name, and
+  // the one that holds the folder's, and so on up for every folder made here.
+  const folders = new Set([resolve(dir), dirname(resolve(dir))]);
   try {
+    if (create) reapTemporaries(dir);
     if (!existsSync(path)) {
       if (!create) return { ok: false, why: `there is no signing key at ${path}`, missing: true };
-      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const made = mkdirSync(dir, { recursive: true, mode: 0o700 });
+      if (made) for (let d = resolve(dir); d !== dirname(d); d = dirname(d)) { folders.add(dirname(d)); if (d === resolve(made)) break; }
       const { privateKey } = generateKeyPairSync("ed25519");
       const temp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
       const fd = openSync(temp, "wx", 0o600);
@@ -142,7 +147,7 @@ export function signingKey(dir, { create = false, write = (fd, buf, offset, leng
     // A record signed by a key whose file a power loss took could never be
     // checked, and the store keeps that record.
     if (create) {
-      try { syncDir(dir); }
+      try { for (const f of folders) syncDir(f); }
       catch (err) {
         return { ok: false, why: `the signing key's folder ${dir} couldn't be synced, so the key might not outlast a power loss: ${/** @type {Error} */ (err).message}` };
       }
@@ -215,6 +220,31 @@ function keepReplaced(dir, pubPath, oldId, syncDir) {
   } catch (err) {
     return `${said}, and it couldn't be kept at ${archive}: ${/** @type {Error} */ (err).message}`;
   }
+}
+
+/**
+ * Remove the key files' temporaries that a process killed partway left in `dir`:
+ * each is named for the process that made it, and one whose process is gone is
+ * never finished. A private one holds a key, and one linked into place is a
+ * second name for the key in use. One of a process still running is its own,
+ * still being written, and is left.
+ * @param {string} dir
+ */
+function reapTemporaries(dir) {
+  let names = [];
+  try { names = readdirSync(dir); } catch { return; }
+  for (const n of names) {
+    const m = /^signing-ed25519\.(?:pem|pub)\.(\d+)\.[0-9a-f]{8}\.tmp$/.exec(n);
+    if (!m || running(Number(m[1]))) continue;
+    try { unlinkSync(join(dir, n)); } catch { /* gone already, or not this user's to remove */ }
+  }
+}
+
+/** Whether process `pid` is running. One that can't be signalled is, but isn't this user's. @param {number} pid */
+function running(pid) {
+  if (pid === process.pid) return true;
+  try { process.kill(pid, 0); return true; }
+  catch (err) { return /** @type {NodeJS.ErrnoException} */ (err).code === "EPERM"; }
 }
 
 /** Sync the folder `dir`, so the names made in it outlast a power loss. @param {string} dir */

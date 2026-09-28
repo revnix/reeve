@@ -58,9 +58,15 @@ export function signingState(db, keys) {
  * @param {{ digest: string, record: Record<string, any>, envelope?: string | null, unsigned?: string | null }} row
  * @param {Keys} keys
  * @param {ReturnType<typeof signingState>} state
+ * @param {string | null} [repo]  the repository whose store it is, when known: a record of another isn't trusted
  * @returns {import("./signing.mjs").Signature}
  */
-export function trustOf(row, keys, state) {
+export function trustOf(row, keys, state, repo = null) {
+  // Signed by this host, but for another repository: copied into this store, it
+  // would pass for one of this repository's own.
+  const named = row.record?.subject?.repo;
+  if (repo && String(named ?? "").toLowerCase() !== String(repo).toLowerCase())
+    return { state: "corrupt", why: `it's a record of ${named ?? "no repository"}, not of ${repo}` };
   const sig = checkSignature(row, keys);
   if (sig.state !== "unsigned" || !state.began) return sig;
   if (state.baseline?.has(row.digest)) return { state: "unsigned", why: "it was kept before this store began signing" };
@@ -76,16 +82,16 @@ export function trustOf(row, keys, state) {
  * holds no record for it.
  * @param {Db} db
  * @param {number} pr
- * @param {{ head?: string | null, keys?: Keys | null }} [o]
+ * @param {{ head?: string | null, keys?: Keys | null, repo?: string | null }} [o]  `repo`: the repository asked about
  */
-export function explainDecision(db, pr, { head = null, keys = null } = {}) {
+export function explainDecision(db, pr, { head = null, keys = null, repo = null } = {}) {
   const d = latestDecision(db, pr, { head });
   if (!d) return null;
   const r = d.record;
   /** @type {{ id: string, state: string, detail?: string, kind?: string, next?: string }[]} */
   const clauses = r.verdict.clauses ?? [];
   const out = [];
-  const sig = keys ? trustOf(d, keys, signingState(db, keys)) : null;
+  const sig = keys ? trustOf(d, keys, signingState(db, keys), repo) : null;
   if (d.corrupt) out.push(`  this record can't be trusted: ${d.corrupt} (record ${short(d.digest)}); it was changed after it was kept`);
   else if (sig?.state === "corrupt") out.push(`  this record can't be trusted: ${sig.why} (record ${short(d.digest)})`);
   out.push(`${r.verdict.state} at ${short(r.subject.head)}, tree ${short(r.subject.tree)}, judged ${span(d.first_at, d.last_at)} (record ${short(d.digest)})`);
@@ -177,10 +183,10 @@ function clauseDiffs(was, now) {
  * @param {Db} db
  * @param {{ digest?: string | null, pr?: number | null, since?: number | null }} [which]
  * @param {{ code?: Record<string, unknown> | null, profile?: Record<string, any> | null, compute?: typeof computeVerdict,
- *           keys?: Keys | null }} [now]
+ *           keys?: Keys | null, repo?: string | null }} [now]  `repo`: the repository whose store it is, when known
  * @returns {Replayed[]}
  */
-export function replayDecisions(db, which = {}, { code = null, profile = null, compute = computeVerdict, keys = null } = {}) {
+export function replayDecisions(db, which = {}, { code = null, profile = null, compute = computeVerdict, keys = null, repo = null } = {}) {
   /** @type {Replayed[]} */
   const results = [];
   const state = keys ? signingState(db, keys) : null;
@@ -194,7 +200,7 @@ export function replayDecisions(db, which = {}, { code = null, profile = null, c
     // A record, evidence or policy that doesn't match its digest is not the one
     // its key names, so what it would replay to proves nothing either way.
     if (d.corrupt) { results.push({ ...base, outcome: "unreplayable", why: d.corrupt }); continue; }
-    const sig = keys && state ? trustOf(d, keys, state) : null;
+    const sig = keys && state ? trustOf(d, keys, state, repo) : null;
     if (sig?.state === "corrupt") { results.push({ ...base, outcome: "unreplayable", why: sig.why }); continue; }
     const { found, missing, corrupt } = evidenceBy(db, Object.values(r.evidence));
     const policy = policyRecord(db, r.policy);

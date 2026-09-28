@@ -955,7 +955,7 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     let results;
     try {
       results = replayDecisions(open(dbPath), { pr: pr == null ? null : Number(pr), since: sinceAt, digest: opt("record") ?? null },
-                                { code: runningCode(), profile, keys: signingKeys() });
+                                { code: runningCode(), profile, keys: signingKeys(), repo: nwo });
     } catch (e) {
       // A record named by a start that isn't hexadecimal, or that more than one
       // shares, is refused rather than replayed as a pattern.
@@ -1003,7 +1003,7 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     if (cmd === "why") {
       const target = positionals.find(a => /^#?\d+$/.test(a) || a.startsWith("pr:"));
       if (!target) { console.error("reeve why <pr-number>"); process.exit(1); }
-      console.log(why(db, target, { head: opt("head") ?? null, keys: signingKeys() }));
+      console.log(why(db, target, { head: opt("head") ?? null, keys: signingKeys(), repo: nwo }));
       process.exit(0);
     }
 

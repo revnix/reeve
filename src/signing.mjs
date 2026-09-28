@@ -123,6 +123,11 @@ export function signingKey(dir, { create = false, write = (fd, buf, offset, leng
         }
       } finally { try { unlinkSync(temp); } catch { /* gone */ } }
     }
+    // Only a file of its own: what a link points at, or another name for the
+    // file, may lie outside what workers are kept from reading.
+    const own = lstatSync(path);
+    if (own.isSymbolicLink()) return { ok: false, why: `the signing key at ${path} is a link, so it isn't used: a worker could read what it points at` };
+    if (own.nlink > 1) return { ok: false, why: `the signing key at ${path} has another name besides this one, so it isn't used: a worker could read it there` };
     const mode = statSync(path).mode & 0o777;
     if (mode & 0o077) return { ok: false, why: `the signing key at ${path} can be read by others (mode ${mode.toString(8)}), so it isn't used` };
     const key = createPrivateKey(readFileSync(path));
@@ -137,8 +142,11 @@ export function signingKey(dir, { create = false, write = (fd, buf, offset, leng
     const pubPath = join(dir, PUBLIC_FILE);
     let publicWhy = null;
     if (publicIdAt(pubPath) !== keyid) {
-      const old = publicKeyAt(pubPath);
-      publicWhy = old ? keepReplaced(dir, pubPath, old, syncDir, write) : null;
+      // A private key there by mistake is never read as a public key, but its
+      // public half is kept too when it's another key's: written over, it would
+      // be lost, and with it what that key signed.
+      const old = publicKeyAt(pubPath) ?? derivedPublicAt(pubPath);
+      publicWhy = old && keyIdOf(old) !== keyid ? keepReplaced(dir, pubPath, old, syncDir, write) : null;
       if (!publicWhy) {
         try { writePublic(dir, pub, write); }
         catch (err) { publicWhy = `its public half couldn't be written at ${pubPath}: ${/** @type {Error} */ (err).message}`; }
@@ -188,6 +196,20 @@ function publicKeyAt(path) {
   } catch { return null; }
 }
 
+/**
+ * The public half of the Ed25519 private key in `path`, a file meant for a
+ * public key that holds a private one by mistake, or null.
+ * @param {string} path
+ */
+function derivedPublicAt(path) {
+  try {
+    const text = readFileSync(path, "utf8");
+    if (!/PRIVATE KEY/.test(text)) return null;
+    const key = createPublicKey(createPrivateKey(text));
+    return key.asymmetricKeyType === "ed25519" ? key : null;
+  } catch { return null; }
+}
+
 /** The key id of the public key in `path`, or null when there's none to read. @param {string} path */
 function publicIdAt(path) {
   const key = publicKeyAt(path);
@@ -213,7 +235,7 @@ const archivedPublic = (keyid) => `signing-ed25519.${keyid}.pub`;
 function keepReplaced(dir, pubPath, old, syncDir, write) {
   const oldId = keyIdOf(old);
   const archive = join(dir, archivedPublic(oldId));
-  const said = `the public half at ${pubPath} is key ${oldId.slice(0, 12)}'s, which this key replaced`;
+  const said = `${pubPath} holds key ${oldId.slice(0, 12)}'s, which this key replaced`;
   try {
     if (!keptAt(archive, oldId)) {
       if (existsSync(archive)) return `${said}, and ${archive}, where it would be kept, holds something else: move that aside, and reeve keeps it there`;

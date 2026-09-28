@@ -905,7 +905,8 @@ switch (cmd) {
   }
 
   // THE HOST'S SIGNING KEY (#165): its id and public half, to publish under
-  // deploy/signing-keys/. Only the public half is read.
+  // deploy/signing-keys/. Only those are shown: the key is read only to derive
+  // them, and to write its public half again where it's missing.
   case "signing-key": {
     const dir = join(HOME, "credentials");
     // The public half is written again from the key first, if it's missing or

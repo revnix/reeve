@@ -2,7 +2,7 @@
 // no longer passes for the one reeve kept.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { createPublicKey, generateKeyPairSync } from "node:crypto";
 import { signingKey, fileSigner, signDecision, checkSignature, knownKeys, keyIdOf, decisionStatement, baselineStatement,
@@ -478,7 +478,7 @@ test("a public-key file holding a private key is never taken for a public key, a
   assert.deepEqual([...knownKeys({ local: dir }).keys()], [], "a private key is never read as a public one");
   assert.equal(signingKey(dir).ok, true);
   assert.doesNotMatch(readFileSync(join(dir, PUBLIC_FILE), "utf8"), /PRIVATE KEY/);
-  assert.deepEqual([...knownKeys({ local: dir }).keys()], [k.ok ? k.keyid : ""]);
+  assert.equal(knownKeys({ local: dir }).get(k.ok ? k.keyid : "")?.path, join(dir, PUBLIC_FILE), "the slot holds this key's public half again");
 });
 
 test("reeve signing-key never points at a file holding a private key", () => {
@@ -767,4 +767,39 @@ test("a replaced key's public half is kept as a file of its own, whatever the sl
   const archive = join(dir, `signing-ed25519.${oldId}.pub`);
   assert.equal(idAt(archive), oldId, "the replaced key's public half is still kept, whatever became of what the slot pointed at");
   assert.ok(lstatSync(archive).isFile(), "as a file of its own");
+});
+
+// ── from #271's eighth review ────────────────────────────────────────────────
+
+test("another key's private key in the public slot has its public half kept before the slot is written over", () => {
+  const dir = credentials();
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const oldId = keyIdOf(publicKey);
+  writeFileSync(join(dir, PUBLIC_FILE), String(privateKey.export({ type: "pkcs8", format: "pem" })));
+  const made = signingKey(dir, { create: true });
+  assert.equal(made.ok, true, "control: a new key was made");
+  assert.doesNotMatch(readFileSync(join(dir, PUBLIC_FILE), "utf8"), /PRIVATE KEY/, "the slot holds a public half again");
+  const kept = knownKeys({ local: dir }).get(oldId);
+  assert.equal(kept?.where, "this host's, replaced", "the old key's public half is kept, so what it signed still checks");
+  assert.doesNotMatch(readFileSync(kept?.path ?? "", "utf8"), /PRIVATE KEY/, "kept as a public half, never as the private key");
+});
+
+test("a signing key that's a link isn't used, or replaced: what it points at may be outside what workers are kept from", () => {
+  const dir = credentials();
+  const elsewhere = join(tempDir("reeve-signing-elsewhere-"), "key.pem");
+  writeFileSync(elsewhere, privatePem(), { mode: 0o600 });
+  symlinkSync(elsewhere, join(dir, KEY_FILE));
+  const k = signingKey(dir, { create: true });
+  assert.equal(k.ok, false);
+  assert.match(k.ok ? "" : k.why, /is a link/);
+  assert.ok(lstatSync(join(dir, KEY_FILE)).isSymbolicLink(), "and it's left as it is");
+});
+
+test("a signing key with another name besides its own isn't used: a worker could read it there", () => {
+  const dir = credentials();
+  assert.equal(signingKey(dir, { create: true }).ok, true, "control: a key was made");
+  linkSync(join(dir, KEY_FILE), join(tempDir("reeve-signing-other-name-"), "copy.pem"));
+  const k = signingKey(dir, { create: true });
+  assert.equal(k.ok, false);
+  assert.match(k.ok ? "" : k.why, /another name/);
 });

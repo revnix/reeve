@@ -56,7 +56,7 @@ import { codeVersion, policyOf, recordsFor } from "./evidence.mjs";
 import { saveDecision } from "./db/records.mjs";
 import { decisionStatement, baselineStatement, latestStatement, checkSignature } from "./signing.mjs";
 import { BASELINE_OP, LATEST_OP, STORE_ID_OP, latestDecision, storeIdentity } from "./db/records.mjs";
-import { signedOrder } from "./decisions.mjs";
+import { signedOrder, strayEntry } from "./decisions.mjs";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -1433,6 +1433,9 @@ export async function tick(ctx) {
   // number a store edit put there. The top it answers is noted on the anchor once
   // the transaction has committed; 0 for none.
   /** @type {Map<string, any> | null | undefined} */ let orderKeys;
+  // This host's own keys, the ones its own records are signed with: of all the
+  // keys an order is checked with, only these vouch that this host kept a record.
+  /** @type {Map<string, any> | null | undefined} */ let orderHostKeys;
   // What this reeve kept for each pull request as it runs, and hasn't ordered
   // yet: the record it kept last, where in the store's sequence of events it
   // kept it, and every one it kept. The latest is signed from this, not from the
@@ -1476,13 +1479,14 @@ export async function tick(ctx) {
     // reeve on the store signed it. Where this one kept none as it runs, the
     // store's own order is taken only for a first entry, as nothing else says,
     // or where it has as the latest the one record no entry names yet, signed by
-    // this host: kept since the order's last entry by a tick that stopped before
-    // ordering it. Never an older record raised over it.
+    // this host, not by another whose key is published: kept since the order's
+    // last entry by a tick that stopped before ordering it. Never an older record
+    // raised over it.
     const stored = latestDecision(db, pr);
     /** @type {[string | null, number | null]} */
     const [digest, seq] = own ? (order.seq == null || own.seq > order.seq ? [own.latest, own.seq] : [order.digest, order.seq])
       : !order.top ? [stored?.digest ?? null, stored ? Number(stored.last_seq) : null]
-      : stored && unnamed.size === 1 && unnamed.has(stored.digest) && checkSignature(stored, /** @type {any} */ (orderKeys)).state === "signed" ? [stored.digest, Number(stored.last_seq)]
+      : stored && unnamed.size === 1 && unnamed.has(stored.digest) && checkSignature(stored, /** @type {any} */ (orderHostKeys ?? new Map())).state === "signed" ? [stored.digest, Number(stored.last_seq)]
       : [order.digest, order.seq];
     if (!digest) return { top: order.top, named: true };
     unnamed.delete(digest);
@@ -1522,12 +1526,15 @@ export async function tick(ctx) {
     /** @type {Map<number, string[]>} */ const entries = new Map();
     for (const r of /** @type {any[]} */ (db.prepare(`SELECT subject, payload FROM event WHERE op = ? ORDER BY seq`).all(LATEST_OP))) {
       const pr = Number(String(r.subject).slice(3)), held = entries.get(pr);
+      if (!Number.isInteger(pr) || pr < 1) continue;
       if (held) held.push(String(r.payload)); else entries.set(pr, [String(r.payload)]);
     }
     const keyed = [...(/** @type {Map<string, any>} */ (orderKeys)).keys()].join(",");
+    // An entry filed under another name fails every order, so it's in each key.
+    const stray = strayEntry(db);
     /** @type {Map<number, ReturnType<typeof signedOrder>>} */ const orders = new Map();
     for (const [pr, texts] of entries) {
-      const key = `${store}\n${keyed}\n${texts.join("\n")}`;
+      const key = `${store}\n${keyed}\n${stray}\n${texts.join("\n")}`;
       let was = orderChecked.get(pr);
       if (was?.key !== key) orderChecked.set(pr, (was = { key, order: signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), store) }));
       orders.set(pr, was.order);
@@ -1552,6 +1559,7 @@ export async function tick(ctx) {
     withOrderLock((held) => {
       if (!held) return;
       if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
+      if (orderHostKeys === undefined) orderHostKeys = ctx.hostKeys?.() ?? null;
       if (!orderKeys) return;
       (ctx.durably ?? durably)(db, () => {
         let id = null, a = null;

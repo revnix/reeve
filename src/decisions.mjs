@@ -78,6 +78,11 @@ export function signingState(db, keys, anchor = null) {
  * @returns {{ top: number, digest: string | null, digests: Set<string>, seq: number | null } | { corrupt: string }}
  */
 export function signedOrder(db, repo, pr, keys, store = null) {
+  // An entry filed under anything but a pull request's own name is found by no
+  // pull request's order: its own would read as shorter than it is. So none is
+  // taken as checked while one is.
+  const stray = strayEntry(db);
+  if (stray !== null) return { corrupt: `an entry of a signed order in this store is filed under ${JSON.stringify(stray)}, not a pull request's name` };
   /** @type {Map<number, string>} */ const byN = new Map();
   /** @type {Map<number, number | null>} */ const seqs = new Map();
   /** @type {Set<string>} */ const named = new Set();
@@ -106,6 +111,20 @@ export function signedOrder(db, repo, pr, keys, store = null) {
   const top = byN.size ? Math.max(...byN.keys()) : 0;
   for (let n = 1; n <= top; n++) if (!byN.has(n)) return { corrupt: `its signed order is missing entry ${n}` };
   return { top, digest: top ? /** @type {string} */ (byN.get(top)) : null, digests: named, seq: top ? seqs.get(top) ?? null : null };
+}
+
+/**
+ * The name of an entry of a signed order filed under anything but a pull
+ * request's own, `pr:` and its number as reeve writes it, or null where there's
+ * none (#274). The name sits outside the entry's signature, and one spelled
+ * otherwise, `pr:042` say, is found by no pull request's order.
+ * @param {Db} db
+ * @returns {string | null}
+ */
+export function strayEntry(db) {
+  const r = /** @type {any} */ (db.prepare(`SELECT COALESCE(subject, '') AS subject FROM event WHERE op = ?
+    AND NOT (COALESCE(subject, '') GLOB 'pr:[1-9]*' AND substr(subject, 4) NOT GLOB '*[^0-9]*' AND length(subject) <= 18) LIMIT 1`).get(LATEST_OP));
+  return r ? String(r.subject) : null;
 }
 
 /**
@@ -350,7 +369,10 @@ export function replayDecisions(db, which = {}, { code = null, profile = null, c
     if (canonical(now) === canonical(r.verdict)) results.push({ ...base, outcome: "same" });
     else results.push({ ...base, outcome: "differs", now: now.state, diffs: clauseDiffs(r.verdict, now) });
   }
-  if (keys && repo && which.digest == null) results.push(...orderReplayed(db, results, which, keys, repo, anchor));
+  // Replaying one record, its pull request's order is checked, as a record
+  // that survived a rollback replays as the same.
+  if (keys && repo && (which.digest == null || results.length))
+    results.push(...orderReplayed(db, results, which.digest == null ? which : { pr: results[0].pr }, keys, repo, anchor));
   return results;
 }
 
@@ -371,13 +393,15 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
   /** @param {number} pr @param {string} digest @param {string} why @returns {Replayed} */
   const fault = (pr, digest, why) => ({ digest, pr, head: "", recorded: "unknown", outcome: "unreplayable", why, codeChanged: null, policyChanged: null });
   if (anchor?.why) return [fault(which.pr ?? 0, "", anchor.why)];
+  const stray = strayEntry(db);
+  if (stray !== null) return [fault(which.pr ?? 0, "", `an entry of a signed order in this store is filed under ${JSON.stringify(stray)}, not a pull request's name`)];
   /** @type {Set<number>} */ const prs = new Set();
   if (which.pr != null) prs.add(which.pr);
   else {
     for (const r of replayed) prs.add(r.pr);
     // Every pull request an order or the host's anchor names, whatever the date:
     // a rollback takes the very records the date would have matched.
-    for (const r of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ?`).all(LATEST_OP))) prs.add(Number(String(r.subject).slice(3)));
+    for (const r of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ? AND subject GLOB 'pr:[1-9]*' AND substr(subject, 4) NOT GLOB '*[^0-9]*' AND length(subject) <= 18`).all(LATEST_OP))) prs.add(Number(String(r.subject).slice(3)));
     for (const pr of anchor?.anchor?.latest.keys() ?? []) prs.add(pr);
   }
   // Each record an order names, as the store holds it: a row that isn't that

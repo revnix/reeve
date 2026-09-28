@@ -5,7 +5,7 @@
 // 22.x and the state layer is the authority, so it must not run under a warning
 // it might one day become.
 import { runDoctor, render, checkAppIdentity, hubFindings, renderHub } from "../src/doctor.mjs";
-import { open } from "../src/db/ops.mjs";
+import { open, storeLock } from "../src/db/ops.mjs";
 import { statePathFor, dashPathFor, legacyStatePathFor, legacyDashPathFor, hubPathFor, adoptLegacyStore, missingStoreMessage } from "../src/paths.mjs";
 import { hubAccess } from "../src/build/hubaccess.mjs";
 import { resolveRepoIdAt } from "../src/build/repoid.mjs";
@@ -2415,6 +2415,16 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     // nobody. (Codex #4g-[2].)
     const dbPath = resolve(opt("db") ?? stateFor(nwo));
     if (!existsSync(dbPath)) { console.error(`reeve run: ${missingStoreMessage(dbPath, { initCreatesIt: !opt("db"), nwo })}`); process.exit(1); }
+    // One reeve runs on a store at a time (#274), held until this one ends: a
+    // second, on a store another is running on, would keep records whose signed
+    // order neither knows whole.
+    const running = storeLock(dbPath);
+    if ("why" in running) {
+      console.error(running.busy ? `reeve ${cmd}: another reeve is running on ${dbPath}; one runs on a store at a time`
+                                 : `reeve ${cmd}: the lock on ${dbPath} couldn't be taken, so this reeve doesn't run on it: ${running.why}`);
+      process.exit(1);
+    }
+    process.on("exit", () => running.release());
     // Resolved before the context so the REASON survives. A project that is
     // simply not registered is `{ project: null, why: null }` -- an ordinary
     // state. A registry that could not be parsed is a fault that says so.
@@ -2437,6 +2447,8 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       // the keys its entries are checked with (#274).
       anchor: fileAnchor(join(HOME, "credentials")),
       keys: signingKeys,
+      // This host's own keys, public halves only: what vouches that it kept a record.
+      hostKeys: () => knownKeys({ local: join(HOME, "credentials") }),
       // Execution is opt-in. A loop that acts before its decisions have been
       // watched is how an unattended run becomes an incident.
       execute: flag("execute"),

@@ -9,7 +9,8 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { fileSigner, knownKeys, latestStatement, signStatement, signingKey } from "../src/signing.mjs";
 import { fileAnchor, readAnchor, anchorPath } from "../src/anchor.mjs";
-import { open, durably } from "../src/db/ops.mjs";
+import { open, durably, storeLock } from "../src/db/ops.mjs";
+import { withDefaults } from "../src/profile/schema.mjs";
 import { explainDecision, replayDecisions, signedOrder, anchorForStore } from "../src/decisions.mjs";
 import { computeVerdict } from "../src/verdict.mjs";
 import { recordsFor, policyOf } from "../src/evidence.mjs";
@@ -43,7 +44,7 @@ const at = (head, ci = "GREEN") => {
   return { ...EVAL, head, input: i, verdict: computeVerdict(i) };
 };
 /** What the host's reeve is given: its signer, its keys and its anchor, over the credentials folder `dir`. */
-const host = (dir) => ({ signer: fileSigner(dir), keys: () => knownKeys({ local: dir }), anchor: fileAnchor(dir) });
+const host = (dir) => ({ signer: fileSigner(dir), keys: () => knownKeys({ local: dir }), anchor: fileAnchor(dir), hostKeys: () => knownKeys({ local: dir }) });
 /** Ticks over one store, each with its own evaluation of #42, as `host` gives. Answers the store's path. */
 async function ticks(evals, ctx, dbPath = null) {
   const path = dbPath ?? join(tempDir("reeve-order-ticks-"), "s.db");
@@ -134,6 +135,11 @@ test("the host's anchor is written whole, its folder and every folder made for i
   const file = anchorPath(dir, REPO);
   for (const d of [dirname(file), dirname(dirname(file)), dir]) assert.ok(seen.includes(d), `${d} synced: ${JSON.stringify(seen)}`);
   assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { began: true, latest: { 7: 1 }, store: null });
+  // And by a writer that made none of them, as a reeve after a restart is: a
+  // sync that failed before it started is made again.
+  const again = [];
+  assert.equal(fileAnchor(dir, { syncDir: (d) => again.push(d) }).note(REPO, 7, 2), true, "control: written again");
+  for (const d of [dirname(file), dirname(dirname(file)), dir]) assert.ok(again.includes(d), `${d} synced again: ${JSON.stringify(again)}`);
 });
 
 test("the host's anchor only moves forward", () => {
@@ -283,6 +289,7 @@ test("reeve why and reeve replay read the host's anchor for the repository asked
 test("the daemon run by reeve is given the host's anchor and keys", () => {
   const src = readFileSync(REEVE, "utf8");
   assert.match(src, /anchor: fileAnchor\(join\(HOME, "credentials"\)\),\n\s+keys: signingKeys,/);
+  assert.match(src, /\n\s+hostKeys: \(\) => knownKeys\(\{ local: join\(HOME, "credentials"\) \}\),/, "and this host's own keys");
   assert.ok(existsSync(REEVE), "control");
 });
 
@@ -1223,4 +1230,136 @@ test("an entry whose latest isn't placed in the store's sequence by a whole numb
   db.close();
   assert.equal(k.ok, true, "control: the host's key");
   assert.deepEqual(order, { corrupt: "an entry of its signed order isn't one" });
+});
+
+// ── from #278's tenth review ─────────────────────────────────────────────────
+
+test("after a restart, a record another host signed, its key published, isn't signed as the latest", async () => {
+  const dir = credentials(), otherDir = credentials();
+  const dbPath = await ticks([at(A, "RED")], host(dir));
+  // Another host's record of the same pull request, and its key published, as it would be.
+  const theirs = open(await ticks([at(B, "RED")], host(otherDir)));
+  const rec = theirs.prepare("SELECT * FROM decision WHERE pr = ?").get(PR);
+  theirs.close();
+  const published = tempDir("reeve-order-published-");
+  for (const [id, v] of knownKeys({ local: otherDir })) writeFileSync(join(published, `${id}.pub`), readFileSync(v.path));
+  let db = open(dbPath);
+  const [ours] = digestsOf(db);
+  // Put in by a store edit as this store's latest, the one record no entry names.
+  const cols = Object.keys(rec);
+  db.prepare(`INSERT INTO decision(${cols.join(",")}) VALUES(${cols.map(() => "?").join(",")})`).run(...cols.map((c) => (c === "last_seq" ? 1000000 : rec[c])));
+  db.close();
+  // A reeve that kept neither record, checking orders with both hosts' keys.
+  const keys = () => knownKeys({ published, local: dir });
+  await closedTick(dbPath, { ...host(dir), keys });
+  db = open(dbPath);
+  const order = signedOrder(db, REPO, PR, keys());
+  db.close();
+  assert.ok(rec && "digests" in order && order.digests.has(rec.digest), `control: it's named, as a record the store holds: ${JSON.stringify(order)}`);
+  assert.equal("digest" in order && order.digest, ours, "the order's latest stays the record this host signed");
+});
+
+test("an entry filed under another spelling of a pull request's name fails every order while it's there, so none is signed afresh", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A), at(A, "RED")], host(dir));
+  let db = open(dbPath);
+  const [, red] = digestsOf(db);
+  // Every entry of #42 filed as pr:042, its newest record taken away, and the host's anchor gone.
+  db.prepare("UPDATE event SET subject = 'pr:042' WHERE op = 'decision.latest'").run();
+  db.prepare("DELETE FROM decision WHERE digest = ?").run(red);
+  const before = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n;
+  const keys = knownKeys({ local: dir });
+  const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: null });
+  const replayed = replayDecisions(db, {}, { keys, repo: REPO, anchor: null });
+  db.close();
+  rmSync(anchorPath(dir, REPO));
+  const r = await closedTick(dbPath, host(dir));
+  db = open(dbPath);
+  const after = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n;
+  db.close();
+  assert.match(String(shown), /can't be trusted as the latest: an entry of a signed order in this store is filed under "pr:042"/);
+  assert.ok(replayed.some((x) => x.outcome === "unreplayable" && /filed under "pr:042"/.test(String(x.why))), JSON.stringify(replayed));
+  assert.equal(after, before, "no entry signed afresh");
+  assert.match(r.log, /#42: its signed order doesn't hold, so it isn't extended — an entry of a signed order in this store is filed under "pr:042"/);
+});
+
+test("replay of one record checks its pull request's order, so a record that survived a rollback doesn't pass as whole", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], host(dir)));
+  const [green, red] = digestsOf(db);
+  db.prepare("DELETE FROM decision WHERE digest = ?").run(red);
+  db.prepare("DELETE FROM event WHERE op = 'decision.latest' AND json_extract(payload, '$.n') = 2").run();
+  const replayed = replayDecisions(db, { digest: green }, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.ok(replayed.some((x) => x.digest === green && x.outcome === "same"), `control: the record replays as it was: ${JSON.stringify(replayed)}`);
+  assert.ok(replayed.some((x) => /ends at entry 1, though this host signed up to entry 2/.test(String(x.why))), JSON.stringify(replayed));
+});
+
+test("replay reports an entry filed under a name that's no pull request's, though no pull request's records are left", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A, "RED")], host(dir)));
+  db.prepare("UPDATE event SET subject = 'zz' WHERE op = 'decision.latest'").run();
+  db.prepare("DELETE FROM decision").run();
+  const replayed = replayDecisions(db, {}, { keys: knownKeys({ local: dir }), repo: REPO, anchor: null });
+  db.close();
+  assert.ok(replayed.some((x) => x.outcome === "unreplayable" && /filed under "zz"/.test(String(x.why))), JSON.stringify(replayed));
+});
+
+test("an entry filed under another name while a reeve runs is caught by its next tick, whatever it checked before", async () => {
+  const dir = credentials();
+  const dbPath = join(tempDir("reeve-order-renamed-"), "s.db");
+  open(dbPath).close();
+  let tick = 0;
+  const r = await run({ ticks: 2, dbPath, ...host(dir), prState: () => "CLOSED", prIsFinished: () => true,
+                        evaluate: () => at(A, "RED"),
+                        openPrs: () => (++tick === 1 ? [PR] : []),
+                        afterTick: async (i) => {
+                          if (i !== 0) return;
+                          const s = open(dbPath);
+                          s.prepare("UPDATE event SET subject = 'pr:042' WHERE op = 'decision.latest'").run();
+                          s.close();
+                        } });
+  assert.match(r.log, /#42: its signed order doesn't hold, so it isn't extended — an entry of a signed order in this store is filed under "pr:042"/);
+});
+
+test("one reeve runs on a store at a time: its lock is held by one, a link to the store included", () => {
+  const dbPath = join(tempDir("reeve-order-running-"), "s.db");
+  open(dbPath).close();
+  const link = join(tempDir("reeve-order-running-link-"), "s.db");
+  symlinkSync(dbPath, link);
+  const first = storeLock(dbPath);
+  assert.ok(first && "release" in first, "control: the lock was taken");
+  const second = storeLock(link);
+  assert.ok(second && "why" in second && second.busy, "a second, through a link to the store, can't take it");
+  first.release();
+  const third = storeLock(link);
+  assert.ok(third && "release" in third, "and can once it's released");
+  third.release();
+  // A lock file that's a link is never locked through.
+  const other = join(tempDir("reeve-order-running-other-"), "s.db");
+  open(other).close();
+  symlinkSync(join(tempDir("reeve-order-running-elsewhere-"), "x"), `${other}.running`);
+  const linked = storeLock(other);
+  assert.ok(linked && "why" in linked && /isn't a file of its own/.test(linked.why), JSON.stringify(linked));
+});
+
+test("reeve tick doesn't run on a store another reeve is running on", () => {
+  const home = tempDir("reeve-order-running-cli-");
+  mkdirSync(join(home, "profiles", "o"), { recursive: true });
+  writeFileSync(join(home, "profiles", "o", "r.json"), JSON.stringify(withDefaults({ schemaVersion: 1, project: { kind: "product" },
+    identity: { key: REPO, defaultBranch: "main", visibility: "public" },
+    authority: { permission: "admin", policy: "propose_only", profileLocation: "sidecar" },
+    state: { mode: "in-repo" }, units: [{ id: "root", root: ".", language: "javascript", packageManager: "npm", commands: {} }],
+    ci: { provider: "github-actions" }, merge: { method: "squash", enforcement: "attested" }, reviewers: [] })));
+  // Were it to tick, the tick would halt at once, reaching nothing.
+  writeFileSync(join(home, "HALT"), "");
+  const dbPath = join(home, "s.db");
+  open(dbPath).close();
+  const other = storeLock(dbPath);
+  assert.ok(other && "release" in other, "control: another reeve holds the store's lock");
+  let r;
+  try { r = spawnSync(process.execPath, [REEVE, "tick", REPO, "--db", dbPath], { cwd: home, encoding: "utf8", env: { ...offlineEnv(), REEVE_HOME: home } }); }
+  finally { other.release(); }
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stderr, /another reeve is running on .*s\.db; one runs on a store at a time/);
 });

@@ -54,7 +54,7 @@ import { randomBytes } from "node:crypto";
 import { resolveHome } from "./home.mjs";
 import { codeVersion, policyOf, recordsFor } from "./evidence.mjs";
 import { saveDecision } from "./db/records.mjs";
-import { decisionStatement, baselineStatement, latestStatement } from "./signing.mjs";
+import { decisionStatement, baselineStatement, latestStatement, checkSignature } from "./signing.mjs";
 import { BASELINE_OP, LATEST_OP, STORE_ID_OP, latestDecision, storeIdentity } from "./db/records.mjs";
 import { signedOrder } from "./decisions.mjs";
 
@@ -1406,14 +1406,15 @@ export async function tick(ctx) {
     try { return fn(true); } finally { lock.release(); }
   };
   const begun = ctx.signer ? withOrderLock((held) => {
-    // Synced to disk before the anchor says the store began: a baseline a power
-    // loss took would leave the anchor saying it began, and the store never
-    // given one again.
-    const b = held ? (ctx.durably ?? durably)(db, () => beginSigning(db, signWith, logPath, ctx.anchor ?? null, nwo))
-      : beginSigning(db, signWith, logPath, ctx.anchor ?? null, nwo);
+    // Synced to disk, whether or not this tick holds the lock: a baseline a power
+    // loss took would leave the anchor saying the store began, as a later tick
+    // that finds it says so, and the store never given one again.
+    const b = (ctx.durably ?? durably)(db, () => beginSigning(db, signWith, logPath, ctx.anchor ?? null, nwo));
     // Said on the host's anchor once the store has committed it, where a store
-    // restored from before can't take it back.
-    if (held && b.began && !ctx.anchor.began(nwo)) log(logPath, "signing: the host's anchor couldn't say this store began signing; it's said again next tick");
+    // restored from before can't take it back. Only on an anchor bound to this
+    // store: said on one no store holds yet, by a store that judges nothing,
+    // it would have a store with records to vouch for refused its baseline.
+    if (held && b.began && !ctx.anchor.began(nwo, storeIdentity(db))) log(logPath, "signing: the host's anchor couldn't say this store began signing; it's said again next tick");
     return b;
   }) : { began: true };
   let unsignedSaid = false;
@@ -1426,39 +1427,71 @@ export async function tick(ctx) {
   };
   // Each change of a pull request's latest decision, a numbered, signed entry of
   // its order (#274), so which record is latest isn't read from the store's own
-  // order alone: the store's latest as the tick leaves it, entered in its own
+  // order alone: the record this reeve kept last, entered in its own
   // transaction, under the host's lock on the repository's anchor. Extended only
   // from an order that checks whole, with the host's own keys, and never from a
   // number a store edit put there. The top it answers is noted on the anchor once
   // the transaction has committed; 0 for none.
   /** @type {Map<string, any> | null | undefined} */ let orderKeys;
+  // What this reeve kept for each pull request as it runs, and hasn't ordered
+  // yet: the record it kept last, and every one it kept. The latest is signed
+  // from this, not from the store's own order, which is only what a store edit
+  // left there: an older record raised there would be signed as the one this
+  // host kept last. Across ticks, so work a tick couldn't finish is finished by
+  // the next, and let go once ordered.
+  /** @type {Map<number, { latest: string, since: Set<string> }>} */
+  const orderKept = (ctx.orderKept ??= new Map());
+  const keptFor = (/** @type {number} */ pr, /** @type {string} */ digest) => {
+    const k = orderKept.get(pr) ?? { latest: digest, since: new Set() };
+    k.latest = digest;
+    k.since.add(digest);
+    orderKept.set(pr, k);
+  };
+  // Each pull request's signed order as checked whole, checked again only once
+  // what its entries hold changes, as this process runs.
+  /** @type {Map<number, { key: string, order: ReturnType<typeof signedOrder> }>} */
+  const orderChecked = (ctx.orderChecked ??= new Map());
   const extendOrder = (pr, anchored, store) => {
-    const decision = latestDecision(db, pr);
-    if (!decision) return 0;
     const order = signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), store);
-    if ("corrupt" in order) { log(logPath, `signing: #${pr}: its signed order doesn't hold, so it isn't extended — ${order.corrupt}`); return 0; }
+    if ("corrupt" in order) { log(logPath, `signing: #${pr}: its signed order doesn't hold, so it isn't extended — ${order.corrupt}`); return { top: 0, named: false }; }
     // Nor one cut short of what the host signed: an entry signed now would take
     // a number the host already signed, and two entries under one number would
     // each pass for the latest.
     if (order.top < anchored) {
       log(logPath, `signing: #${pr}: its signed order ends at entry ${order.top}, though this host signed up to entry ${anchored}, so it isn't extended`);
-      return 0;
+      return { top: 0, named: false };
     }
-    let top = order.top;
+    const own = orderKept.get(pr);
     // Every record kept for it that no entry names yet: all of them, for its
     // first, those kept before orders began included, and for a later one, any
     // kept since, a record superseded within the tick that kept it among them.
-    const records = /** @type {any[]} */ (db.prepare(`SELECT digest FROM decision WHERE pr = ?`).all(pr))
-      .map((r) => String(r.digest)).filter((d) => d !== decision.digest && !order.digests.has(d)).sort();
-    if (order.digest !== decision.digest || records.length) {
-      const entry = { repo: nwo, pr, n: top + 1, digest: decision.digest, records, store };
+    // And every one this reeve kept, though the store no longer holds it.
+    const unnamed = new Set([.../** @type {any[]} */ (db.prepare(`SELECT digest FROM decision WHERE pr = ?`).all(pr)).map((r) => String(r.digest)),
+                             ...(own?.since ?? [])]);
+    for (const d of order.digests) unnamed.delete(d);
+    // Its latest: the record this reeve kept last. Where it kept none as it
+    // runs, the store's own order is taken only for a first entry, as nothing
+    // else says, or where it has as the latest the one record no entry names
+    // yet, signed by this host: kept since the order's last entry by a tick
+    // that stopped before ordering it. Never an older record raised over it.
+    const stored = latestDecision(db, pr);
+    const digest = own ? own.latest
+      : !order.top ? stored?.digest ?? null
+      : stored && unnamed.size === 1 && unnamed.has(stored.digest) && checkSignature(stored, /** @type {any} */ (orderKeys)).state === "signed" ? stored.digest
+      : order.digest;
+    if (!digest) return { top: order.top, named: true };
+    unnamed.delete(digest);
+    const records = [...unnamed].sort();
+    let top = order.top;
+    if (order.digest !== digest || records.length) {
+      const entry = { repo: nwo, pr, n: top + 1, digest, records, store };
       const s = signWith(latestStatement(entry));
-      if (!s?.envelope) return top;
+      if (!s?.envelope) return { top, named: false };
       db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
-        .run(now(), "daemon", LATEST_OP, `pr:${pr}`, canonical({ repo: nwo, n: top + 1, digest: decision.digest, records, store, envelope: s.envelope }));
+        .run(now(), "daemon", LATEST_OP, `pr:${pr}`, canonical({ repo: nwo, n: top + 1, digest, records, store, envelope: s.envelope }));
       top += 1;
     }
-    return top;
+    return { top, named: true };
   };
   // The host's anchor moved to entry `top` of `pr`'s order, only once the store
   // has committed it: moved before, a transaction that failed would leave the
@@ -1468,35 +1501,40 @@ export async function tick(ctx) {
     if (top && !ctx.anchor.note(nwo, pr, top))
       log(logPath, `signing: #${pr}: the host's anchor couldn't be moved to entry ${top} of its order, so it lags until a later tick`);
   };
-  // The pull requests with a record their order doesn't name yet, or a latest
-  // that isn't its last entry's, read from the store: work a tick couldn't do,
-  // as another daemon held the lock, or it stopped or halted first, is done by
-  // the next, though the pull request is never judged again. Extended once a tick, at its end or where it
-  // halts, to the store's latest then: not as its passes went by, as a pull
-  // request in the merge queue is judged at its head and at the queue's commit
-  // every tick, and would add both, tick after tick.
-  // And those whose order ran ahead of the anchor, an entry committed and its
-  // note never made: noted, though the pull request is never judged again.
-  const pendingOrders = (/** @type {import("./anchor.mjs").Anchor} */ a) => {
-    // What the entries say, as candidates only: each order is checked whole
-    // before anything is signed on it. A record no entry names, or a latest
-    // that isn't its last entry's, is work; one seen again, already named, isn't.
-    const payload = "CASE WHEN json_valid(v.payload) THEN v.payload ELSE '{}' END";
-    const prs = new Set(/** @type {any[]} */ (db.prepare(
-      `SELECT d.pr FROM decision d
-        WHERE NOT EXISTS (SELECT 1 FROM event v WHERE v.op = ?1 AND v.subject = 'pr:' || d.pr
-                            AND (json_extract(${payload}, '$.digest') = d.digest
-                                 OR EXISTS (SELECT 1 FROM json_each(${payload}, '$.records') r WHERE r.value = d.digest)))
-       UNION
-       SELECT d.pr FROM decision d
-        WHERE d.last_seq = (SELECT max(e.last_seq) FROM decision e WHERE e.pr = d.pr)
-          AND d.digest IS NOT (SELECT json_extract(${payload}, '$.digest') FROM event v WHERE v.op = ?1 AND v.subject = 'pr:' || d.pr
-                                ORDER BY json_extract(${payload}, '$.n') DESC LIMIT 1)`).all(LATEST_OP))
-      .map((r) => Number(r.pr)));
-    for (const r of /** @type {any[]} */ (db.prepare(
-      `SELECT subject, max(json_extract(payload, '$.n')) AS n FROM event WHERE op = ? AND json_valid(payload) GROUP BY subject`).all(LATEST_OP))) {
-      const pr = Number(String(r.subject).slice(3));
-      if (Number(r.n) > (a.latest.get(pr) ?? 0)) prs.add(pr);
+  // The pull requests whose order has work, read from their orders as checked
+  // whole, never from an entry that doesn't check: that one counts neither as
+  // naming a record nor as how far its order goes, and its order is work, so
+  // it's checked, and said not to hold, every tick. Work is a record kept for
+  // it that no entry names yet, one this reeve kept and hasn't ordered, or an
+  // order that ran ahead of the host's anchor, an entry committed and its note
+  // never made: done by a later tick when a tick couldn't, as another daemon
+  // held the lock, or it stopped or halted first, though the pull request is
+  // never judged again. Extended once a tick, at its end or where it stops: not
+  // as its passes went by, as a pull request in the merge queue is judged at its
+  // head and at the queue's commit every tick, and would add both, tick after
+  // tick. One seen again, already named, is no work.
+  const pendingOrders = (/** @type {import("./anchor.mjs").Anchor} */ a, /** @type {string} */ store) => {
+    /** @type {Map<number, string[]>} */ const entries = new Map();
+    for (const r of /** @type {any[]} */ (db.prepare(`SELECT subject, payload FROM event WHERE op = ? ORDER BY seq`).all(LATEST_OP))) {
+      const pr = Number(String(r.subject).slice(3)), held = entries.get(pr);
+      if (held) held.push(String(r.payload)); else entries.set(pr, [String(r.payload)]);
+    }
+    const keyed = [...(/** @type {Map<string, any>} */ (orderKeys)).keys()].join(",");
+    /** @type {Map<number, ReturnType<typeof signedOrder>>} */ const orders = new Map();
+    for (const [pr, texts] of entries) {
+      const key = `${store}\n${keyed}\n${texts.join("\n")}`;
+      let was = orderChecked.get(pr);
+      if (was?.key !== key) orderChecked.set(pr, (was = { key, order: signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), store) }));
+      orders.set(pr, was.order);
+    }
+    const named = (/** @type {number} */ pr, /** @type {string} */ d) => { const o = orders.get(pr); return Boolean(o && "digests" in o && o.digests.has(d)); };
+    /** @type {Set<number>} */ const prs = new Set();
+    for (const [pr, o] of orders) if ("corrupt" in o || o.top > (a.latest.get(pr) ?? 0)) prs.add(pr);
+    for (const r of /** @type {any[]} */ (db.prepare(`SELECT pr, digest FROM decision`).all())) if (!named(Number(r.pr), String(r.digest))) prs.add(Number(r.pr));
+    for (const [pr, k] of orderKept) {
+      const o = orders.get(pr);
+      if (o && "digest" in o && o.digest === k.latest && [...k.since].every((d) => named(pr, d))) orderKept.delete(pr);
+      else prs.add(pr);
     }
     return [...prs].sort((x, y) => x - y);
   };
@@ -1533,17 +1571,19 @@ export async function tick(ctx) {
         // Bound only by a store with an order to extend: one that judges nothing,
         // named by --db say, would otherwise take the anchor from the store that
         // has one.
-        const pending = pendingOrders(a);
+        const pending = pendingOrders(a, id);
         if (!pending.length) return;
         if (!bound && !ctx.anchor.bind(nwo, id)) {
           log(logPath, `signing: the host's anchor for ${nwo} couldn't be bound to this store, so its signed orders aren't extended`);
           return;
         }
         for (const pr of pending) {
-          let top = 0;
-          try { top = tx(db, () => extendOrder(pr, a.latest.get(pr) ?? 0, id)); }
+          let r = { top: 0, named: false };
+          try { r = tx(db, () => extendOrder(pr, a.latest.get(pr) ?? 0, id)); }
           catch (err) { log(logPath, `signing: #${pr}: its signed order couldn't be extended — ${err.message}`); continue; }
-          noteAnchor(pr, top);
+          // What this reeve kept is ordered, once its entry is committed.
+          if (r.named) orderKept.delete(pr);
+          noteAnchor(pr, r.top);
         }
       });
     });
@@ -2543,6 +2583,7 @@ export async function tick(ctx) {
     }
     // Its signed order is extended at the tick's end, to its latest then.
     const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire, kept });
+    if (decided.ok && kept) keptFor(pr, kept.decision.digest);
     if (effects.length && !decided.ok) {
       log(logPath, `  #${pr}: REQUEST_REVIEW — the decision and its ${effects.length} effect(s) could NOT be recorded: ${decided.why}`);
       // Escalated, not merely logged. Nothing else covers this: no worker is
@@ -2761,6 +2802,7 @@ export async function tick(ctx) {
               }));
             if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr: entry.pr, head: sha, ...kept });
           });
+          if (kept) keptFor(entry.pr, kept.decision.digest);
         } catch (err) {
           log(logPath, `  ${at}: the verdict could not be kept — ${err.message}`);
         }

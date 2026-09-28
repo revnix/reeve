@@ -228,7 +228,11 @@ test("a store stripped of its baseline and every signature still began signing, 
 
 test("a store holding no record begins signing again, though the host's anchor says it began", async () => {
   const dir = credentials();
-  fileAnchor(dir).began(REPO);
+  // The anchor says a store began: the one it's bound to.
+  const anchor = fileAnchor(dir);
+  anchor.bind(REPO, "a".repeat(32));
+  anchor.began(REPO, "a".repeat(32));
+  assert.equal(readAnchor(dir, REPO)?.began, true, "control: the anchor says a store began");
   const dbPath = await ticks([at(A)], host(dir));
   const db = open(dbPath);
   const baselines = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n;
@@ -372,16 +376,19 @@ test("a queue commit's record takes its place in the pull request's signed order
   assert.ok("digests" in order && order.digests.has(queued), JSON.stringify(order));
 });
 
-test("a tick says on the host's anchor that its store began signing, though it judges nothing", async () => {
+test("a store the host's anchor is bound to says there that it began signing, though no entry of its order is noted", async () => {
   const dir = credentials();
-  // A store that began signing, as #271's reeve did, without judging any pull
-  // request: none stands whose state a tick with none open would look up.
-  const dbPath = join(tempDir("reeve-order-idle-"), "s.db");
-  open(dbPath).close();
-  await run({ openPrs: () => [], evaluate: () => at(A), dbPath, signer: fileSigner(dir) });
-  assert.equal(readAnchor(dir, REPO), null, "control: no anchor yet");
-  await run({ openPrs: () => [], evaluate: () => at(A), dbPath, ...host(dir) });
-  assert.equal(readAnchor(dir, REPO)?.began, true);
+  const dbPath = await ticks([at(A)], host(dir));
+  const db = open(dbPath);
+  const id = db.prepare("SELECT json_extract(payload, '$.id') AS id FROM event WHERE op = 'store.identity'").get()?.id;
+  db.close();
+  // Bound to the store and saying nothing more, as a tick that bound it and noted no entry leaves it.
+  rmSync(anchorPath(dir, REPO));
+  assert.equal(fileAnchor(dir).bind(REPO, id), true, "control: bound");
+  // No keys to check an order with, so none is extended or noted.
+  await run({ evaluate: () => at(A), dbPath, ...host(dir), keys: () => null });
+  const a = readAnchor(dir, REPO);
+  assert.deepEqual({ began: a?.began, latest: a?.latest }, { began: true, latest: new Map() });
 });
 
 test("a store stripped of its baseline and signatures isn't given one again where the host's anchor can't be read", async () => {
@@ -969,4 +976,175 @@ test("a store with no order to extend doesn't bind the host's anchor, so the sto
   db.close();
   assert.ok("top" in order && order.top === 1, JSON.stringify(order));
   assert.equal(readAnchor(dir, REPO)?.store, store, "the store with an order to extend bound it");
+});
+
+// ── from #278's eighth review ────────────────────────────────────────────────
+
+/** A tick of the store at `dbPath` whose pull requests are all closed: nothing is judged. */
+const closedTick = (dbPath, ctx) => run({ openPrs: () => [], evaluate: () => at(A), prState: () => "CLOSED", prIsFinished: () => true, dbPath, ...ctx });
+/** The store's identity, as it keeps it. */
+const identityOf = (db) => db.prepare("SELECT json_extract(payload, '$.id') AS id FROM event WHERE op = 'store.identity'").get()?.id;
+
+test("a store with no order to extend says nothing on the host's anchor, so another store's records from before signing are still vouched for", async () => {
+  const dir = credentials();
+  // A store kept before signing: its record unsigned, and no baseline.
+  const dbPath = await ticks([at(A, "RED")], {});
+  // Another store of the repository, named by --db say, begins signing first and judges nothing.
+  const idle = join(tempDir("reeve-order-idle-first-"), "s.db");
+  open(idle).close();
+  // Twice: the second time with an identity of its own, kept by the first.
+  await run({ openPrs: () => [], evaluate: () => at(A), dbPath: idle, ticks: 2, ...host(dir) });
+  const said = readAnchor(dir, REPO);
+  await closedTick(dbPath, host(dir));
+  const db = open(dbPath);
+  const shown = explainDecision(db, PR, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorFor(db, dir) });
+  const baselines = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n;
+  db.close();
+  assert.equal(said?.began ?? false, false, "the idle store didn't say on the anchor that a store began");
+  assert.equal(baselines, 1, "the store with records was given its baseline");
+  assert.match(String(shown), /kept before this store began signing/);
+  assert.doesNotMatch(String(shown), /can't be trusted/);
+});
+
+test("a baseline made while another reeve holds the host's lock is committed synced to disk all the same", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)], {});
+  const seen = [];
+  const count = (db) => db.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n;
+  const watched = (db, fn) => durably(db, () => {
+    const level = db.prepare("PRAGMA synchronous").get().synchronous;
+    const before = count(db);
+    const r = fn();
+    seen.push({ level, baseline: count(db) > before });
+    return r;
+  });
+  const other = fileAnchor(dir).lock(REPO);
+  assert.ok(other && "release" in other, "control: the lock was taken");
+  try { await run({ evaluate: () => at(A), dbPath, ...host(dir), durably: watched }); } finally { other.release(); }
+  const db = open(dbPath);
+  const baselines = count(db);
+  db.close();
+  assert.equal(baselines, 1, "control: the baseline was made");
+  assert.ok(seen.some((x) => x.baseline && x.level === 2), `it committed at FULL: ${JSON.stringify(seen)}`);
+});
+
+test("an older record a store edit raises isn't signed as the latest, whether or not its pull request is judged again", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A), at(A, "RED")], host(dir));
+  // A record kept while another held the host's lock, by a reeve that stopped
+  // before ordering it: the one record no entry names yet.
+  const other = fileAnchor(dir).lock(REPO);
+  try { await run({ evaluate: () => at(B, "RED"), dbPath, ...host(dir) }); } finally { other.release(); }
+  let db = open(dbPath);
+  const [green, red] = digestsOf(db);
+  db.prepare("UPDATE decision SET last_seq = 1000000 WHERE digest = ?").run(green);
+  db.close();
+  // Closed, and never judged again: the reeve ordering it kept none of its records.
+  await closedTick(dbPath, host(dir));
+  db = open(dbPath);
+  const leftOver = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  db.close();
+  assert.equal("digest" in leftOver && leftOver.digest, red, "the order keeps the latest this host signed, not the raised one");
+  // Reopened and judged again: the reeve judging it kept the newest record.
+  await run({ evaluate: () => at(A, "RED"), dbPath, ...host(dir) });
+  db = open(dbPath);
+  const newest = digestsOf(db).at(-1);
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  const shown = explainDecision(db, PR, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.ok(newest !== green && newest !== red, "control: a record kept after the raised one");
+  assert.equal("digest" in order && order.digest, newest, "the order ends at the record this host kept last, not the raised one");
+  assert.match(String(shown), new RegExp(`can't be trusted as the latest: its signed order ends at record ${String(newest).slice(0, 12)}`));
+});
+
+test("a record a store edit put in, unsigned, isn't signed as the latest though no entry names it yet", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A, "RED")], host(dir));
+  let db = open(dbPath);
+  const [first] = digestsOf(db);
+  const i = input(B);
+  const k = recordsFor({ nwo: REPO, pr: PR, head: B, input: i, verdict: computeVerdict(i), policy: policyOf({ identity: { key: REPO } }),
+                         code: { commit: "d".repeat(40), tree: "e".repeat(40), dirty: false, diff: null }, observedAt: new Date(0).toISOString() });
+  saveDecision(db, { at: 1, seq: 1000000, pr: PR, head: B, ...k });
+  db.close();
+  await closedTick(dbPath, host(dir));
+  db = open(dbPath);
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  db.close();
+  assert.ok("digests" in order && order.digests.has(k.decision.digest), `control: it's named, as a record the store holds: ${JSON.stringify(order)}`);
+  assert.equal("digest" in order && order.digest, first, "the order's latest stays the record this host signed");
+});
+
+test("where more than one record no entry names is kept, the store's own order doesn't pick which is the latest", async () => {
+  const dir = credentials();
+  const C = "c".repeat(40);
+  const dbPath = await ticks([at(A, "RED")], host(dir));
+  // Two records kept while another held the host's lock, each by a reeve that stopped before ordering it.
+  for (const head of [B, C]) {
+    const other = fileAnchor(dir).lock(REPO);
+    try { await run({ evaluate: () => at(head, "RED"), dbPath, ...host(dir) }); } finally { other.release(); }
+  }
+  await closedTick(dbPath, host(dir));
+  const db = open(dbPath);
+  const [first, ...kept] = digestsOf(db);
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  db.close();
+  assert.equal(kept.length, 2, "control: two records kept since the first entry");
+  assert.ok("digests" in order && kept.every((d) => order.digests.has(d)), `control: both are named: ${JSON.stringify(order)}`);
+  assert.equal("digest" in order && order.digest, first, "and the order's latest stays the one this host signed");
+});
+
+test("an entry that doesn't check never counts as naming a record, so the order it's in is checked and said not to hold", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)], host(dir));
+  // A record kept while another held the host's lock, so no entry names it yet.
+  const other = fileAnchor(dir).lock(REPO);
+  try { await run({ evaluate: () => at(A, "RED"), dbPath, ...host(dir) }); } finally { other.release(); }
+  let db = open(dbPath);
+  const [, red] = digestsOf(db);
+  // A store edit: an entry, unsigned, that names it, numbered as no entry is.
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
+    .run(3, "daemon", "decision.latest", `pr:${PR}`, JSON.stringify({ repo: REPO, n: "x", digest: red, records: [red], store: null, envelope: "{}" }));
+  db.close();
+  const r = await closedTick(dbPath, host(dir));
+  assert.match(r.log, /#42: its signed order doesn't hold, so it isn't extended/);
+});
+
+test("a record this reeve kept, taken away before an entry named it, is named all the same, so replay reports it gone", async () => {
+  const dir = credentials();
+  const dbPath = join(tempDir("reeve-order-taken-first-"), "s.db");
+  open(dbPath).close();
+  let tick = 0, lock = null, gone = [];
+  await run({ ticks: 4, dbPath, ...host(dir), prState: () => "CLOSED", prIsFinished: () => true,
+              evaluate: () => (tick === 1 ? at(A) : at(tick === 2 ? A : B, "RED")),
+              openPrs: () => {
+                tick++;
+                // The second and third ticks' records aren't ordered, as another holds the lock.
+                if (tick === 2) lock = fileAnchor(dir).lock(REPO);
+                if (tick < 4) return [PR];
+                // Then both are taken away, the latest and the one it superseded, before a tick orders them.
+                lock?.release?.();
+                const s = open(dbPath);
+                gone = s.prepare("SELECT digest FROM decision WHERE pr = ? AND digest NOT IN (SELECT json_extract(payload, '$.digest') FROM event WHERE op = 'decision.latest')").all(PR).map((r) => r.digest);
+                s.prepare(`DELETE FROM decision WHERE digest IN (${gone.map(() => "?").join(",")})`).run(...gone);
+                s.close();
+                return [];
+              } });
+  const db = open(dbPath);
+  const replayed = replayDecisions(db, { pr: PR }, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.equal(gone.length, 2, "control: two records were taken away");
+  for (const g of gone) assert.ok(replayed.some((r) => r.digest === g && /no longer holds it/.test(String(r.why))), `${g}: ${JSON.stringify(replayed)}`);
+});
+
+test("an order that doesn't check is said not to hold, though its pull request's records are all gone", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A, "RED")], host(dir));
+  const db = open(dbPath);
+  db.prepare("DELETE FROM decision WHERE pr = ?").run(PR);
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
+    .run(3, "daemon", "decision.latest", `pr:${PR}`, JSON.stringify({ repo: REPO, n: "x", digest: "f".repeat(64), records: [], store: null, envelope: "{}" }));
+  db.close();
+  const r = await closedTick(dbPath, host(dir));
+  assert.match(r.log, /#42: its signed order doesn't hold, so it isn't extended/);
 });

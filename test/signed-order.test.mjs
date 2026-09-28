@@ -3,7 +3,7 @@
 // short, or restored from before, doesn't pass for the one the host kept.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -455,4 +455,106 @@ test("an anchor's temporaries left by a process that's gone are removed, and a r
   writeFileSync(live, "partway");
   assert.equal(fileAnchor(dir).note(REPO, 7, 1), true, "control: it was written");
   assert.deepEqual({ left: existsSync(left), live: existsSync(live) }, { left: false, live: true });
+});
+
+// ── from #278's second review ────────────────────────────────────────────────
+
+test("the host's anchor moves only once the order's entry is committed, so a store that rolled it back isn't left behind the anchor", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)], host(dir));
+  let db = open(dbPath);
+  // The transaction that keeps entry 2 fails at its commit, after the entry was written.
+  db.exec(`CREATE TABLE fk_parent(id INTEGER PRIMARY KEY);
+           CREATE TABLE fk_child(p INTEGER REFERENCES fk_parent(id) DEFERRABLE INITIALLY DEFERRED);
+           CREATE TRIGGER fail_commit AFTER INSERT ON event WHEN NEW.op = 'decision.latest' BEGIN INSERT INTO fk_child VALUES (999); END;`);
+  db.close();
+  await run({ evaluate: () => at(A, "RED"), dbPath, ...host(dir) });
+  db = open(dbPath);
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  db.close();
+  assert.equal("top" in order && order.top, 1, "control: entry 2 wasn't kept");
+  assert.equal(readAnchor(dir, REPO)?.latest.get(PR), 1, "nor did the anchor move to it");
+});
+
+test("the host's lock on a repository's anchor is held by one at a time", () => {
+  const dir = credentials();
+  const first = fileAnchor(dir).lock(REPO);
+  assert.ok(first && "release" in first, "control: the lock was taken");
+  const second = fileAnchor(dir).lock(REPO);
+  assert.ok(second && "why" in second, "a second can't take it while the first holds it");
+  first.release();
+  const third = fileAnchor(dir).lock(REPO);
+  assert.ok(third && "release" in third, "and can once it's released");
+  third.release();
+});
+
+test("while another reeve holds the host's lock on the repository's anchor, a tick extends no signed order", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)], host(dir));
+  const other = fileAnchor(dir).lock(REPO);
+  assert.ok(other && "release" in other, "control: the lock was taken");
+  let r;
+  try { r = await run({ evaluate: () => at(A, "RED"), dbPath, ...host(dir) }); } finally { other.release(); }
+  let db = open(dbPath);
+  const held = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n;
+  db.close();
+  assert.equal(held, 1, "no entry signed while another held the lock");
+  assert.match(r.log, /another reeve holds the host's lock on o\/r's anchor, so no signed order is extended/);
+  await run({ evaluate: () => at(A, "RED"), dbPath, ...host(dir) });
+  db = open(dbPath);
+  const after = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n;
+  db.close();
+  assert.equal(after, 2, "control: once it's free, the order goes on");
+});
+
+test("reeve replay and reeve why refuse a store named by --db alone, as which repository it's of can't be told", async () => {
+  const home = tempDir("reeve-order-unbound-");
+  const dir = join(home, "credentials");
+  mkdirSync(dir, { mode: 0o700 });
+  // A store cut short of its anchor, which would replay as the same, checked as no repository.
+  const cut = await ticks([at(A), at(A, "RED")], host(dir));
+  const db = open(cut);
+  db.prepare("DELETE FROM event WHERE op = 'decision.latest' AND json_extract(payload, '$.n') = 2").run();
+  db.close();
+  const empty = join(tempDir("reeve-order-unbound-empty-"), "s.db");
+  open(empty).close();
+  // No checkout here, so no repository to take from one.
+  const cwd = tempDir("reeve-order-nowhere-");
+  const env = { ...offlineEnv(), REEVE_HOME: home };
+  for (const dbPath of [cut, empty]) {
+    for (const args of [["replay", "--db", dbPath], ["why", String(PR), "--db", dbPath]]) {
+      const r = spawnSync(process.execPath, [REEVE, ...args], { encoding: "utf8", env, cwd });
+      assert.equal(r.status, 1, `${args[0]} ${dbPath === cut ? "cut short" : "empty"}: ${r.stdout}${r.stderr}`);
+      assert.match(r.stderr, /which repository this store is of can't be told/, args[0]);
+    }
+  }
+  const named = spawnSync(process.execPath, [REEVE, "replay", REPO, "--db", cut], { encoding: "utf8", env, cwd });
+  assert.match(named.stdout, /its signed order ends at entry 1, though this host signed up to entry 2/, "control: named, it's checked");
+});
+
+test("an anchor reached through a link, or with another name, is never read or written", () => {
+  const dir = credentials();
+  const file = anchorPath(dir, REPO);
+  assert.equal(fileAnchor(dir).note(REPO, 7, 3), true, "control: an anchor was written");
+  const elsewhere = join(tempDir("reeve-order-elsewhere-"), "r.json");
+  writeFileSync(elsewhere, '{"began":true,"latest":{"7":1}}');
+  rmSync(file);
+  symlinkSync(elsewhere, file);
+  assert.throws(() => readAnchor(dir, REPO), /is a link/);
+  assert.equal(fileAnchor(dir).note(REPO, 7, 4), false, "nor written through");
+  assert.equal(readFileSync(elsewhere, "utf8"), '{"began":true,"latest":{"7":1}}', "what it points at is left as it was");
+  rmSync(file);
+  writeFileSync(file, '{"began":true,"latest":{"7":3}}');
+  linkSync(file, join(tempDir("reeve-order-other-name-"), "r.json"));
+  assert.throws(() => readAnchor(dir, REPO), /another name/);
+});
+
+test("an anchor whose folder is a link is never read", () => {
+  const dir = credentials();
+  const owner = dirname(anchorPath(dir, REPO));
+  const elsewhere = tempDir("reeve-order-owner-");
+  writeFileSync(join(elsewhere, "r.json"), '{"began":true,"latest":{}}');
+  mkdirSync(dirname(owner), { recursive: true });
+  symlinkSync(elsewhere, owner);
+  assert.throws(() => readAnchor(dir, REPO), /is a link/);
 });

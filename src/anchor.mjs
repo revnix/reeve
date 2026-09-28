@@ -18,8 +18,15 @@
 // written or found already there, so a power loss leaves the last whole anchor,
 // never part of one, and a sync that failed is made again. One that can't be
 // read is never read as none, and never written over: it might have said more.
+// Nor is one read or written through a link, or with another name: what that
+// leads to may lie outside the folder that's kept from workers.
+//
+// One daemon at a time extends a repository's signed order and notes it here,
+// however many stores it's watched through: each holds the host's lock on the
+// repository's anchor across reading it, extending the order and noting it.
 
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { randomBytes } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { canonical } from "./db/ops.mjs";
@@ -54,8 +61,7 @@ export function readAnchor(dir, repo) {
   const path = anchorPath(dir, repo);
   let text;
   try {
-    // A pipe or a device there would hold the read up for ever.
-    if (!statSync(path).isFile()) throw new Error("it isn't a file");
+    unlinked(dir, path);
     text = readFileSync(path, "utf8");
   } catch (err) {
     if (/** @type {NodeJS.ErrnoException} */ (err).code === "ENOENT") return null;
@@ -68,6 +74,57 @@ export function readAnchor(dir, repo) {
       || Object.entries(latest).some(([pr, n]) => !/^[1-9]\d*$/.test(pr) || !Number.isInteger(n) || n < 1))
     throw new Error(`the host's anchor for ${repo} can't be read: it isn't an anchor`);
   return { began: a.began, latest: new Map(Object.entries(latest).map(([pr, n]) => [Number(pr), Number(n)])) };
+}
+
+/**
+ * Throws unless the way to the anchor at `path` is the credentials folder's own:
+ * the anchors' folder and its owner's a folder, not a link, and the anchor a
+ * file of its own, not a link, with no other name, and not a pipe, whose read
+ * would wait for ever. What a link leads to, or another name for the file, may
+ * lie outside the folder that's kept from workers. A part not there yet passes,
+ * and is made here as it should be.
+ * @param {string} dir @param {string} path
+ */
+function unlinked(dir, path) {
+  for (const p of [join(dir, ANCHOR_DIR), dirname(path), path]) {
+    let st;
+    try { st = lstatSync(p); }
+    catch (err) { if (/** @type {NodeJS.ErrnoException} */ (err).code === "ENOENT") return; throw err; }
+    if (st.isSymbolicLink()) throw new Error(`${p} is a link`);
+    if (p !== path && !st.isDirectory()) throw new Error(`${p} isn't a folder`);
+    if (p === path && !st.isFile()) throw new Error("it isn't a file");
+    if (p === path && st.nlink > 1) throw new Error(`it has another name besides ${p}`);
+  }
+}
+
+/**
+ * The host's lock on `repo`'s anchor, in the credentials folder `dir`: SQLite's
+ * exclusive lock on a file beside the anchor, which the operating system holds
+ * for the process and drops when it ends, however it ends. `why` when it
+ * couldn't be taken, and `busy` when that's because another process holds it.
+ * @param {string} dir @param {string} repo
+ * @returns {{ release: () => void } | { why: string, busy: boolean }}
+ */
+export function anchorLock(dir, repo) {
+  /** @type {DatabaseSync | null} */ let lock = null;
+  try {
+    const path = anchorPath(dir, repo);
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    unlinked(dir, path);
+    const lockPath = `${path}.lock`;
+    let st = null;
+    try { st = lstatSync(lockPath); } catch { /* made here */ }
+    if (st && !st.isFile()) throw new Error(`${lockPath} isn't a file of its own`);
+    lock = new DatabaseSync(lockPath, { timeout: 0 });
+    // Nothing is ever written to it, so its journal stays in memory.
+    lock.exec("PRAGMA journal_mode=MEMORY");
+    lock.exec("BEGIN EXCLUSIVE");
+    const held = lock;
+    return { release: () => { try { held.exec("ROLLBACK"); } catch { /* nothing to undo */ } try { held.close(); } catch { /* closed */ } } };
+  } catch (err) {
+    try { lock?.close(); } catch { /* never opened */ }
+    return { why: /** @type {Error} */ (err).message, busy: /** @type {any} */ (err).errcode === 5 };
+  }
 }
 
 /**
@@ -129,6 +186,8 @@ export function fileAnchor(dir, { write = (fd, buf, offset, length) => writeSync
   return {
     /** The anchor for `repo`, as `readAnchor` reads it. @param {string} repo */
     read: (repo) => readAnchor(dir, repo),
+    /** The host's lock on `repo`'s anchor, as `anchorLock` takes it. @param {string} repo */
+    lock: (repo) => anchorLock(dir, repo),
     /** @param {string} repo */
     began: (repo) => update(repo, (a) => (a.began ? false : ((a.began = true), true))),
     /** @param {string} repo @param {number} pr @param {number} n */

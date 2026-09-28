@@ -949,23 +949,19 @@ function standingAt(db, pr) {
  * restored from before: no baseline is made over what it holds, which would
  * vouch for whatever was rewritten there, and its unsigned records aren't
  * trusted. One holding no record at all begins again, as that vouches for none.
+ * Where it began, the caller says so on the host's anchor, once this store's
+ * transaction has committed.
  * @returns {{ began: boolean, why?: string }}
  */
 function beginSigning(db, sign, logPath, anchor = null, nwo = null) {
-  // Said on the host's anchor under the store's write lock, as every write of
-  // it is, so two daemons on one store never write it over each other.
-  const saidBegun = () => {
-    if (anchor && !anchor.began(nwo)) log(logPath, "signing: the host's anchor couldn't say this store began signing; it's said again next tick");
-    return { began: true };
-  };
   try {
     // Under the store's write lock, so a second daemon on the store can't list
     // and sign between this one's checks and its insert.
     return tx(db, () => {
-      if (db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(BASELINE_OP)) return saidBegun();
-      if (db.prepare(`SELECT 1 FROM decision WHERE envelope IS NOT NULL LIMIT 1`).get()) return saidBegun();
+      if (db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(BASELINE_OP)) return { began: true };
+      if (db.prepare(`SELECT 1 FROM decision WHERE envelope IS NOT NULL LIMIT 1`).get()) return { began: true };
       // An entry of a signed order is signed too, and only made once a store began.
-      if (db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(LATEST_OP)) return saidBegun();
+      if (db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(LATEST_OP)) return { began: true };
       let hostSays = false;
       if (anchor) {
         // One that can't be read might say so: taken as saying it.
@@ -985,7 +981,7 @@ function beginSigning(db, sign, logPath, anchor = null, nwo = null) {
       }
       db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
         .run(now(), "daemon", BASELINE_OP, "store", JSON.stringify({ digests: baselineStatement(digests).predicate.digests, envelope: s.envelope }));
-      return saidBegun();
+      return { began: true };
     });
   } catch (err) {
     log(logPath, `signing: the records kept before signing couldn't be listed and signed — ${err.message}`);
@@ -1392,7 +1388,33 @@ export async function tick(ctx) {
   // that isn't signed, or whose signature was stripped, isn't one of them. Until
   // that list is made, records are kept unsigned: one signed first would stop it
   // being made, and every record kept before would be untrusted for good.
-  const begun = ctx.signer ? beginSigning(db, signWith, logPath, ctx.anchor ?? null, nwo) : { began: true };
+  // One daemon at a time extends a repository's signed order and notes it on
+  // the host's anchor, however many stores it's watched through (#274): each
+  // holds the host's lock on the repository's anchor across reading it,
+  // extending the order in its store, and noting it once that's committed. One
+  // that can't take the lock extends no order, and says so once a tick.
+  const ordering = Boolean(ctx.signer && ctx.anchor && ctx.keys);
+  let lockSaid = false;
+  const withOrderLock = (fn) => {
+    if (!ordering) return fn(false);
+    const lock = ctx.anchor.lock(nwo);
+    if ("why" in lock) {
+      if (!lockSaid) {
+        lockSaid = true;
+        log(logPath, lock.busy ? `signing: another reeve holds the host's lock on ${nwo}'s anchor, so no signed order is extended this tick`
+                               : `signing: the host's lock on ${nwo}'s anchor couldn't be taken, so no signed order is extended this tick — ${lock.why}`);
+      }
+      return fn(false);
+    }
+    try { return fn(true); } finally { lock.release(); }
+  };
+  const begun = ctx.signer ? withOrderLock((held) => {
+    const b = beginSigning(db, signWith, logPath, ctx.anchor ?? null, nwo);
+    // Said on the host's anchor once the store has committed it, where a store
+    // restored from before can't take it back.
+    if (held && b.began && !ctx.anchor.began(nwo)) log(logPath, "signing: the host's anchor couldn't say this store began signing; it's said again next tick");
+    return b;
+  }) : { began: true };
   let unsignedSaid = false;
   const signed = (decision) => {
     if (!begun.began) return { unsigned: `this store hasn't begun signing, as the records it kept before couldn't be signed: ${begun.why}` };
@@ -1404,39 +1426,43 @@ export async function tick(ctx) {
   // Each change of a pull request's latest decision, a numbered, signed entry of
   // its order (#274), so which record is latest isn't read from the store's own
   // order alone. Made inside the decision's transaction, under the store's write
-  // lock, so two daemons on one store never number an entry alike. Extended only
-  // from an order that checks whole, with the host's own keys, and the host's
-  // anchor moved to its top under the same lock: never from a number a store
-  // edit put there, and a write of it that failed, or never ran, is made good on
-  // a later tick.
+  // lock and the host's lock on the repository's anchor. Extended only from an
+  // order that checks whole, with the host's own keys, and never from a number a
+  // store edit put there. The top it answers is noted on the anchor once the
+  // transaction has committed; 0 for none.
   /** @type {Map<string, any> | null | undefined} */ let orderKeys;
-  const advanceOrder = (pr, decision) => {
-    if (!ctx.signer || !begun.began) return;
+  const extendOrder = (pr, decision) => {
+    if (!begun.began) return 0;
     if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
-    if (!orderKeys) return;
+    if (!orderKeys) return 0;
     const order = signedOrder(db, nwo, pr, orderKeys);
-    if ("corrupt" in order) { log(logPath, `signing: #${pr}: its signed order doesn't hold, so it isn't extended — ${order.corrupt}`); return; }
+    if ("corrupt" in order) { log(logPath, `signing: #${pr}: its signed order doesn't hold, so it isn't extended — ${order.corrupt}`); return 0; }
     // Nor one cut short of what the host signed: an entry signed now would take
     // a number the host already signed, and two entries under one number would
     // each pass for the latest. Nor where that can't be read.
-    if (ctx.anchor) {
-      let anchored = 0;
-      try { anchored = ctx.anchor.read(nwo)?.latest.get(pr) ?? 0; }
-      catch (err) { log(logPath, `signing: #${pr}: ${err.message}, so its signed order isn't extended`); return; }
-      if (order.top < anchored) {
-        log(logPath, `signing: #${pr}: its signed order ends at entry ${order.top}, though this host signed up to entry ${anchored}, so it isn't extended`);
-        return;
-      }
+    let anchored = 0;
+    try { anchored = ctx.anchor.read(nwo)?.latest.get(pr) ?? 0; }
+    catch (err) { log(logPath, `signing: #${pr}: ${err.message}, so its signed order isn't extended`); return 0; }
+    if (order.top < anchored) {
+      log(logPath, `signing: #${pr}: its signed order ends at entry ${order.top}, though this host signed up to entry ${anchored}, so it isn't extended`);
+      return 0;
     }
     let top = order.top;
     if (order.digest !== decision.digest) {
       const s = signWith(latestStatement({ repo: nwo, pr, n: top + 1, digest: decision.digest }));
-      if (!s?.envelope) return;
+      if (!s?.envelope) return top;
       db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
         .run(now(), "daemon", LATEST_OP, `pr:${pr}`, canonical({ repo: nwo, n: top + 1, digest: decision.digest, envelope: s.envelope }));
       top += 1;
     }
-    if (ctx.anchor && top && !ctx.anchor.note(nwo, pr, top))
+    return top;
+  };
+  // The host's anchor moved to entry `top` of `pr`'s order, only once the store
+  // has committed it: moved before, a transaction that failed would leave the
+  // anchor ahead of its store, and its order never extended again. A write that
+  // failed is made good on a later tick.
+  const noteAnchor = (pr, top) => {
+    if (top && !ctx.anchor.note(nwo, pr, top))
       log(logPath, `signing: #${pr}: the host's anchor couldn't be moved to entry ${top} of its order, so it lags until a later tick`);
   };
   // What each base requires is read afresh every tick. Kept across ticks, a rule
@@ -2425,8 +2451,13 @@ export async function tick(ctx) {
         log(logPath, `  #${pr}: what this verdict was judged from could not be recorded — ${err.message}`);
       }
     }
-    const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire, kept,
-                                 inTx: kept ? () => advanceOrder(pr, kept.decision) : null });
+    const decided = withOrderLock((held) => {
+      let ordered = 0;
+      const d = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire, kept,
+                             inTx: kept && held ? () => { ordered = extendOrder(pr, kept.decision); } : null });
+      if (d.ok && ordered) noteAnchor(pr, ordered);
+      return d;
+    });
     if (effects.length && !decided.ok) {
       log(logPath, `  #${pr}: REQUEST_REVIEW — the decision and its ${effects.length} effect(s) could NOT be recorded: ${decided.why}`);
       // Escalated, not merely logged. Nothing else covers this: no worker is
@@ -2636,15 +2667,20 @@ export async function tick(ctx) {
           log(logPath, `  ${at}: what this verdict was judged from could not be recorded — ${err.message}`);
         }
         try {
-          tx(db, () => {
-            const decided = db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
-              .run(now(), "daemon", "queue.decided", `pr:${entry.pr}`, JSON.stringify({
-                head: sha, base: entry.baseSha, state: j.verdict.state, summary: j.verdict.summary,
-                clauses: j.verdict.clauses.map((c) => ({ id: c.id, state: c.state })),
-                record: kept?.decision.digest ?? null,
-              }));
-            if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr: entry.pr, head: sha, ...kept });
-            if (kept) advanceOrder(entry.pr, kept.decision);
+          withOrderLock((held) => {
+            let ordered = 0;
+            tx(db, () => {
+              const decided = db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
+                .run(now(), "daemon", "queue.decided", `pr:${entry.pr}`, JSON.stringify({
+                  head: sha, base: entry.baseSha, state: j.verdict.state, summary: j.verdict.summary,
+                  clauses: j.verdict.clauses.map((c) => ({ id: c.id, state: c.state })),
+                  record: kept?.decision.digest ?? null,
+                }));
+              if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr: entry.pr, head: sha, ...kept });
+              if (kept && held) ordered = extendOrder(entry.pr, kept.decision);
+            });
+            // Only once the store has committed it.
+            noteAnchor(entry.pr, ordered);
           });
         } catch (err) {
           log(logPath, `  ${at}: the verdict could not be kept — ${err.message}`);

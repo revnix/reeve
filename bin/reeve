@@ -956,6 +956,10 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       console.error(dbPath ? `reeve replay: ${missingStoreMessage(dbPath, { initCreatesIt: !opt("db"), nwo })}` : "reeve replay: no state database");
       process.exit(1);
     }
+    // A store named by --db alone is of no repository that can be told, so
+    // which records it should hold, by its signed orders and the host's anchor,
+    // couldn't be checked, and a store cut short would replay as whole (#274).
+    if (!nwo) { console.error(`reeve replay: which repository this store is of can't be told, so which records it should hold can't be checked: name it, as reeve replay <owner/repo> --db ${dbPath}`); process.exit(1); }
     const pr = opt("pr"), since = opt("since");
     const sinceAt = since == null ? null : Math.floor(Date.parse(since) / 1000);
     if (pr != null && !/^\d+$/.test(pr)) { console.error(`reeve replay: --pr takes a pull request number, got ${JSON.stringify(pr)}`); process.exit(1); }
@@ -1012,6 +1016,8 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     if (cmd === "why") {
       const target = positionals.find(a => /^#?\d+$/.test(a) || a.startsWith("pr:"));
       if (!target) { console.error("reeve why <pr-number>"); process.exit(1); }
+      // As replay: which record is latest can't be checked for no repository.
+      if (!nwo) { console.error(`reeve why: which repository this store is of can't be told, so which record is latest can't be checked: name it, as reeve why <owner/repo> ${target} --db ${dbPath}`); process.exit(1); }
       console.log(why(db, target, { head: opt("head") ?? null, keys: signingKeys(), repo: nwo, anchor: anchorFor(nwo) }));
       process.exit(0);
     }

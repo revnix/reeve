@@ -2,7 +2,7 @@
 // no longer passes for the one reeve kept.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { generateKeyPairSync } from "node:crypto";
 import { signingKey, fileSigner, signDecision, checkSignature, knownKeys, keyIdOf, decisionStatement,
@@ -60,7 +60,7 @@ test("a signing key others can read isn't used", () => {
 test("a decision is signed as a DSSE envelope over its in-toto statement, and checks with its key", () => {
   const dir = credentials();
   const d = decision();
-  const signed = fileSigner(dir)(d);
+  const signed = fileSigner(dir)(decisionStatement(d));
   assert.ok("envelope" in signed, JSON.stringify(signed));
   const env = JSON.parse(signed.envelope);
   assert.equal(env.payloadType, PAYLOAD_TYPE);
@@ -73,7 +73,7 @@ test("a decision is signed as a DSSE envelope over its in-toto statement, and ch
 test("a record rewritten after it was signed fails its check, though its digest was computed again", () => {
   const dir = credentials();
   const d = decision("BLOCK");
-  const signed = fileSigner(dir)(d);
+  const signed = fileSigner(dir)(decisionStatement(d));
   const record = { ...d.record, verdict: { ...d.record.verdict, state: "PASS" } };
   const rewritten = { digest: digestOf(record), record, envelope: "envelope" in signed ? signed.envelope : null, unsigned: null };
   const got = checkSignature(rewritten, knownKeys({ local: dir }));
@@ -84,7 +84,7 @@ test("a record rewritten after it was signed fails its check, though its digest 
 test("a signature that doesn't verify is corrupt", () => {
   const dir = credentials();
   const d = decision();
-  const signed = fileSigner(dir)(d);
+  const signed = fileSigner(dir)(decisionStatement(d));
   const env = JSON.parse("envelope" in signed ? signed.envelope : "{}");
   assert.ok(Array.isArray(env.signatures), "control: it was signed");
   env.signatures[0].sig = Buffer.alloc(64).toString("base64");
@@ -112,7 +112,7 @@ test("an unsigned record is never read as signed, and says why it's unsigned", (
 test("a record whose signing failed is kept unsigned, with the reason", () => {
   const dir = credentials();
   writeFileSync(join(dir, KEY_FILE), "not a key", { mode: 0o600 });
-  const signed = fileSigner(dir)(decision());
+  const signed = fileSigner(dir)(decisionStatement(decision()));
   assert.ok("unsigned" in signed);
   assert.match("unsigned" in signed ? signed.unsigned : "", /signing key/);
 });
@@ -158,7 +158,7 @@ function kept(signer = null) {
   const k = recordsFor({ nwo: "o/r", pr: 7, head: i.head, input: i, verdict: computeVerdict(i), policy: policyOf({ identity: { key: "o/r" } }),
                          code: CODE, observedAt: new Date(0).toISOString() });
   const sign = signer === "file" ? fileSigner(dir) : signer;
-  saveDecision(db, { at: 1, seq: 1, pr: 7, head: i.head, ...k, ...(sign ? { signed: sign(k.decision) } : {}) });
+  saveDecision(db, { at: 1, seq: 1, pr: 7, head: i.head, ...k, ...(sign ? { signed: sign(decisionStatement(k.decision)) } : {}) });
   return { db, dbPath, home, dir, k };
 }
 
@@ -194,7 +194,7 @@ test("a record rewritten in the store, digest and all, can't be replayed, and wh
 test("a record held unsigned is signed when it's seen again, over exactly what it says", () => {
   const { db, dir, k } = kept();
   assert.equal(db.prepare("SELECT envelope FROM decision").get().envelope, null);
-  saveDecision(db, { at: 2, seq: 2, pr: 7, head: k.decision.record.subject.head, ...k, signed: fileSigner(dir)(k.decision) });
+  saveDecision(db, { at: 2, seq: 2, pr: 7, head: k.decision.record.subject.head, ...k, signed: fileSigner(dir)(decisionStatement(k.decision)) });
   const shown = explainDecision(db, 7, { keys: knownKeys({ local: dir }) });
   db.close();
   assert.match(String(shown), /signed by key/);
@@ -287,7 +287,7 @@ test("a signing key that isn't Ed25519 isn't used", () => {
 test("an envelope over anything but an in-toto statement is corrupt, whatever it says", () => {
   const dir = credentials();
   const d = decision();
-  const signed = fileSigner(dir)(d);
+  const signed = fileSigner(dir)(decisionStatement(d));
   const env = JSON.parse("envelope" in signed ? signed.envelope : "{}");
   env.payloadType = "text/plain";
   const got = checkSignature(row(d, { envelope: JSON.stringify(env) }), knownKeys({ local: dir }));
@@ -301,4 +301,188 @@ test("a record held signed keeps its signature when it's seen again unsigned", (
   const shown = explainDecision(db, 7, { keys: knownKeys({ local: dir }) });
   db.close();
   assert.match(String(shown), /signed by key/);
+});
+
+// ── from #271's first review ─────────────────────────────────────────────────
+
+test("a malformed signature entry is corrupt, and replay goes on past it", () => {
+  const { db, dir } = kept("file");
+  const env = JSON.parse(db.prepare("SELECT envelope FROM decision").get().envelope ?? "null");
+  assert.ok(env, "control: it was signed");
+  env.signatures = [null];
+  db.prepare("UPDATE decision SET envelope = ?").run(JSON.stringify(env));
+  let replayed;
+  assert.doesNotThrow(() => { replayed = replayDecisions(db, { pr: 7 }, { keys: knownKeys({ local: dir }) }); });
+  db.close();
+  assert.deepEqual(replayed?.map(r => [r.outcome, r.why]), [["unreplayable", "its envelope holds a signature that isn't one"]]);
+});
+
+test("a key whose writing stops partway leaves nothing at the key's path, and the next signing makes a whole one", () => {
+  const dir = credentials();
+  const full = () => { throw Object.assign(new Error("no space left on device"), { code: "ENOSPC" }); };
+  assert.equal(signingKey(dir, { create: true, write: full }).ok, false);
+  assert.equal(existsSync(join(dir, KEY_FILE)), false, "no part of a key where the key goes");
+  assert.deepEqual(readdirSync(dir).filter(f => f.endsWith(".tmp")), [], "and nothing left beside it");
+  const k = signingKey(dir, { create: true });
+  assert.equal(k.ok && k.created, true);
+});
+
+test("a public half that's missing, cut short or another key's is written again from the key", () => {
+  const dir = credentials();
+  const k = signingKey(dir, { create: true });
+  const id = k.ok ? k.keyid : "";
+  for (const broken of ["-----BEGIN PUBLIC KEY-----\nMCow", String(generateKeyPairSync("ed25519").publicKey.export({ type: "spki", format: "pem" }))]) {
+    writeFileSync(join(dir, PUBLIC_FILE), broken);
+    assert.equal(signingKey(dir).ok, true);
+    assert.deepEqual([...knownKeys({ local: dir }).keys()], [id]);
+  }
+});
+
+/** #42 at `head`, evaluated with its CI `ci` ("GREEN" passes it, "RED" blocks it). */
+const at = (head, ci = "GREEN") => {
+  const i = { ...input(), head, checks: { ...input().checks, verdict: ci, failing: ci === "RED" ? [{ name: "unit", id: "1" }] : [] } };
+  return { ...EVAL, head, input: i, verdict: computeVerdict(i) };
+};
+/**
+ * Ticks over one store, each with its own evaluation, and with `signer` from
+ * tick `from` on. The ticks with one signer share a run, and so its profile.
+ */
+async function ticks(evals, { signer = null, from = 0 } = {}) {
+  const dbPath = join(tempDir("reeve-signing-ticks-"), "s.db");
+  open(dbPath).close();
+  const each = async (list, s) => {
+    if (!list.length) return;
+    // By tick, not by call: a tick may evaluate a pull request more than once.
+    let tick = 0;
+    await run({ openPrs: () => { tick++; return [42]; }, evaluate: () => list[Math.min(tick, list.length) - 1],
+                dbPath, ticks: list.length, ...(s ? { signer: s } : {}) });
+  };
+  await each(evals.slice(0, from), null);
+  await each(evals.slice(from), signer);
+  return dbPath;
+}
+const A = "a".repeat(40), B = "b".repeat(40);
+
+test("a signature stripped from a record kept after its store began signing leaves it untrusted", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A)], { signer: fileSigner(dir) }));
+  db.prepare("UPDATE decision SET envelope = NULL, unsigned = 'it was kept before records were signed'").run();
+  const keys = knownKeys({ local: dir });
+  const shown = explainDecision(db, 42, { keys });
+  const replayed = replayDecisions(db, { pr: 42 }, { keys });
+  db.close();
+  assert.match(String(shown), /can't be trusted: it's unsigned, though it was kept after this store began signing/);
+  assert.deepEqual(replayed.map(r => r.outcome), ["unreplayable"]);
+});
+
+test("records a store kept before it began signing are vouched for by its signed baseline, and read as unsigned", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(B)], { signer: fileSigner(dir), from: 1 }));
+  const keys = knownKeys({ local: dir });
+  const before = explainDecision(db, 42, { head: A.slice(0, 8), keys });
+  const replayed = replayDecisions(db, { pr: 42 }, { keys });
+  db.close();
+  assert.match(String(before), /unsigned: it was kept before this store began signing/);
+  assert.doesNotMatch(String(before), /can't be trusted/);
+  assert.deepEqual(replayed.map(r => r.outcome), ["same", "same"]);
+});
+
+test("a baseline changed after it was signed vouches for nothing", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(B)], { signer: fileSigner(dir), from: 1 }));
+  const row = db.prepare("SELECT seq, payload FROM event WHERE op = 'signing.baseline'").get();
+  assert.ok(row, "control: the store began signing with a baseline");
+  const p = JSON.parse(row.payload);
+  db.prepare("UPDATE event SET payload = ? WHERE seq = ?").run(JSON.stringify({ ...p, digests: [...p.digests, "f".repeat(64)] }), row.seq);
+  const replayed = replayDecisions(db, { pr: 42 }, { keys: knownKeys({ local: dir }) });
+  db.close();
+  assert.deepEqual(replayed.map(r => r.outcome).sort(), ["same", "unreplayable"], "the record kept before signing is no longer vouched for");
+});
+
+test("a store that never began signing reads its records as unsigned, and replays them", async () => {
+  const db = open(await ticks([at(A)]));
+  const keys = knownKeys({ local: credentials() });
+  const shown = explainDecision(db, 42, { keys });
+  const replayed = replayDecisions(db, { pr: 42 }, { keys });
+  db.close();
+  assert.match(String(shown), /unsigned: this run was given no signing key/);
+  assert.deepEqual(replayed.map(r => r.outcome), ["same"]);
+});
+
+test("an older decision made to look latest in the store is caught by the signed order", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], { signer: fileSigner(dir) }));
+  const keys = knownKeys({ local: dir });
+  assert.doesNotMatch(String(explainDecision(db, 42, { keys })), /as the latest/, "control: the store's order and the signed one agree");
+  const older = db.prepare("SELECT digest FROM decision ORDER BY last_seq LIMIT 1").get().digest;
+  db.prepare("UPDATE decision SET last_seq = 999999 WHERE digest = ?").run(older);
+  const shown = explainDecision(db, 42, { keys });
+  db.close();
+  assert.match(String(shown), /can't be trusted as the latest: the signed order of this pull request's decisions ends at record/);
+});
+
+test("the signed order records each change of a pull request's latest decision, and only a change", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A), at(A, "RED"), at(A)], { signer: fileSigner(dir) }));
+  const order = db.prepare("SELECT payload FROM event WHERE op = 'decision.latest' AND subject = 'pr:42' ORDER BY seq").all().map(r => JSON.parse(r.payload));
+  const digests = db.prepare("SELECT digest FROM decision ORDER BY first_seq").all().map(r => r.digest);
+  db.close();
+  assert.deepEqual(order.map(o => [o.n, o.digest]), [[1, digests[0]], [2, digests[1]], [3, digests[0]]]);
+});
+
+test("an entry missing from the signed order is caught", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED"), at(A)], { signer: fileSigner(dir) }));
+  db.prepare("DELETE FROM event WHERE op = 'decision.latest' AND json_extract(payload, '$.n') = 2").run();
+  const shown = explainDecision(db, 42, { keys: knownKeys({ local: dir }) });
+  db.close();
+  assert.match(String(shown), /can't be trusted as the latest: the signed order of its decisions is missing entry 2/);
+});
+
+test("a store whose baseline was deleted still began signing, by its signed records", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], { signer: fileSigner(dir) }));
+  db.prepare("DELETE FROM event WHERE op = 'signing.baseline'").run();
+  const older = db.prepare("SELECT digest FROM decision ORDER BY first_seq LIMIT 1").get().digest;
+  db.prepare("UPDATE decision SET envelope = NULL WHERE digest = ?").run(older);
+  const replayed = replayDecisions(db, { pr: 42 }, { keys: knownKeys({ local: dir }) });
+  db.close();
+  assert.deepEqual(replayed.map(r => r.outcome), ["unreplayable", "same"]);
+});
+
+test("a baseline isn't made once a store holds signed records, so it can't vouch for one stripped since", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A), at(A, "RED")], { signer: fileSigner(dir) });
+  let db = open(dbPath);
+  db.prepare("DELETE FROM event WHERE op = 'signing.baseline'").run();
+  const older = db.prepare("SELECT digest FROM decision ORDER BY first_seq LIMIT 1").get().digest;
+  db.prepare("UPDATE decision SET envelope = NULL WHERE digest = ?").run(older);
+  db.close();
+  await run({ evaluate: () => at(A, "RED"), dbPath, signer: fileSigner(dir) });
+  db = open(dbPath);
+  const replayed = replayDecisions(db, { digest: older.slice(0, 12) }, { keys: knownKeys({ local: dir }) });
+  db.close();
+  assert.deepEqual(replayed.map(r => r.outcome), ["unreplayable"]);
+});
+
+test("an entry of the signed order changed after it was signed doesn't hold", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], { signer: fileSigner(dir) }));
+  const older = db.prepare("SELECT digest FROM decision ORDER BY first_seq LIMIT 1").get().digest;
+  const top = db.prepare("SELECT seq, payload FROM event WHERE op = 'decision.latest' ORDER BY seq DESC LIMIT 1").get();
+  assert.ok(top, "control: the signed order has entries");
+  db.prepare("UPDATE event SET payload = ? WHERE seq = ?").run(JSON.stringify({ ...JSON.parse(top.payload), digest: older }), top.seq);
+  db.prepare("UPDATE decision SET last_seq = 999999 WHERE digest = ?").run(older);
+  const shown = explainDecision(db, 42, { keys: knownKeys({ local: dir }) });
+  db.close();
+  assert.match(String(shown), /can't be trusted as the latest: an entry in the signed order of its decisions doesn't hold/);
+});
+
+test("an entry the signed order names twice is caught", async () => {
+  const dir = credentials();
+  const db = open(await ticks([at(A), at(A, "RED")], { signer: fileSigner(dir) }));
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) SELECT at, actor, op, subject, payload FROM event WHERE op = 'decision.latest' AND json_extract(payload, '$.n') = 1").run();
+  const shown = explainDecision(db, 42, { keys: knownKeys({ local: dir }) });
+  db.close();
+  assert.match(String(shown), /can't be trusted as the latest: the signed order of its decisions names entry 1 twice/);
 });

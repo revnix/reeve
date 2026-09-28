@@ -36,14 +36,16 @@ function hexStart(typed, what, max) {
  *
  * `signed` is its signature (#165), or why it has none. A record held unsigned
  * that is signed when seen again keeps that signature, which is over exactly
- * what it says; one held signed keeps the signature it has.
+ * what it says; one held signed keeps the signature it has. `latest`, when the
+ * pull request's latest decision changed, is the signed entry that says so.
  * @param {Db} db
  * @param {{ at: number, seq: number, pr: number, head: string, policy: { hash: string, body: unknown },
  *           evidence: { kind: string, digest: string, statement: unknown }[],
  *           decision: { digest: string, record: unknown },
- *           signed?: { envelope?: string, unsigned?: string } }} r
+ *           signed?: { envelope?: string, unsigned?: string },
+ *           latest?: { repo: string, n: number, digest: string, envelope: string } | null }} r
  */
-export function saveDecision(db, { at, seq, pr, head, policy, evidence, decision, signed = {} }) {
+export function saveDecision(db, { at, seq, pr, head, policy, evidence, decision, signed = {}, latest = null }) {
   db.prepare(`INSERT INTO policy(hash, body, first_seen) VALUES(?,?,?) ON CONFLICT(hash) DO NOTHING`)
     .run(policy.hash, canonical(policy.body), at);
   const put = db.prepare(`INSERT INTO evidence(digest, kind, statement, first_seen, last_seen) VALUES(?,?,?,?,?)
@@ -56,7 +58,13 @@ export function saveDecision(db, { at, seq, pr, head, policy, evidence, decision
                 envelope = COALESCE(decision.envelope, excluded.envelope),
                 unsigned = CASE WHEN COALESCE(decision.envelope, excluded.envelope) IS NULL THEN excluded.unsigned END`)
     .run(decision.digest, pr, head, canonical(decision.record), at, at, seq, seq, envelope, unsigned);
+  if (latest) db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
+    .run(at, "daemon", LATEST_OP, `pr:${pr}`, canonical({ repo: latest.repo, n: latest.n, digest: latest.digest, envelope: latest.envelope }));
 }
+
+/** The events that say a store began signing, and each change of a pull request's latest decision (#165). */
+export const BASELINE_OP = "signing.baseline";
+export const LATEST_OP = "decision.latest";
 
 /**
  * @typedef {{ digest: string, pr: number, head: string, record: Record<string, any>, corrupt: string | null,

@@ -54,6 +54,8 @@ import { randomBytes } from "node:crypto";
 import { resolveHome } from "./home.mjs";
 import { codeVersion, policyOf, recordsFor } from "./evidence.mjs";
 import { saveDecision } from "./db/records.mjs";
+import { decisionStatement, baselineStatement, latestStatement } from "./signing.mjs";
+import { BASELINE_OP, LATEST_OP } from "./db/records.mjs";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -932,6 +934,25 @@ function standingAt(db, pr) {
 }
 
 /**
+ * Begin signing a store (#165): sign the list of the decision records it holds
+ * unsigned, once. Not once any record is signed: a list made then would vouch for
+ * records left unsigned since. A signing that fails is tried again next tick.
+ */
+function beginSigning(db, sign, logPath) {
+  try {
+    if (db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(BASELINE_OP)) return;
+    if (db.prepare(`SELECT 1 FROM decision WHERE envelope IS NOT NULL LIMIT 1`).get()) return;
+    const digests = db.prepare(`SELECT digest FROM decision ORDER BY digest`).all().map((r) => r.digest);
+    const s = sign(baselineStatement(digests));
+    if (!s?.envelope) { log(logPath, `signing: the records kept before signing couldn't be signed — ${s?.unsigned}`); return; }
+    db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
+      .run(now(), "daemon", BASELINE_OP, "store", JSON.stringify({ digests: baselineStatement(digests).predicate.digests, envelope: s.envelope }));
+  } catch (err) {
+    log(logPath, `signing: the records kept before signing couldn't be listed and signed — ${err.message}`);
+  }
+}
+
+/**
  * Every PASS reeve has standing and hasn't taken back, one per pull request and
  * check name. A publication whose record can't be read may be a PASS, so it's
  * listed too, as `{ pr, unread }`, until a later record at that pull request
@@ -1322,6 +1343,22 @@ export async function tick(ctx) {
     try { s = ctx.signer(decision); } catch (err) { return { unsigned: `it couldn't be signed: ${err.message}` }; }
     if (s?.created) log(logPath, `made this host's signing key, ${s.created}: publish its public half, as reeve signing-key says`);
     return s;
+  };
+  // A store begins signing with a signed list of the records it already held
+  // unsigned, made once and before its first signed record: after it, a record
+  // that isn't signed, or whose signature was stripped, isn't one of them.
+  if (ctx.signer) beginSigning(db, signed, logPath);
+  // Each change of a pull request's latest decision, numbered and signed, so which
+  // is latest isn't read from the store's own order alone.
+  const nextLatest = (pr, decision) => {
+    if (!ctx.signer) return null;
+    let last = null;
+    try { last = JSON.parse(db.prepare(`SELECT payload FROM event WHERE op = ? AND subject = ? ORDER BY seq DESC LIMIT 1`).get(LATEST_OP, `pr:${pr}`)?.payload ?? "null"); }
+    catch { last = null; }
+    if (last?.digest === decision.digest) return null;
+    const n = (Number.isInteger(last?.n) ? last.n : 0) + 1;
+    const s = signed(latestStatement({ repo: nwo, pr, n, digest: decision.digest }));
+    return s?.envelope ? { repo: nwo, n, digest: decision.digest, envelope: s.envelope } : null;
   };
   // What each base requires is read afresh every tick. Kept across ticks, a rule
   // added between them went unseen for as long as the reading was kept.
@@ -2304,7 +2341,7 @@ export async function tick(ctx) {
         kept = recordsFor({ nwo, pr, head: e.head, tree: (ctx.treeOf ?? treeOf)(nwo, e.head), input: e.input,
                             verdict: e.verdict, policy: policyFor(profile), code,
                             observedAt: new Date(now() * 1000).toISOString() });
-        kept = { ...kept, signed: signed(kept.decision) };
+        kept = { ...kept, signed: signed(decisionStatement(kept.decision)), latest: nextLatest(pr, kept.decision) };
       } catch (err) {
         log(logPath, `  #${pr}: what this verdict was judged from could not be recorded — ${err.message}`);
       }
@@ -2514,7 +2551,7 @@ export async function tick(ctx) {
           kept = recordsFor({ nwo, pr: entry.pr, head: sha, tree: (ctx.treeOf ?? treeOf)(nwo, sha), input: j.input,
                               verdict: j.verdict, policy: policyFor(profile), code,
                               observedAt: new Date(now() * 1000).toISOString() });
-          kept = { ...kept, signed: signed(kept.decision) };
+          kept = { ...kept, signed: signed(decisionStatement(kept.decision)), latest: nextLatest(entry.pr, kept.decision) };
         } catch (err) {
           log(logPath, `  ${at}: what this verdict was judged from could not be recorded — ${err.message}`);
         }

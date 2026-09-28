@@ -56,7 +56,7 @@ import { codeVersion, policyOf, recordsFor } from "./evidence.mjs";
 import { saveDecision } from "./db/records.mjs";
 import { decisionStatement, baselineStatement, latestStatement } from "./signing.mjs";
 import { BASELINE_OP, LATEST_OP, STORE_ID_OP, latestDecision, storeIdentity } from "./db/records.mjs";
-import { signedOrder, strayEntry } from "./decisions.mjs";
+import { signedOrder, strayEntry, baselineLost, otherRepository } from "./decisions.mjs";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -1582,12 +1582,27 @@ export async function tick(ctx) {
           log(logPath, `signing: the host's anchor for ${nwo} is another store's, so this store's signed orders aren't extended`);
           return;
         }
+        // A record the store's baseline vouches for, kept before it began
+        // signing, that it no longer holds and no order names: taken away before
+        // an order could name it. The baseline says no pull request, so it's no
+        // order's work, and it's said every tick.
+        const lost = baselineLost(db, nwo, /** @type {any} */ (orderKeys), id);
+        if (lost.length) log(logPath, `signing: the store's baseline names ${lost.length} record(s) kept before it began signing that it no longer holds, ` +
+                                      `and no signed order names: ${lost.map((d) => d.slice(0, 12)).join(", ")}; they were taken away`);
         // Bound only by a store with an order to extend: one that judges nothing,
         // named by --db say, would otherwise take the anchor from the store that
         // has one. It began signing, or nothing is ordered, and the binding says
         // so too.
         const pending = pendingOrders(a, id);
         if (!pending.length) return;
+        // And only to a store of this repository: one of another, named by --db
+        // say, would take the anchor for good, and the repository's own store be
+        // refused as another store's.
+        const other = bound ? null : otherRepository(db, nwo);
+        if (other !== null) {
+          log(logPath, `signing: this store holds records of ${other}, not only of ${nwo}, so the host's anchor for ${nwo} isn't bound to it`);
+          return;
+        }
         if (!bound && !ctx.anchor.bind(nwo, id)) {
           log(logPath, `signing: the host's anchor for ${nwo} couldn't be bound to this store, so its signed orders aren't extended`);
           return;

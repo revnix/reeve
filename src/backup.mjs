@@ -22,7 +22,7 @@ import { execFileSync } from "node:child_process";
 // same-second writers would both believe they won.
 import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync, linkSync, renameSync, openSync, closeSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { open as openStore, exportJsonl } from "./db/ops.mjs";
+import { open as openStore, exportJsonl, storeLock } from "./db/ops.mjs";
 // Task 8's subset. `tablesAt` and `HUB_TABLES` are what a snapshot's table set
 // is validated against; Task 9 adds the locks, replay and hubEvent imports when
 // `restoreHub` needs them, and not before -- ESM resolves at instantiation, so
@@ -563,10 +563,24 @@ export function restore(snapshotPath, dbPath, { overwrite = false, force = false
   if (holder && !force)
     return { ok: false, why: `the reeve daemon is running (${holder}) — stop it first: touch ~/.reeve/HALT, or pass force if you are certain` };
 
+  // Nor over a store a reeve is running on, a `reeve tick` the process check
+  // doesn't see included. Each holds the store's own lock, a file beside it, for
+  // as long as it runs (#274), and this takes that lock across the copy, so
+  // none starts on the store halfway. Not for force: the lock is held only
+  // while a reeve runs, and the operating system drops it when one ends.
+  let held = null;
+  if (existsSync(dbPath)) {
+    const lock = storeLock(dbPath);
+    if ("why" in lock)
+      return { ok: false, why: lock.busy ? `another reeve is running on ${dbPath} — let it end, or stop it, first`
+                                         : `the lock on ${dbPath} couldn't be taken, so it isn't restored over: ${lock.why}` };
+    held = lock;
+  }
   try {
     for (const s of ["-wal", "-shm"]) { try { rmSync(dbPath + s, { force: true }); } catch {} }
     copyFileSync(snapshotPath, dbPath);
   } catch (e) { return { ok: false, why: `could not restore: ${e.message}` }; }
+  finally { held?.release(); }
   return { ok: true, why: null };
 }
 

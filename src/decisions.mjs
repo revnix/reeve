@@ -135,6 +135,43 @@ export function strayEntry(db) {
 }
 
 /**
+ * The records the store's signed baseline names, kept before it began signing,
+ * that it no longer holds and no signed order that checks names (#274): taken
+ * away before an order could name them, and found by nothing else, as the
+ * baseline says no pull request. Sorted; none where its baseline doesn't check,
+ * which vouches for nothing.
+ * @param {Db} db @param {string} repo @param {Keys} keys @param {string | null} [store]
+ * @returns {string[]}
+ */
+export function baselineLost(db, repo, keys, store = storeIdentity(db)) {
+  const { baseline } = signingState(db, keys);
+  if (!baseline?.size) return [];
+  const held = db.prepare(`SELECT 1 FROM decision WHERE digest = ? LIMIT 1`);
+  const unheld = [...baseline].filter((d) => !held.get(d));
+  if (!unheld.length) return [];
+  // One an order names is its order's to report, as replay does.
+  /** @type {Set<string>} */ const named = new Set();
+  for (const r of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ? AND subject GLOB 'pr:[1-9]*' AND substr(subject, 4) NOT GLOB '*[^0-9]*' AND length(subject) <= 18`).all(LATEST_OP))) {
+    const order = signedOrder(db, repo, Number(String(r.subject).slice(3)), keys, store);
+    if ("digests" in order) for (const d of order.digests) named.add(d);
+  }
+  return unheld.filter((d) => !named.has(d)).sort();
+}
+
+/**
+ * A repository other than `repo` that a decision record the store holds is of,
+ * or null where there's none (#274): the store of another repository, named by
+ * --db say, or one holding another's records beside its own.
+ * @param {Db} db @param {string} repo
+ * @returns {string | null}
+ */
+export function otherRepository(db, repo) {
+  const r = /** @type {any} */ (db.prepare(`SELECT name FROM (SELECT CASE WHEN json_valid(record) THEN json_extract(record, '$.subject.repo') END AS name FROM decision)
+    WHERE name IS NOT NULL AND lower(name) <> lower(?) LIMIT 1`).get(String(repo)));
+  return r ? String(r.name) : null;
+}
+
+/**
  * The host's anchor as it bears on `db`: as read, where it's this store's or no
  * store's yet, and otherwise one that vouches for nothing here (#274). The
  * anchor is bound to one store per repository, and another store's order and
@@ -390,7 +427,8 @@ export function replayDecisions(db, which = {}, { code = null, profile = null, c
  * longer holds as it was kept, a record taken away, changed or moved to another
  * pull request, adverse perhaps. Never passed over.
  * Every pull request with records replayed, an order or an anchor entry is
- * read, whatever `since` says, or only the one asked for.
+ * read, whatever `since` says, or only the one asked for; and, unless one is
+ * asked for, each record the store's baseline names that no order names.
  * @param {Db} db @param {Replayed[]} replayed
  * @param {{ pr?: number | null, since?: number | null }} which
  * @param {Keys} keys @param {string} repo @param {AnchorRead | null} anchor
@@ -437,6 +475,12 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
       if (why) out.push(fault(pr, digest, `its signed order names this record, but ${why}`));
     }
   }
+  // And each record the store's signed baseline names that it no longer holds,
+  // and no order names: taken away before its first entry, it's found by
+  // nothing else. The baseline says no pull request, so it's read replaying the
+  // whole store, or since a date, which a rollback would have matched.
+  if (which.pr == null) for (const d of baselineLost(db, repo, keys, store))
+    out.push(fault(0, d, "the store's baseline names this record, kept before it began signing, but the store no longer holds it, and no signed order names it: it was taken away"));
   return out;
 }
 
@@ -451,7 +495,7 @@ export function renderReplay(results) {
     if (r.outcome === "same") continue;
     // What the signed order says the store should hold names no commit (#274).
     const at = r.head ? `#${r.pr} at ${short(r.head)} (record ${short(r.digest)})`
-      : r.pr ? `#${r.pr}${r.digest ? ` (record ${short(r.digest)})` : ""}` : "the store";
+      : r.pr ? `#${r.pr}${r.digest ? ` (record ${short(r.digest)})` : ""}` : `the store${r.digest ? ` (record ${short(r.digest)})` : ""}`;
     if (r.outcome === "unreplayable") { out.push(`${at}: could not be replayed: ${r.why}`); continue; }
     out.push(`${at}: was ${r.recorded}, now ${r.now}`);
     for (const x of r.diffs ?? []) out.push(`    ${x.id}: was ${x.was}`, `    ${" ".repeat(x.id.length)}  now ${x.now}`);

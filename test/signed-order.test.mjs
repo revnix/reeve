@@ -3,7 +3,7 @@
 // short, or restored from before, doesn't pass for the one the host kept.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -15,6 +15,7 @@ import { explainDecision, replayDecisions, signedOrder, anchorForStore } from ".
 import { computeVerdict } from "../src/verdict.mjs";
 import { recordsFor, policyOf } from "../src/evidence.mjs";
 import { saveDecision } from "../src/db/records.mjs";
+import { restore } from "../src/backup.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 import { offlineEnv } from "./fixtures/offline-github.mjs";
 import { run, EVAL } from "./fixtures/tick-harness.mjs";
@@ -1498,4 +1499,86 @@ test("a store holding entries of signed orders, its identity taken away, has non
   assert.match(String(shown), /can't be trusted as the latest: this store holds entries of signed orders, but no identity to check them against/);
   assert.doesNotMatch(String(shown), /the latest by its signed order/);
   assert.ok(replayed.some((x) => x.outcome === "unreplayable" && /no identity to check them against/.test(String(x.why))), JSON.stringify(replayed));
+});
+
+// ── from #278's fourteenth review ────────────────────────────────────────────
+
+/** A record of `repo`'s pull request `pr` at `head`, as reeve keeps one. */
+const recordOf = (repo, pr, head) => {
+  const i = input(head);
+  return recordsFor({ nwo: repo, pr, head, input: i, verdict: computeVerdict(i), policy: policyOf({ identity: { key: repo } }),
+                      code: { commit: "d".repeat(40), tree: "e".repeat(40), dirty: false, diff: null }, observedAt: new Date(0).toISOString() });
+};
+
+test("reeve restore doesn't write over a store a reeve is running on, a reeve tick included", () => {
+  const dir = tempDir("reeve-order-restore-");
+  const dbPath = join(dir, "s.db"), snap = join(dir, "snap.db");
+  open(dbPath).close();
+  copyFileSync(dbPath, snap);
+  // A reeve tick holds the store's lock, and no reeve run is seen.
+  const running = storeLock(dbPath);
+  assert.ok("release" in running, "control: the store's lock is held");
+  let r;
+  try { r = restore(snap, dbPath, { overwrite: true, isDaemonRunning: () => null }); } finally { running.release(); }
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.match(String(r.why), /another reeve is running on .*s\.db/);
+  const after = restore(snap, dbPath, { overwrite: true, isDaemonRunning: () => null });
+  assert.equal(after.ok, true, `and once it's released, the store is restored: ${JSON.stringify(after)}`);
+});
+
+/**
+ * A store kept before signing, with records of #42 and #43, that begins signing
+ * while another reeve holds the host's lock, so no order names either yet; then
+ * #43's record is taken away. Answers the store, and that record.
+ */
+async function lostBeforeOrdered(dir) {
+  const dbPath = await ticks([at(A)], {});
+  let db = open(dbPath);
+  const k = recordOf(REPO, 43, B);
+  saveDecision(db, { at: 1, seq: 1000, pr: 43, head: B, ...k });
+  db.close();
+  const other = fileAnchor(dir).lock(REPO);
+  try { await closedTick(dbPath, host(dir)); } finally { other.release(); }
+  db = open(dbPath);
+  const baseline = JSON.parse(db.prepare("SELECT payload FROM event WHERE op = 'signing.baseline'").get()?.payload ?? "{}").digests ?? [];
+  const entries = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n;
+  db.prepare("DELETE FROM decision WHERE pr = 43").run();
+  db.close();
+  assert.ok(baseline.includes(k.decision.digest) && entries === 0, `control: the baseline names it, and no order does: ${baseline.length} named, ${entries} entries`);
+  return { dbPath, lost: k.decision.digest };
+}
+
+test("a record the store's baseline names, taken away before an order named it, is reported by a whole-store replay", async () => {
+  const dir = credentials();
+  const { dbPath, lost } = await lostBeforeOrdered(dir);
+  const db = open(dbPath);
+  const replayed = replayDecisions(db, {}, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorOf(dir) });
+  db.close();
+  assert.ok(replayed.some((x) => x.digest === lost && x.outcome === "unreplayable" && /the store's baseline names this record.*no longer holds it/.test(String(x.why))),
+            JSON.stringify(replayed));
+});
+
+test("a record the store's baseline names, taken away before an order named it, is said by the daemon's every tick", async () => {
+  const dir = credentials();
+  const { dbPath, lost } = await lostBeforeOrdered(dir);
+  const r = await run({ openPrs: () => [], evaluate: () => at(A), prState: () => "CLOSED", prIsFinished: () => true, dbPath, ticks: 2, ...host(dir) });
+  const said = r.log.match(/the store's baseline names 1 record\(s\) kept before it began signing that it no longer holds, and no signed order names: [0-9a-f]{12}/g) ?? [];
+  assert.equal(said.length, 2, `said on each tick: ${r.log}`);
+  assert.ok(said.every((s) => s.endsWith(lost.slice(0, 12))), JSON.stringify(said));
+});
+
+test("a store holding another repository's records doesn't bind the host's anchor, so that repository's own store still can", async () => {
+  const dir = credentials();
+  // Another repository's store, named by --db say: a record of x/y's #43 in it.
+  const foreign = join(tempDir("reeve-order-foreign-"), "s.db");
+  const f = open(foreign);
+  saveDecision(f, { at: 1, seq: 1, pr: 43, head: A, ...recordOf("x/y", 43, A) });
+  f.close();
+  const r = await closedTick(foreign, host(dir));
+  assert.equal(readAnchor(dir, REPO)?.store ?? null, null, "the host's anchor for o/r isn't bound to it");
+  assert.match(r.log, /this store holds records of x\/y, not only of o\/r, so the host's anchor for o\/r isn't bound to it/);
+  const db = open(await ticks([at(A)], host(dir)));
+  const id = identityOf(db);
+  db.close();
+  assert.equal(readAnchor(dir, REPO)?.store, id, "and o/r's own store binds it");
 });

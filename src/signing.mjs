@@ -25,6 +25,8 @@ export const PAYLOAD_TYPE = "application/vnd.in-toto+json";
 export const DECISION_PREDICATE = "https://revnix.com/reeve/decision/v1";
 /** The records a store held unsigned when it began signing. */
 export const BASELINE_PREDICATE = "https://revnix.com/reeve/unsigned-baseline/v1";
+/** An entry of a pull request's signed order of decisions (#274). */
+export const LATEST_PREDICATE = "https://revnix.com/reeve/latest-decision/v1";
 /** The private key's file in the credentials folder, and its public half's. */
 export const KEY_FILE = "signing-ed25519.pem";
 export const PUBLIC_FILE = "signing-ed25519.pub";
@@ -77,6 +79,26 @@ export function baselineStatement(digests) {
     subject: [{ name: "decision records kept before signing began", digest: { sha256: createHash("sha256").update(sorted.join("\n")).digest("hex") } }],
     predicateType: BASELINE_PREDICATE,
     predicate: { digests: sorted },
+  };
+}
+
+/**
+ * Entry `n` of a pull request's signed order of decisions (#274): the record that
+ * became its latest decision then, numbered from 1, so which record is latest is
+ * signed too, not read from the store's own order. With every other record kept
+ * for the pull request since the entry before, or, for its first, before it, so
+ * none of them can be taken away unseen; the store it's of, so an entry of
+ * another store, another host's say, never passes for one of this store's; and
+ * where in the store's sequence of events its latest was seen, as the reeve that
+ * signed it saw it, so a reeve never signs a record it saw earlier over it.
+ * @param {{ repo: string, pr: number, n: number, digest: string, records?: string[], store?: string | null, seq?: number | null }} entry
+ */
+export function latestStatement({ repo, pr, n, digest, records = [], store = null, seq = null }) {
+  return {
+    _type: STATEMENT_TYPE,
+    subject: [{ name: `${repo}#${pr}`, digest: { sha256: digest } }],
+    predicateType: LATEST_PREDICATE,
+    predicate: { repo, pr, n, digest, records: [...records].sort(), store, seq },
   };
 }
 
@@ -174,7 +196,7 @@ export function signingKey(dir, { create = false, write = (fd, buf, offset, leng
  * @param {number} fd @param {string} text
  * @param {(fd: number, buf: Buffer, offset: number, length: number) => number} write
  */
-function writeAll(fd, text, write) {
+export function writeAll(fd, text, write) {
   const buf = Buffer.from(text);
   for (let at = 0; at < buf.length;) {
     const n = write(fd, buf, at, buf.length - at);
@@ -299,14 +321,14 @@ function reapTemporaries(dir) {
 }
 
 /** Whether process `pid` is running. One that can't be signalled is, but isn't this user's. @param {number} pid */
-function running(pid) {
+export function running(pid) {
   if (pid === process.pid) return true;
   try { process.kill(pid, 0); return true; }
   catch (err) { return /** @type {NodeJS.ErrnoException} */ (err).code === "EPERM"; }
 }
 
 /** Sync the folder `dir`, so the names made in it outlast a power loss. @param {string} dir */
-function syncFolder(dir) {
+export function syncFolder(dir) {
   const fd = openSync(dir, "r");
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }

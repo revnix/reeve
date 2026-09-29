@@ -5,17 +5,18 @@
 // 22.x and the state layer is the authority, so it must not run under a warning
 // it might one day become.
 import { runDoctor, render, checkAppIdentity, hubFindings, renderHub } from "../src/doctor.mjs";
-import { open } from "../src/db/ops.mjs";
+import { open, storeLock } from "../src/db/ops.mjs";
 import { statePathFor, dashPathFor, legacyStatePathFor, legacyDashPathFor, hubPathFor, adoptLegacyStore, missingStoreMessage } from "../src/paths.mjs";
 import { hubAccess } from "../src/build/hubaccess.mjs";
 import { resolveRepoIdAt } from "../src/build/repoid.mjs";
 import { loadRegistry } from "../src/build/registryio.mjs";
 import { snapshot, restore, latestSnapshot, exportEvents,
-         snapshotAll, restoreHub, validateSnapshot } from "../src/backup.mjs";
+         snapshotAll, restoreHub, validateSnapshot, settleRestores } from "../src/backup.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick, measuredContainment, withdrawStanding, tellStuck, runningCode } from "../src/daemon.mjs";
 import { replayDecisions, renderReplay } from "../src/decisions.mjs";
 import { knownKeys, fileSigner, signingKey, PUBLIC_FILE } from "../src/signing.mjs";
+import { fileAnchor, readAnchor } from "../src/anchor.mjs";
 import { SelectorError } from "../src/db/records.mjs";
 import { readState, render as renderStatus, statusline, why, cleanMergeRate } from "../src/status.mjs";
 import { init } from "../src/init.mjs";
@@ -454,6 +455,13 @@ const HOME = resolveHome(opt("home"));
 // The keys a decision record may be signed by (#165): those this checkout
 // publishes, and this host's own.
 const signingKeys = () => knownKeys({ published: join(ROOT, "deploy", "signing-keys"), local: join(HOME, "credentials") });
+// The host's anchor for the repository asked about (#274): none where it isn't
+// known, and one that can't be read says so, which vouches for nothing.
+const anchorFor = (/** @type {string | null} */ nwo) => {
+  if (!nwo) return null;
+  try { return { anchor: readAnchor(join(HOME, "credentials"), nwo), why: null }; }
+  catch (e) { return { anchor: null, why: e.message }; }
+};
 // And WRITTEN BACK, before any route runs. `--home` used to change only this
 // constant, so `credentialPaths()` still denied the state root named by the
 // ENVIRONMENT and the canary still wrote its decoy under `~/.reeve` -- a
@@ -948,6 +956,10 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       console.error(dbPath ? `reeve replay: ${missingStoreMessage(dbPath, { initCreatesIt: !opt("db"), nwo })}` : "reeve replay: no state database");
       process.exit(1);
     }
+    // A store named by --db alone is of no repository that can be told, so
+    // which records it should hold, by its signed orders and the host's anchor,
+    // couldn't be checked, and a store cut short would replay as whole (#274).
+    if (!nwo) { console.error(`reeve replay: which repository this store is of can't be told, so which records it should hold can't be checked: name it, as reeve replay <owner/repo> --db ${dbPath}`); process.exit(1); }
     const pr = opt("pr"), since = opt("since");
     const sinceAt = since == null ? null : Math.floor(Date.parse(since) / 1000);
     if (pr != null && !/^\d+$/.test(pr)) { console.error(`reeve replay: --pr takes a pull request number, got ${JSON.stringify(pr)}`); process.exit(1); }
@@ -956,7 +968,7 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     let results;
     try {
       results = replayDecisions(open(dbPath), { pr: pr == null ? null : Number(pr), since: sinceAt, digest: opt("record") ?? null },
-                                { code: runningCode(), profile, keys: signingKeys(), repo: nwo });
+                                { code: runningCode(), profile, keys: signingKeys(), repo: nwo, anchor: anchorFor(nwo) });
     } catch (e) {
       // A record named by a start that isn't hexadecimal, or that more than one
       // shares, is refused rather than replayed as a pattern.
@@ -1004,7 +1016,9 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     if (cmd === "why") {
       const target = positionals.find(a => /^#?\d+$/.test(a) || a.startsWith("pr:"));
       if (!target) { console.error("reeve why <pr-number>"); process.exit(1); }
-      console.log(why(db, target, { head: opt("head") ?? null, keys: signingKeys(), repo: nwo }));
+      // As replay: which record is latest can't be checked for no repository.
+      if (!nwo) { console.error(`reeve why: which repository this store is of can't be told, so which record is latest can't be checked: name it, as reeve why <owner/repo> ${target} --db ${dbPath}`); process.exit(1); }
+      console.log(why(db, target, { head: opt("head") ?? null, keys: signingKeys(), repo: nwo, anchor: anchorFor(nwo) }));
       process.exit(0);
     }
 
@@ -2401,6 +2415,21 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     // nobody. (Codex #4g-[2].)
     const dbPath = resolve(opt("db") ?? stateFor(nwo));
     if (!existsSync(dbPath)) { console.error(`reeve run: ${missingStoreMessage(dbPath, { initCreatesIt: !opt("db"), nwo })}`); process.exit(1); }
+    // One reeve runs on a store at a time (#274), held until this one ends: a
+    // second, on a store another is running on, would keep records whose signed
+    // order neither knows whole.
+    const running = storeLock(dbPath);
+    if ("why" in running) {
+      console.error(running.busy ? `reeve ${cmd}: another reeve is running on ${dbPath}; one runs on a store at a time`
+                                 : `reeve ${cmd}: the lock on ${dbPath} couldn't be taken, so this reeve doesn't run on it: ${running.why}`);
+      process.exit(1);
+    }
+    process.on("exit", () => running.release());
+    // What a restore killed partway left beside the store is put right before
+    // it's opened: the store's log it moved aside goes back, or this reeve
+    // doesn't run, as the store would run without what it committed there.
+    const settled = settleRestores(dbPath);
+    if (!settled.ok) { console.error(`reeve ${cmd}: ${settled.why}`); process.exit(1); }
     // Resolved before the context so the REASON survives. A project that is
     // simply not registered is `{ project: null, why: null }` -- an ordinary
     // state. A registry that could not be parsed is a fault that says so.
@@ -2419,6 +2448,10 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       // Each decision record is signed with the host's key, made on first use in
       // the credentials folder, which no worker may read (#165).
       signer: fileSigner(join(HOME, "credentials")),
+      // And what it signed last, kept beside the key, outside every store; with
+      // the keys its entries are checked with (#274).
+      anchor: fileAnchor(join(HOME, "credentials")),
+      keys: signingKeys,
       // Execution is opt-in. A loop that acts before its decisions have been
       // watched is how an unattended run becomes an incident.
       execute: flag("execute"),

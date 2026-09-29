@@ -60,6 +60,35 @@ export function saveDecision(db, { at, seq, pr, head, policy, evidence, decision
 
 /** The event that says a store began signing, with its baseline (#165). */
 export const BASELINE_OP = "signing.baseline";
+/** The event for each entry of a pull request's signed order of decisions (#274). */
+export const LATEST_OP = "decision.latest";
+/**
+ * The largest pull request number an order is filed under (#274): `pr:` and its
+ * number within 18 characters, as a stray entry is told by, and well within the
+ * whole numbers JavaScript holds exactly. The least is 1.
+ */
+export const PR_MAX = 999999999999999;
+/**
+ * A decision row filed under a pull request's number, as SQL: a whole number
+ * from 1 to PR_MAX. BETWEEN alone takes 1.5, which a table rebuilt without its
+ * types by a store edit could hold.
+ */
+export const FILED = `(typeof(pr) = 'integer' AND pr BETWEEN 1 AND ${PR_MAX})`;
+/** The event that names a store, kept once, so the host's anchor is one store's (#274). */
+export const STORE_ID_OP = "store.identity";
+
+/**
+ * The store's identity, as it keeps it, or null where it keeps none that reads
+ * as one. Its first, only: a later one is never taken for it.
+ * @param {Db} db
+ * @returns {string | null}
+ */
+export function storeIdentity(db) {
+  const row = /** @type {any} */ (db.prepare(`SELECT payload FROM event WHERE op = ? ORDER BY seq LIMIT 1`).get(STORE_ID_OP));
+  if (!row) return null;
+  try { const id = JSON.parse(row.payload)?.id; return typeof id === "string" && /^[0-9a-f]{32}$/.test(id) ? id : null; }
+  catch { return null; }
+}
 
 /**
  * @typedef {{ digest: string, pr: number, head: string, record: Record<string, any>, corrupt: string | null,
@@ -73,7 +102,7 @@ export const BASELINE_OP = "signing.baseline";
  * outside the digest, must be the ones its record names.
  * @param {any} row @returns {Decision}
  */
-const decisionOf = row => {
+export const decisionOf = row => {
   const record = JSON.parse(row.record);
   const subject = record?.subject ?? {};
   const corrupt = digestOf(record) !== row.digest ? "its record doesn't match its digest"

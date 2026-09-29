@@ -25,8 +25,8 @@ const CORE = ["src/verdict.mjs", "src/pr.mjs", "src/github/reconciler.mjs", "src
               "src/mergecheck.mjs", "src/review/derive.mjs", "src/review/ingest.mjs", "src/review/shadow.mjs",
               // What each verdict was judged from, kept, explained and replayed (#165).
               "src/evidence.mjs", "src/db/records.mjs", "src/decisions.mjs",
-              // And signed (#165).
-              "src/signing.mjs"];
+              // And signed (#165), with the host's anchor (#274).
+              "src/signing.mjs", "src/anchor.mjs"];
 
 // tsc and eslint turn on Node's compile cache, which writes a node-compile-cache
 // folder into the temp directory, and CI fails a test file that leaves anything

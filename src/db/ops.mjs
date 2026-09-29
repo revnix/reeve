@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
-import { readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { CHECK_ACCOUNTING } from "../github/reconciler.mjs";
 import { hostname } from "node:os";
 import { createHash } from "node:crypto";
@@ -284,6 +285,20 @@ export function open(path) {
   // AFTER the table exists and has every column, since this writes into it.
   finishReshape(db, staged);
   return db;
+}
+
+/**
+ * `fn`, with the store syncing its log at every commit, and the store put back
+ * as it was after (#274). It runs at NORMAL, which may lose its last
+ * transactions to a power loss: what's then noted outside it, on the host's
+ * anchor, must never be ahead of what a power loss leaves in it.
+ * @param {import("node:sqlite").DatabaseSync} db @template T @param {() => T} fn @returns {T}
+ */
+export function durably(db, fn) {
+  const was = Number(/** @type {any} */ (db.prepare("PRAGMA synchronous").get()).synchronous);
+  db.exec("PRAGMA synchronous = FULL");
+  try { return fn(); }
+  finally { try { db.exec(`PRAGMA synchronous = ${was}`); } catch { /* it goes on as it was opened */ } }
 }
 
 // One helper so every mutation is BEGIN IMMEDIATE + event + projection.
@@ -1350,4 +1365,52 @@ export function noteWorkerResult(db, { runId, modelResolved = null, truncated = 
 
 export function workerContractFor(db, runId) {
   return db.prepare(`SELECT * FROM worker_run WHERE run_id=?`).get(runId) ?? null;
+}
+
+/**
+ * The store's real path, or, where it isn't there yet, the one it will have:
+ * its folder's real path, and its own name.
+ * @param {string} dbPath
+ */
+function realStore(dbPath) {
+  try { return realpathSync(dbPath); }
+  catch (err) {
+    if (/** @type {NodeJS.ErrnoException} */ (err).code !== "ENOENT") throw err;
+    return join(realpathSync(dirname(dbPath)), basename(dbPath));
+  }
+}
+
+/**
+ * One reeve runs on a store at a time (#274): SQLite's exclusive lock on a file
+ * beside the store, which the operating system holds for the process and drops
+ * when it ends, however it ends. Named by the store's real path, so a link to
+ * the store is the same store, and a store with another name, a hard link, is
+ * refused: a reeve on each name would take a lock of its own, and SQLite keeps a
+ * write-ahead log beside each name, which can corrupt the store. `why` when it
+ * couldn't be taken, and `busy` when that's because another process holds it. A
+ * second reeve on a store another is running on would keep records whose signed
+ * order neither knows whole. A store that isn't there yet, as one a restore puts
+ * in place, is locked by the name it will have.
+ * @param {string} dbPath
+ * @returns {{ release: () => void } | { why: string, busy: boolean }}
+ */
+export function storeLock(dbPath) {
+  /** @type {DatabaseSync | null} */ let lock = null;
+  try {
+    const real = realStore(dbPath);
+    if (existsSync(real) && statSync(real).nlink > 1) throw new Error(`${real} has another name besides this one, a hard link, so no reeve runs on it: each name would be locked apart, and SQLite could corrupt it`);
+    const path = `${real}.running`;
+    let st = null;
+    try { st = lstatSync(path); } catch { /* made here */ }
+    if (st && !st.isFile()) throw new Error(`${path} isn't a file of its own`);
+    lock = new DatabaseSync(path, { timeout: 0 });
+    // Nothing is ever written to it, so its journal stays in memory.
+    lock.exec("PRAGMA journal_mode=MEMORY");
+    lock.exec("BEGIN EXCLUSIVE");
+    const held = lock;
+    return { release: () => { try { held.exec("ROLLBACK"); } catch { /* nothing to undo */ } try { held.close(); } catch { /* closed */ } } };
+  } catch (err) {
+    try { lock?.close(); } catch { /* never opened */ }
+    return { why: /** @type {Error} */ (err).message, busy: /** @type {any} */ (err).errcode === 5 };
+  }
 }

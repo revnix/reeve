@@ -62,6 +62,12 @@ export function saveDecision(db, { at, seq, pr, head, policy, evidence, decision
 export const BASELINE_OP = "signing.baseline";
 /** The event for each entry of a pull request's signed order of decisions (#274). */
 export const LATEST_OP = "decision.latest";
+/**
+ * The largest pull request number an order is filed under (#274): `pr:` and its
+ * number within 18 characters, as a stray entry is told by, and well within the
+ * whole numbers JavaScript holds exactly. The least is 1.
+ */
+export const PR_MAX = 999999999999999;
 /** The event that names a store, kept once, so the host's anchor is one store's (#274). */
 export const STORE_ID_OP = "store.identity";
 

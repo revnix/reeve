@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
-import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { CHECK_ACCOUNTING } from "../github/reconciler.mjs";
 import { hostname } from "node:os";
 import { createHash } from "node:crypto";
@@ -1367,6 +1368,19 @@ export function workerContractFor(db, runId) {
 }
 
 /**
+ * The store's real path, or, where it isn't there yet, the one it will have:
+ * its folder's real path, and its own name.
+ * @param {string} dbPath
+ */
+function realStore(dbPath) {
+  try { return realpathSync(dbPath); }
+  catch (err) {
+    if (/** @type {NodeJS.ErrnoException} */ (err).code !== "ENOENT") throw err;
+    return join(realpathSync(dirname(dbPath)), basename(dbPath));
+  }
+}
+
+/**
  * One reeve runs on a store at a time (#274): SQLite's exclusive lock on a file
  * beside the store, which the operating system holds for the process and drops
  * when it ends, however it ends. Named by the store's real path, so a link to
@@ -1375,15 +1389,16 @@ export function workerContractFor(db, runId) {
  * write-ahead log beside each name, which can corrupt the store. `why` when it
  * couldn't be taken, and `busy` when that's because another process holds it. A
  * second reeve on a store another is running on would keep records whose signed
- * order neither knows whole.
+ * order neither knows whole. A store that isn't there yet, as one a restore puts
+ * in place, is locked by the name it will have.
  * @param {string} dbPath
  * @returns {{ release: () => void } | { why: string, busy: boolean }}
  */
 export function storeLock(dbPath) {
   /** @type {DatabaseSync | null} */ let lock = null;
   try {
-    const real = realpathSync(dbPath);
-    if (statSync(real).nlink > 1) throw new Error(`${real} has another name besides this one, a hard link, so no reeve runs on it: each name would be locked apart, and SQLite could corrupt it`);
+    const real = realStore(dbPath);
+    if (existsSync(real) && statSync(real).nlink > 1) throw new Error(`${real} has another name besides this one, a hard link, so no reeve runs on it: each name would be locked apart, and SQLite could corrupt it`);
     const path = `${real}.running`;
     let st = null;
     try { st = lstatSync(path); } catch { /* made here */ }

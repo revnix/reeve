@@ -1763,3 +1763,69 @@ test("a restore puts right what one killed partway left: its copy removed, and t
   assert.equal(r.ok, true, JSON.stringify(r));
   assert.deepEqual(during, { log: "committed", left: [basename(live)] }, "the log put back, and only a running process's left");
 });
+
+// ── from #278's eighteenth review ────────────────────────────────────────────
+
+test("a store holding a record filed under no pull request's number doesn't bind the host's anchor, which still reads", async () => {
+  const dir = credentials();
+  // A store kept before signing, and a record filed under pull request 0, whole as a record.
+  const dbPath = await ticks([at(A)], {});
+  const db = open(dbPath);
+  saveDecision(db, { at: 1, seq: 1000, pr: 0, head: B, ...recordOf(REPO, 0, B) });
+  db.close();
+  const r = await closedTick(dbPath, host(dir));
+  assert.deepEqual(anchorOf(dir), { anchor: null, why: null }, "the host's anchor isn't bound to it, and still reads");
+  assert.match(r.log, /this store holds a record filed under 0, which is no pull request's number, so it isn't taken as o\/r's own/);
+});
+
+test("a record filed under no pull request's number is never ordered or noted, so the host's anchor goes on reading", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)], host(dir));
+  let db = open(dbPath);
+  saveDecision(db, { at: 1, seq: 1000, pr: 0, head: B, ...recordOf(REPO, 0, B) });
+  db.close();
+  const r = await closedTick(dbPath, host(dir));
+  db = open(dbPath);
+  const unfiled = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest' AND subject NOT GLOB 'pr:[1-9]*'").get().n;
+  db.close();
+  assert.equal(unfiled, 0, "no entry filed where no order finds it");
+  assert.equal(anchorOf(dir).why, null, "and the host's anchor still reads");
+  assert.match(r.log, /this store holds a record filed under 0, which is no pull request's number, so no signed order names it/);
+});
+
+test("the host's anchor notes only a pull request's number and an entry's, so it never holds what it can't read back", () => {
+  const dir = credentials();
+  const anchor = fileAnchor(dir);
+  assert.equal(anchor.note(REPO, 7, 1), true, "control: a pull request's entry is noted");
+  for (const [pr, n] of [[0, 1], [-3, 1], [1.5, 1], [7, 0]]) assert.equal(anchor.note(REPO, pr, n), false, `#${pr}, entry ${n}`);
+  assert.deepEqual(anchorOf(dir), { anchor: { began: true, latest: new Map([[7, 1]]), store: null }, why: null }, "and the anchor reads as it was");
+});
+
+test("two restores of a store that's gone run one at a time", () => {
+  const dir = tempDir("reeve-order-restore-twice-");
+  const dbPath = join(dir, "s.db"), snap = join(dir, "snap.db");
+  open(dbPath).close();
+  copyFileSync(dbPath, snap);
+  for (const s of ["", "-wal", "-shm"]) rmSync(dbPath + s, { force: true });
+  let second = null;
+  const first = restore(snap, dbPath, { isDaemonRunning: () => null,
+                                        copy: (from, to) => { second = restore(snap, dbPath, { isDaemonRunning: () => null }); copyFileSync(from, to); } });
+  assert.equal(first.ok, true, JSON.stringify(first));
+  assert.equal(second?.ok, false, `the second waits its turn: ${JSON.stringify(second)}`);
+  assert.match(String(second?.why), /another reeve is running on .*s\.db, or restoring it/);
+});
+
+test("a restore lets go what one killed partway left that couldn't be put back, once its own copy is in place", () => {
+  const dir = tempDir("reeve-order-restore-superseded-");
+  const dbPath = join(dir, "s.db"), snap = join(dir, "snap.db");
+  open(dbPath).close();
+  copyFileSync(dbPath, snap);
+  const gone = spawnSync(process.execPath, ["-e", ""]).pid;
+  // One killed after moving the store's log aside; a reeve has since given the store a log of its own.
+  writeFileSync(`${dbPath}.${gone}.deadbeef.restoring`, "partway");
+  writeFileSync(`${dbPath}.${gone}.deadbeef.restoring-wal`, "old log");
+  writeFileSync(`${dbPath}-wal`, "new log");
+  const r = restore(snap, dbPath, { overwrite: true, isDaemonRunning: () => null });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.deepEqual(readdirSync(dir).filter((n) => n.includes(".restoring")), [], "nothing of the killed one is left");
+});

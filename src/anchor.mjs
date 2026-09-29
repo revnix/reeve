@@ -234,8 +234,14 @@ export function fileAnchor(dir, { write = (fd, buf, offset, length) => writeSync
       a.began = true;
       return true;
     }),
-    /** @param {string} repo @param {number} pr @param {number} n */
+    /**
+     * Only what the anchor reads back, a pull request's number and an entry's,
+     * each a whole number from 1: written otherwise, it couldn't be read, and
+     * would vouch for nothing again.
+     * @param {string} repo @param {number} pr @param {number} n
+     */
     note: (repo, pr, n) => update(repo, (a) => {
+      if (!(Number.isSafeInteger(pr) && pr >= 1 && Number.isSafeInteger(n) && n >= 1)) throw new Error(`#${pr}, entry ${n}, isn't an entry of a pull request's order`);
       if ((a.latest.get(pr) ?? 0) >= n) return false;
       a.latest.set(pr, n);
       a.began = true;

@@ -569,16 +569,16 @@ export function restore(snapshotPath, dbPath, { overwrite = false, force = false
   // Nor over a store a reeve is running on, a `reeve tick` the process check
   // doesn't see included. Each holds the store's own lock, a file beside it, for
   // as long as it runs (#274), and this takes that lock across the copy, so
-  // none starts on the store halfway. Not for force: the lock is held only
-  // while a reeve runs, and the operating system drops it when one ends.
-  let held = null;
-  if (existsSync(dbPath)) {
-    const lock = storeLock(dbPath);
-    if ("why" in lock)
-      return { ok: false, why: lock.busy ? `another reeve is running on ${dbPath} — let it end, or stop it, first`
-                                         : `the lock on ${dbPath} couldn't be taken, so it isn't restored over: ${lock.why}` };
-    held = lock;
-  }
+  // none starts on the store halfway. Taken for a store that's gone too, by the
+  // name it will have, so two restores of it run one at a time: the second
+  // would put its copy in place over the first's, a reeve running on it. Not
+  // for force: the lock is held only while a reeve or a restore runs, and the
+  // operating system drops it when one ends.
+  const lock = storeLock(dbPath);
+  if ("why" in lock)
+    return { ok: false, why: lock.busy ? `another reeve is running on ${dbPath}, or restoring it — let it end, or stop it, first`
+                                       : `the lock on ${dbPath} couldn't be taken, so it isn't restored over: ${lock.why}` };
+  const held = lock;
   // What a restore killed partway left beside the store is put right first.
   reapRestores(dbPath, rename);
   // Copied to a file of its own beside the store, its bytes on disk, and renamed
@@ -605,6 +605,9 @@ export function restore(snapshotPath, dbPath, { overwrite = false, force = false
     try { syncDir(dirname(dbPath)); }
     catch (e) { return { ok: false, why: `${dbPath} is restored, but its folder couldn't be synced to disk, so a power loss could undo it: ${e.message}` }; }
     synced = true;
+    // What a restore killed partway left that couldn't be put back, its log's
+    // name taken since say, was of a store this one has replaced: let go.
+    reapRestores(dbPath, rename, { replaced: true });
   } catch (e) { return { ok: false, why: `could not restore: ${e.message}` }; }
   finally {
     if (!placed) {
@@ -626,10 +629,12 @@ export function restore(snapshotPath, dbPath, { overwrite = false, force = false
  * wasn't replaced, so what was moved aside goes back where nothing has taken
  * its name since, and the copy goes once nothing of it is left to put back.
  * Where the copy is gone, it was put in place, and what was moved aside was
- * the old store's, let go. A running process's are its own, and left.
- * @param {string} dbPath @param {(from: string, to: string) => void} rename
+ * the old store's, let go. A running process's are its own, and left. Once a
+ * restore has put its own copy in place, `replaced`, all of a dead one's go:
+ * they're of a store it replaced.
+ * @param {string} dbPath @param {(from: string, to: string) => void} rename @param {{ replaced?: boolean }} [o]
  */
-function reapRestores(dbPath, rename) {
+function reapRestores(dbPath, rename, { replaced = false } = {}) {
   const dir = dirname(dbPath), base = basename(dbPath);
   let names = [];
   try { names = readdirSync(dir); } catch { return; }
@@ -639,6 +644,10 @@ function reapRestores(dbPath, rename) {
     const m = /^\.(\d+)\.[0-9a-f]{8}\.restoring(-wal|-shm)?$/.exec(n.startsWith(base) ? n.slice(base.length) : "");
     return m && !running(Number(m[1])) ? m[2] ?? "" : null;
   };
+  if (replaced) {
+    for (const n of names) if (dead(n) !== null) { try { rmSync(join(dir, n), { force: true }); } catch { /* gone already */ } }
+    return;
+  }
   for (const n of names) {
     const s = dead(n);
     if (!s) continue;

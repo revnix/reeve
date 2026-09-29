@@ -10,7 +10,7 @@
 import { computeVerdict } from "./verdict.mjs";
 import { joinEvidence, asJson, policyOf } from "./evidence.mjs";
 import { canonical } from "./db/ops.mjs";
-import { latestDecision, decisionsFor, decisionOf, evidenceBy, policyRecord, storeIdentity, BASELINE_OP, LATEST_OP } from "./db/records.mjs";
+import { latestDecision, decisionsFor, decisionOf, evidenceBy, policyRecord, storeIdentity, BASELINE_OP, LATEST_OP, PR_MAX } from "./db/records.mjs";
 import { checkSignature, checkEnvelope, baselineStatement, latestStatement } from "./signing.mjs";
 
 /** @typedef {import("node:sqlite").DatabaseSync} Db */
@@ -182,9 +182,10 @@ export function baselineLost(db, repo, keys, store = storeIdentity(db), skip = n
  * What the store holds besides whole records of `repo`, or null where it holds
  * nothing else (#274): records of another repository, the store of another,
  * named by --db say, or one holding another's beside its own; a record whose
- * repository can't be read, which can't be told to be this one's; or one of
- * this repository's that doesn't hold as it was kept, its record changed or its
- * row moved, which can't be told to be this store's own.
+ * repository can't be read, which can't be told to be this one's; one filed
+ * under no pull request's number; or one of this repository's that doesn't hold
+ * as it was kept, its record changed or its row moved, which can't be told to be
+ * this store's own.
  * @param {Db} db @param {string} repo
  * @returns {string | null}
  */
@@ -192,6 +193,8 @@ export function otherRepository(db, repo) {
   const r = /** @type {any} */ (db.prepare(`SELECT name FROM (SELECT CASE WHEN json_valid(record) THEN json_extract(record, '$.subject.repo') END AS name FROM decision)
     WHERE name IS NULL OR lower(name) <> lower(?) LIMIT 1`).get(String(repo)));
   if (r) return r.name == null ? "a record whose repository can't be read" : `records of ${r.name}`;
+  const unfiled = /** @type {any} */ (db.prepare(`SELECT pr FROM decision WHERE pr NOT BETWEEN 1 AND ${PR_MAX} LIMIT 1`).get());
+  if (unfiled) return `a record filed under ${unfiled.pr}, which is no pull request's number`;
   for (const row of /** @type {any} */ (db.prepare(`SELECT * FROM decision`)).iterate()) {
     const d = readDecision(row);
     if (d.corrupt) return `a record of ${repo} that doesn't hold as it was kept (${d.corrupt})`;

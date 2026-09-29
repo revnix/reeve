@@ -651,13 +651,15 @@ export function restore(snapshotPath, dbPath, { overwrite = false, force = false
  * Where the copy is gone, it was put in place, and what was moved aside was
  * the old store's, let go. A running process's are its own, and left. Once a
  * restore has put its own copy in place, `replaced`, all of a dead one's go:
- * they're of a store it replaced.
+ * they're of a store it replaced. Answers what was moved aside that couldn't
+ * be put back.
  * @param {string} dbPath @param {(from: string, to: string) => void} rename @param {{ replaced?: boolean }} [o]
+ * @returns {string[]}
  */
 function reapRestores(dbPath, rename, { replaced = false } = {}) {
   const dir = dirname(dbPath), base = basename(dbPath);
   let names = [];
-  try { names = readdirSync(dir); } catch { return; }
+  try { names = readdirSync(dir); } catch { return []; }
   // The suffix of a dead restore's file: "" for its copy, "-wal" or "-shm" for
   // what it moved aside; null for anything else.
   const dead = (n) => {
@@ -666,20 +668,41 @@ function reapRestores(dbPath, rename, { replaced = false } = {}) {
   };
   if (replaced) {
     for (const n of names) if (dead(n) !== null) { try { rmSync(join(dir, n), { force: true }); } catch { /* gone already */ } }
-    return;
+    return [];
   }
+  /** @type {string[]} */ const left = [];
   for (const n of names) {
     const s = dead(n);
     if (!s) continue;
     const from = join(dir, n);
     if (names.includes(n.slice(0, -s.length))) {
-      if (!existsSync(dbPath + s)) { try { rename(from, dbPath + s); } catch { /* left for the next */ } }
+      let back = false;
+      if (!existsSync(dbPath + s)) { try { rename(from, dbPath + s); back = true; } catch { /* left for the next */ } }
+      if (!back) left.push(from);
     } else { try { rmSync(from, { force: true }); } catch { /* gone already */ } }
   }
   for (const n of names) {
     if (dead(n) !== "" || existsSync(join(dir, `${n}-wal`)) || existsSync(join(dir, `${n}-shm`))) continue;
     try { rmSync(join(dir, n), { force: true }); } catch { /* gone already */ }
   }
+  return left;
+}
+
+/**
+ * Before a reeve opens the store at `dbPath`, what a restore killed partway left
+ * beside it is put right, as `restore` does first (#274): the store's log it
+ * moved aside goes back. Where some of it can't, its name taken since say, `why`:
+ * opened without it, the store would run without what it committed there.
+ * @param {string} dbPath @param {{ rename?: (from: string, to: string) => void }} [o]
+ * @returns {{ ok: true } | { ok: false, why: string }}
+ */
+export function settleRestores(dbPath, { rename = renameSync } = {}) {
+  let store = dbPath;
+  try { store = realpathSync(dbPath); } catch { /* not there: nothing beside it is its */ }
+  const left = reapRestores(store, rename);
+  return left.length
+    ? { ok: false, why: `a restore killed partway left what the store at ${store} held in its log aside, at ${left.join(", ")}, and it couldn't be put back, as that name is taken now: see to it before a reeve runs on the store` }
+    : { ok: true };
 }
 
 /**

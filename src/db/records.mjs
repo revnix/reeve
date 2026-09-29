@@ -68,6 +68,12 @@ export const LATEST_OP = "decision.latest";
  * whole numbers JavaScript holds exactly. The least is 1.
  */
 export const PR_MAX = 999999999999999;
+/**
+ * A decision row filed under a pull request's number, as SQL: a whole number
+ * from 1 to PR_MAX. BETWEEN alone takes 1.5, which a table rebuilt without its
+ * types by a store edit could hold.
+ */
+export const FILED = `(typeof(pr) = 'integer' AND pr BETWEEN 1 AND ${PR_MAX})`;
 /** The event that names a store, kept once, so the host's anchor is one store's (#274). */
 export const STORE_ID_OP = "store.identity";
 

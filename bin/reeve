@@ -11,7 +11,7 @@ import { hubAccess } from "../src/build/hubaccess.mjs";
 import { resolveRepoIdAt } from "../src/build/repoid.mjs";
 import { loadRegistry } from "../src/build/registryio.mjs";
 import { snapshot, restore, latestSnapshot, exportEvents,
-         snapshotAll, restoreHub, validateSnapshot } from "../src/backup.mjs";
+         snapshotAll, restoreHub, validateSnapshot, settleRestores } from "../src/backup.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick, measuredContainment, withdrawStanding, tellStuck, runningCode } from "../src/daemon.mjs";
 import { replayDecisions, renderReplay } from "../src/decisions.mjs";
@@ -2425,6 +2425,11 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       process.exit(1);
     }
     process.on("exit", () => running.release());
+    // What a restore killed partway left beside the store is put right before
+    // it's opened: the store's log it moved aside goes back, or this reeve
+    // doesn't run, as the store would run without what it committed there.
+    const settled = settleRestores(dbPath);
+    if (!settled.ok) { console.error(`reeve ${cmd}: ${settled.why}`); process.exit(1); }
     // Resolved before the context so the REASON survives. A project that is
     // simply not registered is `{ project: null, why: null }` -- an ordinary
     // state. A registry that could not be parsed is a fault that says so.

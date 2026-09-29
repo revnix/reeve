@@ -9,7 +9,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { fileSigner, knownKeys, latestStatement, signStatement, signingKey } from "../src/signing.mjs";
 import { fileAnchor, readAnchor, anchorPath } from "../src/anchor.mjs";
-import { open, durably, storeLock } from "../src/db/ops.mjs";
+import { open, durably, storeLock, canonical } from "../src/db/ops.mjs";
 import { withDefaults } from "../src/profile/schema.mjs";
 import { explainDecision, replayDecisions, signedOrder, anchorForStore } from "../src/decisions.mjs";
 import { computeVerdict } from "../src/verdict.mjs";
@@ -1898,4 +1898,60 @@ test("a store isn't restored from itself, by its own name or another", () => {
   linkSync(dbPath, join(dir, "also.db"));
   refused(join(dir, "also.db"));
   assert.equal(readFileSync(`${dbPath}-wal`, "utf8"), "committed", "and its log is where it was");
+});
+
+// ── from #278's twentieth review ─────────────────────────────────────────────
+
+test("a store holding a record filed under a number that isn't whole doesn't bind the host's anchor, which still reads", async () => {
+  const dir = credentials();
+  const dbPath = await ticks([at(A)], {});
+  const db = open(dbPath);
+  // Its table rebuilt without its types held, as a store edit could, and a record filed under 1.5 in it, whole as a record.
+  db.exec("CREATE TABLE decision_loose AS SELECT * FROM decision; DROP TABLE decision; ALTER TABLE decision_loose RENAME TO decision;");
+  const k = recordOf(REPO, 1.5, B);
+  db.prepare("INSERT INTO decision(digest, pr, head, record, first_at, last_at, first_seq, last_seq, envelope, unsigned) VALUES(?,?,?,?,?,?,?,?,?,?)")
+    .run(k.decision.digest, 1.5, B, canonical(k.decision.record), 1, 1, 1000, 1000, null, "kept before signing");
+  db.close();
+  const r = await closedTick(dbPath, host(dir));
+  assert.deepEqual(anchorOf(dir), { anchor: null, why: null }, "the host's anchor isn't bound to it, and still reads");
+  assert.match(r.log, /this store holds a record filed under 1\.5, which is no pull request's number/);
+});
+
+/** A reeve home with a profile for o/r, halted, and a store in it: `reeve tick` there reaches nothing. */
+function haltedHome(prefix) {
+  const home = tempDir(prefix);
+  mkdirSync(join(home, "profiles", "o"), { recursive: true });
+  writeFileSync(join(home, "profiles", "o", "r.json"), JSON.stringify(withDefaults({ schemaVersion: 1, project: { kind: "product" },
+    identity: { key: REPO, defaultBranch: "main", visibility: "public" },
+    authority: { permission: "admin", policy: "propose_only", profileLocation: "sidecar" },
+    state: { mode: "in-repo" }, units: [{ id: "root", root: ".", language: "javascript", packageManager: "npm", commands: {} }],
+    ci: { provider: "github-actions" }, merge: { method: "squash", enforcement: "attested" }, reviewers: [] })));
+  writeFileSync(join(home, "HALT"), "");
+  const dbPath = join(home, "s.db");
+  open(dbPath).close();
+  return { home, dbPath };
+}
+const tickOn = ({ home, dbPath }) => spawnSync(process.execPath, [REEVE, "tick", REPO, "--db", dbPath], { cwd: home, encoding: "utf8", env: { ...offlineEnv(), REEVE_HOME: home } });
+
+test("reeve tick puts back the store's log a restore killed partway had moved aside, before it opens the store", () => {
+  const h = haltedHome("reeve-order-settle-");
+  const gone = spawnSync(process.execPath, ["-e", ""]).pid;
+  writeFileSync(`${h.dbPath}.${gone}.deadbeef.restoring`, "partway");
+  writeFileSync(`${h.dbPath}.${gone}.deadbeef.restoring-wal`, "");
+  const r = tickOn(h);
+  assert.deepEqual(readdirSync(h.home).filter((n) => n.includes(".restoring")), [], `put right: ${r.stdout}${r.stderr}`);
+  assert.doesNotMatch(r.stderr, /couldn't be put back/);
+});
+
+test("reeve tick doesn't run on a store whose log a restore killed partway moved aside, where it can't be put back", () => {
+  const h = haltedHome("reeve-order-settle-taken-");
+  const gone = spawnSync(process.execPath, ["-e", ""]).pid;
+  writeFileSync(`${h.dbPath}.${gone}.cafebabe.restoring`, "partway");
+  writeFileSync(`${h.dbPath}.${gone}.cafebabe.restoring-wal`, "committed");
+  // Its name taken since.
+  writeFileSync(`${h.dbPath}-wal`, "");
+  const r = tickOn(h);
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stderr, /a restore killed partway left what the store at .*s\.db held in its log aside/);
+  assert.equal(readFileSync(`${h.dbPath}.${gone}.cafebabe.restoring-wal`, "utf8"), "committed", "and what it moved aside is kept");
 });

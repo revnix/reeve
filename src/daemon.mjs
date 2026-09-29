@@ -55,7 +55,7 @@ import { resolveHome } from "./home.mjs";
 import { codeVersion, policyOf, recordsFor } from "./evidence.mjs";
 import { saveDecision } from "./db/records.mjs";
 import { decisionStatement, baselineStatement, latestStatement } from "./signing.mjs";
-import { BASELINE_OP, LATEST_OP, STORE_ID_OP, PR_MAX, latestDecision, storeIdentity } from "./db/records.mjs";
+import { BASELINE_OP, LATEST_OP, STORE_ID_OP, FILED, latestDecision, storeIdentity } from "./db/records.mjs";
 import { signedOrder, strayEntry, baselineLost, otherRepository } from "./decisions.mjs";
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -1551,7 +1551,7 @@ export async function tick(ctx) {
     // Only a record filed under a pull request's number: one under 0, say, would
     // have an entry filed where no order finds it, and a note on the host's
     // anchor it couldn't read back. It's said at each tick.
-    for (const r of /** @type {any[]} */ (db.prepare(`SELECT pr, digest FROM decision WHERE pr BETWEEN 1 AND ${PR_MAX}`).all())) if (!named(Number(r.pr), String(r.digest))) prs.add(Number(r.pr));
+    for (const r of /** @type {any[]} */ (db.prepare(`SELECT pr, digest FROM decision WHERE ${FILED}`).all())) if (!named(Number(r.pr), String(r.digest))) prs.add(Number(r.pr));
     for (const [pr, k] of orderKept) {
       const o = orders.get(pr);
       if (o && "digest" in o && o.digest === k.latest && [...k.since].every((d) => named(pr, d))) orderKept.delete(pr);
@@ -1594,7 +1594,7 @@ export async function tick(ctx) {
         // away or changed before an order could name it. The baseline says no
         // pull request, so it's no order's work, and it's said every tick.
         // A record filed under no pull request's number is none an order can name.
-        const unfiled = /** @type {any} */ (db.prepare(`SELECT pr FROM decision WHERE pr NOT BETWEEN 1 AND ${PR_MAX} LIMIT 1`).get());
+        const unfiled = /** @type {any} */ (db.prepare(`SELECT pr FROM decision WHERE NOT ${FILED} LIMIT 1`).get());
         if (unfiled) log(logPath, `signing: this store holds a record filed under ${unfiled.pr}, which is no pull request's number, so no signed order names it`);
         const lost = baselineLost(db, nwo, /** @type {any} */ (orderKeys), id);
         if (lost.length) log(logPath, `signing: the store's baseline names ${lost.length} record(s) kept before it began signing that it doesn't hold as they were kept, ` +

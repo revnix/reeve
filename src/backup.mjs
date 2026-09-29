@@ -20,7 +20,8 @@ import { execFileSync } from "node:child_process";
 // `linkSync` is the snapshot PUBLISH: it is atomic AND exclusive, where
 // `renameSync` is atomic but REPLACES an existing destination -- so two
 // same-second writers would both believe they won.
-import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync, linkSync, renameSync, openSync, closeSync, statSync, fsyncSync } from "node:fs";
+import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync, linkSync, renameSync, openSync, closeSync, statSync, fsyncSync,
+         lstatSync, realpathSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join, dirname, basename } from "node:path";
 import { open as openStore, exportJsonl, storeLock } from "./db/ops.mjs";
@@ -547,6 +548,21 @@ export function restore(snapshotPath, dbPath, { overwrite = false, force = false
   if (!existsSync(snapshotPath)) return { ok: false, why: `no snapshot at ${snapshotPath}` };
   if (existsSync(dbPath) && !overwrite)
     return { ok: false, why: `${dbPath} exists; pass overwrite to replace it, which discards anything newer than the snapshot` };
+  // Restored at the store itself, through any link to it: the copy renamed over
+  // the link would leave the store it leads to as it was, and its lock where it
+  // is, for a reeve starting through the link to take another.
+  let entry = null;
+  try { entry = lstatSync(dbPath); } catch { /* not there: it's put there */ }
+  if (entry?.isSymbolicLink() && !existsSync(dbPath))
+    return { ok: false, why: `${dbPath} is a link to nothing, so which store it's to restore can't be told` };
+  if (entry) dbPath = realpathSync(dbPath);
+  // Nor from itself, by another name or none: its copy holds only what its
+  // main file does, and putting that in place would lose what its log holds.
+  if (entry) {
+    const from = statSync(snapshotPath), to = statSync(dbPath);
+    if (from.dev === to.dev && from.ino === to.ino)
+      return { ok: false, why: `${snapshotPath} is the store itself, so restoring it from that would only lose what its log holds` };
+  }
 
   // Verify BEFORE replacing anything, with the same check that chooses a
   // snapshot, so a file that can't be restored is never called usable.
@@ -596,6 +612,10 @@ export function restore(snapshotPath, dbPath, { overwrite = false, force = false
     copy(snapshotPath, temp);
     const fd = openSync(temp, "r");
     try { fsyncSync(fd); } finally { closeSync(fd); }
+    // The copy's name synced into its folder before the store's log is moved
+    // aside: a power loss that kept the move and lost the name would leave the
+    // next restore to take the log for a replaced store's, and let it go.
+    syncDir(dirname(dbPath));
     for (const s of ["-wal", "-shm"]) if (existsSync(dbPath + s)) { rename(dbPath + s, temp + s); aside.push([dbPath + s, temp + s]); }
     rename(temp, dbPath);
     placed = true;

@@ -3,7 +3,7 @@
 // short, or restored from before, doesn't pass for the one the host kept.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -1681,10 +1681,12 @@ test("reeve restore syncs the store's folder once the store is in place, before 
   const r = restore(snap, dbPath, { overwrite: true, isDaemonRunning: () => null,
                                     syncDir: (d) => synced.push({ d, placed: !readdirSync(d).some((n) => n.endsWith(".restoring")) }) });
   assert.equal(r.ok, true, JSON.stringify(r));
-  assert.deepEqual(synced, [{ d: dir, placed: true }], "its folder synced, once the copy was renamed into place");
-  const failed = restore(snap, dbPath, { overwrite: true, isDaemonRunning: () => null, syncDir: () => { throw new Error("EIO: i/o error"); } });
+  assert.deepEqual(synced.at(-1), { d: realpathSync(dir), placed: true }, "its folder synced, once the copy was renamed into place");
+  // Its last sync, the one once the copy is in place, failing.
+  let n = 0;
+  const failed = restore(snap, dbPath, { overwrite: true, isDaemonRunning: () => null, syncDir: () => { if (++n === 2) throw new Error("EIO: i/o error"); } });
   assert.equal(failed.ok, false, "and a store whose folder couldn't be synced isn't said to be restored");
-  assert.match(String(failed.why), /couldn't be synced to disk/);
+  assert.match(String(failed.why), /is restored, but its folder couldn't be synced to disk/);
 });
 
 // ── from #278's seventeenth review ───────────────────────────────────────────
@@ -1828,4 +1830,72 @@ test("a restore lets go what one killed partway left that couldn't be put back, 
   const r = restore(snap, dbPath, { overwrite: true, isDaemonRunning: () => null });
   assert.equal(r.ok, true, JSON.stringify(r));
   assert.deepEqual(readdirSync(dir).filter((n) => n.includes(".restoring")), [], "nothing of the killed one is left");
+});
+
+// ── from #278's nineteenth review ────────────────────────────────────────────
+
+test("a restore syncs its copy's name into the store's folder before it moves the store's log aside", () => {
+  const dir = tempDir("reeve-order-restore-order-");
+  const dbPath = join(dir, "s.db"), snap = join(dir, "snap.db");
+  open(dbPath).close();
+  copyFileSync(dbPath, snap);
+  writeFileSync(`${dbPath}-wal`, "committed");
+  const real = realpathSync(dbPath);
+  const steps = [];
+  const r = restore(snap, dbPath, { overwrite: true, isDaemonRunning: () => null,
+    copy: (from, to) => { copyFileSync(from, to); steps.push("copied"); },
+    syncDir: () => { steps.push("synced"); },
+    rename: (from, to) => { steps.push(to.endsWith(".restoring-wal") ? "log aside" : to === real ? "placed" : `renamed to ${basename(to)}`); renameSync(from, to); } });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.deepEqual(steps, ["copied", "synced", "log aside", "placed", "synced"]);
+});
+
+test("a restore through a link to the store restores the store, and leaves the link", () => {
+  const dir = tempDir("reeve-order-restore-link-");
+  const real = join(dir, "real.db"), link = join(dir, "link.db"), snap = join(dir, "snap.db");
+  open(real).close();
+  // The snapshot holds an event the store doesn't.
+  const s = open(snap);
+  s.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(1, "test", "restored.marker", "store", "{}");
+  s.close();
+  symlinkSync(real, link);
+  const r = restore(snap, link, { overwrite: true, isDaemonRunning: () => null });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.ok(lstatSync(link).isSymbolicLink(), "the link is still a link");
+  const db = open(real);
+  const marked = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'restored.marker'").get().n;
+  db.close();
+  assert.equal(marked, 1, "and the store it leads to is the snapshot");
+});
+
+test("a restore through a link to nothing is refused, as which store it names can't be told", () => {
+  const dir = tempDir("reeve-order-restore-dangling-");
+  const snap = join(dir, "snap.db"), dangling = join(dir, "gone.db");
+  open(snap).close();
+  symlinkSync(join(dir, "nowhere.db"), dangling);
+  let r;
+  try { r = restore(snap, dangling, { isDaemonRunning: () => null }); } catch (e) { r = { ok: false, why: `threw: ${e.message}` }; }
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.match(String(r.why), /is a link to nothing/);
+  assert.ok(lstatSync(dangling).isSymbolicLink(), "and the link is left as it was");
+});
+
+test("a store isn't restored from itself, by its own name or another", () => {
+  const dir = tempDir("reeve-order-restore-self-");
+  const dbPath = join(dir, "s.db");
+  open(dbPath).close();
+  // What it committed, in its log alone.
+  writeFileSync(`${dbPath}-wal`, "committed");
+  const refused = (from) => {
+    const r = restore(from, dbPath, { overwrite: true, isDaemonRunning: () => null });
+    assert.equal(r.ok, false, `${basename(from)}: ${JSON.stringify(r)}`);
+    assert.match(String(r.why), /is the store itself/);
+  };
+  refused(dbPath);
+  symlinkSync(dbPath, join(dir, "link.db"));
+  refused(join(dir, "link.db"));
+  // And by another name for its file, a hard link, which its lock would refuse too.
+  linkSync(dbPath, join(dir, "also.db"));
+  refused(join(dir, "also.db"));
+  assert.equal(readFileSync(`${dbPath}-wal`, "utf8"), "committed", "and its log is where it was");
 });

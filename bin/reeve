@@ -946,6 +946,28 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     process.exit(0);
   }
 
+  // THE SHADOW TRIAL, against its conditions (#291): the store, and what
+  // GitHub says merged, read as the person running this reads it. It changes
+  // nothing. 0 once every condition holds, 1 until then, as a false call is
+  // for a person's audit and is never taken as none.
+  case "trial": {
+    const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
+    // Refused in the typed form, so --json gets a document even then.
+    if (!nwo) fail("usage", "reeve trial: no repo. Pass owner/repo.", { exit: EXITS.misuse });
+    const dbPath = opt("db") ?? stateFor(nwo);
+    if (!existsSync(dbPath)) fail("store_absent", `reeve trial: ${missingStoreMessage(dbPath, { initCreatesIt: !opt("db"), nwo })}`);
+    const since = opt("since");
+    const sinceAt = since == null ? NaN : Math.floor(Date.parse(since) / 1000);
+    if (!Number.isFinite(sinceAt))
+      fail("usage", `reeve trial: --since takes the date the trial's count started from, as 2026-09-30T09:14Z${since == null ? "" : `, got ${JSON.stringify(since)}`}`);
+    const now = Math.floor(Date.now() / 1000);
+    if (sinceAt > now) fail("usage", `reeve trial: --since ${since} is after now, and a trial can't have begun after now`);
+    const { trialReport, renderTrial, mergedSince } = await import("../src/trial.mjs");
+    const report = trialReport(open(dbPath), { since: sinceAt, now, merged: mergedSince(nwo, sinceAt) });
+    console.log(flag("json") ? JSON.stringify(report, null, 2) : renderTrial(report, nwo));
+    process.exit(report.passed ? 0 : 1);
+  }
+
   // RECOMPUTE RECORDED VERDICTS (#165), with this code, from the evidence and
   // policy each decision recorded. The current profile's hash only says whether
   // the policy has changed since. Nothing to replay is not a pass: it exits 3.
@@ -2589,6 +2611,8 @@ function usage() {
   replay [owner/repo]   recompute recorded verdicts with this code and compare them
                         (--pr <n>, --since <date>, --record <digest>;
                          0 all the same · 1 one differs or can't be replayed · 3 none)
+  trial [owner/repo]    the shadow trial against its conditions  (--since <date> it started, --json;
+                         0 it has passed · 1 not yet)
   signing-key           the id and public half of the key decision records are signed with
                         (0 there is one · 3 none yet)
   statusline            one line for the terminal statusline; reads state only

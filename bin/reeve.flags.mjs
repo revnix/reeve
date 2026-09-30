@@ -32,7 +32,7 @@ export const APPLIES = Object.freeze({
   // doctor 2, builder 8, task 8 -- and `build` 0, across all 447 of its lines. The
   // flag is accepted there and cannot do anything, on any of its subcommands. So
   // it is refused until something honours it, rather than advertised and inert.
-  json: Object.freeze(["doctor", "status", "builder", "task", "notify"]),
+  json: Object.freeze(["doctor", "status", "builder", "task", "notify", "trial"]),
 
   // `--dry-run` was the first flag to need this and had its own allow-list, one
   // gate above the dispatch switch, for the right reason: a per-route check is a
@@ -61,7 +61,7 @@ export const APPLIES = Object.freeze({
   // `--since` is the cursor a previous digest handed back, and only the digest
   // answers "what moved since then". `replay` reads it as the date from which
   // recorded decisions are replayed (#165).
-  since: Object.freeze(["task dash", "replay"]),
+  since: Object.freeze(["task dash", "replay", "trial"]),
 
   // The decision records' own flags (#165): which pull request's, or which
   // record, to replay, and which commit `why` explains.

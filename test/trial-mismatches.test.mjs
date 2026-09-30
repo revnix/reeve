@@ -192,7 +192,7 @@ test("a repair is taken only from a base read whole, at a commit the head contai
 test("the base's failing checks and the head's passed ones are named from what GitHub reported, a pass being only a success", () => {
   const status = { name: "Build", source: "status", state: "completed", conclusion: "failure" };
   assert.deepEqual(baseHealthOf({ verdict: "RED", failing: [run("Build", "failure"), run("Build", "failure"), run("Lint", "timed_out"), status] }, { complete: true, inHead: true }),
-                   { verdict: "RED", readable: true, complete: true, inHead: true, failing: [check("Build"), check("Lint"), check("Build", null)] });
+                   { verdict: "RED", readable: true, complete: true, inHead: true, failing: [check("Build"), check("Lint"), check("Build", null)], ancillaryFailing: [] });
   assert.deepEqual(passedChecks([run("Build", "success"), run("Lint", "skipped"), run("Docs", "neutral"), { name: "Slow", state: "in_progress" }]), [check("Build")]);
 });
 
@@ -219,7 +219,7 @@ test("a merge queue's commit that repairs its red base passes the base clause th
   };
   const judged = judge(() => true);
   assert.ok(judged.ok, judged.why);
-  assert.deepEqual(judged.input.base, { verdict: "RED", readable: true, complete: true, inHead: true, failing: [check("Build")] });
+  assert.deepEqual(judged.input.base, { verdict: "RED", readable: true, complete: true, inHead: true, failing: [check("Build")], ancillaryFailing: [] });
   assert.deepEqual(judged.input.checks.passed, [check("Build")]);
   assert.equal(judge(() => false).input.base.inHead, false, "and whether the queue's commit contains the base is read, not assumed");
 });

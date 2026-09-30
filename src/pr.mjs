@@ -171,8 +171,8 @@ export function evaluateQueueEntry({ nwo, entry, input, baseRef, profile, db = n
   const key = `${nwo}@merge-queue`;
   const s = db ? saveSettlement(db, key, entry.pr, settle(loadSettlement(db, key, entry.pr), reading))
     : { ...settle(null, reading), settled: false, why: "settlement needs a state store to compare readings across ticks" };
-  // For health, as evaluatePr judges the base: only failures on it count.
-  const health = { required: profile.ci?.requiredChecks ?? [] };
+  // For health, as evaluatePr judges the base: only failures on it count, of the checks that gate merges (#288).
+  const health = { required: profile.ci?.requiredChecks ?? [], failuresOf: gatingOf(req) };
   const baseRead = entry.baseSha ? read(nwo, entry.baseSha, { reviewerContexts }) : null;
   const base = baseRead ? classifyRead(baseRead, health, { evidence: false })
     : { verdict: "UNKNOWN", readable: false, why: "the queue's base commit isn't known" };
@@ -321,8 +321,8 @@ export function requiredChecksOf({ nwo, baseRef, profile = /** @type {CiProfile}
  * passes nothing, since the surface that went unread may hold a failure, and
  * says so with `readable: false`; but a failure it did read is one, and stays RED.
  */
-export function classifyRead(read, { required = [], known = true, queueOnly = [] } = {}, { evidence = true } = {}) {
-  const c = classify(read?.rows ?? [], required, { requiredKnown: known, evidence, queueOnly });
+export function classifyRead(read, { required = [], known = true, queueOnly = [], failuresOf = null } = {}, { evidence = true } = {}) {
+  const c = classify(read?.rows ?? [], required, { requiredKnown: known, evidence, queueOnly, failuresOf });
   // Checks judged while the base's requirements couldn't be read are read again,
   // whatever else left them unknown, no check reported yet say: only reading
   // the requirements again settles them.
@@ -743,7 +743,17 @@ const eachOnce = (list) => list.filter((c, i) => list.findIndex((d) => d.name ==
  */
 export const baseHealthOf = (base, { complete = false, inHead = null } = {}) => ({
   verdict: base.verdict, readable: base.readable !== false, complete, inHead,
-  failing: eachOnce((base.failing ?? []).filter((r) => r?.name).map(checkOf)) });
+  failing: eachOnce((base.failing ?? []).filter((r) => r?.name).map(checkOf)),
+  // Named, so a base passed with a workflow failing there says so (#288).
+  ancillaryFailing: [.../** @type {any} */ (base).ancillaryFailing ?? []] });
+
+/**
+ * The checks that gate merges into a base, whose failures alone make it red
+ * (#288): the required ones, where they're known and there are any. Null where
+ * they aren't, and then every check on the base counts.
+ * @param {{ required?: { context: string, app: string | null }[], known?: boolean }} req
+ */
+export const gatingOf = (req) => (req?.known === true && (req.required ?? []).length ? req.required ?? null : null);
 
 /**
  * The checks that passed at a commit: completed with success, not merely skipped
@@ -834,7 +844,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // apply. Only a partial read does: it can hide a failure.
   const baseRead = baseHead.ok ? readChecks(nwo, baseHead.sha, { reviewerContexts }) : null;
   const base = baseRead
-    ? classifyRead(baseRead, { required: profile.ci?.requiredChecks ?? [] }, { evidence: false })
+    ? classifyRead(baseRead, { required: profile.ci?.requiredChecks ?? [], failuresOf: gatingOf(req) }, { evidence: false })
     : { verdict: "UNKNOWN", readable: false };
   // Whether the head contains the base's commit, asked only of a red base: a head
   // from before it went red can't show the failure repaired (#286).

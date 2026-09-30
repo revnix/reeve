@@ -298,7 +298,7 @@ test("reeve trial reports a store against the trial's conditions, reading what m
   const seededCond = (/** @type {any} */ doc) => doc.conditions.find((/** @type {any} */ c) => /seeded/.test(c.name));
   assert.match(seededCond(JSON.parse(json.stdout)).detail, /not run/);
   const seeded = JSON.parse(run("o/r", "--db", s.path, "--since", since, "--seeded", "--json").stdout);
-  assert.ok(seeded.seeded.length > 1 && seeded.seeded.every((/** @type {any} */ x) => x.ok), JSON.stringify(seeded.seeded.filter((/** @type {any} */ x) => !x.ok)));
+  assert.ok(Array.isArray(seeded.seeded) && seeded.seeded.length > 1 && seeded.seeded.every((/** @type {any} */ x) => x.ok), JSON.stringify(seeded.seeded));
   assert.equal(seededCond(seeded).met, true);
   const elsewhere = spawnSync(process.execPath, [REEVE, "replay", "o/r", "--seeded"], { encoding: "utf8", env: offlineEnv() });
   assert.equal(elsewhere.status, 2, "only the trial runs them: " + elsewhere.stderr);

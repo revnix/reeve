@@ -73,15 +73,15 @@ test("a push the remote took, answering after the bound, is published", () => {
   assert.equal(out.head, r.fix);
 });
 
-test("a push stopped at the bound, the remote still where it was, isn't published, and isn't said to be refused", () => {
+test("a push stopped at the bound, the remote still where it was, isn't known to be published or not, as it may yet land", () => {
   const r = repos();
   const { out, err } = publish(r, lateGit(r.root, { lands: false }));
   assert.ok(out, `it answered: ${err}`);
-  assert.equal(g(r.origin, "rev-parse", "main"), r.was, "control: the push didn't land");
+  assert.equal(g(r.origin, "rev-parse", "main"), r.was, "control: the push hadn't landed when the remote was read");
   assert.equal(out.ok, false);
-  assert.equal(out.unknown, undefined, JSON.stringify(out));
-  assert.match(String(out.why), /didn't answer within 3 seconds, and the remote is still at/);
-  assert.doesNotMatch(String(out.why), /refused/);
+  assert.equal(out.unknown, true, JSON.stringify(out));
+  assert.match(String(out.why), /didn't answer within 3 seconds, and whether it landed isn't known: the remote was still at [0-9a-f]{10} when read again, and the push may yet land/);
+  assert.doesNotMatch(String(out.why), /refused|not published/);
 });
 
 test("a push stopped at the bound, the remote unreadable after, isn't known to be published or not", () => {

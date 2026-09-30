@@ -13557,12 +13557,12 @@ export const STUBS = [
   },
   {
     name: "push-stopped-not-published",
-    why: "take a push the remote doesn't hold, stopped at the bound, as not known",
+    why: "take a push the remote hadn't taken when read again, stopped at the bound, as not published. The remote may still be applying it, and the daemon then escalates a failure for a fix that landed",
     test: "test/push-bound.test.mjs",
-    expectRed: "a push stopped at the bound, the remote still where it was, isn't published, and isn't said to be refused",
+    expectRed: "a push stopped at the bound, the remote still where it was, isn't known to be published or not, as it may yet land",
     edits: [{ file: "src/checkout.mjs",
-              find: "  if (expected && now === expected) return { ok: false, why: `${stopped}, and the remote is still at ${expected.slice(0, 10)}: not published` };\n",
-              replace: "" }],
+              find: "  return { ok: false, unknown: true, why: `${stopped}, and whether it landed isn't known: ${seen}` };",
+              replace: "  if (expected && now === expected) return { ok: false, why: `${stopped}, and the remote is still at ${expected.slice(0, 10)}: not published` };\n  return { ok: false, unknown: true, why: `${stopped}, and whether it landed isn't known: ${seen}` };" }],
   },
   {
     name: "push-stopped-unknown",
@@ -13570,8 +13570,8 @@ export const STUBS = [
     test: "test/push-bound.test.mjs",
     expectRed: "a push stopped at the bound, the remote unreadable after, isn't known to be published or not",
     edits: [{ file: "src/checkout.mjs",
-              find: "  return { ok: false, unknown: true,",
-              replace: "  return { ok: false," }],
+              find: "  return { ok: false, unknown: true, why: `${stopped}, and whether it landed isn't known: ${seen}` };",
+              replace: "  return { ok: false, why: `${stopped}, and whether it landed isn't known: ${seen}` };" }],
   },
   {
     name: "push-plain-stopped-settled",

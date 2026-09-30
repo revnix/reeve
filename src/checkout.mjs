@@ -492,9 +492,10 @@ export function fetchRunWork({ repoRoot, path, branch, into = null }) {
 /**
  * What came of a push stopped at the network bound (#284): the remote may have
  * taken it and answered late, so it's no refusal. The remote's head is read
- * again, bounded too. At the pushed head, it was published; still at the head it
- * was expected at, it wasn't; anywhere else, or unread, whether it landed isn't
- * known, and says so.
+ * again, bounded too. At the pushed head, it was published. Anywhere else,
+ * still at the head it was expected at included, or unread, whether it landed
+ * isn't known, and says so: the remote may still be applying a push its client
+ * was stopped waiting on, so the head it had a moment ago proves nothing.
  * @param {string} repoRoot @param {string} branch @param {string} head @param {string | null} expected
  */
 function settleStoppedPush(repoRoot, branch, head, expected) {
@@ -502,9 +503,10 @@ function settleStoppedPush(repoRoot, branch, head, expected) {
   const ls = founderGit(repoRoot, ["ls-remote", "origin", `refs/heads/${branch}`]);
   const now = ls.ok ? (ls.out.split(/\s+/)[0] ?? "") : null;
   if (now === head) return { ok: true, why: null, head };
-  if (expected && now === expected) return { ok: false, why: `${stopped}, and the remote is still at ${expected.slice(0, 10)}: not published` };
-  return { ok: false, unknown: true,
-           why: `${stopped}, and whether it landed isn't known: ${ls.ok ? `the remote is at ${now ? now.slice(0, 10) : "no branch"}` : `the remote couldn't be read: ${ls.err}`}` };
+  const seen = !ls.ok ? `the remote couldn't be read: ${ls.err}`
+    : expected && now === expected ? `the remote was still at ${expected.slice(0, 10)} when read again, and the push may yet land`
+    : `the remote is at ${now ? now.slice(0, 10) : "no branch"}`;
+  return { ok: false, unknown: true, why: `${stopped}, and whether it landed isn't known: ${seen}` };
 }
 
 /**

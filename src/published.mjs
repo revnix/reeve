@@ -7,6 +7,7 @@
 
 import { execFileSync } from "node:child_process";
 import { POLICY_APP, POLICY_CONTEXT } from "./github/reconciler.mjs";
+import { netTimeoutMs, netFailure } from "./net-bound.mjs";
 
 /**
  * What one result published: the record kept for its verdict, and the pull
@@ -47,10 +48,11 @@ export function readEvidence(text, pr) {
   return { pr, record, order: m ? { n: Number(m[1]), names: m[2] } : null };
 }
 
-/** `gh api`, as the person running this reads GitHub: `out` or `err`. @param {string[]} args */
+/** `gh api`, as the person running this reads GitHub, bounded as every read is (#282): `out` or `err`. @param {string[]} args */
 function ghApi(args) {
-  try { return { ok: true, out: execFileSync("gh", ["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 60_000 }).trim() }; }
-  catch (e) { return { ok: false, out: "", err: String(/** @type {any} */ (e).stderr || /** @type {Error} */ (e).message).trim() }; }
+  try { return { ok: true, out: execFileSync("gh", ["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,
+                                                                   timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim() }; }
+  catch (e) { return { ok: false, out: "", err: netFailure(e) }; }
 }
 
 /**

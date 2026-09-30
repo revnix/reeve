@@ -1505,6 +1505,28 @@ export async function tick(ctx) {
     }
     return { top, named: true };
   };
+  // Where a pull request's signed order stands as its verdict is published,
+  // with the record kept for it (#274): its top entry and the record that names,
+  // null for none yet. Undefined where that can't be said, and then nothing is
+  // published of it: a reeve that doesn't sign orders, an order that doesn't
+  // hold, or one cut short of what this host signed, as a store restored from
+  // before. The host's anchor is read once a tick, and one another store is
+  // bound to, or that can't be read, says nothing of this store's orders.
+  /** @type {import("./anchor.mjs").Anchor | null | undefined} */ let publishedAnchor;
+  const orderAt = (/** @type {number} */ pr) => {
+    if (!ordering) return undefined;
+    if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
+    if (!orderKeys) return undefined;
+    if (publishedAnchor === undefined) {
+      try { publishedAnchor = ctx.anchor.read(nwo) ?? { began: false, latest: new Map(), store: null }; }
+      catch { publishedAnchor = null; }
+    }
+    const store = storeIdentity(db);
+    if (!publishedAnchor || (publishedAnchor.store && publishedAnchor.store !== store)) return undefined;
+    const order = signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), store);
+    if ("corrupt" in order || order.top < (publishedAnchor.latest.get(pr) ?? 0)) return undefined;
+    return order.top ? { n: order.top, names: /** @type {string} */ (order.digest) } : null;
+  };
   // The host's anchor moved to entry `top` of `pr`'s order, only once the store
   // has committed it: moved before, a transaction that failed would leave the
   // anchor ahead of its store, and its order never extended again. A write that
@@ -2683,7 +2705,10 @@ export async function tick(ctx) {
         && !note("pr.published", { head: e.head, state: PASS, name, id: was?.id ?? null }))
       pub = { ok: false, why: "its PASS couldn't be written down first, so it isn't published" };
     else {
-      try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict: e.verdict, shadow, base: e.baseRef }); }
+      // With the record kept for it, and where its signed order stood, where both can be said.
+      const order = decided.ok && kept ? orderAt(pr) : undefined;
+      const evidence = order === undefined ? null : { pr, record: /** @type {any} */ (kept).decision.digest, order };
+      try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict: e.verdict, shadow, base: e.baseRef, evidence }); }
       // A publish that throws, a network error say, fails this pull request's
       // publication, not the tick for every one after it (#161).
       catch (err) { pub = { ok: false, why: err.message }; }

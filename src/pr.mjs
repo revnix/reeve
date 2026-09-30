@@ -19,6 +19,7 @@ import { compare } from "./review/shadow.mjs";
 import { authenticate, apiAsInstallation, loadAppCredentials } from "./github/app.mjs";
 import { execFileSync } from "node:child_process";
 import { netTimeoutMs, netFailure } from "./net-bound.mjs";
+import { evidenceText } from "./published.mjs";
 
 /**
  * The profile's CI settings, as far as this module reads them.
@@ -1122,8 +1123,12 @@ export const requiredOnBase = (args) => requirementsOnBase(args).own;
  * came to require it, so it is marked superseded. And when a rule already
  * requires the enforcement check, every pull request is blocked until reeve
  * enforces: that comes back as `held`, for the daemon to raise.
+ *
+ * `evidence`, where given, is written after the verdict: the record kept for it
+ * and where the pull request's signed order stood (#274), for a copy of the
+ * store to be checked against away from the host.
  */
-export async function publishVerdict({ nwo, verdict, shadow = true, context = POLICY_CONTEXT, base = null, queue = false,
+export async function publishVerdict({ nwo, verdict, shadow = true, context = POLICY_CONTEXT, base = null, queue = false, evidence = null,
                                       auth: authenticateAs = authenticate, api = apiAsInstallation }) {
   const auth = await authenticateAs(nwo);
   if (!auth.ok) return { ok: false, why: auth.why };
@@ -1147,10 +1152,12 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = PO
   // an UNKNOWN only a person can settle are settled there as anywhere: the last
   // lets the queue go on rather than hold every entry behind it to its timeout.
   const running = queue && !shadow && verdict.state === UNKNOWN && verdict.kind !== "person";
+  const tail = evidence ? evidenceText(evidence) : "";
   const fields = [
     ...(running ? ["-f", "status=in_progress"] : ["-f", "status=completed", "-f", `conclusion=${conclusion}`]),
     "-f", `output[title]=${title.slice(0, 250)}`,
-    "-f", `output[summary]=${body.slice(0, 60000)}`,
+    // The evidence is kept whole, however long the verdict, as the check reads it back whole or not at all.
+    "-f", `output[summary]=${body.slice(0, 60000 - tail.length)}${tail}`,
   ];
   const runs = existingRuns(auth.token, nwo, verdict.head, [name, context], api);
   const existing = runs?.mine[name]?.id ?? null;

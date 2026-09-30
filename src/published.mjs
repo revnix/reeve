@@ -63,6 +63,23 @@ export function readEvidence(text) {
            store: { prs: Number(all[1]), entries: Number(all[2]) } };
 }
 
+/**
+ * How evidence `e` falls short of `prior`, published before it for the same
+ * pull request: an earlier entry of its order, or fewer pull requests' orders
+ * or entries in the store, as a store rolled back or restored from before
+ * would give. Null where it doesn't.
+ * @param {Evidence} e @param {Evidence} prior
+ */
+export function evidenceBehind(e, prior) {
+  const n = e.order?.n ?? 0, was = prior.order?.n ?? 0;
+  const short = [
+    n < was ? `the store's signed order of #${e.pr} ends at entry ${n}, where entry ${was} was published` : null,
+    e.store.prs < prior.store.prs ? `it holds the signed orders of ${e.store.prs} pull request(s), where ${prior.store.prs} were published` : null,
+    e.store.entries < prior.store.entries ? `it holds ${e.store.entries} entries in all, where ${prior.store.entries} were published` : null,
+  ].filter(Boolean);
+  return short.length ? short.join("; ") : null;
+}
+
 /** `gh api`, as the person running this reads GitHub, bounded as every read is (#282): `out` or `err`. @param {string[]} args */
 function ghApi(args) {
   try { return { ok: true, out: execFileSync("gh", ["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,

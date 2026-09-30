@@ -188,6 +188,103 @@ test("a published result carries its evidence after the verdict, however long th
   }
 });
 
+/**
+ * What publishing `evidence` writes at a head whose result already carries
+ * `prior`'s evidence (none where null), and whether it says the store is behind.
+ */
+async function publishOver(prior, evidence) {
+  const calls = [];
+  const run0 = prior ? JSON.stringify({ name: "merge-policy (shadow)", id: 5, conclusion: "neutral", app: "merge-policy", summary: `BLOCK: ci\n${evidenceText(prior)}` }) : "";
+  const api = (_token, args) => {
+    calls.push(args);
+    if (args.includes("PATCH") || args.includes("POST")) return { ok: true, out: JSON.stringify({ id: 5 }) };
+    if (args.join(" ").includes("/check-runs?")) return { ok: true, out: run0 };
+    return { ok: true, out: "" };
+  };
+  const r = await publishVerdict({ nwo: REPO, verdict: { head: A, state: "BLOCK", summary: "ci", clauses: [] }, shadow: true, evidence,
+                                   auth: async () => ({ ok: true, token: "t" }), api });
+  const write = calls.find((a) => a.includes("PATCH") || a.includes("POST")) ?? [];
+  const summary = String(write.find((x) => typeof x === "string" && x.startsWith("output[summary]=")) ?? "").slice("output[summary]=".length);
+  return { written: readEvidence(summary), behind: r.behind ?? null };
+}
+
+test("published evidence only moves forward: evidence behind what a head carries never replaces it, and says the store is behind", async () => {
+  const newer = ev(X, { n: 3, names: X }, { prs: 4, entries: 9 });
+  for (const [older, why] of [
+    [ev(Y, { n: 2, names: Y }, { prs: 4, entries: 9 }), /the store's signed order of #42 ends at entry 2, where entry 3 was published/],
+    [ev(X, { n: 3, names: X }, { prs: 3, entries: 9 }), /it holds the signed orders of 3 pull request\(s\), where 4 were published/],
+    [ev(X, { n: 3, names: X }, { prs: 4, entries: 8 }), /it holds 8 entries in all, where 9 were published/],
+  ]) {
+    const r = await publishOver(newer, older);
+    assert.deepEqual(r.written, newer, `what was published stays: ${JSON.stringify(older)}`);
+    assert.match(String(r.behind), why);
+    assert.match(String(r.behind), /^at aaaaaaaa, /);
+  }
+  const ahead = ev(Y, { n: 4, names: Y }, { prs: 4, entries: 10 });
+  assert.deepEqual(await publishOver(newer, ahead), { written: ahead, behind: null }, "control: evidence ahead of it is written");
+});
+
+test("a result published with no evidence keeps what the head carries, rather than erasing it", async () => {
+  const newer = ev(X, { n: 3, names: X }, { prs: 4, entries: 9 });
+  assert.deepEqual(await publishOver(newer, null), { written: newer, behind: null });
+  assert.deepEqual(await publishOver(null, null), { written: null, behind: null }, "control: and a head with none gets none");
+});
+
+test("another pull request's evidence, at a commit both are at, is written over, as that one's to keep", async () => {
+  const theirs = { ...ev(Y, { n: 9, names: Y }, { prs: 9, entries: 99 }), pr: 7 };
+  const ours = ev(X, { n: 1, names: X }, { prs: 1, entries: 1 });
+  assert.deepEqual(await publishOver(theirs, ours), { written: ours, behind: null });
+});
+
+test("the daemon raises a store behind what the merge policy published of it", async () => {
+  const dir = credentials();
+  const path = join(tempDir("reeve-pub-behind-"), "s.db");
+  open(path).close();
+  const r = await run({ openPrs: () => [PR], evaluate: () => at(A), dbPath: path, ticks: 1, ...host(dir),
+                        publish: async () => ({ ok: true, id: 1, conclusion: "neutral", behind: "at aaaaaaaa, it holds 1 entries in all, where 9 were published, so what was published there is kept" }) });
+  assert.match(r.esc, /#42: the store is behind what the merge policy published at aaaaaaaa, it holds 1 entries in all, where 9 were published/);
+  assert.match(r.log, /#42: the store is behind what was published at aaaaaaaa/);
+});
+
+test("a merge queue's result carries its pull request's evidence, where the queue's commit is that one pull request's", async () => {
+  const Q = "c".repeat(40), BASE = "d".repeat(40);
+  const judgedAt = ({ entry, input }) => { const i = { ...input, head: entry.sha }; return { ok: true, input: i, verdict: computeVerdict(i) }; };
+  const one = [];
+  const path = join(tempDir("reeve-pub-queue-"), "s.db");
+  open(path).close();
+  await run({ openPrs: () => [PR], evaluate: () => at(A), dbPath: path, ticks: 2, ...host(credentials()),
+              readQueue: () => ({ ok: true, queue: true, entries: [{ pr: PR, sha: Q, baseSha: BASE, state: "AWAITING_CHECKS" }] }), evaluateQueue: judgedAt,
+              publish: async (args) => { one.push(args); return { ok: true, id: 1, conclusion: "neutral" }; } });
+  const db = open(path);
+  const queuedRecord = db.prepare("SELECT digest FROM decision WHERE pr = ? AND head = ?").get(PR, Q)?.digest;
+  db.close();
+  const atQueue = one.filter((p) => p.queue);
+  assert.ok(queuedRecord && atQueue.length === 2, `control: the queue's commit was judged and published: ${atQueue.length}`);
+  assert.deepEqual(atQueue.map((p) => p.evidence?.record ?? null), [queuedRecord, queuedRecord]);
+  assert.equal(atQueue[1].evidence?.pr, PR);
+
+  const both = [];
+  const two = join(tempDir("reeve-pub-queue-"), "s.db");
+  open(two).close();
+  await run({ openPrs: () => [PR, 7], evaluate: ({ pr }) => ({ ...at(A), pr }), dbPath: two, ticks: 1, ...host(credentials()),
+              readQueue: () => ({ ok: true, queue: true, entries: [{ pr: PR, sha: Q, baseSha: BASE, state: "AWAITING_CHECKS" }, { pr: 7, sha: Q, baseSha: BASE, state: "AWAITING_CHECKS" }] }),
+              evaluateQueue: judgedAt, publish: async (args) => { both.push(args); return { ok: true, id: 1, conclusion: "neutral" }; } });
+  const batched = both.filter((p) => p.queue);
+  assert.equal(batched.length, 1, "control: the commit of two was published once");
+  assert.equal(batched[0].evidence ?? null, null, "a commit of two carries no one pull request's evidence");
+
+  const refused = [];
+  const refusing = join(tempDir("reeve-pub-queue-"), "s.db");
+  open(refusing).close();
+  const r0 = open(refusing);
+  r0.exec("CREATE TRIGGER refuse BEFORE INSERT ON decision BEGIN SELECT RAISE(ABORT, 'refused'); END;");
+  r0.close();
+  await run({ openPrs: () => [PR], evaluate: () => at(A), dbPath: refusing, ticks: 1, ...host(credentials()),
+              readQueue: () => ({ ok: true, queue: true, entries: [{ pr: PR, sha: Q, baseSha: BASE, state: "AWAITING_CHECKS" }] }), evaluateQueue: judgedAt,
+              publish: async (args) => { refused.push(args); return { ok: true, id: 1, conclusion: "neutral" }; } });
+  assert.deepEqual(refused.filter((p) => p.queue).map((p) => p.evidence ?? null), [null], "a queue's record the store refused isn't published as kept");
+});
+
 test("each result the daemon publishes names the record it kept, and where the pull request's signed order stood", async () => {
   const dir = credentials();
   const { path, published } = await ticks([at(A), at(A), at(A, "RED")], host(dir));

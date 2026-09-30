@@ -19,7 +19,7 @@ import { compare } from "./review/shadow.mjs";
 import { authenticate, apiAsInstallation, loadAppCredentials } from "./github/app.mjs";
 import { execFileSync } from "node:child_process";
 import { netTimeoutMs, netFailure } from "./net-bound.mjs";
-import { evidenceText } from "./published.mjs";
+import { evidenceText, readEvidence, evidenceBehind } from "./published.mjs";
 
 /**
  * The profile's CI settings, as far as this module reads them.
@@ -907,7 +907,7 @@ export const shadowContextOf = (context) => `${context} (shadow)`;
  */
 function existingRuns(token, nwo, sha, names, api = apiAsInstallation) {
   const r = api(token, ["--paginate", `repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=latest`,
-    "--jq", ".check_runs[] | {name, id, conclusion, app: .app.slug}"]);
+    "--jq", ".check_runs[] | {name, id, conclusion, app: .app.slug, summary: .output.summary}"]);
   if (!r.ok) return null;
   const rows = [];
   for (const line of (r.out ?? "").split("\n").filter(Boolean)) { try { rows.push(JSON.parse(line)); } catch { return null; } }
@@ -1126,7 +1126,9 @@ export const requiredOnBase = (args) => requirementsOnBase(args).own;
  *
  * `evidence`, where given, is written after the verdict: the record kept for it
  * and where the pull request's signed order stood (#274), for a copy of the
- * store to be checked against away from the host.
+ * store to be checked against away from the host. What's published there only
+ * moves forward: evidence behind what a head already carries, or none, never
+ * replaces it, and `behind` says so, for the daemon to raise.
  */
 export async function publishVerdict({ nwo, verdict, shadow = true, context = POLICY_CONTEXT, base = null, queue = false, evidence = null,
                                       auth: authenticateAs = authenticate, api = apiAsInstallation }) {
@@ -1152,15 +1154,25 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = PO
   // an UNKNOWN only a person can settle are settled there as anywhere: the last
   // lets the queue go on rather than hold every entry behind it to its timeout.
   const running = queue && !shadow && verdict.state === UNKNOWN && verdict.kind !== "person";
-  const tail = evidence ? evidenceText(evidence) : "";
+  const runs = existingRuns(auth.token, nwo, verdict.head, [name, context], api);
+  const existing = runs?.mine[name]?.id ?? null;
+  // The evidence already published at this head is GitHub's witness of the
+  // store, kept out of reach of whoever can change it (#274). So it only moves
+  // forward: a store behind it, rolled back or restored onto a host without its
+  // anchor, never writes older evidence, or none, over it, and would otherwise
+  // leave a copy as far behind to pass. Evidence of another pull request, at a
+  // commit both are at, is that one's, and is written over.
+  const was = readEvidence(runs?.mine[name]?.summary);
+  const prior = was && !("garbled" in was) && (!evidence || was.pr === evidence.pr) ? was : null;
+  const short = prior && evidence ? evidenceBehind(evidence, prior) : null;
+  const behind = short ? `at ${verdict.head.slice(0, 8)}, ${short}, so what was published there is kept` : null;
+  const tail = prior && (!evidence || short) ? evidenceText(prior) : evidence ? evidenceText(evidence) : "";
   const fields = [
     ...(running ? ["-f", "status=in_progress"] : ["-f", "status=completed", "-f", `conclusion=${conclusion}`]),
     "-f", `output[title]=${title.slice(0, 250)}`,
     // The evidence is kept whole, however long the verdict, as the check reads it back whole or not at all.
     "-f", `output[summary]=${body.slice(0, 60000 - tail.length)}${tail}`,
   ];
-  const runs = existingRuns(auth.token, nwo, verdict.head, [name, context], api);
-  const existing = runs?.mine[name]?.id ?? null;
 
   // Shadow mode supersedes first. A passing result an earlier version left under
   // the enforcement name passes that check for as long as it stands, so it is
@@ -1187,7 +1199,7 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = PO
   // Enforcing, a failed write is the whole story. In shadow mode it isn't: a
   // rule requiring the enforcement name still needs saying, or one failed write
   // would leave it unseen.
-  if (!res.ok && !shadow) return { ok: false, why: res.err.split("\n")[0] };
+  if (!res.ok && !shadow) return { ok: false, why: res.err.split("\n")[0], behind };
   const unwritten = res.ok ? null : `couldn't publish as ${name} (${res.err.split("\n")[0]})`;
 
   let held = null;
@@ -1218,8 +1230,8 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = PO
   const id = res.ok ? JSON.parse(res.out).id : null;
   if (unwritten || left)
     return { ok: false, why: [unwritten, left && (res.ok ? `published as ${name}, but ${left}` : left)].filter(Boolean).join("; "),
-             id, conclusion, name, wouldBe: real, shadow, updated: Boolean(existing), superseded, held };
-  return { ok: true, id, conclusion, name, wouldBe: real, shadow, updated: Boolean(existing), superseded, held };
+             id, conclusion, name, wouldBe: real, shadow, updated: Boolean(existing), superseded, held, behind };
+  return { ok: true, id, conclusion, name, wouldBe: real, shadow, updated: Boolean(existing), superseded, held, behind };
 }
 
 /**

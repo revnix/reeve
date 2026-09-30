@@ -2771,6 +2771,13 @@ export async function tick(ctx) {
       log(logPath, `    shadow: ${pub.held}`);
       raise(`shadow mode: ${pub.held}`);
     }
+    // The store is behind what the merge policy already published of it (#274):
+    // rolled back, or restored from before, perhaps onto a host without its
+    // anchor. What was published stands, and a person should know now.
+    if (pub.behind) {
+      log(logPath, `  #${pr}: the store is behind what was published ${pub.behind}`);
+      raise(`#${pr}: the store is behind what the merge policy published ${pub.behind}; it may have been rolled back or restored from before`);
+    }
 
     // A shared cause is one problem, not N. Four PRs blocked on a red base is a
     // single escalation, or the phone becomes noise and gets muted.
@@ -2874,6 +2881,8 @@ export async function tick(ctx) {
         try { j = (ctx.evaluateQueue ?? evaluateQueueEntry)({ nwo, entry, input: e.input, baseRef: base, profile, db }); }
         catch (err) { j = { ok: false, why: err.message }; }
         if (!j.ok) { log(logPath, `  ${at}: not judged — ${j.why}`); continue; }
+        // The record kept for it, once the store has it, for what's published of it (#274).
+        let record = null;
         let kept = null;
         try {
           kept = recordsFor({ nwo, pr: entry.pr, head: sha, tree: (ctx.treeOf ?? treeOf)(nwo, sha), input: j.input,
@@ -2894,12 +2903,12 @@ export async function tick(ctx) {
             if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr: entry.pr, head: sha, ...kept });
             return Number(decided.lastInsertRowid);
           });
-          if (kept) keptFor(entry.pr, kept.decision.digest, seq);
+          if (kept) { keptFor(entry.pr, kept.decision.digest, seq); record = kept.decision.digest; }
         } catch (err) {
           log(logPath, `  ${at}: the verdict could not be kept — ${err.message}`);
         }
         log(logPath, `  ${at}: ${j.verdict.state}`);
-        judged.push({ pr: entry.pr, verdict: j.verdict });
+        judged.push({ pr: entry.pr, verdict: j.verdict, record });
       }
       const prs = entries.map((x) => x.pr);
       const at = `queue commit ${sha.slice(0, 10)} (${prs.map((n) => `#${n}`).join(", ")})`;
@@ -2937,7 +2946,15 @@ export async function tick(ctx) {
       if (verdict.state === PASS && !prs.every((n) => noteQueued(n, { state: PASS, id: standing.get(n)?.id ?? null })))
         pub = { ok: false, why: "its PASS couldn't be written down first, so it isn't published" };
       else {
-        try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict, shadow, base, queue: true }); }
+        // With the evidence of its pull request, where the commit is one's: a
+        // queue that merges before that pull request's head is published again
+        // would otherwise leave its last record witnessed nowhere. A commit of
+        // several pull requests carries one result, and each of them is still
+        // counted in what's published for the rest (#274).
+        const one = judged.length === 1 && judged[0].record ? judged[0] : null;
+        const stood = one ? orderAt(one.pr) : undefined;
+        const evidence = one && stood !== undefined ? { pr: one.pr, record: /** @type {string} */ (one.record), ...stood } : null;
+        try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict, shadow, base, queue: true, evidence }); }
         catch (thrown) { pub = { ok: false, why: thrown.message }; }
       }
       // An enforcing PASS a shadow publication superseded here is cancelled, so

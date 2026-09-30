@@ -12099,12 +12099,12 @@ export const STUBS = [
   },
   {
     name: "replay-ordered-row-unreadable",
-    why: "read a decision row so that one whose record isn't JSON throws. Replay would stop at the very damage it's there to report",
+    why: "read a row an order names so that one whose record isn't JSON throws. Replay would stop at the very damage it's there to report",
     test: "test/signed-order.test.mjs",
     expectRed: "replay since a date reports a record its order names whose row can't be read, rather than stopping",
-    edits: [{ file: "src/db/records.mjs",
-              find: "  let record;\n  try { record = JSON.parse(row.record); }\n  catch (err) { return { ...row, record: null, corrupt: `its record can't be read: ${/** @type {Error} */ (err).message}` }; }",
-              replace: "  const record = JSON.parse(row.record);" }],
+    edits: [{ file: "src/decisions.mjs",
+              find: "      const d = row ? decisionOf(row) : null;\n      const why = !d ? \"the store no longer holds it\"",
+              replace: "      const d = row ? { ...decisionOf(row), record: JSON.parse(row.record) } : null;\n      const why = !d ? \"the store no longer holds it\"" }],
   },
   {
     name: "unreadable-record-refuses-bind",
@@ -12645,5 +12645,14 @@ export const STUBS = [
     edits: [{ file: "bin/reeve",
               find: "      if (flag(\"published\")) {",
               replace: "      if (false) {" }],
+  },
+  {
+    name: "decision-row-unreadable-said",
+    why: "read a decision row so that one whose record isn't JSON throws. why and replay would stop at the very damage they're there to report",
+    test: "test/published-order.test.mjs",
+    expectRed: "why says a latest record that can't be read can't be trusted, rather than stopping",
+    edits: [{ file: "src/db/records.mjs",
+              find: "  let record;\n  try { record = JSON.parse(row.record); }\n  catch (err) { return { ...row, record: null, corrupt: `its record can't be read: ${/** @type {Error} */ (err).message}` }; }",
+              replace: "  const record = JSON.parse(row.record);" }],
   },
 ];

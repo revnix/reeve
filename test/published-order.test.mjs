@@ -129,7 +129,7 @@ test("what was published is read from the merge policy's own results only, at th
 });
 
 test("a read of GitHub that fails vouches for nothing", () => {
-  assert.match(JSON.stringify(readPublished(REPO, PR, [A], { gh: () => ({ ok: false, out: "", err: "HTTP 502" }) })), /couldn't be read from GitHub: HTTP 502/);
+  assert.match(JSON.stringify(readPublished(REPO, PR, [A], { gh: () => ({ ok: false, out: "", err: "HTTP 502" }) })), /#42 couldn't be read from GitHub: HTTP 502/);
   const runsFail = (args) => (args[0] === `repos/${REPO}/pulls/${PR}` ? { ok: true, out: B } : { ok: false, out: "", err: "HTTP 502" });
   assert.match(JSON.stringify(readPublished(REPO, PR, [A], { gh: runsFail })), /results at bbbbbbbb couldn't be read from GitHub: HTTP 502/);
   const garbled = (args) => (args[0] === `repos/${REPO}/pulls/${PR}` ? { ok: true, out: B } : { ok: true, out: "{not json" });
@@ -217,6 +217,7 @@ test("only a record the store kept is published as the record of a verdict", asy
   db.exec("CREATE TRIGGER refuse BEFORE INSERT ON decision BEGIN SELECT RAISE(ABORT, 'refused'); END;");
   db.close();
   assert.deepEqual(await publishedOnce(refusing, host(credentials())), [null], "a record the store refused");
+  assert.ok((await publishedOnce(fresh(), host(credentials())))[0]?.record, "control: a record the store kept is published");
 });
 
 // ── checking a copy against it, away from the host ──────────────────────────

@@ -63,6 +63,9 @@ export const APPLIES = Object.freeze({
   // recorded decisions are replayed (#165).
   since: Object.freeze(["task dash", "replay", "trial"]),
 
+  // The trial's seeded known-bad cases, run for its report (#293).
+  seeded: Object.freeze(["trial"]),
+
   // The decision records' own flags (#165): which pull request's, or which
   // record, to replay, and which commit `why` explains.
   pr: Object.freeze(["replay"]),

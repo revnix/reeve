@@ -1127,10 +1127,12 @@ export const requiredOnBase = (args) => requirementsOnBase(args).own;
  * `evidence`, where given, is written after the verdict: the record kept for it
  * and where the pull request's signed order stood (#274), for a copy of the
  * store to be checked against away from the host. What's published there only
- * moves forward: evidence behind what a head already carries, or none, never
- * replaces it, and `behind` says so, for the daemon to raise.
+ * moves forward: evidence behind what a head already carries, under either of
+ * reeve's names, or none, never replaces it, and `behind` says so, for the
+ * daemon to raise. `entryAt` gives the record the store's order names at an
+ * entry, so a fork signed under a number already published is behind too.
  */
-export async function publishVerdict({ nwo, verdict, shadow = true, context = POLICY_CONTEXT, base = null, queue = false, evidence = null,
+export async function publishVerdict({ nwo, verdict, shadow = true, context = POLICY_CONTEXT, base = null, queue = false, evidence = null, entryAt = null,
                                       auth: authenticateAs = authenticate, api = apiAsInstallation }) {
   const auth = await authenticateAs(nwo);
   if (!auth.ok) return { ok: false, why: auth.why };
@@ -1161,10 +1163,14 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = PO
   // forward: a store behind it, rolled back or restored onto a host without its
   // anchor, never writes older evidence, or none, over it, and would otherwise
   // leave a copy as far behind to pass. Evidence of another pull request, at a
-  // commit both are at, is that one's, and is written over.
-  const was = readEvidence(runs?.mine[name]?.summary);
-  const prior = was && !("garbled" in was) && (!evidence || was.pr === evidence.pr) ? was : null;
-  const short = prior && evidence ? evidenceBehind(evidence, prior) : null;
+  // commit both are at, is that one's, and is written over. Under either of
+  // reeve's names: an enforcing result's evidence is as much a witness as a
+  // shadow one's, and a switch between them doesn't drop it.
+  const priors = [...new Set([name, context])].map((n) => readEvidence(runs?.mine[n]?.summary))
+    .filter((w) => w && !("garbled" in w) && (!evidence || w.pr === evidence.pr));
+  const prior = /** @type {import("./published.mjs").Evidence | null} */
+    (priors.find((p) => priors.every((q) => q === p || !evidenceBehind(/** @type {any} */ (p), /** @type {any} */ (q)))) ?? priors[0] ?? null);
+  const short = prior && evidence ? evidenceBehind(evidence, prior, entryAt) : null;
   const behind = short ? `at ${verdict.head.slice(0, 8)}, ${short}, so what was published there is kept` : null;
   const tail = prior && (!evidence || short) ? evidenceText(prior) : evidence ? evidenceText(evidence) : "";
   const fields = [
@@ -1184,9 +1190,12 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = PO
     stale = runs?.mine[context];
     if (!runs) left = `the check runs at ${verdict.head.slice(0, 8)} couldn't be read, so a passing result an earlier version may have left there under ${context} couldn't be superseded`;
     else if (stale && stale.app === POLICY_APP && PASSING_RUN.has(stale.conclusion)) {
+      // Superseded, it keeps the evidence it carried: GitHub's witness of the store stays where it was (#274).
+      const carried = readEvidence(stale.summary);
+      const kept = carried && !("garbled" in carried) ? evidenceText(carried) : "";
       const s = api(auth.token, ["-X", "PATCH", `repos/${nwo}/check-runs/${stale.id}`, "-f", "status=completed", "-f", "conclusion=cancelled",
         "-f", `output[title]=Superseded: shadow results now publish as ${name}`,
-        "-f", `output[summary]=This result was published in shadow mode under the enforcement check's name, where it could pass that check if a rule came to require it. Shadow results now publish as \`${name}\`.`]);
+        "-f", `output[summary]=This result was published in shadow mode under the enforcement check's name, where it could pass that check if a rule came to require it. Shadow results now publish as \`${name}\`.${kept}`]);
       superseded = s.ok;
       if (!s.ok) left = `the passing result an earlier version left under ${context} at ${verdict.head.slice(0, 8)} couldn't be superseded (${(s.err ?? "").split("\n")[0]})`;
     }

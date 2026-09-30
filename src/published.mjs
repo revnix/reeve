@@ -65,15 +65,21 @@ export function readEvidence(text) {
 
 /**
  * How evidence `e` falls short of `prior`, published before it for the same
- * pull request: an earlier entry of its order, or fewer pull requests' orders
- * or entries in the store, as a store rolled back or restored from before
- * would give. Null where it doesn't.
- * @param {Evidence} e @param {Evidence} prior
+ * pull request: an earlier entry of its order, or another record at the entry
+ * published, as a store restored onto a host without its anchor would sign
+ * under a number already published; or fewer pull requests' orders or entries
+ * in the store. `entryAt` gives the record the store's order names at an entry,
+ * where it can say; without it, only an entry of the same number is compared.
+ * Null where it doesn't fall short.
+ * @param {Evidence} e @param {Evidence} prior @param {((n: number) => string | undefined) | null} [entryAt]
  */
-export function evidenceBehind(e, prior) {
+export function evidenceBehind(e, prior, entryAt = null) {
   const n = e.order?.n ?? 0, was = prior.order?.n ?? 0;
+  const there = !prior.order || n < was ? undefined : entryAt ? entryAt(was) : n === was ? e.order?.names : undefined;
   const short = [
     n < was ? `the store's signed order of #${e.pr} ends at entry ${n}, where entry ${was} was published` : null,
+    there !== undefined && there !== prior.order?.names
+      ? `the store's entry ${was} of #${e.pr}'s signed order names ${String(there).slice(0, 12)}, where ${String(prior.order?.names).slice(0, 12)} was published` : null,
     e.store.prs < prior.store.prs ? `it holds the signed orders of ${e.store.prs} pull request(s), where ${prior.store.prs} were published` : null,
     e.store.entries < prior.store.entries ? `it holds ${e.store.entries} entries in all, where ${prior.store.entries} were published` : null,
   ].filter(Boolean);

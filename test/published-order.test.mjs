@@ -192,20 +192,23 @@ test("a published result carries its evidence after the verdict, however long th
  * What publishing `evidence` writes at a head whose result already carries
  * `prior`'s evidence (none where null), and whether it says the store is behind.
  */
-async function publishOver(prior, evidence) {
+async function publishOver(prior, evidence, { entryAt = null, name = "merge-policy (shadow)", conclusion = "neutral", also = [] } = {}) {
   const calls = [];
-  const run0 = prior ? JSON.stringify({ name: "merge-policy (shadow)", id: 5, conclusion: "neutral", app: "merge-policy", summary: `BLOCK: ci\n${evidenceText(prior)}` }) : "";
+  const run0 = [...(prior ? [{ name, id: 5, conclusion, evidence: prior }] : []), ...also]
+    .map((r, i) => JSON.stringify({ name: r.name, id: r.id ?? 6 + i, conclusion: r.conclusion, app: "merge-policy", summary: `BLOCK: ci\n${evidenceText(r.evidence)}` })).join("\n");
   const api = (_token, args) => {
     calls.push(args);
     if (args.includes("PATCH") || args.includes("POST")) return { ok: true, out: JSON.stringify({ id: 5 }) };
     if (args.join(" ").includes("/check-runs?")) return { ok: true, out: run0 };
     return { ok: true, out: "" };
   };
-  const r = await publishVerdict({ nwo: REPO, verdict: { head: A, state: "BLOCK", summary: "ci", clauses: [] }, shadow: true, evidence,
+  const r = await publishVerdict({ nwo: REPO, verdict: { head: A, state: "BLOCK", summary: "ci", clauses: [] }, shadow: true, evidence, entryAt,
                                    auth: async () => ({ ok: true, token: "t" }), api });
-  const write = calls.find((a) => a.includes("PATCH") || a.includes("POST")) ?? [];
-  const summary = String(write.find((x) => typeof x === "string" && x.startsWith("output[summary]=")) ?? "").slice("output[summary]=".length);
-  return { written: readEvidence(summary), behind: r.behind ?? null };
+  const summaryOf = (a) => String(a.find((x) => typeof x === "string" && x.startsWith("output[summary]=")) ?? "").slice("output[summary]=".length);
+  // The shadow result written: a new one, or the one at this head updated. A superseded result is written apart.
+  const write = calls.find((a) => a.includes("POST") || (a.includes("PATCH") && !a.includes("conclusion=cancelled"))) ?? [];
+  const superseded = calls.find((a) => a.includes("conclusion=cancelled"));
+  return { written: readEvidence(summaryOf(write)), behind: r.behind ?? null, ...(superseded ? { superseded: readEvidence(summaryOf(superseded)) } : {}) };
 }
 
 test("published evidence only moves forward: evidence behind what a head carries never replaces it, and says the store is behind", async () => {
@@ -222,6 +225,32 @@ test("published evidence only moves forward: evidence behind what a head carries
   }
   const ahead = ev(Y, { n: 4, names: Y }, { prs: 4, entries: 10 });
   assert.deepEqual(await publishOver(newer, ahead), { written: ahead, behind: null }, "control: evidence ahead of it is written");
+});
+
+test("a fork signed under an entry number already published is behind, not forward, whether or not it has gone further", async () => {
+  const published = ev(X, { n: 3, names: X }, { prs: 4, entries: 9 });
+  const fork = await publishOver(published, ev(Y, { n: 3, names: Y }, { prs: 4, entries: 9 }));
+  assert.deepEqual(fork.written, published, "the fork at the same number doesn't replace it");
+  assert.match(String(fork.behind), /the store's entry 3 of #42's signed order names d{12}, where c{12} was published/);
+  const further = ev(Y, { n: 5, names: Y }, { prs: 4, entries: 11 });
+  const on = await publishOver(published, further, { entryAt: (n) => (n === 3 ? Y : undefined) });
+  assert.deepEqual(on.written, published, "nor does one gone further, where the store's entry 3 names another record");
+  assert.match(String(on.behind), /the store's entry 3 of #42's signed order names d{12}, where c{12} was published/);
+  assert.deepEqual(await publishOver(published, further, { entryAt: (n) => (n === 3 ? X : undefined) }), { written: further, behind: null },
+                   "control: one gone further from the same entry is written");
+});
+
+test("switching from enforcing to shadow keeps the evidence the enforcing result carried, and holds a store behind it", async () => {
+  const enforced = ev(X, { n: 3, names: X }, { prs: 4, entries: 9 });
+  const r = await publishOver(enforced, ev(Y, { n: 2, names: Y }, { prs: 4, entries: 8 }), { name: "merge-policy", conclusion: "success" });
+  assert.deepEqual(r.superseded, enforced, "the superseded result keeps its evidence");
+  assert.deepEqual(r.written, enforced, "and the shadow result carries it, not the store's older evidence");
+  assert.match(String(r.behind), /ends at entry 2, where entry 3 was published/);
+  // With both names carrying evidence, the one furthest on is what the store is held to.
+  const both = await publishOver(ev(Y, { n: 2, names: Y }, { prs: 4, entries: 8 }), ev(Y, { n: 2, names: Y }, { prs: 4, entries: 8 }),
+                                 { also: [{ name: "merge-policy", conclusion: "success", evidence: enforced }] });
+  assert.deepEqual(both.written, enforced);
+  assert.match(String(both.behind), /ends at entry 2, where entry 3 was published/);
 });
 
 test("a result published with no evidence keeps what the head carries, rather than erasing it", async () => {
@@ -262,6 +291,7 @@ test("a merge queue's result carries its pull request's evidence, where the queu
   assert.ok(queuedRecord && atQueue.length === 2, `control: the queue's commit was judged and published: ${atQueue.length}`);
   assert.deepEqual(atQueue.map((p) => p.evidence?.record ?? null), [queuedRecord, queuedRecord]);
   assert.equal(atQueue[1].evidence?.pr, PR);
+  assert.equal(atQueue[1].entryAt?.(1), queuedRecord, "with what the store's order names at an entry");
 
   const both = [];
   const two = join(tempDir("reeve-pub-queue-"), "s.db");
@@ -297,6 +327,7 @@ test("each result the daemon publishes names the record it kept, and where the p
     // The order is extended at the tick's end, so it lags the record by a tick.
     { pr: PR, record: red, order: { n: 1, names: green }, store: { prs: 1, entries: 1 } },
   ]);
+  assert.equal(published[2].entryAt?.(1), green, "and says what the store's order names at an entry, so a fork is told from progress");
 });
 
 /** What one tick over the store at `path` publishes of #42 at A, red, with `ctx`. */

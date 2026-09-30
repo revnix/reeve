@@ -1516,7 +1516,7 @@ export async function tick(ctx) {
   // hold. Every order is checked once a tick, as none is extended until its end.
   // The host's anchor, read with them, says nothing of this store's orders where
   // another store is bound to it, or it can't be read.
-  /** @type {{ orders: Map<number, { top: number, digest: string | null }>, store: { prs: number, entries: number } } | null | undefined} */
+  /** @type {{ orders: Map<number, { top: number, digest: string | null, entries: Map<number, string> }>, store: { prs: number, entries: number } } | null | undefined} */
   let asPublished;
   const ordersAsPublished = () => {
     /** @type {import("./anchor.mjs").Anchor} */ let a;
@@ -1526,7 +1526,7 @@ export async function tick(ctx) {
     /** @type {Set<number>} */ const prs = new Set(a.latest.keys());
     for (const { subject } of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ? AND subject GLOB 'pr:[1-9]*' AND substr(subject, 4) NOT GLOB '*[^0-9]*' AND length(subject) <= 18`).all(LATEST_OP)))
       prs.add(Number(String(subject).slice(3)));
-    /** @type {Map<number, { top: number, digest: string | null }>} */ const orders = new Map();
+    /** @type {Map<number, { top: number, digest: string | null, entries: Map<number, string> }>} */ const orders = new Map();
     let entries = 0;
     for (const pr of prs) {
       const order = signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), store);
@@ -1544,6 +1544,8 @@ export async function tick(ctx) {
     const order = asPublished.orders.get(pr);
     return { order: order ? { n: order.top, names: /** @type {string} */ (order.digest) } : null, store: asPublished.store };
   };
+  // The record the store's order of `pr` names at entry `n`, as checked with the rest, for a publication to tell a fork from progress.
+  const entryAtOf = (/** @type {number} */ pr) => (/** @type {number} */ n) => asPublished?.orders.get(pr)?.entries.get(n);
   // The host's anchor moved to entry `top` of `pr`'s order, only once the store
   // has committed it: moved before, a transaction that failed would leave the
   // anchor ahead of its store, and its order never extended again. A write that
@@ -2725,7 +2727,7 @@ export async function tick(ctx) {
       // With the record kept for it, and where its signed order stood, where both can be said.
       const stood = decided.ok && kept ? orderAt(pr) : undefined;
       const evidence = stood === undefined ? null : { pr, record: /** @type {any} */ (kept).decision.digest, ...stood };
-      try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict: e.verdict, shadow, base: e.baseRef, evidence }); }
+      try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict: e.verdict, shadow, base: e.baseRef, evidence, ...(evidence ? { entryAt: entryAtOf(pr) } : {}) }); }
       // A publish that throws, a network error say, fails this pull request's
       // publication, not the tick for every one after it (#161).
       catch (err) { pub = { ok: false, why: err.message }; }
@@ -2954,7 +2956,7 @@ export async function tick(ctx) {
         const one = judged.length === 1 && judged[0].record ? judged[0] : null;
         const stood = one ? orderAt(one.pr) : undefined;
         const evidence = one && stood !== undefined ? { pr: one.pr, record: /** @type {string} */ (one.record), ...stood } : null;
-        try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict, shadow, base, queue: true, evidence }); }
+        try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict, shadow, base, queue: true, evidence, ...(evidence && one ? { entryAt: entryAtOf(one.pr) } : {}) }); }
         catch (thrown) { pub = { ok: false, why: thrown.message }; }
       }
       // An enforcing PASS a shadow publication superseded here is cancelled, so

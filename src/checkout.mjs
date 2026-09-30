@@ -96,7 +96,7 @@ function run(cwd, neutralise, args, env, { raw = false, input = undefined, timeo
     return { ok: true, out: raw ? out : out.trim() };
   // `reason` picks git's own fatal line rather than the last thing it printed,
   // which is usually progress narration and sends the reader somewhere else.
-  } catch (e) { return { ok: false, out: "", err: e?.code === "ETIMEDOUT" ? netFailure(e) : reason(e.stderr || e.message) }; }
+  } catch (e) { return { ok: false, out: "", err: e?.code === "ETIMEDOUT" ? netFailure(e) : reason(e.stderr || e.message), timedOut: e?.code === "ETIMEDOUT" }; }
 }
 
 /** What reeve will read of a tree's attributes files before it refuses instead.
@@ -490,6 +490,26 @@ export function fetchRunWork({ repoRoot, path, branch, into = null }) {
 }
 
 /**
+ * What came of a push stopped at the network bound (#284): the remote may have
+ * taken it and answered late, so it's no refusal. The remote's head is read
+ * again, bounded too. At the pushed head, it was published. Anywhere else,
+ * still at the head it was expected at included, or unread, whether it landed
+ * isn't known, and says so: the remote may still be applying a push its client
+ * was stopped waiting on, so the head it had a moment ago proves nothing.
+ * @param {string} repoRoot @param {string} branch @param {string} head @param {string | null} expected
+ */
+function settleStoppedPush(repoRoot, branch, head, expected) {
+  const stopped = `the push didn't answer within ${netTimeoutMs() / 1000} seconds`;
+  const ls = founderGit(repoRoot, ["ls-remote", "origin", `refs/heads/${branch}`]);
+  const now = ls.ok ? (ls.out.split(/\s+/)[0] ?? "") : null;
+  if (now === head) return { ok: true, why: null, head };
+  const seen = !ls.ok ? `the remote couldn't be read: ${ls.err}`
+    : expected && now === expected ? `the remote was still at ${expected.slice(0, 10)} when read again, and the push may yet land`
+    : `the remote is at ${now ? now.slice(0, 10) : "no branch"}`;
+  return { ok: false, unknown: true, why: `${stopped}, and whether it landed isn't known: ${seen}` };
+}
+
+/**
  * Publish the worker's work, from REEVE's checkout, never the worker's.
  *
  * The commits exist only in the run's clone, so they are fetched into reeve's
@@ -534,12 +554,12 @@ export function publishRunWork({ repoRoot, path, branch, expectedRemote = null }
     if (!ff.ok) return { ok: false, why: `the worker's branch does not descend from ${expectedRemote.slice(0, 10)}; reeve does not rewrite published history` };
     const leased = founderGit(repoRoot, ["push", `--force-with-lease=refs/heads/${branch}:${expectedRemote}`,
                                        "origin", `${fetched.ref}:refs/heads/${branch}`]);
-    if (!leased.ok) return { ok: false, why: `push refused: ${leased.err}` };
+    if (!leased.ok) return leased.timedOut ? settleStoppedPush(repoRoot, branch, fetched.head, expectedRemote) : { ok: false, why: `push refused: ${leased.err}` };
     return { ok: true, why: null, head: fetched.head };
   }
   // Never force: a worker's fix is not worth another party's commit.
   const pushed = founderGit(repoRoot, ["push", "origin", `${fetched.ref}:refs/heads/${branch}`]);
-  if (!pushed.ok) return { ok: false, why: `push refused: ${pushed.err}` };
+  if (!pushed.ok) return pushed.timedOut ? settleStoppedPush(repoRoot, branch, fetched.head, null) : { ok: false, why: `push refused: ${pushed.err}` };
   return { ok: true, why: null, head: fetched.head };
 }
 

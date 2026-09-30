@@ -1884,8 +1884,8 @@ async function tickOnce(ctx) {
         // stops.
         //
         // This catch is reachable in a way the `ok:false` branch is not:
-        // `authenticate` can THROW rather than return -- `apiAsApp` uses an
-        // uncaught `fetch`, so a DNS, TLS or connection failure arrives here. And
+        // `authenticate` can still THROW rather than return -- on an answer that
+        // isn't JSON, say; a request that got no answer fails it (#296). And
         // silence would be worse than a missing alert: on an otherwise complete
         // tick, a standing authentication escalation that this tick did not
         // re-raise is CLEARED, so a persistent outage would announce itself once

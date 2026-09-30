@@ -15,6 +15,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { resolveHome } from "../home.mjs";
+import { netTimeoutMs } from "../net-bound.mjs";
 
 // A FUNCTION, not a constant. As a module-level constant this was evaluated
 // at import -- before `bin/reeve` had resolved `--home` -- and it consulted
@@ -55,22 +56,62 @@ export function mintAppJwt({ appId, keyPath }) {
   return `${header}.${payload}.${sig}`;
 }
 
-/** Call the API as the App itself, with a Bearer header gh cannot produce. */
-async function apiAsApp(jwt, path, init = {}) {
-  const r = await fetch(`https://api.github.com/${path}`, {
-    ...init,
-    headers: { Authorization: `Bearer ${jwt}`, Accept: "application/vnd.github+json", "User-Agent": "reeve", ...(init.headers ?? {}) },
-  });
-  const text = await r.text();
-  if (!r.ok) return { ok: false, status: r.status, err: text.slice(0, 300) };
-  return { ok: true, status: r.status, out: text };
+/**
+ * Why a request to GitHub got no answer (#296). `fetch` says only "fetch
+ * failed", and keeps the reason in its `cause`: a name that didn't resolve, a
+ * connection refused or reset, a handshake that failed. One stopped at its bound
+ * says so.
+ * @param {unknown} e
+ */
+export function fetchFailure(e) {
+  const err = /** @type {any} */ (e);
+  if (err?.name === "TimeoutError") return `it didn't answer within ${netTimeoutMs() / 1000} seconds, so it was stopped`;
+  const c = err?.cause;
+  // A connection tried at more than one address fails with each address's error.
+  const causes = Array.isArray(c?.errors) && c.errors.length ? c.errors : c ? [c] : [];
+  const why = [...new Set(causes.map((/** @type {any} */ x) => String(x?.message || x?.code || x)))].join("; ");
+  return why ? `${err?.message ?? "fetch failed"} (${why})` : String(err?.message ?? err);
 }
 
-/** Which installation covers this repo? */
-export async function findInstallation(jwt, nwo) {
+/**
+ * Call the API as the App itself, with a Bearer header gh cannot produce.
+ * Bounded, as every other call the daemon makes over the network is (#282), and
+ * asked once more, a moment later, where no answer came: asking for the
+ * installation or a token again does no harm, and a connection the host lost
+ * in a sleep is often back by then (#296). An answer, whatever its status, is
+ * never asked for again. One that got no answer is `unanswered`, with why.
+ * @param {string} jwt @param {string} path @param {RequestInit} [init]
+ * @param {{ pause?: (ms: number) => Promise<unknown> }} [o]  `pause`: waits between the two, a test's to skip
+ */
+async function apiAsApp(jwt, path, init = {}, { pause = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
+  let why = "";
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    if (attempt > 1) await pause(2000);
+    try {
+      const r = await fetch(`https://api.github.com/${path}`, {
+        ...init,
+        headers: { Authorization: `Bearer ${jwt}`, Accept: "application/vnd.github+json", "User-Agent": "reeve", ...(init.headers ?? {}) },
+        signal: AbortSignal.timeout(netTimeoutMs()),
+      });
+      const text = await r.text();
+      if (!r.ok) return { ok: false, status: r.status, err: text.slice(0, 300) };
+      return { ok: true, status: r.status, out: text };
+    } catch (e) { why = fetchFailure(e); }
+  }
+  return { ok: false, status: 0, unanswered: true, err: `GitHub didn't answer, asked twice: ${why}` };
+}
+
+/** Why a request failed: its status and GitHub's first line, or why no answer came. */
+const failed = (/** @type {{ status: number, err: string, unanswered?: boolean }} */ r) => (r.unanswered ? r.err : `HTTP ${r.status}: ${r.err.split("\n")[0]}`);
+
+/**
+ * Which installation covers this repo?
+ * @param {string} jwt @param {string} nwo @param {{ pause?: (ms: number) => Promise<unknown> }} [o]
+ */
+export async function findInstallation(jwt, nwo, o = {}) {
   const [owner, repo] = nwo.split("/");
-  const r = await apiAsApp(jwt, `repos/${owner}/${repo}/installation`);
-  if (!r.ok) return { ok: false, why: `HTTP ${r.status}: ${r.err.split("\n")[0]}` };
+  const r = await apiAsApp(jwt, `repos/${owner}/${repo}/installation`, {}, o);
+  if (!r.ok) return { ok: false, why: failed(r), unanswered: Boolean(r.unanswered) };
   const inst = JSON.parse(r.out);
   // `app_slug` is carried because it is the only way to know what reeve's own
   // comments are AUTHORED as: a GitHub App writes as `<app_slug>[bot]`, and a
@@ -80,10 +121,13 @@ export async function findInstallation(jwt, nwo) {
            permissions: inst.permissions, repositorySelection: inst.repository_selection };
 }
 
-/** An installation token: one hour, scoped to the repos the App is installed on. */
-export async function mintInstallationToken(jwt, installationId) {
-  const r = await apiAsApp(jwt, `app/installations/${installationId}/access_tokens`, { method: "POST" });
-  if (!r.ok) return { ok: false, why: `HTTP ${r.status}: ${r.err.split("\n")[0]}` };
+/**
+ * An installation token: one hour, scoped to the repos the App is installed on.
+ * @param {string} jwt @param {number} installationId @param {{ pause?: (ms: number) => Promise<unknown> }} [o]
+ */
+export async function mintInstallationToken(jwt, installationId, o = {}) {
+  const r = await apiAsApp(jwt, `app/installations/${installationId}/access_tokens`, { method: "POST" }, o);
+  if (!r.ok) return { ok: false, why: failed(r) };
   const j = JSON.parse(r.out);
   return { ok: true, token: j.token, expiresAt: j.expires_at, permissions: j.permissions };
 }
@@ -135,16 +179,20 @@ export function apiAsInstallation(token, args, { timeoutMs = 60_000, maxBuffer =
   }
 }
 
-/** One call: credentials to a usable installation token. */
-export async function authenticate(nwo, name = "merge-policy") {
+/**
+ * One call: credentials to a usable installation token. A request GitHub didn't
+ * answer fails it, with why, rather than throwing (#296).
+ * @param {string} nwo @param {string} [name] @param {{ pause?: (ms: number) => Promise<unknown> }} [o]
+ */
+export async function authenticate(nwo, name = "merge-policy", o = {}) {
   const cred = loadAppCredentials(name);
   if (!cred.ok) return cred;
   let jwt;
   try { jwt = mintAppJwt(cred); }
   catch (e) { return { ok: false, why: `could not sign a JWT with ${cred.keyPath}: ${e.message}` }; }
-  const inst = await findInstallation(jwt, nwo);
-  if (!inst.ok) return { ok: false, why: `no installation for ${nwo}: ${inst.why}` };
-  const tok = await mintInstallationToken(jwt, inst.id);
+  const inst = await findInstallation(jwt, nwo, o);
+  if (!inst.ok) return { ok: false, why: inst.unanswered ? `the App's installation on ${nwo} couldn't be asked for: ${inst.why}` : `no installation for ${nwo}: ${inst.why}` };
+  const tok = await mintInstallationToken(jwt, inst.id, o);
   if (!tok.ok) return { ok: false, why: tok.why };
   return { ok: true, token: tok.token, expiresAt: tok.expiresAt, installationId: inst.id, appId: cred.appId,
            account: inst.account, permissions: tok.permissions, repositorySelection: inst.repositorySelection,

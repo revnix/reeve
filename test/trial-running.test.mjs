@@ -4,6 +4,7 @@
 // too, and the time inside a tick is running, as long as a tick may take.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { open } from "../src/db/ops.mjs";
 import { trialReport } from "../src/trial.mjs";
@@ -22,7 +23,9 @@ function store() {
     if (start !== null) put(start, "daemon.tick.started");
     if (end !== null) put(end, "daemon.tick");
   };
-  return { db, path, tick };
+  /** A tick started at `start` that stopped at `at` without judging: halted, unable to list the pull requests, or thrown. */
+  const stopped = (/** @type {number} */ start, /** @type {number} */ at) => { put(start, "daemon.tick.started"); put(at, "daemon.tick.stopped"); };
+  return { db, path, tick, stopped };
 }
 /** The report from `since` to `now`, merging nothing. */
 const report = (/** @type {any} */ db, /** @type {number} */ since, /** @type {number} */ now) => trialReport(db, { repo: R, since, now, merged: [] });
@@ -149,4 +152,47 @@ test("a report that falls inside one tick still running is running throughout", 
   s.db.close();
   assert.deepEqual(r.running.down, []);
   assert.ok(Math.abs(r.running.hours - 10 / 60) < 0.001, `${r.running.hours} hours`);
+});
+
+// ── #301's third review ──────────────────────────────────────────────────────
+
+test("a tick that stopped without judging is downtime from its start, a report made before the next tick included", () => {
+  const s = store();
+  ticking(s, T0, T0 + HOUR);
+  s.stopped(T0 + HOUR, T0 + HOUR + MIN);
+  const r = report(s.db, T0, T0 + HOUR + 10 * MIN);
+  s.db.close();
+  assert.deepEqual(r.running.down, [{ from: T0 + HOUR, to: T0 + HOUR + 10 * MIN }]);
+});
+
+/** The daemon's tick events in the store at `path`, in the order they were recorded. */
+const tickOps = (/** @type {string} */ path) => {
+  const db = open(path);
+  const ops = db.prepare("SELECT op FROM event WHERE op LIKE 'daemon.tick%' ORDER BY seq").all().map((/** @type {any} */ e) => e.op);
+  db.close();
+  return ops;
+};
+
+test("the daemon marks a tick that halts, can't list the pull requests, or throws as stopped", async () => {
+  const fresh = () => { const p = join(tempDir("reeve-trial-running-stop-"), "s.db"); open(p).close(); return p; };
+  const unread = fresh();
+  await run({ dbPath: unread, openPrs: () => null, prState: () => "OPEN", prIsFinished: () => false });
+  const halted = fresh();
+  const marker = join(tempDir("reeve-trial-running-halt-"), "HALT");
+  writeFileSync(marker, "");
+  await run({ dbPath: halted, haltMarker: marker, openPrs: () => [], prState: () => "OPEN", prIsFinished: () => false });
+  const threw = fresh();
+  try { await run({ dbPath: threw, openPrs: () => { throw new Error("database is locked"); }, prState: () => "OPEN", prIsFinished: () => false }); }
+  catch { /* the tick's to throw; its mark is what's checked */ }
+  for (const [what, path] of Object.entries({ unread, halted, threw }))
+    assert.deepEqual(tickOps(path), ["daemon.tick.started", "daemon.tick.stopped"], what);
+});
+
+test("a tick that stopped just before the report's start is downtime from the start, until the next tick", () => {
+  const s = store();
+  s.stopped(T0 - 2 * MIN, T0 - MIN);
+  ticking(s, T0 + 10 * MIN, T0 + HOUR);
+  const r = report(s.db, T0, T0 + HOUR);
+  s.db.close();
+  assert.deepEqual(r.running.down, [{ from: T0, to: T0 + 10 * MIN }]);
 });

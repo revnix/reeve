@@ -128,6 +128,21 @@ export function noteTickStart(db, at = Math.floor(Date.now() / 1000)) {
   } catch { /* a store that cannot record must not stop the loop */ }
 }
 
+/** The event a tick that stopped without judging is recorded as (#301): halted, unable to list the pull requests, or thrown. */
+export const TICK_STOPPED = "daemon.tick.stopped";
+
+/**
+ * A tick's stop, recorded where it ends without judging (#301). Its start was
+ * recorded, and without this, a report made before the next tick would take it
+ * for a tick still running.
+ */
+export function noteTickStopped(db, at = Math.floor(Date.now() / 1000)) {
+  try {
+    db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
+      .run(at, "daemon", TICK_STOPPED, null, "{}");
+  } catch { /* a store that cannot record must not stop the loop */ }
+}
+
 export function noteTick(db, at = Math.floor(Date.now() / 1000)) {
   try {
     db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)

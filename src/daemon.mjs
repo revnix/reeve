@@ -33,7 +33,7 @@ import { claimProvider, releaseProvider, bindProviderLease, noteRateLimit, heart
 import { openHold } from "./build/holds.mjs";
 import { hubSession, NO_HUB } from "./build/hubsession.mjs";
 import { resolveRepoId } from "./build/repoid.mjs";
-import { readState, noteTick, noteTickStart, cleanMergeRate } from "./status.mjs";
+import { readState, noteTick, noteTickStart, noteTickStopped, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify, printable } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects, reap, canonical, durably } from "./db/ops.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
@@ -1359,7 +1359,21 @@ const RATE_LIMIT_COOLDOWN_SECONDS = 600;
  */
 export const CANARY_PAGE = "guardian:sandbox:canary-failed";
 
+/**
+ * One tick, its start and end recorded (#297). One that stops without judging,
+ * halted, unable to list the pull requests, or thrown, is recorded as stopped
+ * (#301): a report made before the next tick would otherwise take it for a tick
+ * still running.
+ */
 export async function tick(ctx) {
+  let r;
+  try { r = await tickOnce(ctx); }
+  catch (err) { noteTickStopped(ctx.db); throw err; }
+  if (r?.halted || r?.unreadable) noteTickStopped(ctx.db);
+  return r;
+}
+
+async function tickOnce(ctx) {
   // The code a verdict is recorded as judged by, taken before anything is read
   // or evaluated: a checkout that moves during the tick's reads doesn't change
   // what this process loaded (#165).

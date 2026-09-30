@@ -83,6 +83,14 @@ export function baselineStatement(digests) {
 }
 
 /**
+ * A baseline's fingerprint, as its statement names it: sha256 over the records
+ * it names, sorted, one per line. The host's anchor holds it while it's being
+ * bound to a store (#281).
+ * @param {string[]} digests
+ */
+export const baselineFingerprint = (digests) => baselineStatement(digests).subject[0].digest.sha256;
+
+/**
  * Entry `n` of a pull request's signed order of decisions (#274): the record that
  * became its latest decision then, numbered from 1, so which record is latest is
  * signed too, not read from the store's own order. With every other record kept

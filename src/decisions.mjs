@@ -74,10 +74,11 @@ export function signingState(db, keys, anchor = null) {
  * twice. With no store to check against, none is taken while the store holds any
  * entry. `top` is its highest entry and
  * `digest` the record that names as latest; 0 and null when the store holds
- * none. `digests` is every record it names, as latest or kept, and `seq` where
- * in the store's sequence its top entry's latest was seen, null where it doesn't say.
+ * none. `digests` is every record it names, as latest or kept, `entries` the
+ * record each entry names as latest, by number, and `seq` where in the store's
+ * sequence its top entry's latest was seen, null where it doesn't say.
  * @param {Db} db @param {string} repo @param {number} pr @param {Keys} keys @param {string | null} [store]
- * @returns {{ top: number, digest: string | null, digests: Set<string>, seq: number | null } | { corrupt: string }}
+ * @returns {{ top: number, digest: string | null, digests: Set<string>, entries: Map<number, string>, seq: number | null } | { corrupt: string }}
  */
 export function signedOrder(db, repo, pr, keys, store = storeIdentity(db)) {
   // An entry filed under anything but a pull request's own name is found by no
@@ -117,7 +118,7 @@ export function signedOrder(db, repo, pr, keys, store = storeIdentity(db)) {
   }
   const top = byN.size ? Math.max(...byN.keys()) : 0;
   for (let n = 1; n <= top; n++) if (!byN.has(n)) return { corrupt: `its signed order is missing entry ${n}` };
-  return { top, digest: top ? /** @type {string} */ (byN.get(top)) : null, digests: named, seq: top ? seqs.get(top) ?? null : null };
+  return { top, digest: top ? /** @type {string} */ (byN.get(top)) : null, digests: named, entries: byN, seq: top ? seqs.get(top) ?? null : null };
 }
 
 /**
@@ -225,6 +226,41 @@ export function anchorForStore(db, anchor, repo) {
 const orderStore = (db, anchor) => anchor?.anchor?.store ?? storeIdentity(db);
 
 /**
+ * What the host's anchor says of a pull request's signed order besides how far
+ * it goes (#279), as why the store isn't current: the record noted at its top
+ * that the store's entry there doesn't name, as a copy of the store signed
+ * another under that number; an entry reserved that the store's order doesn't
+ * hold yet, until a reeve completes it; and each record this host kept and
+ * pinned that the store no longer holds and no entry names, taken away though
+ * the reeve that kept it stopped before ordering it.
+ * @param {{ top: number, digests: Set<string>, entries: Map<number, string> }} order
+ * @param {number} pr @param {AnchorRead | null} anchor @param {(digest: string) => boolean} held
+ * @returns {string[]}
+ */
+function anchoredFaults(order, pr, anchor, held) {
+  const a = anchor?.anchor;
+  if (!a) return [];
+  /** @type {string[]} */ const out = [];
+  const anchored = a.latest.get(pr) ?? 0;
+  const noted = a.named?.get(pr);
+  if (anchored && noted && order.top >= anchored && order.entries.get(anchored) !== noted)
+    out.push(`entry ${anchored} of its signed order names record ${short(String(order.entries.get(anchored)))}, though this host noted record ${short(noted)} there: ` +
+             "a copy of this store signed another record under that number");
+  const r = a.reserved?.get(pr);
+  if (r && order.top >= r.n && order.entries.get(r.n) !== r.digest)
+    out.push(`entry ${r.n} of its signed order names record ${short(String(order.entries.get(r.n)))}, though this host reserved it for record ${short(r.digest)}: ` +
+             "a copy of this store signed another record under that number");
+  else if (r && order.top < r.n)
+    out.push(`this host reserved entry ${r.n} of its signed order for record ${short(r.digest)}, which its order doesn't hold yet` +
+             `${held(r.digest) ? ", until a reeve completes it" : ", and the store doesn't hold that record: a copy of this store may have signed it"}`);
+  const gone = [...(a.pinned?.get(pr) ?? [])].filter((d) => !order.digests.has(d) && !held(d));
+  if (gone.length)
+    out.push(`this host kept ${gone.length === 1 ? "record" : `${gone.length} records`} ${gone.map(short).join(", ")} for it, which the store no longer holds ` +
+             "and no entry of its signed order names: taken away");
+  return out;
+}
+
+/**
  * What a pull request's signed order, and the host's anchor, say of which
  * record is its latest (#274): why `digest` can't be trusted as that, or null
  * when it can. `order` null is no order read, when the repository isn't known.
@@ -233,14 +269,17 @@ const orderStore = (db, anchor) => anchor?.anchor?.store ?? storeIdentity(db);
  * @param {number} anchored  the highest entry the host signed, 0 for none
  * @param {AnchorRead | null} anchor
  * @param {(digest: string) => boolean} held  whether the store holds a record
+ * @param {number} pr
  */
-function notLatest(digest, order, anchored, anchor, held) {
+function notLatest(digest, order, anchored, anchor, held, pr) {
   if (anchor?.why) return anchor.why;
   if (!order) return null;
   if ("corrupt" in order) return order.corrupt;
   if (order.top < anchored)
     return `its signed order ends at entry ${order.top}, though this host signed up to entry ${anchored}: ` +
            "newer records were taken away, or the store restored from before";
+  const faults = anchoredFaults(order, pr, anchor, held);
+  if (faults.length) return faults.join("; and ");
   if (order.digest && order.digest !== digest)
     return `its signed order ends at record ${short(order.digest)}${held(order.digest) ? "" : ", which the store no longer holds"}`;
   return null;
@@ -311,7 +350,7 @@ export function explainDecision(db, pr, { head = null, keys = null, repo = null,
   if (d.corrupt) out.push(`  this record can't be trusted: ${d.corrupt} (record ${short(d.digest)}); it was changed after it was kept`);
   else if (sig?.state === "corrupt") out.push(`  this record can't be trusted: ${sig.why} (record ${short(d.digest)})`);
   const held = (/** @type {string} */ digest) => Boolean(db.prepare(`SELECT 1 FROM decision WHERE digest = ? LIMIT 1`).get(digest));
-  const notIt = keys && head === null ? notLatest(d.digest, order, anchored, anchor, held) : null;
+  const notIt = keys && head === null ? notLatest(d.digest, order, anchored, anchor, held, pr) : null;
   if (notIt) out.push(`  this record can't be trusted as the latest: ${notIt}`);
   out.push(`${r.verdict.state} at ${short(r.subject.head)}, tree ${short(r.subject.tree)}, judged ${span(d.first_at, d.last_at)} (record ${short(d.digest)})`);
   if (sig?.state === "signed") out.push(`  signed by key ${short(sig.keyid)}, ${sig.where}`);
@@ -479,6 +518,9 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
     // a rollback takes the very records the date would have matched.
     for (const r of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ? AND subject GLOB 'pr:[1-9]*' AND substr(subject, 4) NOT GLOB '*[^0-9]*' AND length(subject) <= 18`).all(LATEST_OP))) prs.add(Number(String(r.subject).slice(3)));
     for (const pr of anchor?.anchor?.latest.keys() ?? []) prs.add(pr);
+    // And every one the anchor reserved an entry of, or pinned a record for (#279).
+    for (const pr of anchor?.anchor?.reserved?.keys() ?? []) prs.add(pr);
+    for (const pr of anchor?.anchor?.pinned?.keys() ?? []) prs.add(pr);
   }
   // Each record an order names, as the store holds it: a row that isn't that
   // record, or is another pull request's, is no more held than one taken away,
@@ -495,6 +537,7 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
     if (order.top < anchored)
       out.push(fault(pr, order.digest ?? "", `its signed order ends at entry ${order.top}, though this host signed up to entry ${anchored}: ` +
                                              "newer records were taken away, or the store restored from before"));
+    for (const why of anchoredFaults(order, pr, anchor, (d) => Boolean(rowOf.get(d)))) out.push(fault(pr, order.digest ?? "", why));
     for (const digest of order.digests) {
       if (checked.has(`${pr} ${digest}`)) continue;
       const row = rowOf.get(digest);

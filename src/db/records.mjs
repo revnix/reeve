@@ -44,6 +44,8 @@ function hexStart(typed, what, max) {
  *           signed?: { envelope?: string, unsigned?: string } }} r
  */
 export function saveDecision(db, { at, seq, pr, head, policy, evidence, decision, signed = {} }) {
+  // Whether the store held it before: a record seen again was kept already.
+  const fresh = !db.prepare(`SELECT 1 FROM decision WHERE digest = ?`).get(decision.digest);
   db.prepare(`INSERT INTO policy(hash, body, first_seen) VALUES(?,?,?) ON CONFLICT(hash) DO NOTHING`)
     .run(policy.hash, canonical(policy.body), at);
   const put = db.prepare(`INSERT INTO evidence(digest, kind, statement, first_seen, last_seen) VALUES(?,?,?,?,?)
@@ -56,6 +58,7 @@ export function saveDecision(db, { at, seq, pr, head, policy, evidence, decision
                 envelope = COALESCE(decision.envelope, excluded.envelope),
                 unsigned = CASE WHEN COALESCE(decision.envelope, excluded.envelope) IS NULL THEN excluded.unsigned END`)
     .run(decision.digest, pr, head, canonical(decision.record), at, at, seq, seq, envelope, unsigned);
+  return { fresh };
 }
 
 /** The event that says a store began signing, with its baseline (#165). */

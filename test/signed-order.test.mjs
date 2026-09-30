@@ -3,7 +3,7 @@
 // short, or restored from before, doesn't pass for the one the host kept.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -59,6 +59,8 @@ async function ticks(evals, ctx, dbPath = null) {
 const anchorOf = (dir) => { try { return { anchor: readAnchor(dir, REPO), why: null }; } catch (e) { return { anchor: null, why: e.message }; } };
 /** The same, checked against the store it's read beside, as bin/reeve gives it. */
 const anchorFor = (db, dir) => anchorForStore(db, anchorOf(dir), REPO);
+/** An anchor as read, with the parts #279 and #281 added empty unless given. */
+const anchorAs = (a) => ({ named: new Map(), reserved: new Map(), pinned: new Map(), pending: null, ...a });
 /** The digests of #42's records, oldest first. */
 const digestsOf = (db) => db.prepare("SELECT digest FROM decision WHERE pr = ? ORDER BY first_seq").all(PR).map((r) => r.digest);
 
@@ -135,7 +137,7 @@ test("the host's anchor is written whole, its folder and every folder made for i
   assert.equal(anchor.note(REPO, 7, 1), true, "control: it was written");
   const file = anchorPath(dir, REPO);
   for (const d of [dirname(file), dirname(dirname(file)), dir]) assert.ok(seen.includes(d), `${d} synced: ${JSON.stringify(seen)}`);
-  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { began: true, latest: { 7: 1 }, store: null });
+  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { began: true, latest: { 7: 1 }, store: null, named: {}, reserved: {}, pinned: {}, pending: null });
   // And by a writer that made none of them, as a reeve after a restart is: a
   // sync that failed before it started is made again.
   const again = [];
@@ -149,7 +151,7 @@ test("the host's anchor only moves forward", () => {
   anchor.note(REPO, 7, 3);
   anchor.note(REPO, 7, 2);
   anchor.note(REPO, 9, 1);
-  assert.deepEqual(readAnchor(dir, REPO), { began: true, latest: new Map([[7, 3], [9, 1]]), store: null });
+  assert.deepEqual(readAnchor(dir, REPO), anchorAs({ began: true, latest: new Map([[7, 3], [9, 1]]), store: null }));
 });
 
 test("an anchor that can't be read vouches for nothing, and isn't written over", async () => {
@@ -305,7 +307,7 @@ test("an anchor that isn't one, or isn't a file, is never read as one", () => {
     assert.throws(() => readAnchor(dir, REPO), /can't be read: it isn't an anchor/, text);
   }
   writeFileSync(file, '{"began":true,"latest":{"7":2}}');
-  assert.deepEqual(readAnchor(dir, REPO), { began: true, latest: new Map([[7, 2]]), store: null }, "control: an anchor reads as one");
+  assert.deepEqual(readAnchor(dir, REPO), anchorAs({ began: true, latest: new Map([[7, 2]]), store: null }), "control: an anchor reads as one");
 });
 
 test("an anchor that's a pipe is refused before it's opened, so reading it can't wait for ever", () => {
@@ -399,7 +401,7 @@ test("a store the host's anchor is bound to says there that it began signing, th
   // Bound to the store and saying nothing more. Binding says the store began
   // too, so no reeve leaves it so; whatever did, the next tick says it.
   writeFileSync(anchorPath(dir, REPO), JSON.stringify({ began: false, latest: {}, store: id }));
-  assert.deepEqual(readAnchor(dir, REPO), { began: false, latest: new Map(), store: id }, "control: bound, and saying nothing more");
+  assert.deepEqual(readAnchor(dir, REPO), anchorAs({ began: false, latest: new Map(), store: id }), "control: bound, and saying nothing more");
   // No keys to check an order with, so none is extended or noted.
   await run({ evaluate: () => at(A), dbPath, ...host(dir), keys: () => null });
   const a = readAnchor(dir, REPO);
@@ -663,10 +665,14 @@ test("the host's anchor is one store's: another store of the repository extends 
 test("an entry committed before the host's anchor could be moved to it is noted at the next tick", async () => {
   const dir = credentials();
   const dbPath = await ticks([at(A)], host(dir));
-  // The anchor's write fails before it's renamed into place: the entry is
-  // committed, and the anchor stays at the entry before, as it would were the
-  // process to stop between the two.
-  const stuck = { ...host(dir), anchor: fileAnchor(dir, { write: () => { throw new Error("no space left on device"); } }) };
+  // The note's write fails before it's renamed into place: the entry is
+  // reserved and committed, and the anchor stays at the entry before, as it
+  // would were the process to stop between the two.
+  const noting = (/** @type {Buffer} */ buf) => /"latest":\{"42":2\}/.test(buf.toString());
+  const stuck = { ...host(dir), anchor: fileAnchor(dir, { write: (fd, buf, offset, length) => {
+    if (noting(buf)) throw new Error("no space left on device");
+    return writeSync(fd, buf, offset, length);
+  } }) };
   const r = await run({ evaluate: () => at(A, "RED"), dbPath, ...stuck });
   assert.match(r.log, /the host's anchor couldn't be moved to entry 2 of its order/, "control: the note failed");
   assert.equal(readAnchor(dir, REPO)?.latest.get(PR), 1, "control: the anchor stayed behind");
@@ -1026,7 +1032,10 @@ test("a store with no order to extend says nothing on the host's anchor, so anot
 
 test("a baseline made while another reeve holds the host's lock is committed synced to disk all the same", async () => {
   const dir = credentials();
-  const dbPath = await ticks([at(A)], {});
+  // Over no record: one that vouches for records begins the anchor's binding,
+  // and waits for the lock (#281).
+  const dbPath = join(tempDir("reeve-order-empty-"), "s.db");
+  open(dbPath).close();
   const seen = [];
   const count = (db) => db.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n;
   const watched = (db, fn) => durably(db, () => {
@@ -1451,7 +1460,7 @@ test("binding the host's anchor to a store says there that the store began signi
   const dir = credentials();
   const id = "a".repeat(32);
   assert.equal(fileAnchor(dir).bind(REPO, id), true, "control: bound");
-  assert.deepEqual(readAnchor(dir, REPO), { began: true, latest: new Map(), store: id });
+  assert.deepEqual(readAnchor(dir, REPO), anchorAs({ began: true, latest: new Map(), store: id }));
 });
 
 test("a store stripped while its reeve was down, after a tick that bound the host's anchor and noted no entry, isn't given a baseline again", async () => {
@@ -1529,7 +1538,8 @@ test("reeve restore doesn't write over a store a reeve is running on, a reeve ti
 
 /**
  * A store kept before signing, with records of #42 and #43, that begins signing
- * while another reeve holds the host's lock, so no order names either yet; then
+ * under a reeve with no keys to check an order with, so no order names either
+ * yet (a baseline over records now waits for the host's lock, #281); then
  * `edit` is made, #43's record taken away unless it says otherwise. Answers the
  * store, and that record.
  */
@@ -1539,8 +1549,7 @@ async function lostBeforeOrdered(dir, edit = "DELETE FROM decision WHERE pr = 43
   const k = recordOf(REPO, 43, B);
   saveDecision(db, { at: 1, seq: 1000, pr: 43, head: B, ...k });
   db.close();
-  const other = fileAnchor(dir).lock(REPO);
-  try { await closedTick(dbPath, host(dir)); } finally { other.release(); }
+  await closedTick(dbPath, { ...host(dir), keys: () => null });
   db = open(dbPath);
   const baseline = JSON.parse(db.prepare("SELECT payload FROM event WHERE op = 'signing.baseline'").get()?.payload ?? "{}").digests ?? [];
   const entries = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n;
@@ -1800,7 +1809,7 @@ test("the host's anchor notes only a pull request's number and an entry's, so it
   const anchor = fileAnchor(dir);
   assert.equal(anchor.note(REPO, 7, 1), true, "control: a pull request's entry is noted");
   for (const [pr, n] of [[0, 1], [-3, 1], [1.5, 1], [7, 0]]) assert.equal(anchor.note(REPO, pr, n), false, `#${pr}, entry ${n}`);
-  assert.deepEqual(anchorOf(dir), { anchor: { began: true, latest: new Map([[7, 1]]), store: null }, why: null }, "and the anchor reads as it was");
+  assert.deepEqual(anchorOf(dir), { anchor: anchorAs({ began: true, latest: new Map([[7, 1]]), store: null }), why: null }, "and the anchor reads as it was");
 });
 
 test("two restores of a store that's gone run one at a time", () => {

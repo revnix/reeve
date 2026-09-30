@@ -55,9 +55,10 @@ import { randomBytes } from "node:crypto";
 import { resolveHome } from "./home.mjs";
 import { codeVersion, policyOf, recordsFor } from "./evidence.mjs";
 import { saveDecision } from "./db/records.mjs";
-import { decisionStatement, baselineStatement, latestStatement } from "./signing.mjs";
+import { decisionStatement, baselineStatement, baselineFingerprint, latestStatement } from "./signing.mjs";
 import { BASELINE_OP, LATEST_OP, STORE_ID_OP, FILED, latestDecision, storeIdentity } from "./db/records.mjs";
 import { signedOrder, strayEntry, baselineLost, otherRepository } from "./decisions.mjs";
+import { noAnchor } from "./anchor.mjs";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -869,7 +870,7 @@ function record(db, { pr, head, verdict, decision, effects = [], retire = new Ma
       // What the verdict was judged from, in the same transaction as the event
       // that names it, so neither stands without the other, and under that
       // event's seq, which orders decisions where seconds tie (#165).
-      if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr, head, ...kept });
+      const fresh = kept ? saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr, head, ...kept }).fresh : false;
       // `enqueue` returns null for a key it already holds, which is success: the
       // effect is durable, it was simply made durable by an earlier tick.
       let queued = 0, known = 0, dropped = 0;
@@ -895,7 +896,7 @@ function record(db, { pr, head, verdict, decision, effects = [], retire = new Ma
         // on this pull request at ANY head, and `keep` spares the one just made.
         (enqueue(db, eff) !== null ? queued++ : known++);
       }
-      return { ok: true, queued, known, dropped, seq: Number(decided.lastInsertRowid) };
+      return { ok: true, queued, known, dropped, seq: Number(decided.lastInsertRowid), fresh };
     });
   } catch (err) {
     // A store that cannot record must not stop the loop -- but it must not report
@@ -950,9 +951,18 @@ function standingAt(db, pr) {
  * unless it's the store the anchor is bound to: its records were taken away.
  * Where it began, the caller says so on the host's anchor, once this store's
  * transaction has committed.
+ *
+ * Where the host's anchor is no store's yet, the store's first baseline begins
+ * its binding (#281): the store's identity, made here where it has none, and a
+ * fingerprint of the baseline are written on the anchor, synced, before the
+ * baseline commits, and the caller binds it once it has. A reeve that stops in
+ * between leaves the anchor saying which store, holding which records, it was
+ * binding: finished for that store holding those records, and otherwise no
+ * baseline is made over what's left. So that's done only under the host's lock
+ * on the anchor, `held`; without it, the first baseline waits a tick.
  * @returns {{ began: boolean, why?: string }}
  */
-function beginSigning(db, sign, logPath, anchor = null, nwo = null) {
+function beginSigning(db, sign, logPath, anchor = null, nwo = null, held = false) {
   try {
     // Under the store's write lock, so a second daemon on the store can't list
     // and sign between this one's checks and its insert.
@@ -962,9 +972,10 @@ function beginSigning(db, sign, logPath, anchor = null, nwo = null) {
       // An entry of a signed order is signed too, and only made once a store began.
       if (db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(LATEST_OP)) return { began: true };
       let hostSays = false, ours = false;
+      /** @type {import("./anchor.mjs").Anchor | null} */ let a = null;
       if (anchor) {
         // One that can't be read might say so, of this store: taken as saying it.
-        try { const a = anchor.read(nwo); hostSays = Boolean(a?.began); ours = hostSays && Boolean(a?.store) && a?.store === storeIdentity(db); }
+        try { a = anchor.read(nwo); hostSays = Boolean(a?.began); ours = hostSays && Boolean(a?.store) && a?.store === storeIdentity(db); }
         catch (err) { hostSays = ours = true; log(logPath, `signing: ${err.message}, so it's taken to say this store began signing`); }
       }
       // A store the anchor is bound to that holds no record at all had them all
@@ -980,6 +991,24 @@ function beginSigning(db, sign, logPath, anchor = null, nwo = null) {
       if (!s?.envelope) {
         log(logPath, `signing: the records kept before signing couldn't be signed — ${s?.unsigned}`);
         return { began: false, why: String(s?.unsigned) };
+      }
+      // The binding begun, on an anchor that's no store's yet (#281), before the
+      // baseline commits. Not for a store holding what isn't this repository's:
+      // it's never bound, and its baseline is made as before.
+      if (anchor && !a?.store && (digests.length || a?.pending) && otherRepository(db, nwo) === null) {
+        if (!held) return { began: false, why: "the host's lock on the anchor wasn't held, so the store's first baseline waits for a tick that holds it" };
+        const fingerprint = baselineFingerprint(digests);
+        // A binding begun by a reeve that stopped before this store committed
+        // its baseline: the same store, as its identity went with the baseline,
+        // holding the same records, or none is made over what's left.
+        const id = storeIdentity(db) ?? a?.pending?.store ?? randomBytes(16).toString("hex");
+        if (a?.pending && (a.pending.store !== id || a.pending.baseline !== fingerprint)) {
+          log(logPath, `signing: the host's anchor for ${nwo} was being bound to ${a.pending.store === id ? "this store, holding other records than it holds now" : "another store"}: ` +
+                       "records were taken away, or the store restored from before. No baseline is made over what it holds, and its unsigned records aren't trusted");
+          return { began: true };
+        }
+        if (!anchor.pending(nwo, id, fingerprint)) return { began: false, why: `the host's anchor for ${nwo} couldn't be written` };
+        if (!storeIdentity(db)) db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`).run(now(), "daemon", STORE_ID_OP, "store", canonical({ id }));
       }
       db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
         .run(now(), "daemon", BASELINE_OP, "store", JSON.stringify({ digests: baselineStatement(digests).predicate.digests, envelope: s.envelope }));
@@ -1410,11 +1439,74 @@ export async function tick(ctx) {
     }
     try { return fn(true); } finally { lock.release(); }
   };
+  /** @type {Map<string, any> | null | undefined} */ let orderKeys;
+  // The host's anchor bound to this store (#281), where it's no store's yet: in
+  // the step that makes or finds its baseline, under the host's lock, and only
+  // to a store that holds one, of this repository only, every order in it
+  // holding, as another store, named by --db say, or one edited, would take the
+  // anchor for good. A binding begun is finished only for the store it was begun
+  // for, holding the baseline it was begun with and every record that names;
+  // otherwise records were taken away, or the store restored from before, and
+  // nothing is bound. The store's identity is the binding's where a stop took
+  // the identity with the baseline's commit.
+  /** @param {import("./anchor.mjs").Anchor} a  as read under the lock @param {{ vouching?: boolean }} [o] */
+  const bindStore = (a, { vouching = false } = {}) => {
+    const not = (/** @type {string} */ why) => { log(logPath, `signing: ${why}, so the host's anchor for ${nwo} isn't bound to this store`); return false; };
+    const row = /** @type {any} */ (db.prepare(`SELECT payload FROM event WHERE op = ? ORDER BY seq LIMIT 1`).get(BASELINE_OP));
+    /** @type {string[] | null} */ let digests = null;
+    if (row) try { const p = JSON.parse(row.payload); if (Array.isArray(p?.digests)) digests = p.digests.map(String); } catch { /* said below */ }
+    // In the baseline's step, only a store whose baseline vouches for a record:
+    // one over nothing is bound once it has an order to extend, as a store that
+    // judges nothing, named by --db say, would otherwise take the anchor from the
+    // store that has one.
+    if (vouching && !digests?.length && !a.pending) return false;
+    // Only a store of this repository, every order in it holding, whatever else.
+    const other = otherRepository(db, nwo);
+    if (other !== null) { log(logPath, `signing: this store holds ${other}, so it isn't taken as ${nwo}'s own, and the host's anchor for ${nwo} isn't bound to it`); return false; }
+    const had = storeIdentity(db);
+    const id = had ?? a.pending?.store ?? randomBytes(16).toString("hex");
+    if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
+    if (orderKeys) for (const r of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ?`).all(LATEST_OP))) {
+      const pr = Number(String(r.subject).slice(3));
+      const order = signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), id);
+      if ("corrupt" in order) { log(logPath, `signing: #${pr}'s signed order in this store doesn't hold, so the host's anchor for ${nwo} isn't bound to it — ${order.corrupt}`); return false; }
+    }
+    // And one holding the baseline it's bound by. One whose binding was begun
+    // is said not to be every tick, as its baseline was taken away, or never made
+    // where its records differed.
+    if (!row) return not(a.pending ? "the host's anchor was being bound to a store holding a baseline this one doesn't hold" : "this store holds no baseline");
+    if (!digests) return not("this store's baseline can't be read");
+    const fingerprint = baselineFingerprint(digests);
+    if (a.pending) {
+      if (a.pending.store !== id) return not("the host's anchor was being bound to another store");
+      if (a.pending.baseline !== fingerprint) return not("this store's baseline isn't the one its binding was begun with: the store was restored from before, or its baseline changed");
+      const held = db.prepare(`SELECT 1 FROM decision WHERE digest = ?`);
+      const gone = digests.filter((d) => !held.get(d));
+      if (gone.length) return not(`this store no longer holds ${gone.length} record(s) its baseline names: they were taken away`);
+    }
+    if (!had) (ctx.durably ?? durably)(db, () => tx(db, () => {
+      if (!storeIdentity(db)) db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`).run(now(), "daemon", STORE_ID_OP, "store", canonical({ id }));
+    }));
+    if ((!a.pending && !ctx.anchor.pending(nwo, id, fingerprint)) || !ctx.anchor.bind(nwo, id)) {
+      log(logPath, `signing: the host's anchor for ${nwo} couldn't be bound to this store, so its signed orders aren't extended`);
+      return false;
+    }
+    a.store = id;
+    a.pending = null;
+    a.began = true;
+    return true;
+  };
   const begun = ctx.signer ? withOrderLock((held) => {
     // Synced to disk, whether or not this tick holds the lock: a baseline a power
     // loss took would leave the anchor saying the store began, as a later tick
     // that finds it says so, and the store never given one again.
-    const b = (ctx.durably ?? durably)(db, () => beginSigning(db, signWith, logPath, ctx.anchor ?? null, nwo));
+    const b = (ctx.durably ?? durably)(db, () => beginSigning(db, signWith, logPath, ctx.anchor ?? null, nwo, held));
+    // And bound in the step that made or found its baseline (#281).
+    if (held && b.began && ctx.anchor) {
+      let a = null;
+      try { a = ctx.anchor.read(nwo) ?? noAnchor(); } catch (err) { log(logPath, `signing: ${err.message}, so it isn't bound to this store`); }
+      if (a && !a.store) bindStore(a, { vouching: true });
+    }
     // Said on the host's anchor once the store has committed it, where a store
     // restored from before can't take it back. Only on an anchor bound to this
     // store: said on one no store holds yet, by a store that judges nothing,
@@ -1437,7 +1529,6 @@ export async function tick(ctx) {
   // from an order that checks whole, with the host's own keys, and never from a
   // number a store edit put there. The top it answers is noted on the anchor once
   // the transaction has committed; 0 for none.
-  /** @type {Map<string, any> | null | undefined} */ let orderKeys;
   // What this reeve kept for each pull request as it runs, and hasn't ordered
   // yet: the record it kept last, where in the store's sequence of events it
   // kept it, and every one it kept. The latest is signed from this, not from the
@@ -1447,18 +1538,41 @@ export async function tick(ctx) {
   // once ordered.
   /** @type {Map<number, { latest: string, seq: number, since: Set<string> }>} */
   const orderKept = (ctx.orderKept ??= new Map());
-  const keptFor = (/** @type {number} */ pr, /** @type {string} */ digest, /** @type {number} */ seq) => {
+  // A record new to the store, pinned on the host's anchor once the store has
+  // committed it, synced (#279), where the anchor is this store's: one a reeve
+  // stopped before ordering, taken away while none runs, still shows. An entry
+  // that names it unpins it. One that can't be pinned now is named by this
+  // tick's ordering, or said not to be.
+  let pinSaid = false;
+  const pinKept = (/** @type {number} */ pr, /** @type {string} */ digest) => {
+    if (!ordering || !begun.began) return;
+    withOrderLock((held) => {
+      if (!held) return;
+      let why = null;
+      try {
+        const id = storeIdentity(db);
+        const a = ctx.anchor.read(nwo);
+        if (id && a?.store === id && !ctx.anchor.pin(nwo, id, pr, [digest])) why = "the host's anchor couldn't be written";
+      } catch (err) { why = err.message; }
+      if (why && !pinSaid) { pinSaid = true; log(logPath, `signing: #${pr}: a record kept couldn't be pinned on the host's anchor — ${why}`); }
+    });
+  };
+  const keptFor = (/** @type {number} */ pr, /** @type {string} */ digest, /** @type {number} */ seq, fresh = false) => {
     const k = orderKept.get(pr) ?? { latest: digest, seq, since: new Set() };
     k.latest = digest;
     k.seq = seq;
     k.since.add(digest);
     orderKept.set(pr, k);
+    if (fresh) pinKept(pr, digest);
   };
   // Each pull request's signed order as checked whole, checked again only once
   // what its entries hold changes, as this process runs.
   /** @type {Map<number, { key: string, order: ReturnType<typeof signedOrder> }>} */
   const orderChecked = (ctx.orderChecked ??= new Map());
-  const extendOrder = (pr, anchored, store) => {
+  /** @typedef {{ top: number, named: boolean, digest?: string | null, names?: string[] }} Extended */
+  /** @param {number} pr @param {import("./anchor.mjs").Anchor} a @param {string} store @returns {Extended} */
+  const extendOrder = (pr, a, store) => {
+    const anchored = a.latest.get(pr) ?? 0;
     const order = signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), store);
     if ("corrupt" in order) { log(logPath, `signing: #${pr}: its signed order doesn't hold, so it isn't extended — ${order.corrupt}`); return { top: 0, named: false }; }
     // Nor one cut short of what the host signed: an entry signed now would take
@@ -1467,6 +1581,42 @@ export async function tick(ctx) {
     if (order.top < anchored) {
       log(logPath, `signing: #${pr}: its signed order ends at entry ${order.top}, though this host signed up to entry ${anchored}, so it isn't extended`);
       return { top: 0, named: false };
+    }
+    // Nor one whose entry at the host's top names another record than the host
+    // noted there (#279): a copy of this store signed another under that number,
+    // and each would pass for current.
+    const noted = a.named.get(pr);
+    if (anchored && noted && order.entries.get(anchored) !== noted) {
+      log(logPath, `signing: #${pr}: entry ${anchored} of its signed order names record ${String(order.entries.get(anchored)).slice(0, 12)}, ` +
+                   `though this host noted record ${noted.slice(0, 12)} there, so it isn't extended`);
+      return { top: 0, named: false };
+    }
+    // The store ahead of the host's anchor: an entry committed and its note
+    // never made, by a reeve that stopped in between. It's noted first, and the
+    // order extended from there next tick. Where the anchor reserved that entry
+    // (#279), only the store's entry naming the reserved record is it: another
+    // was signed by a copy of this store under that number.
+    const reserved = a.reserved.get(pr);
+    if (order.top > anchored) {
+      if (reserved && (order.top !== reserved.n || order.entries.get(reserved.n) !== reserved.digest)) {
+        log(logPath, `signing: #${pr}: its signed order ends at entry ${order.top}, naming record ${String(order.digest).slice(0, 12)}, ` +
+                     `though this host reserved entry ${reserved.n} for record ${reserved.digest.slice(0, 12)}, so it isn't extended`);
+        return { top: 0, named: false };
+      }
+      return { top: order.top, named: false, digest: order.digest, names: [...order.digests] };
+    }
+    // An entry reserved and never committed, by a reeve that stopped before
+    // committing it: completed for the record it was reserved for, where the
+    // store holds it. Otherwise the order isn't extended, as a copy of this
+    // store may have signed that number.
+    /** @type {string | null} */ let owed = null;
+    if (reserved) {
+      if (!db.prepare(`SELECT 1 FROM decision WHERE digest = ? AND pr = ?`).get(reserved.digest, pr)) {
+        log(logPath, `signing: #${pr}: this host reserved entry ${reserved.n} of its signed order for record ${reserved.digest.slice(0, 12)}, ` +
+                     "which this store doesn't hold, so it isn't extended: a copy of the store may have signed it");
+        return { top: 0, named: false };
+      }
+      owed = reserved.digest;
     }
     const own = orderKept.get(pr);
     // Every record kept for it that no entry names yet: all of them, for its
@@ -1488,30 +1638,44 @@ export async function tick(ctx) {
     // included, so only a reeve that died leaves one.
     const stored = latestDecision(db, pr);
     /** @type {[string | null, number | null]} */
-    const [digest, seq] = own ? (order.seq == null || own.seq > order.seq ? [own.latest, own.seq] : [order.digest, order.seq])
+    const [digest, seq] = owed ? [owed, Number(/** @type {any} */ (db.prepare(`SELECT last_seq FROM decision WHERE digest = ?`).get(owed)).last_seq)]
+      : own ? (order.seq == null || own.seq > order.seq ? [own.latest, own.seq] : [order.digest, order.seq])
       : !order.top ? [stored?.digest ?? null, stored ? Number(stored.last_seq) : null]
       : [order.digest, order.seq];
-    if (!digest) return { top: order.top, named: true };
+    if (!digest) return { top: order.top, named: true, digest: order.digest, names: [...order.digests] };
     unnamed.delete(digest);
     const records = [...unnamed].sort();
-    let top = order.top;
-    if (order.digest !== digest || records.length) {
-      const entry = { repo: nwo, pr, n: top + 1, digest, records, store, seq };
+    let top = order.top, latest = order.digest;
+    // A reserved entry is committed whatever else is new: left open, its
+    // reservation would stand for good.
+    if (owed || order.digest !== digest || records.length) {
+      const n = top + 1;
+      const entry = { repo: nwo, pr, n, digest, records, store, seq };
       const s = signWith(latestStatement(entry));
-      if (!s?.envelope) return { top, named: false };
+      if (!s?.envelope) return { top, named: false, digest: latest, names: [...order.digests] };
+      // Reserved on the host's anchor, synced, before the store commits it: a
+      // reeve that stops between the two leaves the number held for this record.
+      if (!ctx.anchor.reserve(nwo, store, pr, n, digest)) {
+        log(logPath, `signing: #${pr}: entry ${n} of its signed order couldn't be reserved on the host's anchor, so it isn't extended this tick`);
+        return { top, named: false, digest: latest, names: [...order.digests] };
+      }
       db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
-        .run(now(), "daemon", LATEST_OP, `pr:${pr}`, canonical({ repo: nwo, n: top + 1, digest, records, store, seq, envelope: s.envelope }));
-      top += 1;
+        .run(now(), "daemon", LATEST_OP, `pr:${pr}`, canonical({ repo: nwo, n, digest, records, store, seq, envelope: s.envelope }));
+      top = n;
+      latest = digest;
     }
-    return { top, named: true };
+    // A reserved entry completed isn't what this reeve kept last, where it kept
+    // another since: that's ordered next tick.
+    return { top, named: !owed || !own || own.latest === owed, digest: latest, names: [...order.digests, digest, ...records] };
   };
-  // The host's anchor moved to entry `top` of `pr`'s order, only once the store
-  // has committed it: moved before, a transaction that failed would leave the
-  // anchor ahead of its store, and its order never extended again. A write that
-  // failed is made good on a later tick.
-  const noteAnchor = (pr, top) => {
-    if (top && !ctx.anchor.note(nwo, pr, top))
-      log(logPath, `signing: #${pr}: the host's anchor couldn't be moved to entry ${top} of its order, so it lags until a later tick`);
+  // The host's anchor moved to entry `top` of `pr`'s order, with the record it
+  // names and every record the order names, which are pinned no longer (#279),
+  // only once the store has committed it: moved before, a transaction that
+  // failed would leave the anchor ahead of its store, and its order never
+  // extended again. A write that failed is made good on a later tick.
+  const noteAnchor = (/** @type {number} */ pr, /** @type {Extended} */ r) => {
+    if (r.top && !ctx.anchor.note(nwo, pr, r.top, r.digest ?? null, r.names ?? []))
+      log(logPath, `signing: #${pr}: the host's anchor couldn't be moved to entry ${r.top} of its order, so it lags until a later tick`);
   };
   // The pull requests whose order has work, read from their orders as checked
   // whole, never from an entry that doesn't check: that one counts neither as
@@ -1549,6 +1713,12 @@ export async function tick(ctx) {
     // it, none left in the store included: cut short, or restored from before,
     // it's said every tick, though its pull request is never judged again.
     for (const [pr, n] of a.latest) { const o = orders.get(pr); if (!o || ("top" in o && o.top < n)) prs.add(pr); }
+    // And each the anchor holds an entry reserved for, a record noted at its top
+    // that its order doesn't name there, or a record pinned for (#279): completed,
+    // refused or reported every tick, though its pull request is never judged again.
+    for (const pr of a.reserved.keys()) prs.add(pr);
+    for (const [pr, d] of a.named) { const o = orders.get(pr); if (!o || !("entries" in o) || o.entries.get(a.latest.get(pr) ?? 0) !== d) prs.add(pr); }
+    for (const pr of a.pinned.keys()) prs.add(pr);
     // Only a record filed under a pull request's number: one under 0, say, would
     // have an entry filed where no order finds it, and a note on the host's
     // anchor it couldn't read back. It's said at each tick.
@@ -1573,6 +1743,13 @@ export async function tick(ctx) {
       (ctx.durably ?? durably)(db, () => {
         let id = null, a = null;
         try {
+          // Read once: nothing else writes it while this holds its lock. One that
+          // can't be read extends nothing, as whether an order was cut short
+          // can't be told.
+          a = ctx.anchor.read(nwo) ?? noAnchor();
+          // A binding begun is finished for the store it was begun for, or
+          // refused, as in the baseline's step (#281), before an identity is made.
+          if (!a.store && a.pending && !bindStore(a)) return;
           // The store's identity, kept the first time it's needed.
           id = tx(db, () => {
             if (db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(STORE_ID_OP)) return storeIdentity(db);
@@ -1580,10 +1757,6 @@ export async function tick(ctx) {
             db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`).run(now(), "daemon", STORE_ID_OP, "store", canonical({ id: made }));
             return made;
           });
-          // Read once: nothing else writes it while this holds its lock. One that
-          // can't be read extends nothing, as whether an order was cut short
-          // can't be told.
-          a = ctx.anchor.read(nwo) ?? { began: false, latest: new Map(), store: null };
         } catch (err) { log(logPath, `signing: ${err.message}, so no signed order is extended`); return; }
         const bound = a.store;
         if (!id || (bound && bound !== id)) {
@@ -1600,39 +1773,26 @@ export async function tick(ctx) {
         const lost = baselineLost(db, nwo, /** @type {any} */ (orderKeys), id);
         if (lost.length) log(logPath, `signing: the store's baseline names ${lost.length} record(s) kept before it began signing that it doesn't hold as they were kept, ` +
                                       `and no signed order names: ${lost.map((b) => `${b.digest.slice(0, 12)} (${b.why})`).join(", ")}`);
-        // Bound only by a store with an order to extend: one that judges nothing,
-        // named by --db say, would otherwise take the anchor from the store that
-        // has one. It began signing, or nothing is ordered, and the binding says
-        // so too.
+        // Bound only by a store with an order to extend, where its baseline's step
+        // didn't bind it: its baseline vouched for no record. Only to a store of
+        // this repository, every order in it holding (#281).
         const pending = pendingOrders(a, id);
         if (!pending.length) return;
-        // And only to a store of this repository, every record read as one of its:
-        // one of another, named by --db say, would take the anchor for good, and
-        // the repository's own store be refused as another store's.
-        const other = bound ? null : otherRepository(db, nwo);
-        if (other !== null) {
-          log(logPath, `signing: this store holds ${other}, so it isn't taken as ${nwo}'s own, and the host's anchor for ${nwo} isn't bound to it`);
-          return;
-        }
-        // Nor to one holding an order that doesn't check: of another repository,
-        // or another store, or edited, its entries say it isn't the one the
-        // anchor should hold, records or none.
-        const broken = bound ? null : pending.map((pr) => ({ pr, order: signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), id) })).find((x) => "corrupt" in x.order);
-        if (broken) {
-          log(logPath, `signing: #${broken.pr}'s signed order in this store doesn't hold, so the host's anchor for ${nwo} isn't bound to it — ${"corrupt" in broken.order ? broken.order.corrupt : ""}`);
-          return;
-        }
-        if (!bound && !ctx.anchor.bind(nwo, id)) {
-          log(logPath, `signing: the host's anchor for ${nwo} couldn't be bound to this store, so its signed orders aren't extended`);
-          return;
-        }
+        if (!bound && !bindStore(a)) return;
+        const holds = db.prepare(`SELECT 1 FROM decision WHERE digest = ?`);
         for (const pr of pending) {
-          let r = { top: 0, named: false };
-          try { r = tx(db, () => extendOrder(pr, a.latest.get(pr) ?? 0, id)); }
+          /** @type {Extended} */ let r = { top: 0, named: false };
+          try { r = tx(db, () => extendOrder(pr, /** @type {import("./anchor.mjs").Anchor} */ (a), /** @type {string} */ (id))); }
           catch (err) { log(logPath, `signing: #${pr}: its signed order couldn't be extended — ${err.message}`); continue; }
           // What this reeve kept is ordered, once its entry is committed.
           if (r.named) orderKept.delete(pr);
-          noteAnchor(pr, r.top);
+          noteAnchor(pr, r);
+          // A record this host kept and pinned (#279) that the store no longer
+          // holds and no entry names: taken away, as reeve never removes one,
+          // though the reeve that kept it stopped before ordering it.
+          const gone = [...(a.pinned.get(pr) ?? [])].filter((d) => !(r.names ?? []).includes(d) && !holds.get(d));
+          if (gone.length) log(logPath, `signing: #${pr}: this host kept ${gone.length} record(s) that this store no longer holds, and no entry of its signed order names: ` +
+                                        `they were taken away — ${gone.map((d) => d.slice(0, 12)).join(", ")}`);
         }
       });
     });
@@ -2630,9 +2790,12 @@ export async function tick(ctx) {
         log(logPath, `  #${pr}: what this verdict was judged from could not be recorded — ${err.message}`);
       }
     }
-    // Its signed order is extended at the tick's end, to its latest then.
-    const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire, kept });
-    if (decided.ok && kept) keptFor(pr, kept.decision.digest, decided.seq);
+    // Its signed order is extended at the tick's end, to its latest then. Kept
+    // synced to disk where it may be pinned on the host's anchor (#279): a pin
+    // for a record a power loss then took would say it was taken away.
+    const recordIt = () => record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire, kept });
+    const decided = kept && ordering ? (ctx.durably ?? durably)(db, recordIt) : recordIt();
+    if (decided.ok && kept) keptFor(pr, kept.decision.digest, decided.seq, decided.fresh);
     if (effects.length && !decided.ok) {
       log(logPath, `  #${pr}: REQUEST_REVIEW — the decision and its ${effects.length} effect(s) could NOT be recorded: ${decided.why}`);
       // Escalated, not merely logged. Nothing else covers this: no worker is
@@ -2842,17 +3005,20 @@ export async function tick(ctx) {
           log(logPath, `  ${at}: what this verdict was judged from could not be recorded — ${err.message}`);
         }
         try {
-          const seq = tx(db, () => {
+          let fresh = false;
+          // Synced where it may be pinned, as a pull request's own verdict is.
+          const keep = (/** @type {() => number} */ fn) => (kept && ordering ? (ctx.durably ?? durably)(db, fn) : fn());
+          const seq = keep(() => tx(db, () => {
             const decided = db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
               .run(now(), "daemon", "queue.decided", `pr:${entry.pr}`, JSON.stringify({
                 head: sha, base: entry.baseSha, state: j.verdict.state, summary: j.verdict.summary,
                 clauses: j.verdict.clauses.map((c) => ({ id: c.id, state: c.state })),
                 record: kept?.decision.digest ?? null,
               }));
-            if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr: entry.pr, head: sha, ...kept });
+            if (kept) fresh = saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr: entry.pr, head: sha, ...kept }).fresh;
             return Number(decided.lastInsertRowid);
-          });
-          if (kept) keptFor(entry.pr, kept.decision.digest, seq);
+          }));
+          if (kept) keptFor(entry.pr, kept.decision.digest, seq, fresh);
         } catch (err) {
           log(logPath, `  ${at}: the verdict could not be kept — ${err.message}`);
         }

@@ -1052,3 +1052,37 @@ test("an anchor written before #279 has each pull request's top entry noted, wit
   db.close();
   assert.equal("top" in order && order.top, 2, "and no entry added for it");
 });
+
+// ── #299's fifth review ──────────────────────────────────────────────────────
+
+/** A store holding a record kept before signing began, and an identity that can't be read. */
+const unreadableIdentity = async () => {
+  const dbPath = store();
+  await tick(dbPath, at(A));
+  const db = open(dbPath);
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(1, "daemon", "store.identity", "store", "not an identity");
+  db.close();
+  return dbPath;
+};
+
+test("a store holding an identity that can't be read doesn't bind the host's anchor, nor begin a binding", async () => {
+  const dir = credentials();
+  const dbPath = await unreadableIdentity();
+  const r = await tick(dbPath, null, host(dir));
+  const a = anchorRead(dir);
+  assert.equal(a?.store ?? null, null, "not bound to an identity made here, which the store would never read back");
+  assert.equal(a?.pending ?? null, null, "nor a binding begun for one");
+  assert.match(r.log, /this store holds an identity that can't be read, so the host's anchor for o\/r isn't bound to this store/);
+});
+
+test("a store whose binding was begun, holding an identity that can't be read, makes no baseline", async () => {
+  const dir = credentials();
+  const dbPath = await unreadableIdentity();
+  let db = open(dbPath);
+  const digests = db.prepare("SELECT digest FROM decision ORDER BY digest").all().map((x) => x.digest);
+  db.close();
+  assert.equal(fileAnchor(dir).pending(REPO, ID, digests), true);
+  await tick(dbPath, null, host(dir));
+  assert.equal(baselines(dbPath), 0);
+  assert.equal(anchorRead(dir)?.store ?? null, null);
+});

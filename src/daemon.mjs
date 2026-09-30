@@ -999,7 +999,12 @@ function beginSigning(db, sign, logPath, anchor = null, nwo = null, held = false
       // whole: it's never bound, and its baseline is made as before. Unless a
       // binding was begun: the store it was begun for, a record of it changed,
       // holds such a record too, and is checked as below.
-      const other = anchor && !a?.store && (digests.length || a?.pending) ? otherRepository(db, nwo) : null;
+      // Nor for a store holding an identity it can't read: one made here would
+      // never be read back, as the first is read, and the anchor bound to it
+      // would be no store's for good.
+      const unreadableId = !storeIdentity(db) && Boolean(db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(STORE_ID_OP));
+      const other = anchor && !a?.store && (digests.length || a?.pending)
+        ? otherRepository(db, nwo) ?? (unreadableId ? "an identity it can't read" : null) : null;
       if (anchor && !a?.store && (digests.length || a?.pending) && (other === null || a?.pending)) {
         if (!held) return { began: false, why: "the host's lock on the anchor wasn't held, so the store's first baseline waits for a tick that holds it" };
         // A binding begun before this store committed its baseline, by a reeve
@@ -1009,7 +1014,7 @@ function beginSigning(db, sign, logPath, anchor = null, nwo = null, held = false
         // kept while it waits, so one more was put in the store by hand.
         const id = storeIdentity(db) ?? a?.pending?.store ?? randomBytes(16).toString("hex");
         const whole = holdsWhole(db);
-        if (a?.pending && (a.pending.store !== id || a.pending.baseline !== baselineFingerprint(digests) || a.pending.digests.some((d) => !whole(d)))) {
+        if (a?.pending && (unreadableId || a.pending.store !== id || a.pending.baseline !== baselineFingerprint(digests) || a.pending.digests.some((d) => !whole(d)))) {
           log(logPath, `signing: the host's anchor for ${nwo} was being bound to ${a.pending.store === id ? "this store, holding other records than it holds now" : "another store"}: ` +
                        "records were taken away, or the store restored from before. No baseline is made over what it holds, and its unsigned records aren't trusted");
           return { began: true };
@@ -1474,6 +1479,10 @@ export async function tick(ctx) {
     const other = otherRepository(db, nwo);
     if (other !== null) { log(logPath, `signing: this store holds ${other}, so it isn't taken as ${nwo}'s own, and the host's anchor for ${nwo} isn't bound to it`); return false; }
     const had = storeIdentity(db);
+    // One whose identity was kept and can't be read: an identity made here would
+    // never be read back, as the first is read, and the anchor bound to it would
+    // be no store's for good.
+    if (!had && db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(STORE_ID_OP)) return not("this store holds an identity that can't be read");
     const id = had ?? a.pending?.store ?? randomBytes(16).toString("hex");
     if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
     if (orderKeys) for (const r of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ?`).all(LATEST_OP))) {

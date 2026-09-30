@@ -33,7 +33,7 @@ import { claimProvider, releaseProvider, bindProviderLease, noteRateLimit, heart
 import { openHold } from "./build/holds.mjs";
 import { hubSession, NO_HUB } from "./build/hubsession.mjs";
 import { resolveRepoId } from "./build/repoid.mjs";
-import { readState, noteTick, cleanMergeRate } from "./status.mjs";
+import { readState, noteTick, noteTickStart, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify, printable } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects, reap, canonical, durably } from "./db/ops.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
@@ -1367,6 +1367,9 @@ export async function tick(ctx) {
   // Which tick this is, for what counts only in a row.
   const tickNo = ctx.tickNo = (ctx.tickNo ?? 0) + 1;
   const { nwo, profile, db, execute = false, shadow = true } = ctx;
+  // Recorded as it starts, and again as it ends: the time between is running,
+  // however long the tick takes (#297).
+  noteTickStart(db);
   // Absolute, once, before ANYTHING derives from it. A relative `--log` made
   // every state path relative — the run dir, the worker's tmp, its git config and
   // the `--settings` argument — and those are consumed after the worker's cwd has

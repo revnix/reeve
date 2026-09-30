@@ -4110,8 +4110,12 @@ export async function tick(ctx) {
           const pushed = (ctx.publishWork ?? publishRunWork)({ repoRoot: repoCheckout, path: worktree,
                                                                branch: e.headRef, expectedRemote: e.head });
           if (!pushed.ok) {
-            log(logPath, `  #${e.pr}: NOT published — ${pushed.why}`);
-            raise(`#${e.pr}: a fix was produced but could not be published — ${pushed.why}`);
+            // A push stopped at the network bound, the remote unreadable after,
+            // may have landed (#284): said as not known, never as unpublished.
+            // Its checkout is kept either way, as nothing says the remote holds it.
+            log(logPath, `  #${e.pr}: ${pushed.unknown ? "published or not, it isn't known" : "NOT published"} — ${pushed.why}`);
+            raise(pushed.unknown ? `#${e.pr}: a fix was produced, and whether it was published isn't known — ${pushed.why}`
+                                 : `#${e.pr}: a fix was produced but could not be published — ${pushed.why}`);
           } else {
             log(logPath, `  #${e.pr}: published ${changed.length} file(s)` + (refused.length ? ` (${refused.length} call(s) refused along the way)` : ""));
             // Published, and still escalated: CI at the new head is the check that

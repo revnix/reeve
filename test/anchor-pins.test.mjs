@@ -445,7 +445,7 @@ test("a binding begun for another store isn't finished for this one", async () =
   const dbPath = store();
   await tick(dbPath, at(A));
   await tick(dbPath, null, host(dir, { ...fileAnchor(dir), bind: () => false }));
-  rewrite(dir, (a) => { a.pending.store = OTHER; });
+  rewrite(dir, (a) => { a.pending = { ...(a.pending ?? {}), store: OTHER }; });
   const r = await tick(dbPath, null, host(dir));
   assert.match(r.log, /the host's anchor was being bound to another store, so the host's anchor for o\/r isn't bound to this store/);
   assert.equal(anchorRead(dir)?.store, null);

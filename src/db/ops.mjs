@@ -1092,6 +1092,13 @@ export function exportJsonl(db, { sinceSeq = 0 } = {}) {
  * settle() expects as its `prior`. Returns null when nothing has been recorded,
  * which settle() reads as a first observation.
  */
+/** A settlement key's check names. @param {string | null} key */
+const namesOfKey = (key) => {
+  if (!key) return [];
+  if (!key.startsWith("[")) return key.split("\0");
+  try { const v = JSON.parse(key); return Array.isArray(v) ? v.map(String) : []; } catch { return []; }
+};
+
 export function loadSettlement(db, nwo, pr) {
   const r = db.prepare(`SELECT sha, key, streak, floor, first_seen_at, last_seen_at, accounting
                         FROM settlement WHERE nwo=? AND pr=?`).get(nwo, pr);
@@ -1103,8 +1110,10 @@ export function loadSettlement(db, nwo, pr) {
   return {
     sha: r.sha, key: r.key, streak: r.streak, floor: r.floor,
     // Rebuilt from the key rather than stored twice, so the two cannot disagree.
-    // An empty key is no checks at all, not one check named "".
-    names: r.key ? r.key.split("\0") : [],
+    // An empty key is no checks at all, not one check named "". A key stored
+    // before keys were JSON is its names joined by NUL, read as before, and
+    // replaced at the next reading.
+    names: namesOfKey(r.key),
     firstSeenAt: r.first_seen_at, lastSeenAt: r.last_seen_at,
   };
 }

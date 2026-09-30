@@ -30,6 +30,10 @@ function store() {
     .run(`${repo}#${pr}@${head}`, pr, head, JSON.stringify({ subject: { repo, pr, head } }), T0, T0, 1, 1);
   return { db, path, put, tick, decided, record };
 }
+/** How a seeded case came out, as src/seeded.mjs reports it. */
+const seededAs = (/** @type {string} */ name, /** @type {boolean} */ ok, /** @type {string} */ got, must = "BLOCK") =>
+  ({ name, why: "", must, clauses: {}, ran: true, at: T0, got, gotClauses: {}, ok,
+     detail: ok ? "every clause satisfied" : `it came out ${got}, but not for its reason` });
 /** Ticks every ten minutes, from `from` for `hours`. */
 const ticking = (s, from, hours) => { for (let t = from; t <= from + hours * HOUR; t += 10 * MIN) s.tick(t); };
 
@@ -214,7 +218,7 @@ test("once every condition the records show holds, the trial is ready, and it ne
   // Pull request 1 merged by the queue, at the commit judged there.
   s.put(T0 + 1 * MIN + 10, "queue.decided", "pr:1", { head: sha("e"), state: "PASS" });
   merged[0].mergeCommit = sha("e");
-  const r = trialReport(s.db, { repo: R, since: T0, now: T0 + 80 * HOUR, merged, seeded: [{ name: "red CI", must: "BLOCK", got: "BLOCK" }] });
+  const r = trialReport(s.db, { repo: R, since: T0, now: T0 + 80 * HOUR, merged, seeded: [seededAs("good", true, "PASS", "PASS"), seededAs("red CI", true, "BLOCK")] });
   s.db.close();
   assert.equal(r.conditions.find((c) => /no false call/.test(c.name))?.met, null, "the audit is a person's");
   assert.equal(r.ready, true, "every condition the records show holds");
@@ -222,13 +226,20 @@ test("once every condition the records show holds, the trial is ready, and it ne
   assert.match(renderTrial(r, "o/r"), /every condition the records show holds: it passes once a person's audit finds no false call/);
 });
 
-test("a seeded known-bad case must get the verdict it must, and none seeded is a condition not met", () => {
+test("each seeded case must come out as it must, for its reason, and cases not run or none seeded are a condition not met", () => {
   const s = store();
-  const cond = (seeded) => trialReport(s.db, { repo: R, since: T0, now: T0 + HOUR, merged: [], seeded }).conditions.find((c) => /seeded/.test(c.name));
+  const report = (/** @type {any} */ seeded) => trialReport(s.db, { repo: R, since: T0, now: T0 + HOUR, merged: [], ...(seeded === undefined ? {} : { seeded }) });
+  const cond = (/** @type {any} */ seeded) => report(seeded).conditions.find((c) => /seeded/.test(c.name));
+  assert.equal(cond(undefined)?.met, false);
+  assert.match(String(cond(undefined)?.detail), /not run: pass --seeded to run them/);
   assert.equal(cond([])?.met, false);
   assert.match(String(cond([])?.detail), /none seeded yet/);
-  assert.equal(cond([{ name: "red CI", must: "BLOCK", got: "PASS" }])?.met, false);
-  assert.equal(cond([{ name: "red CI", must: "BLOCK", got: "BLOCK" }])?.met, true);
+  // The right verdict for another reason isn't the case holding.
+  const wrongReason = [seededAs("good", true, "PASS", "PASS"), seededAs("red CI", false, "BLOCK")];
+  assert.equal(cond(wrongReason)?.met, false);
+  assert.match(String(cond(wrongReason)?.detail), /1 of 2; not as they must: red CI \(it came out BLOCK, but not for its reason\)/);
+  assert.match(renderTrial(report(wrongReason), R), /seeded cases:\n {2}ok {3}PASS {5}good: every clause satisfied\n {2}NOT {2}BLOCK {4}red CI: it came out BLOCK, but not for its reason/);
+  assert.equal(cond([seededAs("good", true, "PASS", "PASS"), seededAs("red CI", true, "BLOCK")])?.met, true);
   s.db.close();
 });
 
@@ -244,6 +255,11 @@ test("what merged is read from GitHub since the trial began, with its merge comm
     { number: 1, mergedAt: at(T0 - 60), headRefOid: sha("b"), mergeCommit: { oid: sha("e") } }]) });
   assert.deepEqual(got, [{ pr: 2, mergedAt: T0 + 60, head: sha("a"), mergeCommit: sha("c") }, { pr: 3, mergedAt: T0 + 90, head: sha("d"), mergeCommit: null }], "only since the start");
   assert.match(asked[0], /--json number,mergedAt,headRefOid,mergeCommit /);
+  // Up to the report's own time: one merged while it was made belongs to the next (#295).
+  const upTo = mergedSince("o/r", T0, { until: T0 + 70, run: answer([
+    { number: 2, mergedAt: at(T0 + 60), headRefOid: sha("a"), mergeCommit: null },
+    { number: 4, mergedAt: at(T0 + 80), headRefOid: sha("e"), mergeCommit: null }]) });
+  assert.deepEqual(Array.isArray(upTo) && upTo.map((m) => m.pr), [2]);
   assert.match(JSON.stringify(mergedSince("o/r", T0, { run: () => ({ ok: false, out: "", err: "HTTP 502" }) })), /HTTP 502/);
   assert.match(JSON.stringify(mergedSince("o/r", T0, { run: () => ({ ok: true, out: "{not json" }) })), /doesn't read as a list/);
   assert.match(JSON.stringify(mergedSince("o/r", T0, { run: answer([{ number: 2, mergedAt: at(T0 + 60), headRefOid: "short", mergeCommit: null }]) })), /doesn't read whole/);
@@ -270,19 +286,30 @@ test("reeve trial reports a store against the trial's conditions, reading what m
   s.decided(start + 5 * MIN, 7, sha("a"), "PASS");
   s.record(R, 7, sha("a"));
   s.db.close();
-  const { run } = reeveWith([{ number: 7, mergedAt: new Date((start + 10 * MIN) * 1000).toISOString(), headRefOid: sha("a"), mergeCommit: { oid: sha("b") } }]);
+  const { run } = reeveWith([{ number: 7, mergedAt: new Date((start + 10 * MIN) * 1000).toISOString(), headRefOid: sha("a"), mergeCommit: { oid: sha("b") } },
+                             // Merged after the report's own time, as while it was being made: the next report's.
+                             { number: 8, mergedAt: new Date((start + 5 * HOUR) * 1000).toISOString(), headRefOid: sha("c"), mergeCommit: null }]);
   const since = new Date(start * 1000).toISOString();
   const text = run("o/r", "--db", s.path, "--since", since);
   assert.equal(text.status, 1, "not passed: " + text.stderr);
   assert.match(text.stdout, /#7 at aaaaaaaaaa: PASS/);
   const json = run("o/r", "--db", s.path, "--since", since, "--json");
   assert.equal(JSON.parse(json.stdout).passedFinal, 1);
+  assert.deepEqual(JSON.parse(json.stdout).merges.map((/** @type {any} */ m) => m.pr), [7], "not one merged after the report's time");
   const none = run("o/r", "--db", s.path);
   assert.equal(none.status, 1);
   assert.match(none.stderr, /--since takes the date the trial's count started from/);
   const later = run("o/r", "--db", s.path, "--since", new Date((start + 10 * HOUR) * 1000).toISOString());
   assert.equal(later.status, 1);
   assert.match(later.stderr, /a trial can't have begun after now/);
+  // The seeded cases, run when asked.
+  const seededCond = (/** @type {any} */ doc) => doc.conditions.find((/** @type {any} */ c) => /seeded/.test(c.name));
+  assert.match(seededCond(JSON.parse(json.stdout)).detail, /not run/);
+  const seeded = JSON.parse(run("o/r", "--db", s.path, "--since", since, "--seeded", "--json").stdout);
+  assert.ok(Array.isArray(seeded.seeded) && seeded.seeded.length > 1 && seeded.seeded.every((/** @type {any} */ x) => x.ok), JSON.stringify(seeded.seeded));
+  assert.equal(seededCond(seeded).met, true);
+  const elsewhere = spawnSync(process.execPath, [REEVE, "replay", "o/r", "--seeded"], { encoding: "utf8", env: offlineEnv() });
+  assert.equal(elsewhere.status, 2, "only the trial runs them: " + elsewhere.stderr);
 });
 
 test("reeve trial reads only a store of the repository it's asked about", () => {

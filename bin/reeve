@@ -243,6 +243,7 @@ const FLAGS = {
   tick:           { value: false, what: "run a single tick and exit" },
   write:          { value: false, what: "write the change rather than printing it" },
   "as-app":       { value: false, what: "act as the GitHub App rather than the user" },
+  seeded:         { value: false, what: "run the trial's seeded known-bad cases too" },
   test:           { value: false, what: "send a test alert through every configured channel" },
   help:           { value: false, what: "show this help" },
 };
@@ -963,12 +964,15 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     const now = Math.floor(Date.now() / 1000);
     if (sinceAt > now) fail("usage", `reeve trial: --since ${since} is after now, and a trial can't have begun after now`);
     const { trialReport, renderTrial, mergedSince, storeIsOf } = await import("../src/trial.mjs");
+    // The seeded cases run only when asked: each is a judgement of its own, and
+    // all of them take a while. Not run, the report says so.
+    const seeded = flag("seeded") ? await (await import("../src/seeded.mjs")).runSeeded() : null;
     const db = open(dbPath);
     // Another repository's store would count its ticks, verdicts and cases for
     // this one, and forks share pull request numbers and heads.
     const bound = storeIsOf(db, nwo, { named: opt("db") != null });
     if (!bound.ok) fail("store_unusable", `reeve trial: ${bound.why}`);
-    const report = trialReport(db, { repo: nwo, since: sinceAt, now, merged: mergedSince(nwo, sinceAt) });
+    const report = trialReport(db, { repo: nwo, since: sinceAt, now, merged: mergedSince(nwo, sinceAt, { until: now }), seeded });
     console.log(flag("json") ? JSON.stringify(report, null, 2) : renderTrial(report, nwo));
     process.exit(report.passed ? 0 : 1);
   }

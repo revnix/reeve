@@ -57,7 +57,7 @@ import { codeVersion, policyOf, recordsFor } from "./evidence.mjs";
 import { saveDecision } from "./db/records.mjs";
 import { decisionStatement, baselineStatement, baselineFingerprint, latestStatement } from "./signing.mjs";
 import { BASELINE_OP, LATEST_OP, STORE_ID_OP, FILED, latestDecision, storeIdentity } from "./db/records.mjs";
-import { signedOrder, strayEntry, baselineLost, otherRepository } from "./decisions.mjs";
+import { signedOrder, strayEntry, baselineLost, otherRepository, signingState, holdsWhole } from "./decisions.mjs";
 import { noAnchor } from "./anchor.mjs";
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -1475,15 +1475,21 @@ export async function tick(ctx) {
     // is said not to be every tick, as its baseline was taken away, or never made
     // where its records differed.
     if (!row) return not(a.pending ? "the host's anchor was being bound to a store holding a baseline this one doesn't hold" : "this store holds no baseline");
-    if (!digests) return not("this store's baseline can't be read");
-    const fingerprint = baselineFingerprint(digests);
+    // Its baseline signed by a key this host knows, and every record it names
+    // held as it was kept: a store named by --db could otherwise hold a baseline
+    // written by hand, and take the anchor for good.
+    if (!orderKeys) return not("there are no keys to check its baseline with");
+    const { baseline, why: unsigned } = signingState(db, /** @type {any} */ (orderKeys));
+    if (!baseline) return not(`this store's baseline doesn't hold${unsigned ? `: ${unsigned}` : ""}`);
+    const signedDigests = [...baseline].sort();
+    const fingerprint = baselineFingerprint(signedDigests);
     if (a.pending) {
       if (a.pending.store !== id) return not("the host's anchor was being bound to another store");
       if (a.pending.baseline !== fingerprint) return not("this store's baseline isn't the one its binding was begun with: the store was restored from before, or its baseline changed");
-      const held = db.prepare(`SELECT 1 FROM decision WHERE digest = ?`);
-      const gone = digests.filter((d) => !held.get(d));
-      if (gone.length) return not(`this store no longer holds ${gone.length} record(s) its baseline names: they were taken away`);
     }
+    const whole = holdsWhole(db);
+    const gone = signedDigests.filter((d) => !whole(d));
+    if (gone.length) return not(`this store no longer holds ${gone.length} record(s) its baseline names: they were taken away`);
     if (!had) (ctx.durably ?? durably)(db, () => tx(db, () => {
       if (!storeIdentity(db)) db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`).run(now(), "daemon", STORE_ID_OP, "store", canonical({ id }));
     }));
@@ -1550,9 +1556,14 @@ export async function tick(ctx) {
       if (!held) return;
       let why = null;
       try {
+        const a = ctx.anchor.read(nwo) ?? noAnchor();
+        // The first record a store keeps binds the anchor to it, where its
+        // baseline, over no record, left that to the first order: kept before
+        // then and taken away while no reeve ran, it would leave nothing on the
+        // anchor to show it. bindStore says why where it can't be bound.
+        if (!a.store && !bindStore(a)) return;
         const id = storeIdentity(db);
-        const a = ctx.anchor.read(nwo);
-        if (id && a?.store === id && !ctx.anchor.pin(nwo, id, pr, [digest])) why = "the host's anchor couldn't be written";
+        if (id && a.store === id && !ctx.anchor.pin(nwo, id, pr, [digest])) why = "the host's anchor couldn't be written";
       } catch (err) { why = err.message; }
       if (why && !pinSaid) { pinSaid = true; log(logPath, `signing: #${pr}: a record kept couldn't be pinned on the host's anchor — ${why}`); }
     });
@@ -1611,7 +1622,7 @@ export async function tick(ctx) {
     // store may have signed that number.
     /** @type {string | null} */ let owed = null;
     if (reserved) {
-      if (!db.prepare(`SELECT 1 FROM decision WHERE digest = ? AND pr = ?`).get(reserved.digest, pr)) {
+      if (!holdsWhole(db)(reserved.digest, pr)) {
         log(logPath, `signing: #${pr}: this host reserved entry ${reserved.n} of its signed order for record ${reserved.digest.slice(0, 12)}, ` +
                      "which this store doesn't hold, so it isn't extended: a copy of the store may have signed it");
         return { top: 0, named: false };
@@ -1779,7 +1790,7 @@ export async function tick(ctx) {
         const pending = pendingOrders(a, id);
         if (!pending.length) return;
         if (!bound && !bindStore(a)) return;
-        const holds = db.prepare(`SELECT 1 FROM decision WHERE digest = ?`);
+        const whole = holdsWhole(db);
         for (const pr of pending) {
           /** @type {Extended} */ let r = { top: 0, named: false };
           try { r = tx(db, () => extendOrder(pr, /** @type {import("./anchor.mjs").Anchor} */ (a), /** @type {string} */ (id))); }
@@ -1790,7 +1801,7 @@ export async function tick(ctx) {
           // A record this host kept and pinned (#279) that the store no longer
           // holds and no entry names: taken away, as reeve never removes one,
           // though the reeve that kept it stopped before ordering it.
-          const gone = [...(a.pinned.get(pr) ?? [])].filter((d) => !(r.names ?? []).includes(d) && !holds.get(d));
+          const gone = [...(a.pinned.get(pr) ?? [])].filter((d) => !(r.names ?? []).includes(d) && !whole(d, pr));
           if (gone.length) log(logPath, `signing: #${pr}: this host kept ${gone.length} record(s) that this store no longer holds, and no entry of its signed order names: ` +
                                         `they were taken away — ${gone.map((d) => d.slice(0, 12)).join(", ")}`);
         }

@@ -1285,7 +1285,7 @@ test("an entry filed under another spelling of a pull request's name fails every
   const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: null });
   const replayed = replayDecisions(db, {}, { keys, repo: REPO, anchor: null });
   db.close();
-  rmSync(anchorPath(dir, REPO));
+  rmSync(anchorPath(dir, REPO), { force: true });
   const r = await closedTick(dbPath, host(dir));
   db = open(dbPath);
   const after = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n;
@@ -1538,8 +1538,8 @@ test("reeve restore doesn't write over a store a reeve is running on, a reeve ti
 
 /**
  * A store kept before signing, with records of #42 and #43, that begins signing
- * under a reeve with no keys to check an order with, so no order names either
- * yet (a baseline over records now waits for the host's lock, #281); then
+ * under a reeve whose reservations fail, so no order names either yet (a
+ * baseline over records now waits for the host's lock, #281); then
  * `edit` is made, #43's record taken away unless it says otherwise. Answers the
  * store, and that record.
  */
@@ -1549,7 +1549,7 @@ async function lostBeforeOrdered(dir, edit = "DELETE FROM decision WHERE pr = 43
   const k = recordOf(REPO, 43, B);
   saveDecision(db, { at: 1, seq: 1000, pr: 43, head: B, ...k });
   db.close();
-  await closedTick(dbPath, { ...host(dir), keys: () => null });
+  await closedTick(dbPath, { ...host(dir), anchor: { ...fileAnchor(dir), reserve: () => false } });
   db = open(dbPath);
   const baseline = JSON.parse(db.prepare("SELECT payload FROM event WHERE op = 'signing.baseline'").get()?.payload ?? "{}").digests ?? [];
   const entries = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n;

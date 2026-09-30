@@ -129,7 +129,11 @@ export function computeVerdict(i) {
   // 2. The base's own health. GitHub does not check this when strict is false, so
   //    a PR can merge cleanly into a branch that is already broken.
   if (!i.base) add("base", UNKNOWN, "base health not read", "retry", "read the base branch's checks again");
-  else if (i.base.verdict === "GREEN") add("base", PASS, "base is green");
+  else if (i.base.verdict === "GREEN") {
+    // A workflow no rule requires, failing there, is named, not held against the pull request (#288).
+    const beside = i.base.ancillaryFailing ?? [];
+    add("base", PASS, "base is green" + (beside.length ? `; ${beside.join(", ")} failing there, which no rule requires` : ""));
+  }
   else if (i.base.verdict === "RED") {
     // The pull request that repairs a red base passes, at its own green head,
     // every check failing there. Blocked, it would leave the base red for good,

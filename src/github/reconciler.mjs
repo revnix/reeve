@@ -251,9 +251,14 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
  * requirement unread may be one no row meets. `queueOnly` names required checks
  * that run only in the merge queue, asked of a pull request's head: skipped
  * there by design, they're judged at the queue's commit instead, and named in
- * `queueOnly` rather than read as never having passed (#286).
+ * `queueOnly` rather than read as never having passed (#286). `failuresOf`, for
+ * a base's health, names the checks that gate merges into it, where they're
+ * known: only theirs then count, failing, running or cancelled, and another's
+ * failure is named in `ancillaryFailing` rather than held against every pull
+ * request (#288). Null counts every check, as a base whose rules couldn't be
+ * read, or that requires none, can't say which matter.
  */
-export function classify(allRows, requiredChecks = [], { requiredKnown = true, evidence = true, queueOnly = [] } = {}) {
+export function classify(allRows, requiredChecks = [], { requiredKnown = true, evidence = true, queueOnly = [], failuresOf = null } = {}) {
   // A row with no name is a PARSE DEFECT, not a check. It cannot be reported to a
   // fixer ("failing: undefined") and it must not block on its own, but it must
   // also not vanish silently, so it is counted and surfaced.
@@ -263,12 +268,16 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
     verdict: "UNKNOWN", failing: [], running: [], malformed,
     why: malformed ? `${malformed} unparseable check row(s) and nothing else` : "no checks reported at this revision",
   };
-  const running = rows.filter(r => r.state !== "completed");
+  // A row that could meet a check gating merges, its name and, where it's bound, its App.
+  const gates = (r) => !failuresOf?.length || failuresOf.some(c => c.context === r.name && (c.app == null || (r.source === "check_run" && String(r.appId) === String(c.app))));
+  const running = rows.filter(r => r.state !== "completed" && gates(r));
   const completed = rows.filter(r => r.state === "completed");
   const uninformative = completed.filter(r => UNINFORMATIVE.has(String(r.conclusion)));
-  const failing = completed.filter(r =>
+  const failingAll = completed.filter(r =>
     !UNINFORMATIVE.has(String(r.conclusion)) &&
     (!KNOWN_CONCLUSIONS.has(String(r.conclusion)) || !PASSING.has(String(r.conclusion))));
+  const failing = failingAll.filter(gates);
+  const ancillaryFailing = [...new Set(failingAll.filter(r => !gates(r)).map(r => r.name))];
   const names = new Set(rows.map(r => r.name));
   const required = requiredChecks.map(c => (typeof c === "string" ? { context: c, app: null }
     : { context: c.context, app: c.app == null ? null : String(c.app), ...(c.origin ? { origin: c.origin } : {}) }));
@@ -301,7 +310,8 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
   // meets, reeve's own shadow check say, which GitHub passes on reeve's neutral.
   const green = (result) => (evidence && !requiredKnown ? { verdict: "UNKNOWN", failing: [], running: [], malformed,
     why: "the base's required checks couldn't be read, so whether each one passed can't be told" }
-    : deferred.length ? { ...result, queueOnly: deferred.map(c => c.context) } : result);
+    : { ...result, ...(deferred.length ? { queueOnly: deferred.map(c => c.context) } : {}),
+        ...(ancillaryFailing.length ? { ancillaryFailing } : {}) });
   // A head where nothing ran has no evidence at all, however many rows say so.
   // Unless every required check was left to the merge queue: then the head
   // shows what it can, and the queue's commit shows the rest (#286).
@@ -323,7 +333,7 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
   if (uninformative.length) {
     // Only a row that could have met a requirement: its name, and its App where
     // the requirement is bound to one.
-    const blocking = requiredNames.size
+    const blocking = failuresOf?.length ? uninformative.filter(gates) : requiredNames.size
       ? uninformative.filter(r => required.some(c => c.context === r.name && (c.app == null || (r.source === "check_run" && String(r.appId) === c.app))))
       : uninformative;
     if (blocking.length) return {

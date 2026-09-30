@@ -186,6 +186,7 @@ test("a repair is taken only from a base read whole, at a commit the head contai
   assert.equal(baseClause(passes, redBase([check("Build")], { complete: false }))?.state, "BLOCK", "a base read in part, which may hide more failures");
   assert.equal(baseClause(passes, redBase([check("Build")], { inHead: false }))?.state, "BLOCK", "a head from before the base went red");
   assert.equal(baseClause(passes, redBase([check("Build")], { inHead: null }))?.state, "BLOCK", "a head whose ancestry couldn't be read");
+  assert.equal(baseClause(passes, redBase([check("Build")]))?.state, "PASS", "control: read whole, at a commit the head contains");
 });
 
 test("the base's failing checks and the head's passed ones are named from what GitHub reported, a pass being only a success", () => {

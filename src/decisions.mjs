@@ -604,9 +604,9 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
  * Why a binding the host's anchor began for this store (#281) doesn't hold, or
  * null: the store's baseline isn't the one the binding was begun with, signed
  * by a key this host knows, as binding reads it; or where it has none, the
- * store no longer holds, as it was kept, each record the binding was begun
- * with, though it may hold more, kept while its baseline waited. A binding
- * begun for another store isn't this one's to say.
+ * store doesn't hold exactly the records the binding was begun with, each as it
+ * was kept, as no record is kept while its baseline waits. A binding begun for
+ * another store isn't this one's to say.
  * @param {Db} db @param {AnchorRead | null} anchor @param {Keys} keys @returns {string | null}
  */
 function bindingDiffers(db, anchor, keys) {
@@ -623,7 +623,8 @@ function bindingDiffers(db, anchor, keys) {
     return baselineFingerprint([...baseline]) === p.baseline ? null : other;
   }
   const whole = holdsWhole(db);
-  return p.digests.every((d) => whole(d)) ? null : other;
+  const held = /** @type {any[]} */ (db.prepare(`SELECT digest FROM decision`).all()).map((r) => String(r.digest));
+  return baselineFingerprint(held) === p.baseline && p.digests.every((d) => whole(d)) ? null : other;
 }
 
 /**

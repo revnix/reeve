@@ -308,9 +308,7 @@ export function fileAnchor(dir, { write = (fd, buf, offset, length) => writeSync
      * about to commit (#281): written before the store commits it, so a reeve
      * that stops before binding leaves the anchor saying which store, holding
      * which records, it was binding. Where the anchor is bound, or a binding of
-     * another store was begun, it isn't written over; one of this store is
-     * moved on only to a baseline naming every record it named, as the store
-     * kept more while its baseline waited, never to one naming fewer.
+     * another store, or of other records, was begun, it isn't written over.
      * @param {string} repo @param {string} id @param {string[]} digests
      */
     pending: (repo, id, digests) => update(repo, (a) => {
@@ -321,8 +319,7 @@ export function fileAnchor(dir, { write = (fd, buf, offset, length) => writeSync
       if (a.pending) {
         if (a.pending.store !== id) throw new Error(`the host's anchor for ${repo} is being bound to another store`);
         if (a.pending.baseline === baseline) return false;
-        const now = new Set(sorted);
-        if (a.pending.digests.some((d) => !now.has(d))) throw new Error(`the host's anchor for ${repo} is being bound to this store with records this baseline doesn't name`);
+        throw new Error(`the host's anchor for ${repo} is being bound to this store with another baseline`);
       }
       a.pending = { store: id, baseline, digests: sorted };
       return true;

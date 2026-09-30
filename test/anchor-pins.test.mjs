@@ -180,14 +180,14 @@ test("a binding begun is finished only for the store it was begun for", () => {
   assert.equal(an.pending(REPO, ID, [D1]), false, "and none is begun on an anchor bound");
 });
 
-test("a binding begun moves on only over more records, as its store kept more while its baseline waited", () => {
+test("a binding begun isn't moved to other records, more or fewer", () => {
   const dir = credentials();
   const an = fileAnchor(dir);
   assert.equal(an.pending(REPO, ID, [D1]), true);
-  assert.equal(an.pending(REPO, ID, [D2]), false, "not over records that leave out one it was begun with");
-  assert.equal(an.pending(REPO, ID, [D2, D1]), true, "over more records");
-  assert.equal(an.pending(REPO, ID, [D1]), false, "and never back");
-  assert.deepEqual(anchorRead(dir)?.pending, { store: ID, baseline: baselineFingerprint([D1, D2]), digests: [D1, D2] });
+  assert.equal(an.pending(REPO, ID, [D1, D2]), false, "not over more records");
+  assert.equal(an.pending(REPO, ID, [D2]), false, "nor over others");
+  assert.equal(an.pending(REPO, ID, [D1]), true, "control: begun again as it was, it holds");
+  assert.deepEqual(anchorRead(dir)?.pending, { store: ID, baseline: baselineFingerprint([D1]), digests: [D1] });
 });
 
 // ── #279: an order's entries ─────────────────────────────────────────────────
@@ -940,34 +940,54 @@ test("a store ahead of the host's anchor, its entry naming the reserved record a
   assert.equal(anchorRead(dir)?.latest?.get(PR), 1, "and the anchor isn't moved to it");
 });
 
-test("a binding begun whose baseline didn't commit is finished once it does, over the records kept meanwhile", async () => {
+/** A tick's `durably`, as on a disk that filled: every baseline's commit fails. */
+const noBaseline = (/** @type {any} */ db, /** @type {() => any} */ fn) => {
+  db.exec("CREATE TEMP TRIGGER IF NOT EXISTS no_baseline BEFORE INSERT ON event WHEN NEW.op = 'signing.baseline' BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END");
+  try { return fn(); } finally { db.exec("DROP TRIGGER IF EXISTS temp.no_baseline"); }
+};
+
+test("a binding begun whose baseline didn't commit keeps no record until it does, and is finished then", async () => {
   const dir = credentials();
   const dbPath = store();
   await tick(dbPath, at(A));
-  // The binding begun, and the baseline's commit failing, as on a disk that filled; the tick keeps its record all the same, unsigned.
-  const durably = (/** @type {any} */ db, /** @type {() => any} */ fn) => {
-    db.exec("CREATE TEMP TRIGGER IF NOT EXISTS no_baseline BEFORE INSERT ON event WHEN NEW.op = 'signing.baseline' BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END");
-    try { return fn(); } finally { db.exec("DROP TRIGGER IF EXISTS temp.no_baseline"); }
-  };
-  await tick(dbPath, at(A, "RED"), { ...host(dir), durably });
+  const r = await tick(dbPath, at(A, "RED"), { ...host(dir), durably: noBaseline });
   let db = open(dbPath);
   const kept = digestsOf(db).length;
   db.close();
   assert.equal(baselines(dbPath), 0, "control: the baseline didn't commit");
   assert.ok(anchorRead(dir)?.pending, "control: its binding was begun");
-  assert.equal(kept, 2, "control: a record was kept meanwhile");
-  // Nor does a whole-store replay take the record kept meanwhile for one taken away.
+  assert.equal(kept, 1, "no record kept while the baseline waits: it couldn't be told from one put in the store by hand");
+  assert.match(r.log, /#42: its decision record isn't kept this tick, as the store's first baseline hasn't landed since its binding was begun on the host's anchor/);
+  await tick(dbPath, at(A, "RED"), host(dir));
+  db = open(dbPath);
+  const id = storeIdentity(db);
+  const after = digestsOf(db).length;
+  db.close();
+  assert.equal(baselines(dbPath), 1, "the baseline is made");
+  assert.deepEqual({ store: anchorRead(dir)?.store, pending: anchorRead(dir)?.pending }, { store: id, pending: null }, "and the anchor bound");
+  assert.equal(after, 2, "and the record kept, once it has");
+});
+
+test("a record put in the store while a binding's baseline waited makes no baseline, and replay says so", async () => {
+  const dir = credentials();
+  const dbPath = store();
+  await tick(dbPath, at(A));
+  await tick(dbPath, null, { ...host(dir), durably: noBaseline });
+  assert.ok(anchorRead(dir)?.pending, "control: its binding was begun");
+  // A record put in the store while no reeve with the host's key ran: whole, and unsigned.
+  await tick(dbPath, at(A, "RED"));
+  let db = open(dbPath);
+  const kept = digestsOf(db).length;
+  db.close();
+  assert.equal(kept, 2, "control: it was put there");
+  const r = await tick(dbPath, null, host(dir));
+  assert.equal(baselines(dbPath), 0, "no baseline vouching for it");
+  assert.match(r.log, /the host's anchor for o\/r was being bound to this store, holding other records than it holds now/);
   const keys = knownKeys({ local: dir });
   db = open(dbPath);
   const whole = replayDecisions(db, {}, { keys, repo: REPO, anchor: anchorFor(db, dir) });
   db.close();
-  assert.ok(!whole.some((x) => /was being bound to this store/.test(String(x.why))), JSON.stringify(whole));
-  await tick(dbPath, null, host(dir));
-  db = open(dbPath);
-  const id = storeIdentity(db);
-  db.close();
-  assert.equal(baselines(dbPath), 1, "the baseline is made, over both");
-  assert.deepEqual({ store: anchorRead(dir)?.store, pending: anchorRead(dir)?.pending }, { store: id, pending: null }, "and the anchor bound");
+  assert.ok(whole.some((x) => /the host's anchor was being bound to this store, holding other records than it holds now/.test(String(x.why))), JSON.stringify(whole));
 });
 
 test("a binding begun over a record changed since makes no baseline", async () => {
@@ -985,4 +1005,50 @@ test("a binding begun over a record changed since makes no baseline", async () =
   const r = await tick(dbPath, null, host(dir));
   assert.equal(baselines(dbPath), 0);
   assert.match(r.log, /was being bound to this store, holding other records than it holds now/);
+  const keys = knownKeys({ local: dir });
+  db = open(dbPath);
+  const whole = replayDecisions(db, {}, { keys, repo: REPO, anchor: anchorFor(db, dir) });
+  db.close();
+  assert.ok(whole.some((x) => /was being bound to this store, holding other records than it holds now/.test(String(x.why))), JSON.stringify(whole));
+});
+
+// ── #299's fourth review ─────────────────────────────────────────────────────
+
+test("a record whose pin was written, though its folder's sync failed after, is kept", async () => {
+  const dir = credentials();
+  const dbPath = store();
+  await tick(dbPath, at(A), host(dir));
+  const real = fileAnchor(dir);
+  // The pin renamed into place, and the sync after it failing: the write answers false.
+  const anchor = { ...real, pin: (/** @type {any[]} */ ...args) => { real.pin(...args); return false; } };
+  await tick(dbPath, at(A, "RED"), host(dir, anchor));
+  const db = open(dbPath);
+  const [, red] = digestsOf(db);
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  db.close();
+  assert.ok(red, "kept, as the pin reads on the anchor");
+  assert.ok("digest" in order && order.digest === red, `and ordered: ${JSON.stringify(order)}`);
+});
+
+test("an anchor written before #279 has each pull request's top entry noted, with its record and seal, on the next tick", async () => {
+  const dir = credentials();
+  const dbPath = store();
+  await tick(dbPath, at(A), host(dir));
+  await tick(dbPath, at(A, "RED"), host(dir));
+  let db = open(dbPath);
+  const [, red] = digestsOf(db);
+  const two = entryOf(db, 2);
+  db.close();
+  // As #278 wrote it: each pull request's top entry, and nothing of what it names.
+  rewrite(dir, (a) => { a.named = {}; a.sealed = {}; });
+  assert.equal(anchorRead(dir)?.sealed?.size, 0, "control: no seal");
+  // Quiet: nothing new kept for it, nor judged.
+  await tick(dbPath, null, host(dir));
+  const a = anchorRead(dir);
+  assert.equal(a?.named?.get(PR), red);
+  assert.equal(a?.sealed?.get(PR), sealOf(two));
+  db = open(dbPath);
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  db.close();
+  assert.equal("top" in order && order.top, 2, "and no entry added for it");
 });

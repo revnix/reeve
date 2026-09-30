@@ -958,10 +958,10 @@ function standingAt(db, pr) {
  * baseline commits, and the caller binds it once it has. A reeve that stops in
  * between, or whose baseline didn't commit, leaves the anchor saying which
  * store, holding which records, it was binding: finished for that store while
- * it holds each of those records as it was kept, over those and any it kept
- * since, as it may have while its baseline waited; and otherwise no baseline is
- * made over what's left. So that's done only under the host's lock on the
- * anchor, `held`; without it, the first baseline waits a tick.
+ * it holds exactly those records, each as it was kept, as no record is kept
+ * while its baseline waits; and otherwise no baseline is made over what's left.
+ * So that's done only under the host's lock on the anchor, `held`; without it,
+ * the first baseline waits a tick.
  * @returns {{ began: boolean, why?: string }}
  */
 function beginSigning(db, sign, logPath, anchor = null, nwo = null, held = false) {
@@ -1004,11 +1004,12 @@ function beginSigning(db, sign, logPath, anchor = null, nwo = null, held = false
         if (!held) return { began: false, why: "the host's lock on the anchor wasn't held, so the store's first baseline waits for a tick that holds it" };
         // A binding begun before this store committed its baseline, by a reeve
         // that stopped or whose baseline failed: the same store, as its identity
-        // went with the baseline, holding every record it was begun with as it
-        // was kept, and perhaps more kept since, or none is made over what's left.
+        // went with the baseline, holding exactly the records it was begun with,
+        // each as it was kept, or none is made over what's left. No record is
+        // kept while it waits, so one more was put in the store by hand.
         const id = storeIdentity(db) ?? a?.pending?.store ?? randomBytes(16).toString("hex");
         const whole = holdsWhole(db);
-        if (a?.pending && (a.pending.store !== id || a.pending.digests.some((d) => !whole(d)))) {
+        if (a?.pending && (a.pending.store !== id || a.pending.baseline !== baselineFingerprint(digests) || a.pending.digests.some((d) => !whole(d)))) {
           log(logPath, `signing: the host's anchor for ${nwo} was being bound to ${a.pending.store === id ? "this store, holding other records than it holds now" : "another store"}: ` +
                        "records were taken away, or the store restored from before. No baseline is made over what it holds, and its unsigned records aren't trusted");
           return { began: true };
@@ -1557,10 +1558,19 @@ export async function tick(ctx) {
   // stopped before ordering, taken away while none runs, still shows, whenever
   // the reeve stopped. An entry that names it unpins it, and so does its commit
   // failing. Whether it's pinned, or no anchor is this store's to pin it on, or
-  // why it couldn't be pinned.
-  /** @returns {{ pinned: boolean } | { why: string }} */
+  // why it couldn't be pinned; or, with `waits`, why no record is kept yet.
+  /** @returns {{ pinned: boolean } | { why: string, waits?: boolean }} */
   const pinKept = (/** @type {number} */ pr, /** @type {string} */ digest) => {
-    if (!ordering || !begun.began) return { pinned: false };
+    if (!ordering) return { pinned: false };
+    if (!begun.began) {
+      // A binding begun on the host's anchor names the records the store holds
+      // until its first baseline lands (#281). A record kept meanwhile couldn't
+      // be told from one put in the store by hand, and the baseline made on
+      // recovery would vouch for it, so none is kept until the baseline lands.
+      try { if (ctx.anchor.read(nwo)?.pending) return { why: "the store's first baseline hasn't landed since its binding was begun on the host's anchor", waits: true }; }
+      catch (err) { return { why: err.message }; }
+      return { pinned: false };
+    }
     return withOrderLock((held) => {
       if (!held) return { why: "the host's lock on the anchor wasn't held" };
       try {
@@ -1576,7 +1586,12 @@ export async function tick(ctx) {
         }
         const id = storeIdentity(db);
         if (!id || a.store !== id) return { pinned: false };
-        return ctx.anchor.pin(nwo, id, pr, [digest]) ? { pinned: true } : { why: "the host's anchor couldn't be written" };
+        if (ctx.anchor.pin(nwo, id, pr, [digest])) return { pinned: true };
+        // A pin written, and its folder's sync failed after: it reads there all
+        // the same, and the anchor's next write syncs the folder again. One that
+        // doesn't read there wasn't written.
+        const again = ctx.anchor.read(nwo);
+        return again?.store === id && again.pinned.get(pr)?.has(digest) ? { pinned: true } : { why: "the host's anchor couldn't be written" };
       } catch (err) { return { why: err.message }; }
     });
   };
@@ -1606,7 +1621,7 @@ export async function tick(ctx) {
     const digest = kept && ordering && !db.prepare(`SELECT 1 FROM decision WHERE digest = ?`).get(kept.decision.digest) ? String(kept.decision.digest) : null;
     const pin = digest ? pinKept(pr, digest) : { pinned: false };
     if ("why" in pin) {
-      log(logPath, `  ${at}: its decision record isn't kept this tick, as it couldn't be pinned on the host's anchor — ${pin.why}`);
+      log(logPath, `  ${at}: its decision record isn't kept this tick, as ${pin.waits ? pin.why : `it couldn't be pinned on the host's anchor — ${pin.why}`}`);
       kept = null;
     }
     const pinned = "pinned" in pin && pin.pinned;
@@ -1793,6 +1808,10 @@ export async function tick(ctx) {
     for (const pr of a.reserved.keys()) prs.add(pr);
     for (const [pr, d] of a.named) { const o = orders.get(pr); if (!o || !("entries" in o) || o.entries.get(a.latest.get(pr) ?? 0) !== d) prs.add(pr); }
     for (const [pr, s] of a.sealed) { const o = orders.get(pr); if (!o || !("seals" in o) || o.seals.get(a.latest.get(pr) ?? 0) !== s) prs.add(pr); }
+    // And each the anchor holds an entry of without its record or seal, as an
+    // anchor written before #279 does: noted again, from its order as checked,
+    // so a quiet pull request's top entry is sealed on the first tick after.
+    for (const pr of a.latest.keys()) if (!a.named.has(pr) || !a.sealed.has(pr)) prs.add(pr);
     for (const pr of a.pinned.keys()) prs.add(pr);
     // Only a record filed under a pull request's number: one under 0, say, would
     // have an entry filed where no order finds it, and a note on the host's

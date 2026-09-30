@@ -307,12 +307,17 @@ export function requiredChecksOf({ nwo, baseRef, profile = /** @type {CiProfile}
   // A reviewer's status is aside, but a check bound to an App under the same
   // name is a check run, and required like any other.
   const aside = (c) => c.context === POLICY_CONTEXT || reeveMeets(c) || legacyMeets(c) || (c.app == null && reviewers.has(c.context));
-  const all = [...(profile.ci?.requiredChecks ?? []).map((context) => ({ context, app: null, origin: "profile" })),
-               ...(base ?? []).filter((c) => !aside(c)).map((c) => ({ ...c, origin: "base" }))];
   // One entry per check. Where the profile and the base both name it, the base
-  // wins: its requirement may be any App's, and settles only when it reports.
-  const required = all.filter((c, i) => all.findIndex((d) => d.context === c.context && d.app === c.app) === i)
-    .map((c) => (all.some((d) => d.context === c.context && d.app === c.app && d.origin === "base") ? { ...c, origin: "base" } : c));
+  // wins: its requirement may be any App's, or bound to one, and settles only
+  // when it reports. The profile's, bound to no App, is left out, as beside a
+  // bound one it would take any App's run of that name for the base's (#290).
+  const fromBase = (base ?? []).filter((c) => !aside(c)).map((c) => ({ ...c, origin: "base" }));
+  const all = [...(profile.ci?.requiredChecks ?? []).flatMap((context) => {
+                 const b = fromBase.filter((c) => c.context === context);
+                 return b.length ? b : [{ context, app: null, origin: "profile" }];
+               }),
+               ...fromBase];
+  const required = all.filter((c, i) => all.findIndex((d) => d.context === c.context && d.app === c.app) === i);
   return { required, known: Array.isArray(base), shadowRequired: (base ?? []).some(reeveMeets), legacyRequired: (base ?? []).some(legacyMeets) };
 }
 

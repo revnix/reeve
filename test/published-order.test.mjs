@@ -58,6 +58,18 @@ async function ticks(evals, ctx) {
   return { path, published };
 }
 
+/** Ticks over one store judging #42 and #7 alike, each tick with its evaluation. Answers as `ticks` does. */
+async function ticksOfTwo(evals, ctx) {
+  const path = join(tempDir("reeve-pub-two-"), "s.db");
+  open(path).close();
+  /** @type {any[]} */ const published = [];
+  let tick = 0;
+  await run({ openPrs: () => { tick++; return [PR, 7]; }, evaluate: ({ pr }) => ({ ...evals[Math.min(tick, evals.length) - 1], pr }),
+              dbPath: path, ticks: evals.length,
+              publish: async (args) => { published.push(args); return { ok: true, id: 1, conclusion: "neutral" }; }, ...ctx });
+  return { path, published };
+}
+
 /**
  * GitHub as a copy's check reads it, from what the daemon published: the last
  * result at each head, as a check run updated in place keeps it, with the
@@ -81,25 +93,43 @@ const digestsOf = (db) => db.prepare("SELECT digest FROM decision WHERE pr = ? O
 
 // ── the evidence as a result's text carries it ──────────────────────────────
 
+/** Evidence of #42, with the store's counts. */
+const ev = (record, order = null, store = { prs: 1, entries: 1 }) => ({ pr: PR, record, order, store });
+
 test("the evidence reads back as it was written, with an entry of the order or none yet", () => {
-  for (const e of [{ pr: PR, record: X, order: { n: 3, names: Y } }, { pr: PR, record: X, order: null }]) {
+  for (const e of [ev(X, { n: 3, names: Y }, { prs: 19, entries: 42 }), ev(X), ev(X, null, { prs: 0, entries: 0 })]) {
     const text = `PASS: all clear\n\nclauses...\n${evidenceText(e)}`;
-    assert.deepEqual(readEvidence(text, PR), e);
-    assert.equal(readEvidence(text, 7), null, "and it's evidence of its own pull request only");
+    assert.deepEqual(readEvidence(text), e);
   }
+  assert.equal(readEvidence("PASS: all clear"), null, "and a result with no evidence has none");
 });
 
-test("evidence that doesn't read whole is none", () => {
-  const whole = evidenceText({ pr: PR, record: X, order: { n: 3, names: Y } });
+test("evidence that doesn't read whole is garbled, not taken", () => {
+  const whole = evidenceText(ev(X, { n: 3, names: Y }, { prs: 2, entries: 5 }));
   const lines = whole.split("\n");
-  const without = (i) => lines.filter((_, j) => j !== i).join("\n");
-  assert.equal(readEvidence(without(lines.findIndex((l) => l.startsWith("- record"))), PR), null, "no record");
-  assert.equal(readEvidence(without(lines.findIndex((l) => l.startsWith("- signed order"))), PR), null, "no order line");
-  assert.equal(readEvidence(`${whole}\n- signed order of #${PR}: no entry yet`, PR), null, "both order lines");
-  assert.equal(readEvidence(whole.replace(X, "c".repeat(63)), PR), null, "a record that isn't a digest");
-  assert.ok(readEvidence(whole, PR), "control");
-  assert.throws(() => evidenceText({ pr: PR, record: "c".repeat(63), order: null }), /not evidence to publish/);
-  assert.throws(() => evidenceText({ pr: PR, record: X, order: { n: 0, names: Y } }), /not evidence to publish/);
+  const without = (prefix) => lines.filter((l) => !l.startsWith(prefix)).join("\n");
+  const garbled = { garbled: true };
+  // Read so that a throw is a wrong answer, not a test that died.
+  const readEvidenceOf = (t) => { try { return readEvidence(t); } catch (e) { return { threw: String(e) }; } };
+  assert.deepEqual(readEvidenceOf(without("- record")), garbled, "no record");
+  assert.deepEqual(readEvidenceOf(without("- signed order of")), garbled, "no order line");
+  assert.deepEqual(readEvidenceOf(without("- signed orders of this store")), garbled, "no store line");
+  assert.deepEqual(readEvidenceOf(`${whole}\n- signed order of #${PR}: no entry yet`), garbled, "both order lines");
+  assert.deepEqual(readEvidenceOf(`${whole}\n- record of #${PR}: \`${Y}\``), garbled, "a second record line");
+  assert.deepEqual(readEvidenceOf(`${whole}\nand a line more`), garbled, "a line that isn't evidence");
+  assert.deepEqual(readEvidenceOf(whole.replace(`#${PR}: entry`, "#7: entry")), garbled, "an order of another pull request");
+  assert.deepEqual(readEvidenceOf(whole.replace(X, "c".repeat(63))), garbled, "a record that isn't a digest");
+  assert.deepEqual(readEvidenceOf(whole.replace(/- signed orders of this store: .*/, "- signed orders of this store: many")), garbled, "counts that aren't numbers");
+  assert.ok(readEvidence(whole) && !("garbled" in readEvidence(whole)), "control");
+  for (const bad of [ev("c".repeat(63)), ev(X, { n: 0, names: Y }), ev(X, null, { prs: -1, entries: 0 }), ev(X, null, { prs: 1, entries: 1.5 })])
+    assert.throws(() => evidenceText(bad), /not evidence to publish/, JSON.stringify(bad));
+});
+
+test("evidence the verdict's own text carries, before the published block, is never taken for it", () => {
+  // A check's name, say, that a contributor chose, shown in the verdict above the block.
+  const planted = evidenceText(ev(Y, { n: 9, names: Y }, { prs: 99, entries: 99 }));
+  const real = ev(X, { n: 2, names: X }, { prs: 1, entries: 2 });
+  assert.deepEqual(readEvidence(`BLOCK: ci is red\n\n- ci: failing: ${planted}\n${evidenceText(real)}`), real);
 });
 
 // ── reading it from GitHub ───────────────────────────────────────────────────
@@ -112,15 +142,18 @@ const githubAt = (head, runs, calls = []) => (/** @type {string[]} */ args) => {
   if (!sha) return { ok: false, out: "", err: "not a read this test answers" };
   return { ok: true, out: (runs[sha] ?? []).map((r) => JSON.stringify(r)).join("\n") };
 };
+/** A result's text carrying evidence of `record`, of pull request `pr`. */
+const summary = (record, pr = PR) => `BLOCK: ci is red\n${evidenceText({ ...ev(record), pr })}`;
 
 test("what was published is read from the merge policy's own results only, at the pull request's head and each head asked about", () => {
-  const ev = (record) => `BLOCK: ci is red\n${evidenceText({ pr: PR, record, order: null })}`;
   const calls = [];
   const gh = githubAt(B, {
-    [A]: [{ name: "merge-policy (shadow)", app: "merge-policy", summary: ev(X) }],
-    [B]: [{ name: "merge-policy", app: "merge-policy", summary: ev(Y) },
-          { name: "merge-policy", app: "someone-else", summary: ev("e".repeat(64)) },
-          { name: "tests", app: "merge-policy", summary: ev("f".repeat(64)) }],
+    [A]: [{ name: "merge-policy (shadow)", app: "merge-policy", summary: summary(X) }],
+    [B]: [{ name: "merge-policy", app: "merge-policy", summary: summary(Y) },
+          { name: "merge-policy", app: "someone-else", summary: summary("e".repeat(64)) },
+          { name: "tests", app: "merge-policy", summary: summary("f".repeat(64)) },
+          // Another pull request's, at a commit both are at: that one's to check.
+          { name: "merge-policy (shadow)", app: "merge-policy", summary: summary("a".repeat(64), 7) }],
   }, calls);
   const got = readPublished(REPO, PR, [A], { gh });
   assert.ok("evidence" in got, JSON.stringify(got));
@@ -128,19 +161,21 @@ test("what was published is read from the merge policy's own results only, at th
   assert.ok(calls.every((c) => !c.join(" ").includes("someone")), "control: nothing else was asked");
 });
 
-test("a read of GitHub that fails vouches for nothing", () => {
+test("a read of GitHub that fails, or evidence of the merge policy's own that doesn't read whole, vouches for nothing", () => {
   assert.match(JSON.stringify(readPublished(REPO, PR, [A], { gh: () => ({ ok: false, out: "", err: "HTTP 502" }) })), /#42 couldn't be read from GitHub: HTTP 502/);
   const runsFail = (args) => (args[0] === `repos/${REPO}/pulls/${PR}` ? { ok: true, out: B } : { ok: false, out: "", err: "HTTP 502" });
   assert.match(JSON.stringify(readPublished(REPO, PR, [A], { gh: runsFail })), /results at bbbbbbbb couldn't be read from GitHub: HTTP 502/);
-  const garbled = (args) => (args[0] === `repos/${REPO}/pulls/${PR}` ? { ok: true, out: B } : { ok: true, out: "{not json" });
-  assert.match(JSON.stringify(readPublished(REPO, PR, [A], { gh: garbled })), /results at bbbbbbbb don't read as GitHub's/);
+  const notJson = (args) => (args[0] === `repos/${REPO}/pulls/${PR}` ? { ok: true, out: B } : { ok: true, out: "{not json" });
+  assert.match(JSON.stringify(readPublished(REPO, PR, [A], { gh: notJson })), /results at bbbbbbbb don't read as GitHub's/);
+  const garbled = githubAt(B, { [B]: [{ name: "merge-policy", app: "merge-policy", summary: `${summary(X)}\n- record of #${PR}: \`${Y}\`` }] });
+  assert.match(JSON.stringify(readPublished(REPO, PR, [], { gh: garbled })), /the merge policy's result at bbbbbbbb carries evidence that doesn't read whole/);
 });
 
 // ── publishing it ────────────────────────────────────────────────────────────
 
 test("a published result carries its evidence after the verdict, however long the verdict, shadow or not", async () => {
   const long = { head: A, state: "BLOCK", summary: "ci is red", clauses: [{ id: "ci", state: "BLOCK", detail: "x".repeat(70000) }] };
-  const evidence = { pr: PR, record: X, order: { n: 2, names: Y } };
+  const evidence = ev(X, { n: 2, names: Y }, { prs: 3, entries: 7 });
   for (const shadow of [true, false]) {
     const calls = [];
     const api = (_token, args) => { calls.push(args); return args.includes("POST") || args.includes("PATCH") ? { ok: true, out: JSON.stringify({ id: 9 }) } : { ok: true, out: "" }; };
@@ -160,10 +195,10 @@ test("each result the daemon publishes names the record it kept, and where the p
   const [green, red] = digestsOf(db);
   db.close();
   assert.deepEqual(published.map((p) => p.evidence), [
-    { pr: PR, record: green, order: null },
-    { pr: PR, record: green, order: { n: 1, names: green } },
+    { pr: PR, record: green, order: null, store: { prs: 0, entries: 0 } },
+    { pr: PR, record: green, order: { n: 1, names: green }, store: { prs: 1, entries: 1 } },
     // The order is extended at the tick's end, so it lags the record by a tick.
-    { pr: PR, record: red, order: { n: 1, names: green } },
+    { pr: PR, record: red, order: { n: 1, names: green }, store: { prs: 1, entries: 1 } },
   ]);
 });
 
@@ -197,6 +232,13 @@ test("no evidence is published where no order can be told", async () => {
   db.prepare("UPDATE event SET payload = json_set(payload, '$.seq', 99999) WHERE op = 'decision.latest'").run();
   db.close();
   assert.deepEqual(await publishedOnce(path, host(edited)), [null], "an order that doesn't hold");
+
+  const two = credentials();
+  const both = await ticksOfTwo([at(A), at(A, "RED")], host(two));
+  const theirs = open(both.path);
+  theirs.prepare("UPDATE event SET payload = json_set(payload, '$.seq', 99999) WHERE op = 'decision.latest' AND subject = 'pr:7'").run();
+  theirs.close();
+  assert.deepEqual(await publishedOnce(both.path, host(two)), [null], "another pull request's order that doesn't hold, as the store's counts would vouch for less than it should hold");
 
   const cutDir = credentials();
   const second = await ticks([at(A), at(A, "RED"), at(A, "RED")], host(cutDir));
@@ -273,6 +315,39 @@ test("a copy whose signed orders were all taken away is caught by what was publi
   assert.match(checked.faults.map((f) => f.why).join("\n"), new RegExp(`published entry 2 of its signed order at ${B.slice(0, 8)}, but this copy's ends at entry 0`));
 });
 
+test("a copy with one pull request's every record and entry taken away is caught by the counts published for another", async () => {
+  const dir = credentials();
+  const { path, published } = await ticksOfTwo([at(A), at(B, "RED"), at(B, "RED")], host(dir));
+  const db = open(path);
+  db.prepare("DELETE FROM decision WHERE pr = 7").run();
+  db.prepare("DELETE FROM event WHERE subject = 'pr:7'").run();
+  const checked = publishedChecked(db, {}, { keys: publishedKeys(dir), repo: REPO, anchor: null, published: githubOf(published) });
+  db.close();
+  assert.equal(checked.prs, 1, "control: the copy names only #42 now");
+  assert.match(checked.faults.map((f) => f.why).join("\n"), /published at bbbbbbbb that this store held the signed orders of 2 pull request\(s\), but this copy holds 1/);
+});
+
+test("entries taken from a pull request the check doesn't read are caught by the counts published for the one it does", async () => {
+  const dir = credentials();
+  const { path, published } = await ticksOfTwo([at(A), at(B, "RED"), at(B, "RED")], host(dir));
+  const db = open(path);
+  db.prepare("DELETE FROM event WHERE op = 'decision.latest' AND subject = 'pr:7' AND json_extract(payload, '$.n') = 2").run();
+  const checked = publishedChecked(db, { pr: PR }, { keys: publishedKeys(dir), repo: REPO, anchor: null, published: githubOf(published) });
+  db.close();
+  assert.match(checked.faults.map((f) => f.why).join("\n"), /published at bbbbbbbb that this store's signed orders held 4 entries in all, but this copy's hold 3/);
+});
+
+test("a pull request with nothing published is named as unchecked, not passed over, and the counts still hold the copy to what was", async () => {
+  const dir = credentials();
+  const { path, published } = await ticksOfTwo([at(A), at(B, "RED"), at(B, "RED")], host(dir));
+  const db = open(path);
+  const github = (pr, heads) => (pr === 7 ? { evidence: [] } : githubOf(published)(pr, heads));
+  const checked = publishedChecked(db, {}, { keys: publishedKeys(dir), repo: REPO, anchor: null, published: github });
+  db.close();
+  assert.deepEqual(checked.unchecked, [7]);
+  assert.deepEqual(checked.faults, [], "and the copy holds what was published");
+});
+
 test("a copy whose entry names another record than the one published is caught", async () => {
   const h = await history();
   const db = open(h.path);
@@ -292,7 +367,7 @@ test("a published record the copy doesn't hold as it was kept, or holds as anoth
   db.prepare("UPDATE decision SET record = json_set(record, '$.verdict.summary', 'edited') WHERE digest = ?").run(green);
   const changed = publishedChecked(db, {}, { keys: h.keys, repo: REPO, anchor: null, published: githubOf(h.published) });
   const other = publishedChecked(db, { pr: 7 }, { keys: h.keys, repo: REPO, anchor: null,
-                                                  published: () => ({ evidence: [{ pr: 7, record: digestsOf(db)[1], order: null, head: B }] }) });
+                                                  published: () => ({ evidence: [{ ...ev(digestsOf(db)[1]), pr: 7, head: B }] }) });
   db.close();
   assert.match(changed.faults.map((f) => f.why).join("\n"), new RegExp(`published this record for it at ${A.slice(0, 8)}, but this copy's doesn't hold: its record doesn't match its digest`));
   assert.match(other.faults.map((f) => f.why).join("\n"), /published this record for it at bbbbbbbb, but this copy holds it as pull request 42's/);
@@ -349,6 +424,15 @@ esac
   assert.match(cut.stdout, /published entry 2 of its signed order at bbbbbbbb, but this copy's ends at entry 1/);
   const alone = spawnSync(process.execPath, [REEVE, "replay", REPO, "--db", h.path], { encoding: "utf8", env });
   assert.doesNotMatch(alone.stdout, /published/, "control: without --published, GitHub isn't read");
+});
+
+test("--published is refused by every command but replay, rather than ignored", () => {
+  const env = { ...offlineEnv(), REEVE_HOME: tempDir("reeve-pub-flag-") };
+  for (const cmd of ["status", "backup", "why"]) {
+    const r = spawnSync(process.execPath, [REEVE, cmd, REPO, "--published"], { encoding: "utf8", env });
+    assert.notEqual(r.status, 0, `${cmd}: ${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, new RegExp(`--published is not implemented by \`${cmd}\``), `${cmd}: ${r.stderr}`);
+  }
 });
 
 // ── a record that can't be read (#280) ──────────────────────────────────────

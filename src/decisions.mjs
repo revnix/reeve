@@ -546,15 +546,20 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
  * restored from before or edited: each published record must be held whole, as
  * its pull request's, and each published entry reached, naming the published
  * record. Every pull request the copy holds records or an order of is read, or
- * the one asked for. `published` reads GitHub, and one that can't be read is a
- * fault, never a pass; so is a copy nothing published could be checked
- * against. `results` counts the published results checked, and `prs` the pull
- * requests read.
+ * the one asked for. Each result also published how many pull requests'
+ * orders, and entries in all, the store held, and the copy must hold as many,
+ * so a pull request whose every record and entry was taken away, found by no
+ * read of its own, shows in what was published for any other. `published`
+ * reads GitHub, and one that can't be read is a fault, never a pass; so is a
+ * copy nothing published could be checked against. `results` counts the
+ * published results checked, `prs` the pull requests read, and `unchecked`
+ * names those with nothing published to check against, judged before it
+ * began say.
  * @param {Db} db
  * @param {{ pr?: number | null, digest?: string | null }} which
  * @param {{ keys: Keys, repo: string, anchor?: AnchorRead | null,
  *           published: (pr: number, heads: string[]) => { evidence: (import("./published.mjs").Evidence & { head: string })[] } | { why: string } }} o
- * @returns {{ faults: Replayed[], results: number, prs: number }}
+ * @returns {{ faults: Replayed[], results: number, prs: number, unchecked: number[] }}
  */
 export function publishedChecked(db, which, { keys, repo, anchor: read = null, published }) {
   const anchor = anchorForStore(db, read, repo);
@@ -576,13 +581,19 @@ export function publishedChecked(db, which, { keys, repo, anchor: read = null, p
     if (!said.has(`${pr} ${digest} ${why}`)) { said.add(`${pr} ${digest} ${why}`); faults.push(fault(pr, digest, why)); }
   };
   let results = 0;
+  /** @type {number[]} */ const unchecked = [];
+  // The most any result published the store held, and where.
+  /** @type {{ n: number, head: string } } */ let mostPrs = { n: 0, head: "" }, mostEntries = { n: 0, head: "" };
   for (const pr of [...prs].sort((a, b) => a - b)) {
     const heads = /** @type {any[]} */ (headsOf.all(pr)).map((r) => String(r.head)).filter((h) => /^[0-9a-f]{40}$/.test(h));
     const got = published(pr, heads);
     if ("why" in got) { say(pr, "", `what the merge policy published for it couldn't be read, so this copy wasn't checked against it: ${got.why}`); continue; }
     const order = signedOrder(db, repo, pr, keys, store);
+    if (!got.evidence.length) unchecked.push(pr);
     for (const e of got.evidence) {
       results++;
+      if (e.store.prs > mostPrs.n) mostPrs = { n: e.store.prs, head: e.head };
+      if (e.store.entries > mostEntries.n) mostEntries = { n: e.store.entries, head: e.head };
       const at = e.head.slice(0, 8);
       const row = rowOf.get(e.record);
       const d = row ? decisionOf(row) : null;
@@ -603,7 +614,19 @@ export function publishedChecked(db, which, { keys, repo, anchor: read = null, p
   }
   if (!results && !faults.length)
     faults.push(fault(which.pr ?? 0, "", "no result the merge policy published names a record of these pull requests, so this copy wasn't checked against GitHub"));
-  return { faults, results, prs: prs.size };
+  // The copy's own orders, each as checked whole: one that doesn't hold is the replay's to report, and holds none here.
+  let held = 0, entries = 0;
+  for (const { subject } of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ? AND subject GLOB 'pr:[1-9]*' AND substr(subject, 4) NOT GLOB '*[^0-9]*' AND length(subject) <= 18`).all(LATEST_OP))) {
+    const order = signedOrder(db, repo, Number(String(subject).slice(3)), keys, store);
+    if (!("corrupt" in order) && order.top) { held++; entries += order.top; }
+  }
+  if (held < mostPrs.n)
+    faults.push(fault(0, "", `the merge policy published at ${mostPrs.head.slice(0, 8)} that this store held the signed orders of ${mostPrs.n} pull request(s), ` +
+                             `but this copy holds ${held}: a pull request's orders were taken away, or the copy is from before`));
+  if (entries < mostEntries.n)
+    faults.push(fault(0, "", `the merge policy published at ${mostEntries.head.slice(0, 8)} that this store's signed orders held ${mostEntries.n} entries in all, ` +
+                             `but this copy's hold ${entries}: entries were taken away, or the copy is from before`));
+  return { faults, results, prs: prs.size, unchecked };
 }
 
 /**

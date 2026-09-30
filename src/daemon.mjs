@@ -1507,25 +1507,42 @@ export async function tick(ctx) {
   };
   // Where a pull request's signed order stands as its verdict is published,
   // with the record kept for it (#274): its top entry and the record that names,
-  // null for none yet. Undefined where that can't be said, and then nothing is
-  // published of it: a reeve that doesn't sign orders, an order that doesn't
-  // hold, or one cut short of what this host signed, as a store restored from
-  // before. The host's anchor is read once a tick, and one another store is
-  // bound to, or that can't be read, says nothing of this store's orders.
-  /** @type {import("./anchor.mjs").Anchor | null | undefined} */ let publishedAnchor;
+  // null for none yet; and how many pull requests' orders, and entries in all,
+  // the store holds, so a copy with one pull request's orders taken away shows
+  // short in what's published for any other. Undefined where that can't be
+  // said, and then nothing is published of it: a reeve that doesn't sign
+  // orders, or a store with any order that doesn't hold, or is cut short of
+  // what this host signed, as its counts would vouch for less than it should
+  // hold. Every order is checked once a tick, as none is extended until its end.
+  // The host's anchor, read with them, says nothing of this store's orders where
+  // another store is bound to it, or it can't be read.
+  /** @type {{ orders: Map<number, { top: number, digest: string | null }>, store: { prs: number, entries: number } } | null | undefined} */
+  let asPublished;
+  const ordersAsPublished = () => {
+    /** @type {import("./anchor.mjs").Anchor} */ let a;
+    try { a = ctx.anchor.read(nwo) ?? { began: false, latest: new Map(), store: null }; } catch { return null; }
+    const store = storeIdentity(db);
+    if (a.store && a.store !== store) return null;
+    /** @type {Set<number>} */ const prs = new Set(a.latest.keys());
+    for (const { subject } of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ? AND subject GLOB 'pr:[1-9]*' AND substr(subject, 4) NOT GLOB '*[^0-9]*' AND length(subject) <= 18`).all(LATEST_OP)))
+      prs.add(Number(String(subject).slice(3)));
+    /** @type {Map<number, { top: number, digest: string | null }>} */ const orders = new Map();
+    let entries = 0;
+    for (const pr of prs) {
+      const order = signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), store);
+      if ("corrupt" in order || order.top < (a.latest.get(pr) ?? 0)) return null;
+      if (order.top) { orders.set(pr, order); entries += order.top; }
+    }
+    return { orders, store: { prs: orders.size, entries } };
+  };
   const orderAt = (/** @type {number} */ pr) => {
     if (!ordering) return undefined;
     if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
     if (!orderKeys) return undefined;
-    if (publishedAnchor === undefined) {
-      try { publishedAnchor = ctx.anchor.read(nwo) ?? { began: false, latest: new Map(), store: null }; }
-      catch { publishedAnchor = null; }
-    }
-    const store = storeIdentity(db);
-    if (!publishedAnchor || (publishedAnchor.store && publishedAnchor.store !== store)) return undefined;
-    const order = signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), store);
-    if ("corrupt" in order || order.top < (publishedAnchor.latest.get(pr) ?? 0)) return undefined;
-    return order.top ? { n: order.top, names: /** @type {string} */ (order.digest) } : null;
+    if (asPublished === undefined) asPublished = ordersAsPublished();
+    if (!asPublished) return undefined;
+    const order = asPublished.orders.get(pr);
+    return { order: order ? { n: order.top, names: /** @type {string} */ (order.digest) } : null, store: asPublished.store };
   };
   // The host's anchor moved to entry `top` of `pr`'s order, only once the store
   // has committed it: moved before, a transaction that failed would leave the
@@ -2706,8 +2723,8 @@ export async function tick(ctx) {
       pub = { ok: false, why: "its PASS couldn't be written down first, so it isn't published" };
     else {
       // With the record kept for it, and where its signed order stood, where both can be said.
-      const order = decided.ok && kept ? orderAt(pr) : undefined;
-      const evidence = order === undefined ? null : { pr, record: /** @type {any} */ (kept).decision.digest, order };
+      const stood = decided.ok && kept ? orderAt(pr) : undefined;
+      const evidence = stood === undefined ? null : { pr, record: /** @type {any} */ (kept).decision.digest, ...stood };
       try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict: e.verdict, shadow, base: e.baseRef, evidence }); }
       // A publish that throws, a network error say, fails this pull request's
       // publication, not the tick for every one after it (#161).

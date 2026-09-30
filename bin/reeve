@@ -988,7 +988,13 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     }
     if (!results.length) { console.log("no decision records match, so nothing was replayed"); process.exit(3); }
     console.log(renderReplay(results));
-    if (checked) console.log(`checked against ${checked.results} result(s) the merge policy published for ${checked.prs} pull request(s)`);
+    if (checked) {
+      console.log(`checked against ${checked.results} result(s) the merge policy published for ${checked.prs} pull request(s)`);
+      // Said, not passed over: those were checked by the store's counts alone.
+      if (checked.unchecked.length)
+        console.log(`${checked.unchecked.length} pull request(s) had nothing published to check their records against, judged before it began say: ` +
+                    checked.unchecked.slice(0, 20).map((n) => `#${n}`).join(", ") + (checked.unchecked.length > 20 ? ", …" : ""));
+    }
     process.exit(results.every(r => r.outcome === "same") ? 0 : 1);
   }
 

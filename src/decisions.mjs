@@ -227,17 +227,16 @@ const orderStore = (db, anchor) => anchor?.anchor?.store ?? storeIdentity(db);
 
 /**
  * Whether the store holds a record whole: its row there, reading as the record
- * its digest names, and filed under `pr` where that's given. A row moved to
- * another pull request, or changed, is no more held than one taken away.
- * @param {Db} db @returns {(digest: string, pr?: number | null) => boolean}
+ * its digest names. The record names its pull request, so a row moved to
+ * another, like one changed, doesn't read whole, and is no more held than one
+ * taken away.
+ * @param {Db} db @returns {(digest: string) => boolean}
  */
 export function holdsWhole(db) {
   const rowOf = db.prepare(`SELECT * FROM decision WHERE digest = ?`);
-  return (digest, pr = null) => {
+  return (digest) => {
     const row = rowOf.get(digest);
-    if (!row) return false;
-    const d = readDecision(row);
-    return !d.corrupt && (pr == null || d.pr === pr);
+    return Boolean(row) && !readDecision(row).corrupt;
   };
 }
 
@@ -286,7 +285,7 @@ function anchoredFaults(order, pr, anchor, held) {
  * @param {AnchorRead | null} anchor
  * @param {(digest: string) => boolean} held  whether the store holds a record
  * @param {number} pr
- * @param {(digest: string) => boolean} heldHere  whether it holds a record whole, as this pull request's
+ * @param {(digest: string) => boolean} heldHere  whether it holds a record whole
  */
 function notLatest(digest, order, anchored, anchor, held, pr, heldHere) {
   if (anchor?.why) return anchor.why;
@@ -346,8 +345,7 @@ export function explainDecision(db, pr, { head = null, keys = null, repo = null,
   // anchor: read whether or not the store still holds any record of it.
   const order = keys && repo && head === null ? signedOrder(db, repo, pr, keys, orderStore(db, anchor)) : null;
   const anchored = anchor?.anchor?.latest.get(pr) ?? 0;
-  const whole = holdsWhole(db);
-  const heldHere = (/** @type {string} */ digest) => whole(digest, pr);
+  const heldHere = holdsWhole(db);
   if (!d) {
     if (head !== null || !keys) return null;
     // Every record of it gone: taken away, or the store restored from before
@@ -562,7 +560,7 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
     if (order.top < anchored)
       out.push(fault(pr, order.digest ?? "", `its signed order ends at entry ${order.top}, though this host signed up to entry ${anchored}: ` +
                                              "newer records were taken away, or the store restored from before"));
-    for (const why of anchoredFaults(order, pr, anchor, (d) => whole(d, pr))) out.push(fault(pr, order.digest ?? "", why));
+    for (const why of anchoredFaults(order, pr, anchor, whole)) out.push(fault(pr, order.digest ?? "", why));
     for (const digest of order.digests) {
       if (checked.has(`${pr} ${digest}`)) continue;
       const row = rowOf.get(digest);

@@ -1622,7 +1622,7 @@ export async function tick(ctx) {
     // store may have signed that number.
     /** @type {string | null} */ let owed = null;
     if (reserved) {
-      if (!holdsWhole(db)(reserved.digest, pr)) {
+      if (!holdsWhole(db)(reserved.digest)) {
         log(logPath, `signing: #${pr}: this host reserved entry ${reserved.n} of its signed order for record ${reserved.digest.slice(0, 12)}, ` +
                      "which this store doesn't hold, so it isn't extended: a copy of the store may have signed it");
         return { top: 0, named: false };
@@ -1801,7 +1801,7 @@ export async function tick(ctx) {
           // A record this host kept and pinned (#279) that the store no longer
           // holds and no entry names: taken away, as reeve never removes one,
           // though the reeve that kept it stopped before ordering it.
-          const gone = [...(a.pinned.get(pr) ?? [])].filter((d) => !(r.names ?? []).includes(d) && !whole(d, pr));
+          const gone = [...(a.pinned.get(pr) ?? [])].filter((d) => !(r.names ?? []).includes(d) && !whole(d));
           if (gone.length) log(logPath, `signing: #${pr}: this host kept ${gone.length} record(s) that this store no longer holds, and no entry of its signed order names: ` +
                                         `they were taken away — ${gone.map((d) => d.slice(0, 12)).join(", ")}`);
         }

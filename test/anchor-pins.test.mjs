@@ -59,7 +59,14 @@ const anchorFor = (db, dir) => { let r; try { r = { anchor: readAnchor(dir, REPO
 /** The digests of #42's records, oldest first. */
 const digestsOf = (db) => db.prepare("SELECT digest FROM decision WHERE pr = ? ORDER BY first_seq").all(PR).map((r) => r.digest);
 /** The anchor's file, changed as `fn` changes its JSON: what a copy of the store, or a stop, would have left. */
-const rewrite = (dir, fn) => { const p = anchorPath(dir, REPO); const a = JSON.parse(readFileSync(p, "utf8")); fn(a); writeFileSync(p, JSON.stringify(a)); };
+const rewrite = (dir, fn) => {
+  const p = anchorPath(dir, REPO);
+  const a = JSON.parse(readFileSync(p, "utf8"));
+  // What a writer that left them out didn't write, so an edit here fails an assertion rather than the file.
+  a.named ??= {}; a.reserved ??= {}; a.pinned ??= {};
+  fn(a);
+  writeFileSync(p, JSON.stringify(a));
+};
 /** An anchor file as written whole, with nothing made on the way but its folders. */
 const writeAnchor = (dir, a) => { const p = anchorPath(dir, REPO); mkdirSync(dirname(p), { recursive: true, mode: 0o700 }); writeFileSync(p, JSON.stringify(a), { mode: 0o600 }); };
 const baselines = (dbPath) => { const db = open(dbPath); const n = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n; db.close(); return n; };

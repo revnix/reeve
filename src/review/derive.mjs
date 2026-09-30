@@ -324,12 +324,23 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
     // happened, and rewriting coverage history is a larger question than this.
     if (dismissed) continue;
 
-    const declared = typeof rev?.bodyFindings === "string" || rev?.bodyFindings === false;
+    // A PERSON's review body isn't read as findings, by the founder's decision
+    // of 2026-09-30 (#286): a person's findings come as threads, and their
+    // objection as a "request changes" review, which GitHub's review decision
+    // carries into the merge state; both are read as before. Unread, every
+    // "LGTM" held a pull request until each person was rostered. A person the
+    // profile gives a reading rule is read by it. Told by the raw login GitHub's
+    // REST API reports, kept whole in the payload: an App's always ends in
+    // [bot], which no person's can, as a login can't hold a bracket.
+    const login = o.payload?.login;
+    const person = typeof login === "string" && login.length > 0 && !login.endsWith("[bot]");
+    const noFindings = rev?.bodyFindings === false || (person && typeof rev?.bodyFindings !== "string");
+    const declared = typeof rev?.bodyFindings === "string" || noFindings;
     if (!declared) bodyComplete = false;
     // `false` is a declaration that this reviewer's bodies carry no findings, so
     // it is READ, not skipped. Anything else is read by the splitter, which
     // reports separately whether it could read it at all.
-    const split = rev?.bodyFindings === false
+    const split = noFindings
       ? { readable: true, findings: [] }
       : bodyFindingsOf(o.payload?.body, rev?.bodyFindings);
 

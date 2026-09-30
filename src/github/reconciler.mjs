@@ -248,9 +248,12 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
  * nothing ran shows nothing. A base is judged for health instead, which only
  * its failures decide, so it asks without. `requiredKnown` is false when the
  * base's own requirements couldn't be read: then nothing reads green, since a
- * requirement unread may be one no row meets.
+ * requirement unread may be one no row meets. `queueOnly` names required checks
+ * that run only in the merge queue, asked of a pull request's head: skipped
+ * there by design, they're judged at the queue's commit instead, and named in
+ * `queueOnly` rather than read as never having passed (#286).
  */
-export function classify(allRows, requiredChecks = [], { requiredKnown = true, evidence = true } = {}) {
+export function classify(allRows, requiredChecks = [], { requiredKnown = true, evidence = true, queueOnly = [] } = {}) {
   // A row with no name is a PARSE DEFECT, not a check. It cannot be reported to a
   // fixer ("failing: undefined") and it must not block on its own, but it must
   // also not vanish silently, so it is counted and surfaced.
@@ -288,15 +291,22 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
   // A required job skipped because the job it needs failed was RED above, the
   // failure's to fix. One skipped with nothing failing is terminal evidence,
   // and settles at once.
-  const skipped = evidence ? required.filter(c => notRun(meeting(c))) : [];
+  const notRunRequired = evidence ? required.filter(c => notRun(meeting(c))) : [];
+  // Only skipped: one that failed was RED above, and one that never reported is missing.
+  const deferred = notRunRequired.filter(c => queueOnly.includes(c.context) && meeting(c).every(r => r.conclusion === "skipped"));
+  const skipped = notRunRequired.filter(c => !deferred.includes(c));
   if (skipped.length) return { verdict: "SKIPPED_REQUIRED", why: `required check(s) skipped or neutral, so they never reported a pass: ${skipped.map(label).join(", ")}`,
     failing, running, skipped: skipped.map(c => c.context), malformed };
   // Green needs the whole required set: a requirement unread may be one no row
   // meets, reeve's own shadow check say, which GitHub passes on reeve's neutral.
   const green = (result) => (evidence && !requiredKnown ? { verdict: "UNKNOWN", failing: [], running: [], malformed,
-    why: "the base's required checks couldn't be read, so whether each one passed can't be told" } : result);
+    why: "the base's required checks couldn't be read, so whether each one passed can't be told" }
+    : deferred.length ? { ...result, queueOnly: deferred.map(c => c.context) } : result);
   // A head where nothing ran has no evidence at all, however many rows say so.
-  if (evidence && rows.every(r => NOT_RUN.has(String(r.conclusion)) || UNINFORMATIVE.has(String(r.conclusion))))
+  // Unless every required check was left to the merge queue: then the head
+  // shows what it can, and the queue's commit shows the rest (#286).
+  const allDeferred = deferred.length > 0 && deferred.length === required.length;
+  if (evidence && !allDeferred && rows.every(r => NOT_RUN.has(String(r.conclusion)) || UNINFORMATIVE.has(String(r.conclusion))))
     return { verdict: "UNKNOWN", failing: [], running: [], malformed, why: "no check ran at this revision: every one was skipped, neutral, cancelled or stale" };
   // A cancelled or stale run is a SUPERSEDED run, and superseding is normal: a new
   // push cancels the old workflow. What matters is whether the superseded thing was

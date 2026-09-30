@@ -113,6 +113,36 @@ export function cleanMergeRate(nwo, n = 20, probe = null, { required = [] } = {}
  * Record that a tick completed. Without this there is no way to distinguish a
  * quiet fleet from a stopped daemon, and those look identical on every screen.
  */
+/** The event a tick's start is recorded as (#297). */
+export const TICK_STARTED = "daemon.tick.started";
+
+/**
+ * A tick's start, recorded as it begins (#297). A tick is recorded as it ends
+ * too, and between the two the daemon is running, however long the tick takes:
+ * the shadow trial took one longer than its gap for the daemon being down.
+ */
+export function noteTickStart(db, at = Math.floor(Date.now() / 1000)) {
+  try {
+    db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
+      .run(at, "daemon", TICK_STARTED, null, "{}");
+  } catch { /* a store that cannot record must not stop the loop */ }
+}
+
+/** The event a tick that stopped without judging is recorded as (#301): halted, unable to list the pull requests, or thrown. */
+export const TICK_STOPPED = "daemon.tick.stopped";
+
+/**
+ * A tick's stop, recorded where it ends without judging (#301). Its start was
+ * recorded, and without this, a report made before the next tick would take it
+ * for a tick still running.
+ */
+export function noteTickStopped(db, at = Math.floor(Date.now() / 1000)) {
+  try {
+    db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
+      .run(at, "daemon", TICK_STOPPED, null, "{}");
+  } catch { /* a store that cannot record must not stop the loop */ }
+}
+
 export function noteTick(db, at = Math.floor(Date.now() / 1000)) {
   try {
     db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)

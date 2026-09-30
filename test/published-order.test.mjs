@@ -205,7 +205,8 @@ test("each result the daemon publishes names the record it kept, and where the p
 /** What one tick over the store at `path` publishes of #42 at A, red, with `ctx`. */
 async function publishedOnce(path, ctx, evaluation = at(A, "RED")) {
   /** @type {any[]} */ const got = [];
-  await run({ openPrs: () => [PR], evaluate: () => evaluation, dbPath: path, ticks: 1, ...ctx,
+  // Another pull request the store holds isn't open this tick, and is read as still open, not from GitHub.
+  await run({ openPrs: () => [PR], evaluate: () => evaluation, dbPath: path, ticks: 1, prState: () => "OPEN", prIsFinished: () => false, ...ctx,
               publish: async (args) => { got.push(args); return { ok: true, id: 1, conclusion: "neutral" }; } });
   return got.map((p) => p.evidence ?? null);
 }

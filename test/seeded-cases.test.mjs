@@ -152,11 +152,13 @@ test("a capture with a read that failed writes no recording, and one whole keeps
            stdout: [{ status: "completed", head_commit: { author: { email: "someone@example.com" } }, app: { id: 1, slug: "github-actions" } },
                     { status: "queued", app: { id: 2, slug: "another-app" } }].map((x) => JSON.stringify(x)).join("\n") + "\n" }),
     line({ call: ["gh", "api", "repos/o/r/branches/main"], status: 0, stdout: JSON.stringify({ name: "main", protected: true, commit: { sha: "x", commit: { author: { email: "someone@example.com" } } } }) }),
-  ], { ci: { provider: "github-actions" } });
+    line({ call: ["gh", "api", "repos/o/r/issues/1/comments?per_page=100&page=1"], status: 0, stdout: JSON.stringify([{ user: { login: "rev[bot]" }, body: WRITEUP }]) }),
+  ], { ci: { provider: "github-actions" }, ...RULES });
   assert.ok("answers" in whole, JSON.stringify(whole));
-  const [runs, suites, branch] = "answers" in whole ? whole.answers : [];
+  const [runs, suites, branch, comments] = "answers" in whole ? whole.answers : [];
   assert.deepEqual(JSON.parse(runs.stdout), { name: "ci", app: { id: 1, slug: "github-actions", name: "GitHub Actions", owner: { login: "github" } } });
   assert.deepEqual(suites.stdout.trim().split("\n").map((l) => JSON.parse(l)), [{ status: "completed", app: { id: 1, slug: "github-actions", name: undefined, owner: undefined } }].map((x) => JSON.parse(JSON.stringify(x))));
   assert.deepEqual(JSON.parse(branch.stdout), { name: "main", protected: true });
+  assert.deepEqual(JSON.parse(comments.stdout), [{ user: { login: "rev[bot]" }, body: "![P1]\nno findings\ncommit abcdef1" }], "and bodies cut");
 });
 

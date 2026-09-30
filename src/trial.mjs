@@ -57,26 +57,32 @@ const events = (db, op, since, now) => /** @type {any[]} */ (db.prepare(
 export function trialReport(db, { repo, since, now, merged, seeded = null }) {
   // Running time, from the ticks, recorded as each starts and as it ends
   // (#297). The time inside a tick, from its start to its end, or to now for one
-  // still running, is running up to TICK_LIMIT_SECONDS, however long it took.
-  // Every other gap, between one tick and the next, from the start to the first
-  // and from the last to now, is running up to GAP_SECONDS. Past either, it's
-  // downtime. A tick that started and never ended stopped partway, so the gap
-  // from its start to the next start is between ticks. A store written before
-  // starts were recorded holds only ends, and every gap there is between ticks.
+  // still running, is running while the tick has taken no more than
+  // TICK_LIMIT_SECONDS from its start, however long that was. A tick that
+  // started and never ended, halted, stopped or unable to read GitHub, judged
+  // nothing, so the time from its start to the next start is downtime, however
+  // short. Every other gap, between one tick and the next, from the start to the
+  // first and from the last to now, is running up to GAP_SECONDS, and past it,
+  // downtime. A store written before starts were recorded holds only ends, and
+  // every gap there is between ticks.
   const ended = events(db, "daemon.tick", since, now);
   const started = events(db, TICK_STARTED, since, now);
-  // A tick under way as the report starts: the last recorded before it began.
-  const before = /** @type {any} */ (db.prepare(`SELECT op FROM event WHERE op IN ('daemon.tick', ?) AND at < ? ORDER BY seq DESC LIMIT 1`).get(TICK_STARTED, since));
-  const marks = [{ at: since, start: before?.op === TICK_STARTED, end: false },
-                 ...[...started.map((e) => ({ seq: e.seq, at: e.at, start: true, end: false })),
-                     ...ended.map((e) => ({ seq: e.seq, at: e.at, start: false, end: true }))].sort((a, b) => a.seq - b.seq),
-                 { at: now, start: false, end: true }];
+  // A tick under way as the report starts, the last recorded before it began,
+  // and when it started, which its limit counts from.
+  const before = /** @type {any} */ (db.prepare(`SELECT op, at FROM event WHERE op IN ('daemon.tick', ?) AND at < ? ORDER BY seq DESC LIMIT 1`).get(TICK_STARTED, since));
+  const marks = [{ at: since, from: before?.op === TICK_STARTED ? Number(before.at) : since, start: before?.op === TICK_STARTED, end: false },
+                 ...[...started.map((e) => ({ seq: e.seq, at: e.at, from: e.at, start: true, end: false })),
+                     ...ended.map((e) => ({ seq: e.seq, at: e.at, from: e.at, start: false, end: true }))].sort((a, b) => a.seq - b.seq),
+                 { at: now, from: now, start: false, end: true }];
   /** @type {{ from: number, to: number }[]} */ const down = [];
   let running = 0;
   for (let i = 1; i < marks.length; i++) {
     const [a, b] = [marks[i - 1], marks[i]];
     const gap = b.at - a.at;
-    if (gap > (a.start && b.end ? TICK_LIMIT_SECONDS : GAP_SECONDS)) down.push({ from: a.at, to: b.at });
+    const over = a.start && b.end ? b.at - a.from > TICK_LIMIT_SECONDS
+      : a.start ? gap > 0
+      : gap > GAP_SECONDS;
+    if (over) down.push({ from: a.at, to: b.at });
     else running += gap;
   }
   // No tick at all is no running, however short the time.

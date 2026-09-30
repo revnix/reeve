@@ -108,3 +108,34 @@ test("the daemon records each tick's start, before its end", async () => {
   db.close();
   assert.deepEqual(ops, ["daemon.tick.started", "daemon.tick", "daemon.tick.started", "daemon.tick"]);
 });
+
+// ── #301's first review ──────────────────────────────────────────────────────
+
+test("a tick that halted, and the next started five minutes on, isn't running in between", () => {
+  const s = store();
+  ticking(s, T0, T0 + HOUR);
+  // Halted before its end, as a tick that couldn't list the pull requests does, and tried again.
+  s.tick(T0 + HOUR, null);
+  s.tick(T0 + HOUR + 5 * MIN, T0 + HOUR + 10 * MIN);
+  ticking(s, T0 + HOUR + 15 * MIN, T0 + 2 * HOUR);
+  const r = report(s.db, T0, T0 + 2 * HOUR);
+  s.db.close();
+  assert.deepEqual(r.running.down, [{ from: T0 + HOUR, to: T0 + HOUR + 5 * MIN }]);
+});
+
+test("a daemon whose every tick halts runs no time, however often it tries", () => {
+  const s = store();
+  for (let t = T0; t < T0 + 2 * HOUR; t += 5 * MIN) s.tick(t, null);
+  const r = report(s.db, T0, T0 + 2 * HOUR);
+  s.db.close();
+  assert.ok(r.running.hours < 0.2, `${r.running.hours} hours`);
+});
+
+test("a tick under way for over an hour as the report starts is downtime, though it ends soon after", () => {
+  const s = store();
+  s.tick(T0 - 70 * MIN, T0 + 10 * MIN);
+  ticking(s, T0 + 15 * MIN, T0 + HOUR);
+  const r = report(s.db, T0, T0 + HOUR);
+  s.db.close();
+  assert.deepEqual(r.running.down, [{ from: T0, to: T0 + 10 * MIN }]);
+});

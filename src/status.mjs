@@ -12,14 +12,15 @@
 // churn, and all three were headline stats on the board this replaces.
 
 import { execFileSync } from "node:child_process";
+import { netTimeoutMs, netFailure } from "./net-bound.mjs";
 import { explainDecision } from "./decisions.mjs";
 import { SelectorError } from "./db/records.mjs";
 
 const SPARK = "▁▂▃▄▅▆▇█";
 
 function sh(args) {
-  try { return { ok: true, out: execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() }; }
-  catch (e) { return { ok: false, out: "", err: String(e.stderr || e.message).trim() }; }
+  try { return { ok: true, out: execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim() }; }
+  catch (e) { return { ok: false, out: "", err: netFailure(e) }; }
 }
 
 /** Rolling sparkline from a series of 0..1 values. */

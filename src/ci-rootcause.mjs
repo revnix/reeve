@@ -17,6 +17,7 @@
 // sliced to the failing step rather than downloaded whole.
 
 import { execFileSync } from "node:child_process";
+import { netTimeoutMs, netFailure } from "./net-bound.mjs";
 
 /** Annotation messages that carry no cause. Anything matching needs the log. */
 const GENERIC = [
@@ -27,8 +28,8 @@ const GENERIC = [
 ];
 
 function sh(args) {
-  try { return { ok: true, out: execFileSync("gh", args, { encoding: "utf8", maxBuffer: 64e6, stdio: ["ignore", "pipe", "pipe"] }) }; }
-  catch (e) { return { ok: false, out: "", err: String(e.stderr || e.message).trim() }; }
+  try { return { ok: true, out: execFileSync("gh", args, { encoding: "utf8", maxBuffer: 64e6, stdio: ["ignore", "pipe", "pipe"], timeout: netTimeoutMs(), killSignal: "SIGKILL" }) }; }
+  catch (e) { return { ok: false, out: "", err: netFailure(e) }; }
 }
 const api = (path, jq) => { const a = ["api", path]; if (jq) a.push("--jq", jq); return sh(a); };
 

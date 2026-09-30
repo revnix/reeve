@@ -18,6 +18,7 @@ import { reviewState } from "./review/derive.mjs";
 import { compare } from "./review/shadow.mjs";
 import { authenticate, apiAsInstallation, loadAppCredentials } from "./github/app.mjs";
 import { execFileSync } from "node:child_process";
+import { netTimeoutMs, netFailure } from "./net-bound.mjs";
 
 /**
  * The profile's CI settings, as far as this module reads them.
@@ -29,8 +30,8 @@ import { execFileSync } from "node:child_process";
  */
 
 function ghJson(args) {
-  try { return { ok: true, out: execFileSync("gh", ["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() }; }
-  catch (e) { return { ok: false, out: "", err: String(e.stderr || e.message).trim() }; }
+  try { return { ok: true, out: execFileSync("gh", ["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim() }; }
+  catch (e) { return { ok: false, out: "", err: netFailure(e) }; }
 }
 
 // The REVIEW surface rides along on the query that was already being made.

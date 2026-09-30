@@ -13,6 +13,7 @@
 //     has none.
 
 import { execFileSync } from "node:child_process";
+import { netTimeoutMs, netFailure } from "../net-bound.mjs";
 
 /** Conclusions that do NOT block. Everything else does, including the ones a naive
  *  `conclusion === "failure"` branch would fall straight through. */
@@ -44,8 +45,8 @@ const UNINFORMATIVE = new Set(["cancelled", "stale"]);
 function sh(cmd, args) {
   // A paged read of a busy head runs past the default 1 MiB, and a read cut
   // short there must not be taken for the whole list.
-  try { return { ok: true, out: execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 }).trim() }; }
-  catch (e) { return { ok: false, out: "", err: String(e.stderr || e.message).trim() }; }
+  try { return { ok: true, out: execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024, timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim() }; }
+  catch (e) { return { ok: false, out: "", err: netFailure(e) }; }
 }
 const gh = (path, jq, { paginate = false } = {}) => {
   const a = ["api", ...(paginate ? ["--paginate"] : []), path];

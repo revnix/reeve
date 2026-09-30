@@ -46,6 +46,7 @@ import { observe, ingest, noteHead } from "./review/ingest.mjs";
 import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
 import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
 import { execFileSync, spawn } from "node:child_process";
+import { netTimeoutMs } from "./net-bound.mjs";
 import { appendFileSync, mkdirSync, fstatSync, statSync, readFileSync, writeFileSync, rmSync, openSync, closeSync, readSync, unlinkSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -764,10 +765,10 @@ export function log(logPath, line) {
 }
 
 /** A pull request's state, "OPEN", "CLOSED" or "MERGED", or null when it can't be read. */
-function prStateOf(nwo, pr) {
+export function prStateOf(nwo, pr) {
   try {
     return execFileSync("gh", ["pr", "view", String(pr), "--repo", nwo,
-      "--json", "state", "--jq", ".state"], { encoding: "utf8" }).trim() || null;
+      "--json", "state", "--jq", ".state"], { encoding: "utf8", timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim() || null;
   } catch { return null; }
 }
 
@@ -836,10 +837,10 @@ export function finishedSubjects(db, nwo, open, io = {}) {
   return gone;
 }
 
-function openPrs(nwo, limit = 20) {   // bounded; the caller LOGS when the bound bites
+export function openPrs(nwo, limit = 20) {   // bounded; the caller LOGS when the bound bites
   try {
     const out = execFileSync("gh", ["pr", "list", "--repo", nwo, "--state", "open",
-      "--limit", String(limit), "--json", "number", "--jq", ".[].number"], { encoding: "utf8" }).trim();
+      "--limit", String(limit), "--json", "number", "--jq", ".[].number"], { encoding: "utf8", timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim();
     return out ? out.split("\n").map(Number) : [];
   } catch { return null; }   // null means "could not ask", which is not "none"
 }

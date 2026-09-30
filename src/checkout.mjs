@@ -38,6 +38,7 @@
 // relative and resolves inside the tree, so the copy resolves within the run
 // checkout.
 import { execFileSync } from "node:child_process";
+import { netTimeoutMs, netFailure } from "./net-bound.mjs";
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -74,10 +75,12 @@ function git(cwd, args, opts) {
  * dropped exactly where reeve must reach the remote, and nowhere else.
  */
 function founderGit(cwd, args) {
-  return run(cwd, GIT_NEUTRALISE_FOUNDER, args, founderGitEnv());
+  // Bounded: these reach the remote, and a synchronous call that never answers,
+  // on a connection lost in a sleep say, would stop the daemon (#282).
+  return run(cwd, GIT_NEUTRALISE_FOUNDER, args, founderGitEnv(), { timeout: netTimeoutMs() });
 }
 
-function run(cwd, neutralise, args, env, { raw = false, input = undefined } = {}) {
+function run(cwd, neutralise, args, env, { raw = false, input = undefined, timeout = undefined } = {}) {
   try {
     // 64 MiB, because the default 1 MiB is not enough for a repository-sized
     // answer: `changedFiles` raised it after about 1,800 long paths overflowed
@@ -89,11 +92,11 @@ function run(cwd, neutralise, args, env, { raw = false, input = undefined } = {}
     // reading a textual value want the trim.
     const out = execFileSync("git", ["-C", cwd, ...neutralise, ...args],
       { encoding: "utf8", stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
-        maxBuffer: 64 * 1024 * 1024, env, input });
+        maxBuffer: 64 * 1024 * 1024, env, input, ...(timeout ? { timeout, killSignal: "SIGKILL" } : {}) });
     return { ok: true, out: raw ? out : out.trim() };
   // `reason` picks git's own fatal line rather than the last thing it printed,
   // which is usually progress narration and sends the reader somewhere else.
-  } catch (e) { return { ok: false, out: "", err: reason(e.stderr || e.message) }; }
+  } catch (e) { return { ok: false, out: "", err: e?.code === "ETIMEDOUT" ? netFailure(e) : reason(e.stderr || e.message) }; }
 }
 
 /** What reeve will read of a tree's attributes files before it refuses instead.

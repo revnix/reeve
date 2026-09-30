@@ -8,7 +8,7 @@ import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CASES, LEFT_OUT, loadRecording, pinClock, redactBodies, runCase, runSeeded } from "../src/seeded.mjs";
-import { answersFrom, realTool } from "../scripts/capture-seeded.mjs";
+import { answersFrom, realTool, NAMES, renamed } from "../scripts/capture-seeded.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 
 const STAND_IN = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "seeded-stand-in.mjs");
@@ -160,5 +160,11 @@ test("a capture with a read that failed writes no recording, and one whole keeps
   assert.deepEqual(suites.stdout.trim().split("\n").map((l) => JSON.parse(l)), [{ status: "completed", app: { id: 1, slug: "github-actions", name: undefined, owner: undefined } }].map((x) => JSON.parse(JSON.stringify(x))));
   assert.deepEqual(JSON.parse(branch.stdout), { name: "main", protected: true });
   assert.deepEqual(JSON.parse(comments.stdout), [{ user: { login: "rev[bot]" }, body: "![P1]\nno findings\ncommit abcdef1" }], "and bodies cut");
+});
+
+test("the recording names no review tool: each is renamed throughout it, its calls and profile included", () => {
+  const text = JSON.stringify(r).toLowerCase();
+  assert.deepEqual(NAMES.filter(([from]) => text.includes(from.toLowerCase())).map(([, to]) => to), [], "renamed everywhere");
+  for (const [from, to] of NAMES) assert.equal(renamed(`(${from})`), `(${to})`, "each whole, not in part by a shorter one");
 });
 

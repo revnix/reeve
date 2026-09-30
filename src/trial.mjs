@@ -229,12 +229,15 @@ function gh(args) {
 /**
  * What merged into `nwo` since `since`, in seconds, as GitHub says: each pull
  * request, when, its final head, and the commit it merged as, which is the
- * queue's commit where the queue merged it. `why` where it couldn't be read,
- * which vouches for nothing, or where there may be more than one read holds.
- * @param {string} nwo @param {number} since @param {{ run?: typeof gh, limit?: number }} [o]
+ * queue's commit where the queue merged it, up to `until`, the report's own
+ * time: one merged while the report was made belongs to the next, as the
+ * store's decisions are read only up to that time (#295). `why` where it
+ * couldn't be read, which vouches for nothing, or where there may be more than
+ * one read holds.
+ * @param {string} nwo @param {number} since @param {{ run?: typeof gh, limit?: number, until?: number | null }} [o]
  * @returns {Merged[] | { why: string }}
  */
-export function mergedSince(nwo, since, { run = gh, limit = 1000 } = {}) {
+export function mergedSince(nwo, since, { run = gh, limit = 1000, until = null } = {}) {
   const from = new Date(since * 1000).toISOString().replace(/\.\d+Z$/, "Z");
   const r = run(["pr", "list", "--repo", nwo, "--state", "merged", "--search", `merged:>=${from}`,
                  "--json", "number,mergedAt,headRefOid,mergeCommit", "--limit", String(limit)]);
@@ -251,7 +254,7 @@ export function mergedSince(nwo, since, { run = gh, limit = 1000 } = {}) {
     if (!Number.isSafeInteger(x?.number) || !Number.isFinite(at) || typeof x?.headRefOid !== "string" || !/^[0-9a-f]{40}$/.test(x.headRefOid) ||
         (mergeCommit !== null && !/^[0-9a-f]{40}$/.test(String(mergeCommit))))
       return { why: `GitHub's answer holds a pull request that doesn't read whole: ${JSON.stringify(x).slice(0, 120)}` };
-    if (at / 1000 >= since) out.push({ pr: x.number, mergedAt: Math.floor(at / 1000), head: x.headRefOid, mergeCommit });
+    if (at / 1000 >= since && (until == null || at / 1000 <= until)) out.push({ pr: x.number, mergedAt: Math.floor(at / 1000), head: x.headRefOid, mergeCommit });
   }
   return out.sort((a, b) => a.mergedAt - b.mergedAt);
 }

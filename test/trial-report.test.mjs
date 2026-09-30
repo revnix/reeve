@@ -255,6 +255,11 @@ test("what merged is read from GitHub since the trial began, with its merge comm
     { number: 1, mergedAt: at(T0 - 60), headRefOid: sha("b"), mergeCommit: { oid: sha("e") } }]) });
   assert.deepEqual(got, [{ pr: 2, mergedAt: T0 + 60, head: sha("a"), mergeCommit: sha("c") }, { pr: 3, mergedAt: T0 + 90, head: sha("d"), mergeCommit: null }], "only since the start");
   assert.match(asked[0], /--json number,mergedAt,headRefOid,mergeCommit /);
+  // Up to the report's own time: one merged while it was made belongs to the next (#295).
+  const upTo = mergedSince("o/r", T0, { until: T0 + 70, run: answer([
+    { number: 2, mergedAt: at(T0 + 60), headRefOid: sha("a"), mergeCommit: null },
+    { number: 4, mergedAt: at(T0 + 80), headRefOid: sha("e"), mergeCommit: null }]) });
+  assert.deepEqual(Array.isArray(upTo) && upTo.map((m) => m.pr), [2]);
   assert.match(JSON.stringify(mergedSince("o/r", T0, { run: () => ({ ok: false, out: "", err: "HTTP 502" }) })), /HTTP 502/);
   assert.match(JSON.stringify(mergedSince("o/r", T0, { run: () => ({ ok: true, out: "{not json" }) })), /doesn't read as a list/);
   assert.match(JSON.stringify(mergedSince("o/r", T0, { run: answer([{ number: 2, mergedAt: at(T0 + 60), headRefOid: "short", mergeCommit: null }]) })), /doesn't read whole/);
@@ -281,13 +286,16 @@ test("reeve trial reports a store against the trial's conditions, reading what m
   s.decided(start + 5 * MIN, 7, sha("a"), "PASS");
   s.record(R, 7, sha("a"));
   s.db.close();
-  const { run } = reeveWith([{ number: 7, mergedAt: new Date((start + 10 * MIN) * 1000).toISOString(), headRefOid: sha("a"), mergeCommit: { oid: sha("b") } }]);
+  const { run } = reeveWith([{ number: 7, mergedAt: new Date((start + 10 * MIN) * 1000).toISOString(), headRefOid: sha("a"), mergeCommit: { oid: sha("b") } },
+                             // Merged after the report's own time, as while it was being made: the next report's.
+                             { number: 8, mergedAt: new Date((start + 5 * HOUR) * 1000).toISOString(), headRefOid: sha("c"), mergeCommit: null }]);
   const since = new Date(start * 1000).toISOString();
   const text = run("o/r", "--db", s.path, "--since", since);
   assert.equal(text.status, 1, "not passed: " + text.stderr);
   assert.match(text.stdout, /#7 at aaaaaaaaaa: PASS/);
   const json = run("o/r", "--db", s.path, "--since", since, "--json");
   assert.equal(JSON.parse(json.stdout).passedFinal, 1);
+  assert.deepEqual(JSON.parse(json.stdout).merges.map((/** @type {any} */ m) => m.pr), [7], "not one merged after the report's time");
   const none = run("o/r", "--db", s.path);
   assert.equal(none.status, 1);
   assert.match(none.stderr, /--since takes the date the trial's count started from/);

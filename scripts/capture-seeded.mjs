@@ -32,7 +32,7 @@ const AT = "2026-09-30T06:07:27Z";
 // Reeve's App, as its check runs on the repository name it.
 const APP_ID = "4660593";
 const ABOUT = `${REPO}#${PR} at ${HEAD.slice(0, 10)}, as GitHub answered for it, and as it stood at ${AT}: approved by a person, ` +
-  "every check green, and merged through the queue at 06:10 UTC. Recorded with scripts/capture-seeded.mjs.";
+  "every check green, and merged through the queue at 06:10 UTC. Its review tools are renamed. Recorded with scripts/capture-seeded.mjs.";
 
 const at = Date.parse(AT);
 /** Rows of a JSON array, or JSON values one per line, dated after the moment, left out. */
@@ -64,6 +64,25 @@ const EDITS = [
   { match: (/** @type {string[]} */ c) => reads(c, `issues/${PR}/reactions`), why: `reactions after ${AT} left out`,
     edit: (/** @type {string} */ out) => JSON.stringify(JSON.parse(out).filter((/** @type {any} */ x) => before(x, ["created_at"]))) + "\n" },
 ];
+
+/**
+ * The review tools, and the agent App that opened the pull request, renamed
+ * throughout the recording (#298's review): in its calls, its answers and its
+ * profile alike, so every rule still reads what it read, and no tool is named
+ * with what it found. Longest first, so a name inside another is renamed with it.
+ */
+export const NAMES = Object.freeze([
+  ["chatgpt-codex-connector", "reviewer-one"], ["Codex Review", "Reviewer One review"], ["ChatGPT", "Reviewer One"], ["chatgpt", "reviewer-one"],
+  ["Codex", "Reviewer One"], ["codex", "reviewer-one"], ["OpenAI", "Vendor One"], ["openai", "vendor-one"],
+  ["coderabbitai", "reviewer-two"], ["CodeRabbit", "Reviewer Two"], ["coderabbit", "reviewer-two"],
+  ["greptile-apps", "reviewer-three"], ["Greptile Apps", "Reviewer Three"], ["greptileai", "vendor-three"], ["Greptile", "Reviewer Three"], ["greptile", "reviewer-three"],
+  ["nextly-review-bot", "reviewer-four"], ["Nextly Review Bot", "Reviewer Four"], ["@nextly-bot", "@reviewer-four"], ["pr-review-agent", "reviewer-four-round"],
+  ["review-bot", "reviewer"], ["review agent", "reviewer"], ["nextly-agent", "agent-app"],
+  ["Anthropic", "Vendor Five"], ["anthropics", "vendor-five"], ["Claude", "App Five"], ["claude", "app-five"], ["Copilot", "App Six"], ["copilot", "app-six"],
+].sort((a, b) => b[0].length - a[0].length));
+
+/** `text` with every name in NAMES renamed. @param {string} text */
+export const renamed = (text) => NAMES.reduce((t, [from, to]) => t.split(from).join(to), text);
 
 // Reads the cases make that the good one doesn't: the provider's suites,
 // asked when a required check is missing, and whether the head contains the
@@ -180,7 +199,8 @@ if (process.argv[2] === "--record") {
     if ("why" in got) { console.error(`capture-seeded: ${got.why}`); process.exitCode = 1; }
     else {
       const answers = got.answers;
-      const out = { about: ABOUT, repo: REPO, pr: PR, head: HEAD, base: BASE, at: AT, appId: APP_ID, capturedAt: new Date().toISOString(), profile, answers };
+      const out = { about: ABOUT, repo: REPO, pr: PR, head: HEAD, base: BASE, at: AT, appId: APP_ID, capturedAt: new Date().toISOString(),
+                    ...JSON.parse(renamed(JSON.stringify({ profile, answers }))) };
       const dest = join(ROOT, "seeded", `${NAME}.json`);
       mkdirSync(dirname(dest), { recursive: true });
       writeFileSync(dest, JSON.stringify(out, null, 1) + "\n");

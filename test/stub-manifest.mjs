@@ -13937,7 +13937,7 @@ export const STUBS = [
     test: "test/anchor-pins.test.mjs",
     expectRed: "a copy of the store whose entry at the host's top names another record isn't current, and isn't extended",
     edits: [{ file: "src/decisions.mjs",
-              find: "    for (const why of anchoredFaults(order, pr, anchor, (d) => whole(d, pr))) out.push(fault(pr, order.digest ?? \"\", why));\n",
+              find: "    for (const why of anchoredFaults(order, pr, anchor, whole)) out.push(fault(pr, order.digest ?? \"\", why));\n",
               replace: "" }],
   },
   {

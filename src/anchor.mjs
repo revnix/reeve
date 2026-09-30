@@ -337,6 +337,20 @@ export function fileAnchor(dir, { write = (fd, buf, offset, length) => writeSync
       return true;
     }),
     /**
+     * Records unpinned from the anchor bound to store `id`, as a commit that
+     * failed never kept them (#279).
+     * @param {string} repo @param {string} id @param {number} pr @param {string[]} digests
+     */
+    unpin: (repo, id, pr, digests) => update(repo, (a) => {
+      if (a.store !== id) throw new Error(`the host's anchor for ${repo} isn't this store's`);
+      const pins = a.pinned.get(pr);
+      if (!pins) return false;
+      let changed = false;
+      for (const d of digests) if (pins.delete(d)) changed = true;
+      if (!pins.size) a.pinned.delete(pr);
+      return changed;
+    }),
+    /**
      * Only what the anchor reads back, a pull request's number and an entry's,
      * each a whole number from 1: written otherwise, it couldn't be read, and
      * would vouch for nothing again. With `digest`, the record the entry names

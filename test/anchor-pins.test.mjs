@@ -99,6 +99,16 @@ test("the anchor reserves only an order's next entry, for one record, and noting
   assert.equal(an.note(REPO, PR, 1, D2), false, "an entry noted with one record isn't noted again with another");
 });
 
+test("the anchor unpins a record only on the say of the store it's bound to", () => {
+  const dir = credentials();
+  const an = fileAnchor(dir);
+  assert.equal(an.bind(REPO, ID), true);
+  assert.equal(an.pin(REPO, ID, PR, [D1, D2]), true);
+  assert.equal(an.unpin(REPO, OTHER, PR, [D1]), false, "not by another store");
+  assert.equal(an.unpin(REPO, ID, PR, [D1]), true);
+  assert.deepEqual(anchorRead(dir)?.pinned?.get(PR), new Set([D2]));
+});
+
 test("an anchor holding a part that doesn't read whole isn't read", () => {
   const bad = {
     "an entry reserved past the next": { reserved: { 42: { n: 3, digest: D1 } } },
@@ -277,7 +287,7 @@ test("a record pinned and taken away before a reeve ordered it is said by the ti
   assert.match(String(shown), why);
   assert.ok(replayed.some((x) => x.pr === PR && x.outcome === "unreplayable" && why.test(String(x.why))), JSON.stringify(replayed));
   const r = await tick(dbPath, null, host(dir));
-  assert.match(r.log, new RegExp(`#42: this host kept 1 record\\(s\\) that this store no longer holds, and no entry of its signed order names: they were taken away — ${red.slice(0, 12)}`));
+  assert.match(r.log, new RegExp(`#42: this host kept 1 record\\(s\\) that this store no longer holds, and no entry of its signed order names: they were taken away, or a reeve stopped before its store committed them — ${red.slice(0, 12)}`));
 });
 
 // ── #281: the first baseline ─────────────────────────────────────────────────
@@ -630,7 +640,7 @@ test("a pinned or reserved record moved to another pull request, or changed, isn
   assert.match(String(shown), new RegExp(`reserved entry 2 of its signed order for record ${red.slice(0, 12)}, which its order doesn't hold yet, and the store doesn't hold that record`));
   const r = await tick(dbPath, null, host(dir));
   assert.match(r.log, new RegExp(`#42: this host reserved entry 2 of its signed order for record ${red.slice(0, 12)}, which this store doesn't hold, so it isn't extended`));
-  assert.match(r.log, new RegExp(`#42: this host kept 1 record\\(s\\) that this store no longer holds, and no entry of its signed order names: they were taken away — ${red.slice(0, 12)}`));
+  assert.match(r.log, new RegExp(`#42: this host kept 1 record\\(s\\) that this store no longer holds, and no entry of its signed order names: they were taken away, or a reeve stopped before its store committed them — ${red.slice(0, 12)}`));
   // And one changed in place is no more held than one moved.
   db = open(dbPath);
   db.prepare("UPDATE decision SET pr = 42, record = json_set(record, '$.verdict.state', 'PASS') WHERE digest = ?").run(red);
@@ -638,5 +648,79 @@ test("a pinned or reserved record moved to another pull request, or changed, isn
   db.close();
   assert.ok(changed.some((x) => new RegExp(`this host kept record ${red.slice(0, 12)} for it, which the store no longer holds`).test(String(x.why))), JSON.stringify(changed));
   void green;
+});
+
+const QUEUED = "c".repeat(40), QBASE = "d".repeat(40);
+/** The queue holding #42 at QUEUED, and its commit judged from the pull request's input. */
+const inQueue = {
+  readQueue: () => ({ ok: true, queue: true, entries: [{ pr: PR, sha: QUEUED, baseSha: QBASE, state: "AWAITING_CHECKS" }] }),
+  evaluateQueue: (/** @type {any} */ { entry, input }) => { const i = { ...input, head: entry.sha }; return { ok: true, input: i, verdict: computeVerdict(i) }; },
+};
+
+test("a record is pinned on the host's anchor before the store commits it, at a head and on the queue's commit", async () => {
+  const dir = credentials();
+  const dbPath = store();
+  await tick(dbPath, at(A), host(dir));
+  const real = fileAnchor(dir);
+  /** @type {{ digest: string, held: boolean }[]} */ const pins = [];
+  const anchor = { ...real, pin: (/** @type {any[]} */ ...args) => {
+    const db = open(dbPath);
+    for (const d of args[3]) pins.push({ digest: d, held: Boolean(db.prepare("SELECT 1 FROM decision WHERE digest = ?").get(d)) });
+    db.close();
+    return real.pin(...args);
+  } };
+  await tick(dbPath, at(A, "RED"), { ...host(dir, anchor), ...inQueue });
+  const db = open(dbPath);
+  const kept = db.prepare("SELECT digest, head FROM decision WHERE pr = ? ORDER BY first_seq").all(PR);
+  db.close();
+  const queued = kept.find((k) => k.head === QUEUED)?.digest;
+  assert.ok(queued, `control: the queue's commit was judged: ${JSON.stringify(kept)}`);
+  assert.ok(pins.some((p) => p.digest === queued), `the queue's record pinned: ${JSON.stringify(pins)}`);
+  assert.ok(pins.length >= 2 && pins.every((p) => !p.held), `each pinned while the store didn't hold it yet: ${JSON.stringify(pins)}`);
+});
+
+test("a record whose commit fails is unpinned, at a head and on the queue's commit", async () => {
+  const dir = credentials();
+  const dbPath = store();
+  await tick(dbPath, at(A), host(dir));
+  const real = fileAnchor(dir);
+  /** @type {string[]} */ const pinned = [];
+  const anchor = { ...real, pin: (/** @type {any[]} */ ...args) => { pinned.push(...args[3]); return real.pin(...args); } };
+  // Every record's commit fails, as on a full disk, and nothing else's.
+  const durably = (/** @type {any} */ db, /** @type {() => any} */ fn) => {
+    db.exec("CREATE TEMP TRIGGER IF NOT EXISTS no_room BEFORE INSERT ON decision BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END");
+    try { return fn(); } finally { db.exec("DROP TRIGGER IF EXISTS temp.no_room"); }
+  };
+  await tick(dbPath, at(A, "RED"), { ...host(dir, anchor), ...inQueue, durably });
+  assert.ok(pinned.length >= 2, `control: the head's and the queue's records were pinned: ${JSON.stringify(pinned)}`);
+  assert.equal(anchorRead(dir)?.pinned?.size, 0, "and unpinned once their commits failed");
+});
+
+test("a whole-store replay says a binding begun for other records than the store holds", async () => {
+  const dir = credentials();
+  const dbPath = store();
+  await tick(dbPath, at(A));
+  await tick(dbPath, at(A, "RED"));
+  // Stopped after the baseline committed and before the binding; then stripped of it, and one of its records.
+  await tick(dbPath, null, host(dir, { ...fileAnchor(dir), bind: () => false }));
+  let db = open(dbPath);
+  const [green] = digestsOf(db);
+  db.prepare("DELETE FROM event WHERE op = 'signing.baseline'").run();
+  db.prepare("DELETE FROM decision WHERE digest = ?").run(green);
+  db.close();
+  const keys = knownKeys({ local: dir });
+  db = open(dbPath);
+  const whole = replayDecisions(db, {}, { keys, repo: REPO, anchor: anchorFor(db, dir) });
+  db.close();
+  assert.ok(whole.some((x) => x.outcome === "unreplayable" && /the host's anchor was being bound to this store, holding other records than it holds now: records were taken away/.test(String(x.why))),
+            JSON.stringify(whole));
+  // Another store, of another identity, isn't the one being bound, and isn't said to be.
+  const otherPath = store();
+  await tick(otherPath, at(B));
+  const o = open(otherPath);
+  o.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(1, "daemon", "store.identity", "store", JSON.stringify({ id: OTHER }));
+  const theirs = replayDecisions(o, {}, { keys, repo: REPO, anchor: { anchor: readAnchor(dir, REPO), why: null } });
+  o.close();
+  assert.ok(!theirs.some((x) => /was being bound to this store/.test(String(x.why))), JSON.stringify(theirs));
 });
 

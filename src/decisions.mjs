@@ -271,7 +271,7 @@ function anchoredFaults(order, pr, anchor, held) {
   const gone = [...(a.pinned?.get(pr) ?? [])].filter((d) => !order.digests.has(d) && !held(d));
   if (gone.length)
     out.push(`this host kept ${gone.length === 1 ? "record" : `${gone.length} records`} ${gone.map(short).join(", ")} for it, which the store no longer holds ` +
-             "and no entry of its signed order names: taken away");
+             "and no entry of its signed order names: taken away, or a reeve stopped before its store committed it");
   return out;
 }
 
@@ -576,9 +576,37 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
   // was kept, and no order names: taken away or changed before its first entry,
   // it's found by nothing else, unless replayed above. The baseline says no pull
   // request, so it's read replaying the whole store, or since a date.
+  // And a binding the host's anchor began for this store (#281): its baseline,
+  // or where that's gone the records the store holds, must be those it was begun
+  // with. A store stripped of its baseline and some of those records would
+  // otherwise read as one that never began signing.
+  const begun = which.pr == null ? bindingDiffers(db, anchor) : null;
+  if (begun) out.push(fault(0, "", begun));
   if (which.pr == null) for (const lost of baselineLost(db, repo, keys, store, new Set(replayed.map((r) => r.digest))))
     out.push(fault(0, lost.digest, `the store's baseline names this record, kept before it began signing, and no signed order names it, but ${lost.why}`));
   return out;
+}
+
+/**
+ * Why a binding the host's anchor began for this store (#281) doesn't hold, or
+ * null: the store's baseline, or where it has none the records it holds, isn't
+ * what the binding was begun with. A binding begun for another store isn't this
+ * one's to say.
+ * @param {Db} db @param {AnchorRead | null} anchor @returns {string | null}
+ */
+function bindingDiffers(db, anchor) {
+  const p = anchor?.anchor?.pending;
+  if (!p) return null;
+  const id = storeIdentity(db);
+  if (id && id !== p.store) return null;
+  // The first, as the store's signing reads it.
+  const row = /** @type {any} */ (db.prepare(`SELECT payload FROM event WHERE op = ? ORDER BY seq ASC LIMIT 1`).get(BASELINE_OP));
+  /** @type {string[] | null} */ let digests = null;
+  if (row) { try { const v = JSON.parse(row.payload)?.digests; if (Array.isArray(v)) digests = v.map(String); } catch { /* read as none below */ } }
+  else digests = /** @type {any[]} */ (db.prepare(`SELECT digest FROM decision ORDER BY digest`).all()).map((r) => String(r.digest));
+  if (digests && baselineStatement(digests).subject[0].digest.sha256 === p.baseline) return null;
+  return `the host's anchor was being bound to this store, holding other records than it holds now${row && !digests ? ", and its baseline can't be read" : ""}: ` +
+         "records were taken away, or the store restored from before";
 }
 
 /**

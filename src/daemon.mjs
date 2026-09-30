@@ -870,7 +870,7 @@ function record(db, { pr, head, verdict, decision, effects = [], retire = new Ma
       // What the verdict was judged from, in the same transaction as the event
       // that names it, so neither stands without the other, and under that
       // event's seq, which orders decisions where seconds tie (#165).
-      const fresh = kept ? saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr, head, ...kept }).fresh : false;
+      if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr, head, ...kept });
       // `enqueue` returns null for a key it already holds, which is success: the
       // effect is durable, it was simply made durable by an earlier tick.
       let queued = 0, known = 0, dropped = 0;
@@ -896,7 +896,7 @@ function record(db, { pr, head, verdict, decision, effects = [], retire = new Ma
         // on this pull request at ANY head, and `keep` spares the one just made.
         (enqueue(db, eff) !== null ? queued++ : known++);
       }
-      return { ok: true, queued, known, dropped, seq: Number(decided.lastInsertRowid), fresh };
+      return { ok: true, queued, known, dropped, seq: Number(decided.lastInsertRowid) };
     });
   } catch (err) {
     // A store that cannot record must not stop the loop -- but it must not report
@@ -1544,11 +1544,12 @@ export async function tick(ctx) {
   // once ordered.
   /** @type {Map<number, { latest: string, seq: number, since: Set<string> }>} */
   const orderKept = (ctx.orderKept ??= new Map());
-  // A record new to the store, pinned on the host's anchor once the store has
-  // committed it, synced (#279), where the anchor is this store's: one a reeve
-  // stopped before ordering, taken away while none runs, still shows. An entry
-  // that names it unpins it. One that can't be pinned now is named by this
-  // tick's ordering, or said not to be.
+  // A record new to the store, pinned on the host's anchor, synced, before the
+  // store commits it (#279), where the anchor is this store's: one a reeve
+  // stopped before ordering, taken away while none runs, still shows, whenever
+  // the reeve stopped. An entry that names it unpins it, and so does its commit
+  // failing. One that can't be pinned now is named by this tick's ordering, or
+  // said not to be.
   let pinSaid = false;
   const pinKept = (/** @type {number} */ pr, /** @type {string} */ digest) => {
     if (!ordering || !begun.began) return;
@@ -1568,13 +1569,37 @@ export async function tick(ctx) {
       if (why && !pinSaid) { pinSaid = true; log(logPath, `signing: #${pr}: a record kept couldn't be pinned on the host's anchor — ${why}`); }
     });
   };
-  const keptFor = (/** @type {number} */ pr, /** @type {string} */ digest, /** @type {number} */ seq, fresh = false) => {
+  const unpinKept = (/** @type {number} */ pr, /** @type {string} */ digest) => {
+    withOrderLock((held) => {
+      if (!held) return;
+      try {
+        const id = storeIdentity(db);
+        if (id && ctx.anchor.read(nwo)?.store === id && !ctx.anchor.unpin(nwo, id, pr, [digest]))
+          log(logPath, `signing: #${pr}: a record whose commit failed couldn't be unpinned from the host's anchor`);
+      } catch (err) { log(logPath, `signing: #${pr}: a record whose commit failed couldn't be unpinned from the host's anchor — ${err.message}`); }
+    });
+  };
+  /**
+   * A decision record committed with its pin: a record new to the store is
+   * pinned first, and unpinned where `commit` failed, whether it threw or
+   * answers so. One seen again was pinned, or ordered, when first kept.
+   * @template T @param {number} pr @param {any} kept @param {() => T} commit @param {(r: T) => boolean} failed
+   * @returns {T}
+   */
+  const keepPinned = (pr, kept, commit, failed) => {
+    const digest = kept && ordering && !db.prepare(`SELECT 1 FROM decision WHERE digest = ?`).get(kept.decision.digest) ? String(kept.decision.digest) : null;
+    if (digest) pinKept(pr, digest);
+    /** @type {T} */ let r;
+    try { r = commit(); } catch (err) { if (digest) unpinKept(pr, digest); throw err; }
+    if (digest && failed(r)) unpinKept(pr, digest);
+    return r;
+  };
+  const keptFor = (/** @type {number} */ pr, /** @type {string} */ digest, /** @type {number} */ seq) => {
     const k = orderKept.get(pr) ?? { latest: digest, seq, since: new Set() };
     k.latest = digest;
     k.seq = seq;
     k.since.add(digest);
     orderKept.set(pr, k);
-    if (fresh) pinKept(pr, digest);
   };
   // Each pull request's signed order as checked whole, checked again only once
   // what its entries hold changes, as this process runs.
@@ -1803,7 +1828,7 @@ export async function tick(ctx) {
           // though the reeve that kept it stopped before ordering it.
           const gone = [...(a.pinned.get(pr) ?? [])].filter((d) => !(r.names ?? []).includes(d) && !whole(d));
           if (gone.length) log(logPath, `signing: #${pr}: this host kept ${gone.length} record(s) that this store no longer holds, and no entry of its signed order names: ` +
-                                        `they were taken away — ${gone.map((d) => d.slice(0, 12)).join(", ")}`);
+                                        `they were taken away, or a reeve stopped before its store committed them — ${gone.map((d) => d.slice(0, 12)).join(", ")}`);
         }
       });
     });
@@ -2802,11 +2827,11 @@ export async function tick(ctx) {
       }
     }
     // Its signed order is extended at the tick's end, to its latest then. Kept
-    // synced to disk where it may be pinned on the host's anchor (#279): a pin
-    // for a record a power loss then took would say it was taken away.
+    // pinned (#279), and synced to disk where it's pinned: a pin for a record a
+    // power loss then took would say it was taken away.
     const recordIt = () => record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire, kept });
-    const decided = kept && ordering ? (ctx.durably ?? durably)(db, recordIt) : recordIt();
-    if (decided.ok && kept) keptFor(pr, kept.decision.digest, decided.seq, decided.fresh);
+    const decided = keepPinned(pr, kept, () => (kept && ordering ? (ctx.durably ?? durably)(db, recordIt) : recordIt()), (r) => !r.ok);
+    if (decided.ok && kept) keptFor(pr, kept.decision.digest, decided.seq);
     if (effects.length && !decided.ok) {
       log(logPath, `  #${pr}: REQUEST_REVIEW — the decision and its ${effects.length} effect(s) could NOT be recorded: ${decided.why}`);
       // Escalated, not merely logged. Nothing else covers this: no worker is
@@ -3016,20 +3041,19 @@ export async function tick(ctx) {
           log(logPath, `  ${at}: what this verdict was judged from could not be recorded — ${err.message}`);
         }
         try {
-          let fresh = false;
-          // Synced where it may be pinned, as a pull request's own verdict is.
+          // Pinned, and synced where it's pinned, as a pull request's own verdict is.
           const keep = (/** @type {() => number} */ fn) => (kept && ordering ? (ctx.durably ?? durably)(db, fn) : fn());
-          const seq = keep(() => tx(db, () => {
+          const seq = keepPinned(entry.pr, kept, () => keep(() => tx(db, () => {
             const decided = db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
               .run(now(), "daemon", "queue.decided", `pr:${entry.pr}`, JSON.stringify({
                 head: sha, base: entry.baseSha, state: j.verdict.state, summary: j.verdict.summary,
                 clauses: j.verdict.clauses.map((c) => ({ id: c.id, state: c.state })),
                 record: kept?.decision.digest ?? null,
               }));
-            if (kept) fresh = saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr: entry.pr, head: sha, ...kept }).fresh;
+            if (kept) saveDecision(db, { at: now(), seq: Number(decided.lastInsertRowid), pr: entry.pr, head: sha, ...kept });
             return Number(decided.lastInsertRowid);
-          }));
-          if (kept) keptFor(entry.pr, kept.decision.digest, seq, fresh);
+          })), () => false);
+          if (kept) keptFor(entry.pr, kept.decision.digest, seq);
         } catch (err) {
           log(logPath, `  ${at}: the verdict could not be kept — ${err.message}`);
         }

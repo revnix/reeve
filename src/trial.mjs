@@ -6,7 +6,8 @@
 // final head; each kind of case seen; the seeded known-bad cases; and no false
 // call on audit. This reads the store and what GitHub says merged, and changes
 // nothing. What only a person can judge, a false call, is listed for them,
-// never passed on silence.
+// every call the daemon made and not only those a merge met, never passed on
+// silence.
 
 import { execFileSync } from "node:child_process";
 import { netTimeoutMs, netFailure } from "./net-bound.mjs";
@@ -27,8 +28,9 @@ export const CASE_KINDS = Object.freeze([
 ]);
 
 /**
- * @typedef {{ pr: number, mergedAt: number, head: string }} Merged
- * @typedef {{ pr: number, head: string, state: string, record: string | null, at: number }} Final
+ * @typedef {{ pr: number, mergedAt: number, head: string, mergeCommit: string | null }} Merged
+ * @typedef {{ where: "head" | "queue", pr: number, head: string, state: string, summary: string, why: string,
+ *             first: number, last: number, ticks: number, record: string | null, final: boolean }} Call
  * @typedef {{ name: string, met: boolean | null, detail: string }} Condition
  */
 
@@ -39,16 +41,16 @@ const events = (db, op, since, now) => /** @type {any[]} */ (db.prepare(
                 return { seq: Number(r.seq), at: Number(r.at), pr: Number(String(r.subject ?? "").replace(/^pr:/, "")), p }; });
 
 /**
- * The trial from `since` to `now`, both in seconds, against its conditions.
- * `merged` is what GitHub says merged in that time, or `{ why }` where it
- * couldn't be read, and then whether every merge was covered can't be said.
- * `seeded` is the known-bad cases seeded, each with the verdict it must get and
- * got; none seeded is a condition not yet met.
+ * The trial of `repo` from `since` to `now`, both in seconds, against its
+ * conditions. `merged` is what GitHub says merged in that time, or `{ why }`
+ * where it couldn't be read, and then whether every merge was covered can't be
+ * said. `seeded` is the known-bad cases seeded, each with the verdict it must
+ * get and got; none seeded is a condition not yet met.
  * @param {any} db
- * @param {{ since: number, now: number, merged: Merged[] | { why: string },
+ * @param {{ repo: string, since: number, now: number, merged: Merged[] | { why: string },
  *           seeded?: { name: string, must: string, got: string | null }[] }} o
  */
-export function trialReport(db, { since, now, merged, seeded = [] }) {
+export function trialReport(db, { repo, since, now, merged, seeded = [] }) {
   // Running time, from the ticks: each gap between ticks, and from the start to
   // the first and from the last to now, is running up to GAP_SECONDS, and past
   // it, downtime.
@@ -68,15 +70,24 @@ export function trialReport(db, { since, now, merged, seeded = [] }) {
   const decided = events(db, "pr.decided", since, now);
   const queued = events(db, "queue.decided", since, now);
 
-  // Each merged pull request, its final head, and how it was judged there.
+  // Each merged pull request, its final head, and how it was judged there: by
+  // the verdict that stood when it merged, so not one kept after it.
   /** @type {(Merged & { judged: boolean, state: string | null, record: string | null, down: boolean, queue: boolean, missed: string | null })[]} */
   const merges = [];
+  /** The events that stood when each pull request merged, at its head and in the queue. */
+  const standing = new Set();
   if (Array.isArray(merged)) for (const m of merged) {
-    const atHead = decided.filter((e) => e.pr === m.pr && e.p.head === m.head);
+    const atHead = decided.filter((e) => e.pr === m.pr && e.p.head === m.head && e.at <= m.mergedAt);
     const last = atHead.at(-1);
+    // Merged by the queue only where GitHub's merge commit is the queue's
+    // commit reeve judged before the merge: a pull request the queue held,
+    // then dropped, may have merged another way.
+    const inQueue = m.mergeCommit ? queued.filter((e) => e.pr === m.pr && e.p.head === m.mergeCommit && e.at <= m.mergedAt).at(-1) : undefined;
+    if (last) standing.add(last.seq);
+    if (inQueue) standing.add(inQueue.seq);
     const isDown = wasDown(m.mergedAt);
     merges.push({ ...m, judged: Boolean(last), state: last?.p.state ?? null, record: last?.p.record ?? null, down: isDown,
-                  queue: queued.some((e) => e.pr === m.pr),
+                  queue: Boolean(inQueue),
                   missed: isDown ? "merged while the daemon was down" : !last ? "its final head was never judged" : null });
   }
   const passedFinal = merges.filter((m) => m.state === "PASS");
@@ -87,8 +98,8 @@ export function trialReport(db, { since, now, merged, seeded = [] }) {
   // A new push after a review: a head first seen in the period, after a review
   // round on another head of the same pull request.
   const pushedAfterReview = /** @type {any[]} */ (db.prepare(
-    `SELECT DISTINCT h.pr FROM head_seen h JOIN review_round r ON r.pr = h.pr AND r.head_full <> h.sha
-      WHERE h.first_seen_at >= ? AND h.first_seen_at <= ? AND r.event_at < h.first_seen_at ORDER BY h.pr`).all(since, now)).map((r) => Number(r.pr));
+    `SELECT DISTINCT h.pr FROM head_seen h JOIN review_round r ON r.pr = h.pr AND r.nwo = h.nwo AND r.head_full <> h.sha
+      WHERE h.nwo = ? AND h.first_seen_at >= ? AND h.first_seen_at <= ? AND r.event_at < h.first_seen_at ORDER BY h.pr`).all(repo, since, now)).map((r) => Number(r.pr));
   /** @type {Record<string, number | null>} */
   const kinds = {
     "a pull request that passes": firstPr((e) => e.p.state === "PASS"),
@@ -99,10 +110,29 @@ export function trialReport(db, { since, now, merged, seeded = [] }) {
     "a merge through the merge queue": merges.find((m) => m.queue)?.pr ?? null,
   };
 
-  // What a person must judge: every final verdict on a merged pull request. A
-  // pass that should have stopped, or a block the inputs didn't justify, can't
-  // be told from the records alone.
-  const toAudit = merges.filter((m) => m.state).map((m) => ({ pr: m.pr, head: m.head, state: /** @type {string} */ (m.state), record: m.record }));
+  // What a person must judge: every call the daemon made in the period, at a
+  // pull request's head or on the queue's commit, merged or not, since every
+  // decision is audited (docs/decisions/2026-09-24-direction.md). A pass that
+  // should have stopped, or a block the inputs didn't justify, can't be told
+  // from the records alone. A call is one verdict on one commit with the same
+  // clauses blocked, however many ticks repeated it, with the latest reason: a
+  // reason can count checks still running, which changes tick by tick. Those
+  // standing when a pull request merged are marked: they're what a gate would
+  // have let through.
+  /** @type {Map<string, Call>} */
+  const calls = new Map();
+  for (const [where, list] of /** @type {const} */ ([["head", decided], ["queue", queued]])) for (const e of list) {
+    const call = { where, pr: e.pr, head: String(e.p.head ?? ""), state: String(e.p.state ?? ""), summary: String(e.p.summary ?? "") };
+    const key = JSON.stringify(Object.values(call));
+    const c = calls.get(key) ?? { ...call, why: "", first: e.at, last: e.at, ticks: 0, record: null, final: false };
+    c.why = String(e.p.why ?? "");
+    c.last = e.at;
+    c.ticks++;
+    c.record = e.p.record ?? c.record;
+    if (standing.has(e.seq)) c.final = true;
+    calls.set(key, c);
+  }
+  const toAudit = [...calls.values()].sort((a, b) => a.pr - b.pr || a.first - b.first);
 
   const hours = running / 3600;
   const missed = merges.filter((m) => m.missed);
@@ -120,12 +150,33 @@ export function trialReport(db, { since, now, merged, seeded = [] }) {
       met: seeded.length ? seeded.every((s) => s.got === s.must) : false,
       detail: seeded.length ? `${seeded.filter((s) => s.got === s.must).length} of ${seeded.length}` : "none seeded yet" },
     // Only a person's audit says this, so it's never met here.
-    { name: "no false call on audit", met: null, detail: `${toAudit.length} final verdict(s) to audit` },
+    { name: "no false call on audit", met: null, detail: `${toAudit.length} call(s) on ${new Set(toAudit.map((a) => a.pr)).size} pull request(s) to audit` },
   ];
   // Ready for a person's audit once every condition the records can show holds;
   // passed only once that audit is recorded, which nothing here does.
   return { since, now, running: { hours, ticks: ticks.length, down }, merges, passedFinal: passedFinal.length, kinds, toAudit, seeded, conditions,
            ready: conditions.every((c) => c.met !== false), passed: conditions.every((c) => c.met === true) };
+}
+
+/**
+ * Whether a store is `nwo`'s, told by the repository its decision records name:
+ * each names the one it was judged for. A store with records of another, named
+ * by --db by mistake or copied, would count their ticks, verdicts and cases for
+ * this one. One with no record is told only by where it is, so one named by
+ * hand (`named`) can't be told at all.
+ * @param {any} db @param {string} nwo @param {{ named: boolean }} o
+ * @returns {{ ok: true } | { ok: false, why: string }}
+ */
+export function storeIsOf(db, nwo, { named }) {
+  const repos = /** @type {any[]} */ (db.prepare(
+    `SELECT DISTINCT CASE WHEN json_valid(record) THEN json_extract(record, '$.subject.repo') END AS repo FROM decision`).all())
+    .map((r) => (typeof r.repo === "string" ? r.repo : null));
+  const other = repos.filter((r) => r !== nwo);
+  if (other.length)
+    return { ok: false, why: `this store holds decision records of ${other.map((r) => r ?? "a repository that can't be read").join(", ")}, not ${nwo}` };
+  if (named && !repos.length)
+    return { ok: false, why: `this store holds no decision record, so which repository it's of can't be told: without --db, reeve reads the one it keeps for ${nwo}` };
+  return { ok: true };
 }
 
 /** A time as the report shows it. @param {number} t */
@@ -151,8 +202,11 @@ export function renderTrial(r, nwo) {
   for (const m of r.merges)
     out.push(`  #${m.pr} at ${m.head.slice(0, 10)}: ${m.missed ? `MISSED, ${m.missed}` : `${m.state}${m.queue ? ", through the queue" : ""}`}`);
   if (r.toAudit.length) {
-    out.push("", "to audit (was each final verdict right?):");
-    for (const a of r.toAudit) out.push(`  #${a.pr} ${a.state} at ${a.head.slice(0, 10)}${a.record ? ` (record ${a.record.slice(0, 12)})` : ""}`);
+    out.push("", "to audit (was each call right?):");
+    for (const a of r.toAudit)
+      out.push(`  #${a.pr} ${a.state} ${a.where === "queue" ? "on the queue's commit" : "at"} ${a.head.slice(0, 10)}` +
+               `${a.summary ? ` (${a.summary}${a.why ? `: ${a.why}` : ""})` : a.why ? ` (${a.why})` : ""}, ${a.ticks} tick(s)${a.final ? ", standing when it merged" : ""}` +
+               `${a.record ? `, record ${a.record.slice(0, 12)}` : ""}`);
   }
   return out.join("\n");
 }
@@ -166,15 +220,16 @@ function gh(args) {
 
 /**
  * What merged into `nwo` since `since`, in seconds, as GitHub says: each pull
- * request, when, and its final head. `why` where it couldn't be read, which
- * vouches for nothing, or where there may be more than one read holds.
+ * request, when, its final head, and the commit it merged as, which is the
+ * queue's commit where the queue merged it. `why` where it couldn't be read,
+ * which vouches for nothing, or where there may be more than one read holds.
  * @param {string} nwo @param {number} since @param {{ run?: typeof gh, limit?: number }} [o]
  * @returns {Merged[] | { why: string }}
  */
 export function mergedSince(nwo, since, { run = gh, limit = 1000 } = {}) {
   const from = new Date(since * 1000).toISOString().replace(/\.\d+Z$/, "Z");
   const r = run(["pr", "list", "--repo", nwo, "--state", "merged", "--search", `merged:>=${from}`,
-                 "--json", "number,mergedAt,headRefOid", "--limit", String(limit)]);
+                 "--json", "number,mergedAt,headRefOid,mergeCommit", "--limit", String(limit)]);
   if (!r.ok) return { why: r.err || "gh failed" };
   let rows;
   try { rows = JSON.parse(r.out); } catch { return { why: "GitHub's answer doesn't read as a list of pull requests" }; }
@@ -184,9 +239,11 @@ export function mergedSince(nwo, since, { run = gh, limit = 1000 } = {}) {
   /** @type {Merged[]} */ const out = [];
   for (const x of rows) {
     const at = Date.parse(x?.mergedAt);
-    if (!Number.isSafeInteger(x?.number) || !Number.isFinite(at) || typeof x?.headRefOid !== "string" || !/^[0-9a-f]{40}$/.test(x.headRefOid))
+    const mergeCommit = x?.mergeCommit == null ? null : x.mergeCommit.oid;
+    if (!Number.isSafeInteger(x?.number) || !Number.isFinite(at) || typeof x?.headRefOid !== "string" || !/^[0-9a-f]{40}$/.test(x.headRefOid) ||
+        (mergeCommit !== null && !/^[0-9a-f]{40}$/.test(String(mergeCommit))))
       return { why: `GitHub's answer holds a pull request that doesn't read whole: ${JSON.stringify(x).slice(0, 120)}` };
-    if (at / 1000 >= since) out.push({ pr: x.number, mergedAt: Math.floor(at / 1000), head: x.headRefOid });
+    if (at / 1000 >= since) out.push({ pr: x.number, mergedAt: Math.floor(at / 1000), head: x.headRefOid, mergeCommit });
   }
   return out.sort((a, b) => a.mergedAt - b.mergedAt);
 }

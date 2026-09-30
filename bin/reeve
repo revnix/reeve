@@ -962,8 +962,13 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       fail("usage", `reeve trial: --since takes the date the trial's count started from, as 2026-09-30T09:14Z${since == null ? "" : `, got ${JSON.stringify(since)}`}`);
     const now = Math.floor(Date.now() / 1000);
     if (sinceAt > now) fail("usage", `reeve trial: --since ${since} is after now, and a trial can't have begun after now`);
-    const { trialReport, renderTrial, mergedSince } = await import("../src/trial.mjs");
-    const report = trialReport(open(dbPath), { since: sinceAt, now, merged: mergedSince(nwo, sinceAt) });
+    const { trialReport, renderTrial, mergedSince, storeIsOf } = await import("../src/trial.mjs");
+    const db = open(dbPath);
+    // Another repository's store would count its ticks, verdicts and cases for
+    // this one, and forks share pull request numbers and heads.
+    const bound = storeIsOf(db, nwo, { named: opt("db") != null });
+    if (!bound.ok) fail("store_unusable", `reeve trial: ${bound.why}`);
+    const report = trialReport(db, { repo: nwo, since: sinceAt, now, merged: mergedSince(nwo, sinceAt) });
     console.log(flag("json") ? JSON.stringify(report, null, 2) : renderTrial(report, nwo));
     process.exit(report.passed ? 0 : 1);
   }

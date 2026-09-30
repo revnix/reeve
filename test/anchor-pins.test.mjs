@@ -5,11 +5,12 @@
 // reeve can stop between any two steps, so none of these is left to the store.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileSigner, knownKeys, baselineStatement } from "../src/signing.mjs";
+import { fileSigner, knownKeys, baselineStatement, latestStatement } from "../src/signing.mjs";
 import { fileAnchor, readAnchor, anchorPath } from "../src/anchor.mjs";
-import { open } from "../src/db/ops.mjs";
+import { open, canonical } from "../src/db/ops.mjs";
 import { storeIdentity } from "../src/db/records.mjs";
 import { explainDecision, replayDecisions, signedOrder, anchorForStore } from "../src/decisions.mjs";
 import { computeVerdict } from "../src/verdict.mjs";
@@ -63,13 +64,20 @@ const rewrite = (dir, fn) => {
   const p = anchorPath(dir, REPO);
   const a = JSON.parse(readFileSync(p, "utf8"));
   // What a writer that left them out didn't write, so an edit here fails an assertion rather than the file.
-  a.named ??= {}; a.reserved ??= {}; a.pinned ??= {};
+  a.named ??= {}; a.sealed ??= {}; a.reserved ??= {}; a.pinned ??= {};
   fn(a);
   writeFileSync(p, JSON.stringify(a));
 };
 /** An anchor file as written whole, with nothing made on the way but its folders. */
 const writeAnchor = (dir, a) => { const p = anchorPath(dir, REPO); mkdirSync(dirname(p), { recursive: true, mode: 0o700 }); writeFileSync(p, JSON.stringify(a), { mode: 0o600 }); };
 const baselines = (dbPath) => { const db = open(dbPath); const n = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n; db.close(); return n; };
+/** Entry `n` of #42's order as the store holds it, its payload read. */
+const entryOf = (db, n) => JSON.parse(db.prepare("SELECT payload FROM event WHERE op = 'decision.latest' AND subject = ? AND json_extract(payload, '$.n') = ?").get(`pr:${PR}`, n)?.payload ?? "null");
+/** An entry's seal, from its payload as the store holds it: sha256 over its statement, its repository without case. */
+const sealOf = (/** @type {any} */ e) => createHash("sha256").update(canonical(latestStatement({ repo: String(e.repo).toLowerCase(), pr: PR, n: e.n, digest: e.digest,
+                                                                                          records: e.records ?? [], store: e.store ?? null, seq: e.seq ?? null }))).digest("hex");
+/** An entry reserved on the anchor, as it writes one: whole but for its repository and store. */
+const reservedAs = (/** @type {any} */ e) => ({ n: e.n, digest: e.digest, records: e.records ?? [], seq: e.seq ?? null });
 
 // ── the anchor ───────────────────────────────────────────────────────────────
 
@@ -77,26 +85,42 @@ test("an anchor written before #279 and #281 reads, holding none of what they ad
   const dir = credentials();
   writeAnchor(dir, { began: true, latest: { 42: 2 }, store: ID });
   const a = anchorRead(dir);
-  assert.deepEqual(a, { began: true, latest: new Map([[PR, 2]]), store: ID, named: new Map(), reserved: new Map(), pinned: new Map(), pending: null });
+  assert.deepEqual(a, { began: true, latest: new Map([[PR, 2]]), store: ID, named: new Map(), sealed: new Map(), reserved: new Map(), pinned: new Map(), pending: null });
 });
 
 test("the anchor reserves only an order's next entry, for one record, and noting it clears that and unpins what it names", () => {
   const dir = credentials();
   const an = fileAnchor(dir);
+  assert.equal(an.reserve(REPO, /** @type {any} */ (null), PR, 1, D1), false, "not on an anchor no store's, which couldn't be read back");
   assert.equal(an.bind(REPO, ID), true);
   assert.equal(an.reserve(REPO, ID, PR, 2, D1), false, "not an entry past the next");
   assert.equal(an.reserve(REPO, OTHER, PR, 1, D1), false, "nor on an anchor that's another store's");
   assert.equal(an.reserve(REPO, ID, PR, 1, D1), true);
   assert.equal(an.reserve(REPO, ID, PR, 1, D2), false, "a reserved number stays its record's");
+  assert.equal(an.reserve(REPO, ID, PR, 1, D1, [D3]), false, "and its entry's, naming no other records");
+  assert.equal(an.reserve(REPO, ID, PR, 1, D1, [], 7), false, "nor seen elsewhere");
+  assert.equal(an.note(REPO, PR, 1, D1, [D1], sealOf({ repo: REPO, n: 1, digest: D1, records: [D3], store: ID })), false, "nor is it noted for another entry naming its record");
   assert.equal(an.pin(REPO, OTHER, PR, [D3]), false, "nothing is pinned on another store's anchor");
   assert.equal(an.pin(REPO, ID, PR, [D1, D3]), true);
   assert.equal(an.note(REPO, PR, 1, D2, [D2]), false, "nor is a reserved number noted for another record");
-  assert.deepEqual(anchorRead(dir)?.reserved, new Map([[PR, { n: 1, digest: D1 }]]), "control: it's still reserved");
+  assert.deepEqual(anchorRead(dir)?.reserved, new Map([[PR, { n: 1, digest: D1, records: [], seq: null }]]), "control: it's still reserved");
   assert.equal(an.note(REPO, PR, 1, D1, [D1]), true);
   const a = anchorRead(dir);
   assert.deepEqual({ latest: a?.latest, named: a?.named, reserved: a?.reserved, pinned: a?.pinned },
                    { latest: new Map([[PR, 1]]), named: new Map([[PR, D1]]), reserved: new Map(), pinned: new Map([[PR, new Set([D3])]]) });
   assert.equal(an.note(REPO, PR, 1, D2), false, "an entry noted with one record isn't noted again with another");
+});
+
+test("the anchor keeps the seal of the entry it noted last, and never another for it", () => {
+  const dir = credentials();
+  const an = fileAnchor(dir);
+  const one = sealOf({ repo: REPO, n: 1, digest: D1, store: ID }), other = sealOf({ repo: REPO, n: 1, digest: D1, records: [D2], store: ID });
+  assert.equal(an.note(REPO, PR, 1, D1, [D1], one), true);
+  assert.equal(anchorRead(dir)?.sealed?.get(PR), one);
+  assert.equal(an.note(REPO, PR, 1, D1, [D1], other), false, "not noted again as another entry");
+  assert.equal(anchorRead(dir)?.sealed?.get(PR), one);
+  assert.equal(an.note(REPO, PR, 2, D2, [D2]), true, "control: a later entry noted without one");
+  assert.equal(anchorRead(dir)?.sealed?.has(PR), false, "leaves none for it");
 });
 
 test("the anchor unpins a record only on the say of the store it's bound to", () => {
@@ -111,31 +135,59 @@ test("the anchor unpins a record only on the say of the store it's bound to", ()
 
 test("an anchor holding a part that doesn't read whole isn't read", () => {
   const bad = {
-    "an entry reserved past the next": { reserved: { 42: { n: 3, digest: D1 } } },
+    "an entry reserved past the next": { reserved: { 42: { n: 3, digest: D1, records: [], seq: null } } },
     "a record noted for an entry the anchor doesn't hold": { named: { 7: D1 } },
     "a record noted that isn't a digest": { named: { 42: "abc" } },
     "no record pinned": { pinned: { 42: [] } },
-    "a binding begun on an anchor already bound": { pending: { store: OTHER, baseline: D1 } },
+    "a binding begun on an anchor already bound": { pending: { store: OTHER, baseline: baselineFingerprint([D1]), digests: [D1] } },
+    "a seal for an entry that names no record": { sealed: { 42: D1 } },
+    "an entry reserved without its records": { reserved: { 42: { n: 2, digest: D1, seq: null } } },
+    "an entry reserved seen nowhere": { reserved: { 42: { n: 2, digest: D1, records: [], seq: 0 } } },
   };
   for (const [what, part] of Object.entries(bad)) {
     const dir = credentials();
     writeAnchor(dir, { began: true, latest: { 42: 1 }, store: ID, ...part });
     assert.throws(() => readAnchor(dir, REPO), /isn't an anchor/, what);
   }
+  // And what's only whole on an anchor no store's yet.
+  const unbound = {
+    "an entry reserved on an anchor no store's": { reserved: { 42: { n: 2, digest: D1, records: [], seq: null } } },
+    "a binding begun without its records": { pending: { store: ID, baseline: baselineFingerprint([D1]) } },
+    "a binding begun whose records aren't its fingerprint's": { pending: { store: ID, baseline: baselineFingerprint([D1]), digests: [D2] } },
+    "a binding begun whose records aren't sorted": { pending: { store: ID, baseline: baselineFingerprint([D1, D2]), digests: [D2, D1] } },
+  };
+  for (const [what, part] of Object.entries(unbound)) {
+    const dir = credentials();
+    writeAnchor(dir, { began: false, latest: { 42: 1 }, store: null, ...part });
+    assert.throws(() => readAnchor(dir, REPO), /isn't an anchor/, what);
+  }
+  const dir = credentials();
+  writeAnchor(dir, { began: false, latest: {}, store: null, pending: { store: ID, baseline: baselineFingerprint([D1, D2]), digests: [D1, D2] } });
+  assert.deepEqual(anchorRead(dir)?.pending, { store: ID, baseline: baselineFingerprint([D1, D2]), digests: [D1, D2] }, "control: a binding begun reads");
 });
 
 test("a binding begun is finished only for the store it was begun for", () => {
   const dir = credentials();
   const an = fileAnchor(dir);
-  assert.equal(an.pending(REPO, ID, D1), true);
-  assert.equal(an.pending(REPO, ID, D2), false, "nor begun again with another baseline");
-  assert.equal(an.pending(REPO, OTHER, D1), false, "nor for another store");
+  assert.equal(an.pending(REPO, ID, [D1]), true);
+  assert.equal(an.pending(REPO, OTHER, [D1]), false, "nor for another store");
+  assert.equal(an.pending(REPO, OTHER, [D1, D3]), false, "nor for another store over more records");
   assert.equal(an.bind(REPO, OTHER), false, "another store isn't bound over it");
-  assert.deepEqual(anchorRead(dir)?.pending, { store: ID, baseline: D1 });
+  assert.deepEqual(anchorRead(dir)?.pending, { store: ID, baseline: baselineFingerprint([D1]), digests: [D1] });
   assert.equal(an.bind(REPO, ID), true);
   const a = anchorRead(dir);
   assert.deepEqual({ store: a?.store, began: a?.began, pending: a?.pending }, { store: ID, began: true, pending: null });
-  assert.equal(an.pending(REPO, ID, D1), false, "and none is begun on an anchor bound");
+  assert.equal(an.pending(REPO, ID, [D1]), false, "and none is begun on an anchor bound");
+});
+
+test("a binding begun moves on only over more records, as its store kept more while its baseline waited", () => {
+  const dir = credentials();
+  const an = fileAnchor(dir);
+  assert.equal(an.pending(REPO, ID, [D1]), true);
+  assert.equal(an.pending(REPO, ID, [D2]), false, "not over records that leave out one it was begun with");
+  assert.equal(an.pending(REPO, ID, [D2, D1]), true, "over more records");
+  assert.equal(an.pending(REPO, ID, [D1]), false, "and never back");
+  assert.deepEqual(anchorRead(dir)?.pending, { store: ID, baseline: baselineFingerprint([D1, D2]), digests: [D1, D2] });
 });
 
 // ── #279: an order's entries ─────────────────────────────────────────────────
@@ -144,21 +196,23 @@ test("an entry is reserved on the host's anchor before the store commits it", as
   const dir = credentials();
   const dbPath = store();
   const real = fileAnchor(dir);
-  /** @type {{ n: number, digest: string, top: number }[]} */ const seen = [];
+  /** @type {{ n: number, digest: string, top: number, records: string[], seq: number | null }[]} */ const seen = [];
   const anchor = { ...real, reserve: (/** @type {any[]} */ ...args) => {
-    const [, id, , n, digest] = args;
+    const [, id, , n, digest, records, seq] = args;
     const db = open(dbPath);
     const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }), id);
     db.close();
-    seen.push({ n, digest, top: "top" in order ? order.top : -1 });
+    seen.push({ n, digest, top: "top" in order ? order.top : -1, records, seq });
     return real.reserve(...args);
   } };
   await tick(dbPath, at(A), host(dir, anchor));
   await tick(dbPath, at(A, "RED"), host(dir, anchor));
   const db = open(dbPath);
   const [green, red] = digestsOf(db);
+  const one = entryOf(db, 1), two = entryOf(db, 2);
   db.close();
-  assert.deepEqual(seen, [{ n: 1, digest: green, top: 0 }, { n: 2, digest: red, top: 1 }], "each entry reserved while the store's order ended before it");
+  assert.deepEqual(seen, [{ n: 1, digest: green, top: 0, records: one?.records, seq: one?.seq }, { n: 2, digest: red, top: 1, records: two?.records, seq: two?.seq }],
+                   "each entry reserved, whole, while the store's order ended before it");
 });
 
 test("an entry that can't be reserved isn't committed", async () => {
@@ -181,6 +235,7 @@ test("a copy of the store whose entry at the host's top names another record isn
   let db = open(dbPath);
   const [, red] = digestsOf(db);
   db.close();
+  assert.ok(red, "control: both records were kept");
   assert.equal(anchorRead(dir)?.named?.get(PR), red, "control: the anchor holds the record entry 2 names");
   // Another copy of the store, holding the same identity, signed another record
   // as entry 2 and noted it: this copy's entry 2 is no longer the host's.
@@ -208,7 +263,7 @@ test("an entry reserved for a record the store doesn't hold stops its order, and
   const dbPath = store();
   await tick(dbPath, at(A), host(dir));
   // Reserved, as a copy of the store that kept another record would have.
-  rewrite(dir, (a) => { a.reserved = { 42: { n: 2, digest: "f".repeat(64) } }; });
+  rewrite(dir, (a) => { a.reserved = { 42: reservedAs({ n: 2, digest: "f".repeat(64) }) }; });
   const r = await tick(dbPath, null, host(dir));
   await tick(dbPath, at(A, "RED"), host(dir));
   const keys = knownKeys({ local: dir });
@@ -228,11 +283,14 @@ test("an entry reserved and never committed is completed for the record it was r
   await tick(dbPath, at(A, "RED"), host(dir));
   let db = open(dbPath);
   const [green, red] = digestsOf(db);
+  const two = entryOf(db, 2);
+  assert.ok(red && two, "control: entry 2 was kept");
   // As a reeve that stopped after reserving entry 2 and before committing it
   // would have left it: the record kept, the entry not.
   db.prepare("DELETE FROM event WHERE op = 'decision.latest' AND json_extract(payload, '$.n') = 2").run();
+  const sealOne = entryOf(db, 1);
   db.close();
-  rewrite(dir, (a) => { a.latest["42"] = 1; a.named["42"] = green; a.reserved = { 42: { n: 2, digest: red } }; });
+  rewrite(dir, (a) => { a.latest["42"] = 1; a.named["42"] = green; a.sealed["42"] = sealOf(sealOne); a.reserved = { 42: reservedAs(two) }; });
   const keys = knownKeys({ local: dir });
   db = open(dbPath);
   const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: anchorFor(db, dir) });
@@ -245,6 +303,7 @@ test("an entry reserved and never committed is completed for the record it was r
   db.close();
   assert.ok("entries" in order, JSON.stringify(order));
   assert.equal(order.entries.get(2), red, "entry 2 names the record it was reserved for");
+  assert.equal(order.seals?.get(2), sealOf(two), "and is the entry reserved, whole");
   const a = anchorRead(dir);
   assert.equal(a?.reserved?.size, 0, "and the reservation is noted");
   assert.equal(a?.latest?.get(PR), order.top);
@@ -363,6 +422,11 @@ test("a store whose baseline changed after its binding was begun isn't bound", a
   const r = await tick(dbPath, null, host(dir));
   assert.match(r.log, /this store's baseline isn't the one its binding was begun with: the store was restored from before, or its baseline changed, so the host's anchor for o\/r isn't bound to this store/);
   assert.equal(anchorRead(dir)?.store, null);
+  const keys = knownKeys({ local: dir });
+  db = open(dbPath);
+  const whole = replayDecisions(db, {}, { keys, repo: REPO, anchor: anchorFor(db, dir) });
+  db.close();
+  assert.ok(whole.some((x) => /the host's anchor was being bound to this store, holding other records than it holds now/.test(String(x.why))), JSON.stringify(whole));
 });
 
 test("a binding begun before the baseline committed is finished for its store, with the identity it was begun with", async () => {
@@ -374,7 +438,7 @@ test("a binding begun before the baseline committed is finished for its store, w
   db.close();
   // As a reeve that stopped after writing the binding and before its store
   // committed the baseline and identity would have left it.
-  assert.equal(fileAnchor(dir).pending(REPO, ID, baselineFingerprint(digests)), true);
+  assert.equal(fileAnchor(dir).pending(REPO, ID, digests), true);
   await tick(dbPath, null, host(dir));
   db = open(dbPath);
   const id = storeIdentity(db);
@@ -388,7 +452,7 @@ test("a binding begun for other records than the store holds makes no baseline",
   const dir = credentials();
   const dbPath = store();
   await tick(dbPath, at(A));
-  assert.equal(fileAnchor(dir).pending(REPO, ID, baselineFingerprint(["f".repeat(64)])), true);
+  assert.equal(fileAnchor(dir).pending(REPO, ID, ["f".repeat(64)]), true);
   const r = await tick(dbPath, null, host(dir));
   assert.equal(baselines(dbPath), 0);
   assert.match(r.log, /was being bound to this store, holding other records than it holds now/);
@@ -420,8 +484,9 @@ test("a store ahead of the host's anchor, its entry naming another record than t
   let db = open(dbPath);
   const [green, red] = digestsOf(db);
   db.close();
+  assert.ok(red, "control: both records were kept");
   // The anchor stopped before noting entry 2, and holds it reserved for another record.
-  rewrite(dir, (a) => { a.latest["42"] = 1; a.named["42"] = green; a.reserved = { 42: { n: 2, digest: "f".repeat(64) } }; });
+  rewrite(dir, (a) => { a.latest["42"] = 1; a.named["42"] = green; delete a.sealed["42"]; a.reserved = { 42: reservedAs({ n: 2, digest: "f".repeat(64) }) }; });
   const r = await tick(dbPath, null, host(dir));
   assert.match(r.log, new RegExp(`#42: its signed order ends at entry 2, naming record ${red.slice(0, 12)}, though this host reserved entry 2 for record ffffffffffff, so it isn't extended`));
   const keys = knownKeys({ local: dir });
@@ -525,12 +590,14 @@ test("an entry reserved for the record its order already ends at is completed, t
   const [green] = digestsOf(db);
   db.close();
   // Reserved to name the latest again, with records since taken away.
-  rewrite(dir, (a) => { a.reserved = { 42: { n: 2, digest: green } }; });
+  rewrite(dir, (a) => { a.reserved = { 42: reservedAs({ n: 2, digest: green, records: ["f".repeat(64)], seq: 1 }) }; });
   await tick(dbPath, null, host(dir));
   db = open(dbPath);
   const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  const id = storeIdentity(db);
   db.close();
   assert.ok("entries" in order && order.entries.get(2) === green, JSON.stringify(order));
+  assert.equal(order.seals?.get(2), sealOf({ repo: REPO, n: 2, digest: green, records: ["f".repeat(64)], store: id, seq: 1 }), "completed whole, as it was reserved");
   assert.equal(anchorRead(dir)?.reserved?.size, 0, "and its reservation doesn't stand for good");
 });
 
@@ -627,10 +694,11 @@ test("a pinned or reserved record moved to another pull request, or changed, isn
   await tick(dbPath, at(A, "RED"), host(dir, { ...fileAnchor(dir), reserve: () => false }));
   let db = open(dbPath);
   const [green, red] = digestsOf(db);
+  assert.ok(red, "control: both records were kept");
   // The pinned record moved to #43; and entry 2 reserved for it, as a stop would leave it.
   db.prepare("UPDATE decision SET pr = 43 WHERE digest = ?").run(red);
   db.close();
-  rewrite(dir, (a) => { a.reserved = { 42: { n: 2, digest: red } }; });
+  rewrite(dir, (a) => { a.reserved = { 42: reservedAs({ n: 2, digest: red }) }; });
   const keys = knownKeys({ local: dir });
   db = open(dbPath);
   const replayed = replayDecisions(db, { pr: PR }, { keys, repo: REPO, anchor: anchorFor(db, dir) });
@@ -724,3 +792,197 @@ test("a whole-store replay says a binding begun for other records than the store
   assert.ok(!theirs.some((x) => /was being bound to this store/.test(String(x.why))), JSON.stringify(theirs));
 });
 
+
+// ── #299's third review ──────────────────────────────────────────────────────
+
+test("a record that can't be pinned on the host's anchor isn't kept, and is kept when its pull request is judged again", async () => {
+  const dir = credentials();
+  const dbPath = store();
+  await tick(dbPath, at(A), host(dir));
+  const r = await tick(dbPath, at(A, "RED"), host(dir, { ...fileAnchor(dir), pin: () => false }));
+  let db = open(dbPath);
+  const kept = digestsOf(db).length;
+  db.close();
+  assert.equal(kept, 1, "the verdict's record isn't kept, as nothing would show it was, taken away before an entry named it");
+  assert.match(r.log, /#42: its decision record isn't kept this tick, as it couldn't be pinned on the host's anchor — the host's anchor couldn't be written/);
+  await tick(dbPath, at(A, "RED"), host(dir));
+  db = open(dbPath);
+  const [, red] = digestsOf(db);
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  db.close();
+  assert.ok(red && "digest" in order && order.digest === red, `kept and ordered once it could be pinned: ${JSON.stringify(order)}`);
+});
+
+test("a first record whose binding of the host's anchor can't be written isn't kept", async () => {
+  const dir = credentials();
+  const dbPath = store();
+  // A baseline over no record, so the store's first record binds the anchor.
+  await tick(dbPath, null, host(dir));
+  const r = await tick(dbPath, at(A), host(dir, { ...fileAnchor(dir), bind: () => false }));
+  const db = open(dbPath);
+  const kept = digestsOf(db).length;
+  db.close();
+  assert.equal(kept, 0);
+  assert.match(r.log, /#42: its decision record isn't kept this tick, as it couldn't be pinned on the host's anchor — the host's anchor couldn't be bound to this store/);
+});
+
+/** A store holding a record kept before signing began, and a baseline over it made before #281, signed by this host, with no identity or binding. */
+const olderStore = async (dir) => {
+  const dbPath = store();
+  await tick(dbPath, at(A));
+  const db = open(dbPath);
+  const digests = db.prepare("SELECT digest FROM decision ORDER BY digest").all().map((x) => x.digest);
+  const s = fileSigner(dir)(baselineStatement(digests));
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(2, "daemon", "signing.baseline", "store", JSON.stringify({ digests: baselineStatement(digests).predicate.digests, envelope: s.envelope }));
+  db.close();
+  return dbPath;
+};
+
+test("an older store's identity is committed only once the host's anchor holds the binding begun for it", async () => {
+  const dir = credentials();
+  const dbPath = await olderStore(dir);
+  const real = fileAnchor(dir);
+  /** @type {(string | null)[]} */ const seen = [];
+  const anchor = { ...real, pending: (/** @type {any[]} */ ...args) => { const db = open(dbPath); seen.push(storeIdentity(db)); db.close(); return real.pending(...args); } };
+  await tick(dbPath, null, host(dir, anchor));
+  const db = open(dbPath);
+  const id = storeIdentity(db);
+  db.close();
+  assert.deepEqual(seen.slice(0, 1), [null], "the binding was begun while the store held no identity");
+  assert.equal(anchorRead(dir)?.store, id, "control: bound");
+});
+
+test("an older store whose binding can't be begun on the host's anchor takes no identity", async () => {
+  const dir = credentials();
+  const dbPath = await olderStore(dir);
+  await tick(dbPath, null, host(dir, { ...fileAnchor(dir), pending: () => false }));
+  const db = open(dbPath);
+  const id = storeIdentity(db);
+  db.close();
+  assert.equal(id, null, "none made, by the binding or by ordering");
+  assert.equal(anchorRead(dir)?.store ?? null, null);
+});
+
+test("a whole-store replay says a binding begun over a baseline whose signature doesn't hold", async () => {
+  const dir = credentials();
+  const dbPath = store();
+  await tick(dbPath, at(A));
+  // Stopped after the baseline committed and before the binding; then its envelope forged, its records as they were.
+  await tick(dbPath, null, host(dir, { ...fileAnchor(dir), bind: () => false }));
+  assert.ok(anchorRead(dir)?.pending, "control: its binding was begun");
+  let db = open(dbPath);
+  db.prepare("UPDATE event SET payload = json_set(payload, '$.envelope', 'forged') WHERE op = 'signing.baseline'").run();
+  db.close();
+  const keys = knownKeys({ local: dir });
+  db = open(dbPath);
+  const whole = replayDecisions(db, {}, { keys, repo: REPO, anchor: anchorFor(db, dir) });
+  db.close();
+  assert.ok(whole.some((x) => x.outcome === "unreplayable" && /the host's anchor was being bound to this store, and its baseline doesn't hold/.test(String(x.why))), JSON.stringify(whole));
+});
+
+/** Entry 2 of #42's order in the store at `dbPath`, re-signed by this host naming `records` besides its record: what a copy of the store would hold. */
+const resign = (dbPath, dir, records) => {
+  const db = open(dbPath);
+  const e = entryOf(db, 2);
+  const s = fileSigner(dir)(latestStatement({ repo: e.repo, pr: PR, n: 2, digest: e.digest, records, store: e.store, seq: e.seq }));
+  db.prepare("UPDATE event SET payload = ? WHERE op = 'decision.latest' AND subject = ? AND json_extract(payload, '$.n') = 2")
+    .run(JSON.stringify({ ...e, records, envelope: s.envelope }), `pr:${PR}`);
+  db.close();
+};
+
+test("a copy of the store whose entry at the host's top names that record and others isn't current, and isn't extended", async () => {
+  const dir = credentials();
+  const dbPath = store();
+  await tick(dbPath, at(A), host(dir));
+  await tick(dbPath, at(A, "RED"), host(dir));
+  let db = open(dbPath);
+  const [, red] = digestsOf(db);
+  db.close();
+  assert.ok(anchorRead(dir)?.sealed?.get(PR), "control: the anchor holds entry 2's seal");
+  resign(dbPath, dir, ["f".repeat(64)]);
+  const keys = knownKeys({ local: dir });
+  db = open(dbPath);
+  const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: anchorFor(db, dir) });
+  const replayed = replayDecisions(db, { pr: PR }, { keys, repo: REPO, anchor: anchorFor(db, dir) });
+  db.close();
+  const why = new RegExp(`entry 2 of its signed order names record ${red.slice(0, 12)}, as this host noted, but isn't the entry this host noted there`);
+  assert.match(String(shown), new RegExp(`can't be trusted as the latest: ${why.source}`));
+  assert.ok(replayed.some((x) => x.outcome === "unreplayable" && why.test(String(x.why))), JSON.stringify(replayed));
+  // Said every tick, though the pull request isn't judged again.
+  const r = await tick(dbPath, null, host(dir));
+  assert.match(r.log, new RegExp(`#42: ${why.source}, so it isn't extended`));
+  await tick(dbPath, at(B), host(dir));
+  db = open(dbPath);
+  const order = signedOrder(db, REPO, PR, keys);
+  db.close();
+  assert.equal("top" in order && order.top, 2, "not extended past it");
+});
+
+test("a store ahead of the host's anchor, its entry naming the reserved record and other records, isn't current", async () => {
+  const dir = credentials();
+  const dbPath = store();
+  await tick(dbPath, at(A), host(dir));
+  await tick(dbPath, at(A, "RED"), host(dir));
+  let db = open(dbPath);
+  const [green, red] = digestsOf(db);
+  const one = entryOf(db, 1), two = entryOf(db, 2);
+  db.close();
+  assert.ok(red && one && two, "control: both entries were kept");
+  // The anchor stopped before noting entry 2, reserved for it naming another record besides.
+  rewrite(dir, (a) => { a.latest["42"] = 1; a.named["42"] = green; a.sealed["42"] = sealOf(one); a.reserved = { 42: reservedAs({ ...two, records: ["f".repeat(64)] }) }; });
+  const r = await tick(dbPath, null, host(dir));
+  assert.match(r.log, new RegExp(`#42: its signed order ends at entry 2, naming record ${red.slice(0, 12)}, as this host reserved it, but isn't the entry this host reserved, so it isn't extended`));
+  const keys = knownKeys({ local: dir });
+  db = open(dbPath);
+  const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: anchorFor(db, dir) });
+  db.close();
+  assert.match(String(shown), new RegExp(`entry 2 of its signed order names record ${red.slice(0, 12)}, as this host reserved it, but isn't the entry this host reserved`));
+  assert.equal(anchorRead(dir)?.latest?.get(PR), 1, "and the anchor isn't moved to it");
+});
+
+test("a binding begun whose baseline didn't commit is finished once it does, over the records kept meanwhile", async () => {
+  const dir = credentials();
+  const dbPath = store();
+  await tick(dbPath, at(A));
+  // The binding begun, and the baseline's commit failing, as on a disk that filled; the tick keeps its record all the same, unsigned.
+  const durably = (/** @type {any} */ db, /** @type {() => any} */ fn) => {
+    db.exec("CREATE TEMP TRIGGER IF NOT EXISTS no_baseline BEFORE INSERT ON event WHEN NEW.op = 'signing.baseline' BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END");
+    try { return fn(); } finally { db.exec("DROP TRIGGER IF EXISTS temp.no_baseline"); }
+  };
+  await tick(dbPath, at(A, "RED"), { ...host(dir), durably });
+  let db = open(dbPath);
+  const kept = digestsOf(db).length;
+  db.close();
+  assert.equal(baselines(dbPath), 0, "control: the baseline didn't commit");
+  assert.ok(anchorRead(dir)?.pending, "control: its binding was begun");
+  assert.equal(kept, 2, "control: a record was kept meanwhile");
+  // Nor does a whole-store replay take the record kept meanwhile for one taken away.
+  const keys = knownKeys({ local: dir });
+  db = open(dbPath);
+  const whole = replayDecisions(db, {}, { keys, repo: REPO, anchor: anchorFor(db, dir) });
+  db.close();
+  assert.ok(!whole.some((x) => /was being bound to this store/.test(String(x.why))), JSON.stringify(whole));
+  await tick(dbPath, null, host(dir));
+  db = open(dbPath);
+  const id = storeIdentity(db);
+  db.close();
+  assert.equal(baselines(dbPath), 1, "the baseline is made, over both");
+  assert.deepEqual({ store: anchorRead(dir)?.store, pending: anchorRead(dir)?.pending }, { store: id, pending: null }, "and the anchor bound");
+});
+
+test("a binding begun over a record changed since makes no baseline", async () => {
+  const dir = credentials();
+  const dbPath = store();
+  await tick(dbPath, at(A));
+  let db = open(dbPath);
+  const digests = db.prepare("SELECT digest FROM decision ORDER BY digest").all().map((x) => x.digest);
+  db.close();
+  // Begun by a reeve that stopped before its baseline committed; then the record changed in place.
+  assert.equal(fileAnchor(dir).pending(REPO, ID, digests), true);
+  db = open(dbPath);
+  db.prepare("UPDATE decision SET record = json_set(record, '$.verdict.state', 'BLOCK')").run();
+  db.close();
+  const r = await tick(dbPath, null, host(dir));
+  assert.equal(baselines(dbPath), 0);
+  assert.match(r.log, /was being bound to this store, holding other records than it holds now/);
+});

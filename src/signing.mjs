@@ -111,6 +111,17 @@ export function latestStatement({ repo, pr, n, digest, records = [], store = nul
 }
 
 /**
+ * An entry's seal: sha256 over its statement, which holds all it says, its
+ * repository without case, as GitHub's names don't tell case apart. The host's
+ * anchor keeps it for the entry it noted last of a pull request's order (#279):
+ * another entry under that number, naming the same record and other records,
+ * doesn't pass for it.
+ * @param {{ repo: string, pr: number, n: number, digest: string, records?: string[], store?: string | null, seq?: number | null }} entry
+ */
+export const entrySeal = (entry) =>
+  createHash("sha256").update(canonical(latestStatement({ ...entry, repo: String(entry.repo).toLowerCase() }))).digest("hex");
+
+/**
  * The signing key in `dir`, the credentials folder. With `create`, one is made
  * when there's none, readable only by its owner. It's written whole to a file of
  * its own first, then linked into place, which fails if a key is already there:

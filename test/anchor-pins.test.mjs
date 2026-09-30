@@ -589,16 +589,35 @@ test("an entry reserved for the record its order already ends at is completed, t
   let db = open(dbPath);
   const [green] = digestsOf(db);
   db.close();
-  // Reserved to name the latest again, with records since taken away.
-  rewrite(dir, (a) => { a.reserved = { 42: reservedAs({ n: 2, digest: green, records: ["f".repeat(64)], seq: 1 }) }; });
+  // Reserved to name the latest again, seen at another place in the store's
+  // events, and naming nothing else.
+  rewrite(dir, (a) => { a.reserved = { 42: reservedAs({ n: 2, digest: green, records: [], seq: 1 }) }; });
   await tick(dbPath, null, host(dir));
   db = open(dbPath);
   const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
   const id = storeIdentity(db);
   db.close();
   assert.ok("entries" in order && order.entries.get(2) === green, JSON.stringify(order));
-  assert.equal(order.seals?.get(2), sealOf({ repo: REPO, n: 2, digest: green, records: ["f".repeat(64)], store: id, seq: 1 }), "completed whole, as it was reserved");
+  assert.equal(order.seals?.get(2), sealOf({ repo: REPO, n: 2, digest: green, records: [], store: id, seq: 1 }), "completed whole, as it was reserved");
   assert.equal(anchorRead(dir)?.reserved?.size, 0, "and its reservation doesn't stand for good");
+});
+
+test("an entry reserved naming a record the store no longer holds is completed naming it", async () => {
+  const dir = credentials();
+  const dbPath = store();
+  await tick(dbPath, at(A), host(dir));
+  let db = open(dbPath);
+  const [green] = digestsOf(db);
+  db.close();
+  // Reserved naming a record kept since and taken away before the entry was committed.
+  rewrite(dir, (a) => { a.reserved = { 42: reservedAs({ n: 2, digest: green, records: ["f".repeat(64)], seq: 1 }) }; });
+  await tick(dbPath, null, host(dir));
+  db = open(dbPath);
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  const id = storeIdentity(db);
+  db.close();
+  assert.equal(order.seals?.get(2), sealOf({ repo: REPO, n: 2, digest: green, records: ["f".repeat(64)], store: id, seq: 1 }), "completed whole, the record it names included");
+  assert.ok("digests" in order && order.digests.has("f".repeat(64)), "so its loss shows");
 });
 
 test("a pull request reached only to unpin what its order names takes no new entry", async () => {

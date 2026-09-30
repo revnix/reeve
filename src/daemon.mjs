@@ -1850,9 +1850,6 @@ export async function tick(ctx) {
           // can't be read extends nothing, as whether an order was cut short
           // can't be told.
           a = ctx.anchor.read(nwo) ?? noAnchor();
-          // A binding begun is finished for the store it was begun for, or
-          // refused, as in the baseline's step (#281).
-          if (!a.store && a.pending && !bindStore(a)) return;
           // The store's identity: made by its binding, once that's begun on the
           // host's anchor, where the anchor is no store's yet (#281). A store
           // with none holds no entry an order could name.

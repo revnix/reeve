@@ -88,6 +88,63 @@ export class Edits {
   }
 }
 
+// The pattern reeve reads a clean pass's commit by where a reviewer declares
+// none, as src/pr.mjs names it.
+const CLEAN_COMMIT = "Reviewed commit:\\**\\s*`?([0-9a-f]{7,40})`?";
+/** What a body cut to nothing reeve reads says, told from a body that was empty. */
+export const LEFT_OUT = "(left out)";
+
+/**
+ * A recording's review and comment bodies cut to what reeve's reading matches
+ * in them (#298's review): for a reviewer the profile declares, what its
+ * refusal, clean, commit, body-finding and severity rules match, and in anyone's
+ * body, each reviewer's trigger. The rest, a bot's account of what it found
+ * say, reeve reads none of, so it's left out, and so is the App a comment was
+ * made through. A body with nothing left reads LEFT_OUT: an empty body is a
+ * carrier to reeve, and one cut isn't.
+ * @param {Answer[]} answers @param {any} profile @returns {Answer[]}
+ */
+export function redactBodies(answers, profile) {
+  const roster = /** @type {any[]} */ (profile?.reviewers ?? []);
+  const byLogin = new Map(roster.map((r) => [String(r.login).toLowerCase(), r]));
+  const triggers = roster.map((r) => r.trigger).filter((t) => typeof t === "string" && t);
+  /** @param {unknown} body @param {unknown} login */
+  const cut = (body, login) => {
+    if (typeof body !== "string" || !body) return body;
+    const rev = byLogin.get(String(login ?? "").replace(/\[bot\]$/i, "").toLowerCase());
+    const rules = rev ? [rev.refusal, rev.clean, rev.commitPattern ?? CLEAN_COMMIT, typeof rev.bodyFindings === "string" ? rev.bodyFindings : null,
+                         ...(rev.severityMarkers ?? []).map((/** @type {any[]} */ m) => m[0])].filter(Boolean) : [];
+    /** @type {[number, string][]} */ const kept = [];
+    for (const rule of rules) for (const m of body.matchAll(new RegExp(rule, "gi"))) if (m[0]) kept.push([m.index ?? 0, m[0]]);
+    for (const t of triggers) for (let i = body.indexOf(t); i >= 0; i = body.indexOf(t, i + 1)) kept.push([i, t]);
+    return kept.length ? kept.sort((a, b) => a[0] - b[0]).map(([, text]) => text).join("\n") : LEFT_OUT;
+  };
+  /** One line of tab-separated values, its column `i` cut as `login`'s body, kept on one line. @param {string} line @param {number} i */
+  const row = (line, i) => { const f = line.split("\t"); if (f.length > i) f[i] = String(cut(f[i], f[0])).replace(/\n/g, " "); return f.join("\t"); };
+  return answers.map((a) => {
+    if (a.status !== 0) return a;
+    const path = a.call.find((c) => /^repos\//.test(c)) ?? "";
+    const jq = a.call.includes("--jq");
+    const comments = /^repos\/[^/]+\/[^/]+\/issues\/\d+\/comments\?/.test(path), reviews = /^repos\/[^/]+\/[^/]+\/pulls\/\d+\/reviews\?/.test(path);
+    if ((comments || reviews) && !jq) {
+      const v = JSON.parse(a.stdout);
+      // And the App it was made through, which reeve doesn't read either.
+      return { ...a, stdout: JSON.stringify(v.map((/** @type {any} */ { performed_via_github_app: _app, ...x }) => ({ ...x, body: cut(x.body, x.user?.login) }))) + "\n" };
+    }
+    if ((comments || reviews) && jq) {
+      const lines = a.stdout.split("\n");
+      return { ...a, stdout: lines.map((l) => (l ? row(l, comments ? 2 : 3) : l)).join("\n") };
+    }
+    if (a.call[2] === "graphql" && a.call.some((c) => c.includes("comments(first"))) {
+      const v = JSON.parse(a.stdout);
+      for (const n of v?.data?.repository?.pullRequest?.reviewThreads?.nodes ?? [])
+        for (const c of n?.comments?.nodes ?? []) c.body = cut(c.body, c.author?.login);
+      return { ...a, stdout: JSON.stringify(v) + "\n" };
+    }
+    return a;
+  });
+}
+
 /** The check runs at a commit. @param {Recording} r @param {string} sha */
 const runsAt = (r, sha) => [`repos/${r.repo}/commits/${sha}/check-runs`];
 /** GraphQL's pull request, in both reads that carry it. */

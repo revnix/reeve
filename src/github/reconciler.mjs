@@ -390,7 +390,10 @@ export function suitesComplete(nwo, sha, { app = "github-actions", appId = null 
  */
 export function settle(prior, reading) {
   const names = [...new Set(reading.rows.map(r => r.name))].sort();
-  const key = names.join("\0");
+  // JSON, never names joined by NUL: some Node releases' SQLite binding returns
+  // stored text only up to its first NUL, so such a key never matched itself on
+  // the next reading, and no set of more than one check settled.
+  const key = JSON.stringify(names);
   // The floor guards against a set that has not finished SCHEDULING: within one
   // revision, jobs are added and never removed, so a count below the highest seen
   // means something has yet to report. Across revisions it means nothing -- path

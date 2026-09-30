@@ -13,10 +13,11 @@
 // back to how it stood, each with its reason, at the moment of reeve's last
 // verdict on it before the merge.
 import { spawnSync } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, appendFileSync, chmodSync, constants, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { redactBodies } from "../src/seeded.mjs";
 
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = join(dirname(SELF), "..");
@@ -73,6 +74,55 @@ const ALSO = [
 ];
 
 
+/**
+ * Where `tool` is on `path`: the first file of that name that can be run, as a
+ * shell finds it, or null. Read before the recorder is put first on PATH, so
+ * it runs the real one wherever that's installed.
+ * @param {string} tool @param {string} [path]
+ */
+export function realTool(tool, path = process.env.PATH ?? "") {
+  for (const dir of path.split(delimiter).filter(Boolean)) {
+    const at = join(dir, tool);
+    try { if (statSync(at).isFile()) { accessSync(at, constants.X_OK); return resolve(at); } } catch { /* not here */ }
+  }
+  return null;
+}
+
+/**
+ * The recording's answers from the recorder's log: each call once, with what
+ * reeve doesn't read left out, or `why` where a read failed, as a recording of
+ * a read GitHub didn't answer judges nothing.
+ * - a check run's output, and its App's description: most of the size;
+ * - a check suite's head commit, and a branch's latest commit, which carry
+ *   people's names and addresses. The branch's is also its commit now, not as
+ *   it stood: the read is for the branch's protection;
+ * - the check suites of Apps other than the CI provider, whose alone reeve reads;
+ * - review and comment bodies past what reeve's reading matches (redactBodies).
+ * @param {string[]} lines @param {any} profile
+ * @returns {{ answers: any[] } | { why: string }}
+ */
+export function answersFrom(lines, profile) {
+  /** @type {Map<string, any>} */ const byCall = new Map();
+  for (const line of lines.filter(Boolean)) { const a = JSON.parse(line); byCall.set(JSON.stringify(a.call), a); }
+  const failed = [...byCall.values()].filter((a) => a.status !== 0);
+  if (failed.length) return { why: `reads that failed, so no recording is written: ${failed.map((a) => `${a.call.join(" ")} (${String(a.stderr).trim().split("\n")[0] || `exit ${a.status}`})`).join("; ")}` };
+  const provider = String(profile?.ci?.provider ?? "github-actions");
+  const app = (/** @type {any} */ app) => app && { id: app.id, slug: app.slug, name: app.name, owner: app.owner && { login: app.owner.login } };
+  const perLine = (/** @type {any} */ a, /** @type {(x: any) => any} */ fn) =>
+    ({ ...a, stdout: a.stdout.split("\n").filter(Boolean).map((/** @type {string} */ l) => fn(JSON.parse(l))).filter((/** @type {any} */ x) => x != null).map((/** @type {any} */ x) => JSON.stringify(x)).join("\n") + "\n" });
+  const answers = [...byCall.values()].map((a) => {
+    if (a.call.some((/** @type {string} */ c) => /\/check-runs\?/.test(c))) return perLine(a, ({ output: _output, app: a0, ...rest }) => ({ ...rest, app: app(a0) }));
+    if (a.call.some((/** @type {string} */ c) => /\/check-suites\?/.test(c)))
+      return perLine(a, ({ head_commit: _head, app: a0, ...rest }) => (a0?.slug === provider ? { ...rest, app: app(a0) } : null));
+    if (a.call.some((/** @type {string} */ c) => /^repos\/[^/]+\/[^/]+\/branches\/[^/]+$/.test(c))) {
+      const { commit: _commit, ...rest } = JSON.parse(a.stdout);
+      return { ...a, stdout: JSON.stringify(rest) + "\n" };
+    }
+    return a;
+  });
+  return { answers: redactBodies(answers, profile) };
+}
+
 // ── the recorder: gh or git, as the evaluation calls them ─────────────────────
 if (process.argv[2] === "--record") {
   const [tool, ...args] = process.argv.slice(3);
@@ -87,7 +137,9 @@ if (process.argv[2] === "--record") {
     if (!graphql && !method && args.some((a) => ["-f", "-F", "--field", "--raw-field", "--input"].includes(a) || /^--(raw-)?field=/.test(a)))
       refuse("a call with fields, which gh sends as a POST");
   } else if (tool !== "git" || args[0] !== "ls-remote") refuse("a git command other than ls-remote");
-  const r = spawnSync(`/usr/bin/${tool}`, args, { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+  const real = process.env[tool === "gh" ? "CAPTURE_GH" : "CAPTURE_GIT"];
+  if (!real) refuse("a call with no real tool to make it with");
+  const r = spawnSync(String(real), args, { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
   const call = [tool, ...args];
   const e = EDITS.find((x) => x.match(call));
   const answer = { call, status: r.status ?? 1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
@@ -95,7 +147,10 @@ if (process.argv[2] === "--record") {
   appendFileSync(String(process.env.CAPTURE_LOG), JSON.stringify(answer) + "\n");
   // Exit only once both are written: a pipe takes a large answer in pieces.
   process.stderr.write(answer.stderr, () => process.stdout.write(answer.stdout, () => process.exit(answer.status)));
-} else {
+} else if (process.argv[1] && resolve(process.argv[1]) === SELF) {
+  // The real gh and git, found before the recorder stands in for them.
+  const tools = { CAPTURE_GH: realTool("gh"), CAPTURE_GIT: realTool("git") };
+  for (const [k, v] of Object.entries(tools)) if (!v) { console.error(`capture-seeded: no ${k === "CAPTURE_GH" ? "gh" : "git"} on PATH`); process.exit(1); }
   const dir = mkdtempSync(join(tmpdir(), "reeve-capture-"));
   try {
     const bin = join(dir, "bin"), home = join(dir, "home"), log = join(dir, "calls.jsonl");
@@ -114,41 +169,23 @@ if (process.argv[2] === "--record") {
     const profile = Object.fromEntries(["schemaVersion", "project", "identity", "authority", "state", "units", "ci", "merge", "reviewers", "rounds", "watch"]
       .filter((k) => k in full).map((k) => [k, full[k]]));
     writeFileSync(join(dir, "profile.json"), JSON.stringify(profile));
-    const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, REEVE_HOME: home, CAPTURE_LOG: log,
+    const env = { ...process.env, ...tools, PATH: `${bin}${delimiter}${process.env.PATH}`, REEVE_HOME: home, CAPTURE_LOG: log,
                   SEEDED_REPO: REPO, SEEDED_PR: String(PR), SEEDED_PROFILE: join(dir, "profile.json"), SEEDED_STORE: join(dir, "store.db"),
                   SEEDED_CLOCK: String(Math.floor(at / 1000)) };
     const judged = spawnSync(process.execPath, [join(ROOT, "src", "seeded-evaluate.mjs")], { encoding: "utf8", env });
     const verdict = String(judged.stdout).trim().split("\n").at(-1);
     console.error(`judged: ${verdict}`);
     for (const [tool, ...args] of ALSO) spawnSync(join(bin, tool), args, { encoding: "utf8", env, maxBuffer: 256 * 1024 * 1024 });
-    // Each call once, with what reeve doesn't read left out:
-    // - a check run's output, and its App's description: most of the size;
-    // - a check suite's head commit, and a branch's latest commit, which carry
-    //   people's names and addresses. The branch's is also its commit now, not
-    //   as it stood: the read is for the branch's protection.
-    /** @type {Map<string, any>} */ const byCall = new Map();
-    for (const line of readFileSync(log, "utf8").split("\n").filter(Boolean)) { const a = JSON.parse(line); byCall.set(JSON.stringify(a.call), a); }
-    const perLine = (/** @type {any} */ a, /** @type {(x: any) => any} */ fn) =>
-      ({ ...a, stdout: a.stdout.split("\n").filter(Boolean).map((/** @type {string} */ l) => JSON.stringify(fn(JSON.parse(l)))).join("\n") + "\n" });
-    const answers = [...byCall.values()].map((a) => {
-      if (a.status !== 0) return a;
-      if (a.call.some((/** @type {string} */ c) => /\/check-runs\?/.test(c)))
-        return perLine(a, ({ output, app, ...rest }) => ({ ...rest, app: app && { id: app.id, slug: app.slug, name: app.name, owner: app.owner && { login: app.owner.login } } }));
-      if (a.call.some((/** @type {string} */ c) => /\/check-suites\?/.test(c)))
-        return perLine(a, ({ head_commit, app, ...rest }) => ({ ...rest, app: app && { id: app.id, slug: app.slug, name: app.name, owner: app.owner && { login: app.owner.login } } }));
-      if (a.call.some((/** @type {string} */ c) => new RegExp(`^repos/${REPO}/branches/[^/]+$`).test(c))) {
-        const { commit, ...rest } = JSON.parse(a.stdout);
-        return { ...a, stdout: JSON.stringify(rest) + "\n" };
-      }
-      return a;
-    });
-    if (answers.some((a) => a.status !== 0)) console.error(`reads that failed: ${answers.filter((a) => a.status !== 0).map((a) => a.call.join(" ")).join("; ")}`);
-    const out = { about: ABOUT, repo: REPO, pr: PR, head: HEAD, base: BASE, at: AT, appId: APP_ID, capturedAt: new Date().toISOString(), profile, answers };
-    const dest = join(ROOT, "seeded", `${NAME}.json`);
-    mkdirSync(dirname(dest), { recursive: true });
-    writeFileSync(dest, JSON.stringify(out, null, 1) + "\n");
-    console.error(`wrote ${dest}: ${answers.length} answers, ${answers.filter((a) => a.edited).length} set back to how they stood`);
-    if (!existsSync(dest) || basename(dest) !== `${NAME}.json`) process.exit(1);
+    const got = answersFrom(readFileSync(log, "utf8").split("\n"), profile);
+    if ("why" in got) { console.error(`capture-seeded: ${got.why}`); process.exitCode = 1; }
+    else {
+      const answers = got.answers;
+      const out = { about: ABOUT, repo: REPO, pr: PR, head: HEAD, base: BASE, at: AT, appId: APP_ID, capturedAt: new Date().toISOString(), profile, answers };
+      const dest = join(ROOT, "seeded", `${NAME}.json`);
+      mkdirSync(dirname(dest), { recursive: true });
+      writeFileSync(dest, JSON.stringify(out, null, 1) + "\n");
+      console.error(`wrote ${dest}: ${answers.length} answers, ${answers.filter((/** @type {any} */ a) => a.edited).length} set back to how they stood`);
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -4,10 +4,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CASES, loadRecording, pinClock, runCase, runSeeded } from "../src/seeded.mjs";
+import { CASES, LEFT_OUT, loadRecording, pinClock, redactBodies, runCase, runSeeded } from "../src/seeded.mjs";
+import { answersFrom, realTool } from "../scripts/capture-seeded.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 
 const STAND_IN = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "seeded-stand-in.mjs");
@@ -92,3 +93,70 @@ test("the stand-in answers only a call it holds exactly, and a large answer whol
   assert.ok(existsSync(join(dir, "misses")), "and it's written down as a read the recording doesn't hold");
   assert.deepEqual(JSON.parse(readFileSync(join(dir, "misses"), "utf8").trim()), ["gh", "api", "repos/o/r", "--jq", ".x"]);
 });
+
+// ── what a recording keeps ───────────────────────────────────────────────────
+
+test("the recording keeps no review or comment body past what reeve's reading matches, nor the App a comment came through", () => {
+  assert.deepEqual(redactBodies(r.answers, r.profile), r.answers, "cut already");
+  assert.ok(!r.answers.some((a) => a.stdout.includes("performed_via_github_app")));
+});
+
+const RULES = { reviewers: [{ login: "rev", clean: "no findings", commitPattern: "commit ([0-9a-f]{7})", trigger: "@rev go", bodyFindings: "!\\[P\\d\\]" }] };
+const WRITEUP = "Rev found a bug in your code: ![P1] the parser drops a line.\nno findings\ncommit abcdef1";
+
+test("a body is cut to what its reviewer's rules and the triggers match, a person's otherwise to nothing, and an empty one stays empty", () => {
+  const [out] = redactBodies([{ call: ["gh", "api", "repos/o/r/issues/1/comments?per_page=100&page=1"], status: 0, stdout: JSON.stringify([
+    { user: { login: "rev[bot]" }, body: WRITEUP, performed_via_github_app: { name: "Rev" } },
+    { user: { login: "someone" }, body: "@rev go please, and thanks" },
+    { user: { login: "someone" }, body: "thanks" },
+    { user: { login: "someone" }, body: "" }]) }], RULES);
+  assert.deepEqual(JSON.parse(out.stdout), [
+    { user: { login: "rev[bot]" }, body: "![P1]\nno findings\ncommit abcdef1" },
+    { user: { login: "someone" }, body: "@rev go" },
+    { user: { login: "someone" }, body: LEFT_OUT },
+    { user: { login: "someone" }, body: "" }]);
+});
+
+test("a body read as tab-separated values is cut the same, and stays on its line", () => {
+  const tsv = (/** @type {string} */ path, /** @type {string[]} */ row) => ({ call: ["gh", "api", "--paginate", path, "--jq", ".[]"], status: 0, stdout: row.join("\t") + "\n" });
+  const [comments, reviews] = redactBodies([
+    tsv("repos/o/r/issues/1/comments?per_page=100", ["rev[bot]", "2026-09-30T00:00:00Z", WRITEUP.replace(/\n/g, " ")]),
+    tsv("repos/o/r/pulls/1/reviews?per_page=100", ["rev[bot]", "a".repeat(40), "COMMENTED", WRITEUP.replace(/\n/g, " ")])], RULES);
+  assert.equal(comments.stdout, "rev[bot]\t2026-09-30T00:00:00Z\t![P1] no findings commit abcdef1\n");
+  assert.equal(reviews.stdout, `rev[bot]\t${"a".repeat(40)}\tCOMMENTED\t![P1] no findings commit abcdef1\n`);
+});
+
+test("a review thread's comments are cut the same", () => {
+  const [out] = redactBodies([{ call: ["gh", "api", "graphql", "-f", "query=... comments(first:1){ nodes{ body } } ..."], status: 0,
+    stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [{ comments: { nodes: [{ author: { login: "rev" }, body: WRITEUP }] } }] } } } } }) }], RULES);
+  assert.equal(JSON.parse(out.stdout).data.repository.pullRequest.reviewThreads.nodes[0].comments.nodes[0].body, "![P1]\nno findings\ncommit abcdef1");
+});
+
+test("the capture runs the gh and git on PATH, wherever they're installed", () => {
+  const here = tempDir("reeve-capture-bin-"), notRun = tempDir("reeve-capture-plain-");
+  writeFileSync(join(notRun, "gh"), "not a program");
+  writeFileSync(join(here, "gh"), "#!/bin/sh\n");
+  chmodSync(join(here, "gh"), 0o755);
+  assert.equal(realTool("gh", `${notRun}:${here}`), join(here, "gh"), "the first one that runs");
+  assert.equal(realTool("gh", notRun), null);
+});
+
+test("a capture with a read that failed writes no recording, and one whole keeps only what reeve reads", () => {
+  const line = (/** @type {any} */ a) => JSON.stringify({ stderr: "", ...a });
+  const failed = answersFrom([line({ call: ["gh", "api", "repos/o/r/pulls/1"], status: 1, stdout: "", stderr: "HTTP 502\n" })], {});
+  assert.match("why" in failed ? failed.why : "", /reads that failed, so no recording is written: gh api repos\/o\/r\/pulls\/1 \(HTTP 502\)/);
+  const whole = answersFrom([
+    line({ call: ["gh", "api", "--paginate", "repos/o/r/commits/c/check-runs?per_page=100", "--jq", ".check_runs[]"], status: 0,
+           stdout: JSON.stringify({ name: "ci", output: { text: "long" }, app: { id: 1, slug: "github-actions", name: "GitHub Actions", description: "long", owner: { login: "github", id: 9 } } }) + "\n" }),
+    line({ call: ["gh", "api", "--paginate", "repos/o/r/commits/c/check-suites?per_page=100", "--jq", ".check_suites[]"], status: 0,
+           stdout: [{ status: "completed", head_commit: { author: { email: "someone@example.com" } }, app: { id: 1, slug: "github-actions" } },
+                    { status: "queued", app: { id: 2, slug: "another-app" } }].map((x) => JSON.stringify(x)).join("\n") + "\n" }),
+    line({ call: ["gh", "api", "repos/o/r/branches/main"], status: 0, stdout: JSON.stringify({ name: "main", protected: true, commit: { sha: "x", commit: { author: { email: "someone@example.com" } } } }) }),
+  ], { ci: { provider: "github-actions" } });
+  assert.ok("answers" in whole, JSON.stringify(whole));
+  const [runs, suites, branch] = "answers" in whole ? whole.answers : [];
+  assert.deepEqual(JSON.parse(runs.stdout), { name: "ci", app: { id: 1, slug: "github-actions", name: "GitHub Actions", owner: { login: "github" } } });
+  assert.deepEqual(suites.stdout.trim().split("\n").map((l) => JSON.parse(l)), [{ status: "completed", app: { id: 1, slug: "github-actions", name: undefined, owner: undefined } }].map((x) => JSON.parse(JSON.stringify(x))));
+  assert.deepEqual(JSON.parse(branch.stdout), { name: "main", protected: true });
+});
+

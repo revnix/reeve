@@ -778,6 +778,7 @@ check(existsSync(join(repo, ".git")),
     build: ["build", "status"],
     task: ["task", "list"],
     notify: ["notify", "--test", "revnix/reeve"],
+    trial: ["trial", "revnix/reeve", "--since", "2026-09-30T00:00Z"],
   };
 
   // RUN FROM A DIRECTORY WITH NO REPOSITORY IN IT, and that is load-bearing for

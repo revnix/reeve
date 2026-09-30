@@ -135,10 +135,14 @@ export function computeVerdict(i) {
     // every check failing there. Blocked, it would leave the base red for good,
     // as nothing else could merge either (#286). A base failing a check the head
     // doesn't show passing, one that runs only there say, still blocks.
-    const failing = i.base.failing ?? [];
-    const passed = new Set(i.checks?.passed ?? []);
-    if (failing.length && i.checks?.verdict === "GREEN" && i.checks.settled && failing.every((n) => passed.has(n)))
-      add("base", PASS, `the base branch is red, and this pull request passes every check failing there (${failing.join(", ")}), so it repairs it`);
+    // The same check, from the same App: another's of one name shows nothing.
+    // And only from a base read whole, which a part may hide more failures on,
+    // at a commit the head contains: one from before shows nothing repaired.
+    /** @type {{ name: string, app: string | null }[]} */ const failing = i.base.failing ?? [];
+    /** @type {{ name: string, app: string | null }[]} */ const passed = i.checks?.passed ?? [];
+    if (failing.length && i.base.complete === true && i.base.inHead === true && i.checks?.verdict === "GREEN" && i.checks.settled
+        && failing.every((f) => passed.some((p) => p.name === f.name && p.app === f.app)))
+      add("base", PASS, `the base branch is red, and this pull request passes every check failing there (${[...new Set(failing.map((f) => f.name))].join(", ")}), so it repairs it`);
     else add("base", BLOCK, "the base branch is red; merging into it hides the next failure");
   }
   else if (i.base.readable === false) add("base", UNKNOWN, "the base branch's checks couldn't be read", "retry", "read the base branch's checks again");

@@ -303,7 +303,10 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
     why: "the base's required checks couldn't be read, so whether each one passed can't be told" }
     : deferred.length ? { ...result, queueOnly: deferred.map(c => c.context) } : result);
   // A head where nothing ran has no evidence at all, however many rows say so.
-  if (evidence && rows.every(r => NOT_RUN.has(String(r.conclusion)) || UNINFORMATIVE.has(String(r.conclusion))))
+  // Unless every required check was left to the merge queue: then the head
+  // shows what it can, and the queue's commit shows the rest (#286).
+  const allDeferred = deferred.length > 0 && deferred.length === required.length;
+  if (evidence && !allDeferred && rows.every(r => NOT_RUN.has(String(r.conclusion)) || UNINFORMATIVE.has(String(r.conclusion))))
     return { verdict: "UNKNOWN", failing: [], running: [], malformed, why: "no check ran at this revision: every one was skipped, neutral, cancelled or stale" };
   // A cancelled or stale run is a SUPERSEDED run, and superseding is normal: a new
   // push cancels the old workflow. What matters is whether the superseded thing was

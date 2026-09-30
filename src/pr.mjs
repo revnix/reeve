@@ -156,7 +156,7 @@ export function readMergeQueue(nwo, branch, { gh = ghJson } = {}) {
  * reviews onto a commit built from another.
  */
 export function evaluateQueueEntry({ nwo, entry, input, baseRef, profile, db = null,
-                                     read = readChecks, requirements = requiredChecksOf }) {
+                                     read = readChecks, requirements = requiredChecksOf, contains = baseContainedIn }) {
   if (!entry?.sha) return { ok: false, why: "the queue hasn't built its commit yet" };
   if (!input) return { ok: false, why: "the pull request wasn't evaluated this tick, so its facts can't carry over" };
   if (!entry.prHead || entry.prHead !== input.head)
@@ -173,8 +173,12 @@ export function evaluateQueueEntry({ nwo, entry, input, baseRef, profile, db = n
     : { ...settle(null, reading), settled: false, why: "settlement needs a state store to compare readings across ticks" };
   // For health, as evaluatePr judges the base: only failures on it count.
   const health = { required: profile.ci?.requiredChecks ?? [] };
-  const base = entry.baseSha ? classifyRead(read(nwo, entry.baseSha, { reviewerContexts }), health, { evidence: false })
+  const baseRead = entry.baseSha ? read(nwo, entry.baseSha, { reviewerContexts }) : null;
+  const base = baseRead ? classifyRead(baseRead, health, { evidence: false })
     : { verdict: "UNKNOWN", readable: false, why: "the queue's base commit isn't known" };
+  // Read, not assumed from how a queue builds its commit: only then can the queue's
+  // commit repair a red base (#286). Asked only of a red one.
+  const inHead = base.verdict === "RED" ? contains({ nwo, base: entry.baseSha, head: entry.sha }) : null;
   // A review of the pull request's head covers its queue commit, which carries
   // exactly that change onto the base: the queue builds the commit, no one
   // reviews it. Carried explicitly, with the commit the review covered, so the
@@ -185,8 +189,8 @@ export function evaluateQueueEntry({ nwo, entry, input, baseRef, profile, db = n
   const queued = { ...input, reviewers, head: entry.sha,
     checks: { verdict: s.verdict, settled: s.settled, why: s.why, readable: c.readable !== false, failing: c.failing, inherited: [],
               impostors: got?.impostors ?? [], shadowRequired: req.shadowRequired, legacyRequired: req.legacyRequired,
-              passed: passedNames(got?.rows) },
-    base: baseHealthOf(base) };
+              passed: passedChecks(got?.rows) },
+    base: baseHealthOf(base, { complete: baseRead?.ok === true, inHead }) };
   return { ok: true, input: queued, verdict: computeVerdict(queued) };
 }
 
@@ -720,29 +724,58 @@ export function prAnchor({ nwo, pr }) {
 }
 
 /**
- * A base's health as a verdict reads it: its verdict, whether it could be read,
- * and the names of the checks failing there, so the pull request that repairs a
- * red base can be told from one that would hide its next failure (#286).
- * @param {{ verdict: string, readable?: boolean, failing?: { name?: string }[] }} base
+ * A check as the verdict names it: its name, and the App it came from, null for
+ * a commit status. Two checks of one name from different Apps are different
+ * checks, and one can't stand in for the other (#286).
+ * @param {{ name?: string, source?: string, appId?: string | number | null }} r
  */
-export const baseHealthOf = (base) => ({ verdict: base.verdict, readable: base.readable !== false,
-                                         failing: [...new Set((base.failing ?? []).map((r) => r?.name).filter(Boolean))] });
+const checkOf = (r) => ({ name: String(r.name), app: r.source === "check_run" && r.appId != null ? String(r.appId) : null });
+/** Each check once, by name and App. @param {{ name: string, app: string | null }[]} list */
+const eachOnce = (list) => list.filter((c, i) => list.findIndex((d) => d.name === c.name && d.app === c.app) === i);
 
 /**
- * The names of the checks that passed at a commit: completed with success, not
- * merely skipped or neutral, as only a run that passed shows a failure fixed.
- * @param {{ name?: string, state?: string, conclusion?: string }[] | undefined} rows
+ * A base's health as a verdict reads it: its verdict, whether it could be read,
+ * whether its checks were read whole, whether the commit judged contains the
+ * base's, and the checks failing there. So the pull request that repairs a red
+ * base can be told from one that would hide its next failure (#286).
+ * @param {{ verdict: string, readable?: boolean, failing?: any[] }} base
+ * @param {{ complete?: boolean, inHead?: boolean | null }} [o]
  */
-export const passedNames = (rows) => [...new Set((rows ?? []).filter((r) => r?.state === "completed" && r.conclusion === "success").map((r) => String(r.name)))];
+export const baseHealthOf = (base, { complete = false, inHead = null } = {}) => ({
+  verdict: base.verdict, readable: base.readable !== false, complete, inHead,
+  failing: eachOnce((base.failing ?? []).filter((r) => r?.name).map(checkOf)) });
+
+/**
+ * The checks that passed at a commit: completed with success, not merely skipped
+ * or neutral, as only a run that passed shows a failure fixed.
+ * @param {{ name?: string, state?: string, conclusion?: string, source?: string, appId?: any }[] | undefined} rows
+ */
+export const passedChecks = (rows) => eachOnce((rows ?? []).filter((r) => r?.name && r.state === "completed" && r.conclusion === "success").map(checkOf));
+
+/**
+ * Whether commit `head` contains commit `base`, by GitHub's comparison of the
+ * two: true where the head is ahead of it or the same, false where it's behind
+ * or has diverged, null where that couldn't be read. A head from before its base
+ * went red can't show the base's failure repaired (#286).
+ * @param {{ nwo: string, base: string, head: string, gh?: typeof ghJson }} o
+ */
+export function baseContainedIn({ nwo, base, head, gh = ghJson }) {
+  const r = gh([`repos/${nwo}/compare/${base}...${head}`, "--jq", ".status"]);
+  if (!r.ok) return null;
+  const status = String(r.out ?? "").trim();
+  return status === "ahead" || status === "identical" ? true : status === "behind" || status === "diverged" ? false : null;
+}
 
 /**
  * What a pull request's head is judged against: the required checks, and those
  * the profile says run only in the merge queue, which are skipped at a head by
- * design and judged at the queue's commit instead (#286). Only a head's: the
- * queue's commit is judged against the required checks alone.
- * @param {{ required?: any[], known?: boolean }} req @param {any} profile
+ * design and judged at the queue's commit instead (#286). Only where `queued`,
+ * the base's rules sending every merge through a merge queue: otherwise nothing
+ * would judge a queue's commit, and the check would be skipped for good. Only a
+ * head's: the queue's commit is judged against the required checks alone.
+ * @param {{ required?: any[], known?: boolean }} req @param {any} profile @param {boolean | null} [queued]
  */
-export const headCheckRequirements = (req, profile) => ({ ...req, queueOnly: profile?.ci?.queueOnlyChecks ?? [] });
+export const headCheckRequirements = (req, profile, queued = null) => ({ ...req, queueOnly: queued === true ? (profile?.ci?.queueOnlyChecks ?? []) : [] });
 
 export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}, hold = null }) {
   // Reuses the caller's anchor when it has one, so the head is pinned ONCE per
@@ -761,7 +794,10 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // required check didn't run, and a read that isn't whole is UNKNOWN. Except
   // one that runs only in the merge queue, skipped here by design (#286).
   const req = requiredChecksOf({ nwo, baseRef, profile });
-  const c = classifyRead(read, headCheckRequirements(req, profile));
+  // Asked only of a profile that names queue-only checks: they're left to the
+  // queue's commit only where the base's rules send every merge through one.
+  const queued = profile.ci?.queueOnlyChecks?.length ? mergeQueueOnBase({ nwo, base: baseRef }) : null;
+  const c = classifyRead(read, headCheckRequirements(req, profile, queued));
   // ONE reading, folded into what the previous tick recorded. Settlement is about
   // the check SET being stable ACROSS TIME, so it can only be established by
   // successive ticks -- this used to call settle() three times over the same
@@ -796,9 +832,13 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // only on pull requests, and a push its path filters skip is a healthy one, so
   // neither the base's own requirements nor the head's rules about skipped checks
   // apply. Only a partial read does: it can hide a failure.
-  const base = baseHead.ok
-    ? classifyRead(readChecks(nwo, baseHead.sha, { reviewerContexts }), { required: profile.ci?.requiredChecks ?? [] }, { evidence: false })
+  const baseRead = baseHead.ok ? readChecks(nwo, baseHead.sha, { reviewerContexts }) : null;
+  const base = baseRead
+    ? classifyRead(baseRead, { required: profile.ci?.requiredChecks ?? [] }, { evidence: false })
     : { verdict: "UNKNOWN", readable: false };
+  // Whether the head contains the base's commit, asked only of a red base: a head
+  // from before it went red can't show the failure repaired (#286).
+  const inHead = base.verdict === "RED" && baseHead.ok ? baseContainedIn({ nwo, base: baseHead.sha, head: pin.sha }) : null;
 
   const threads = readThreads(nwo, pr);
   const reviewers = readReviewerStates(nwo, pr, pin.sha, profile.reviewers ?? []);
@@ -882,8 +922,8 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     checks: { verdict: s.verdict, settled: s.settled, why: s.why, readable: c.readable !== false, failing: c.failing, inherited: c.inherited,
               // Another App's check under reeve's own name: kept, never dropped.
               impostors: read.impostors ?? [], shadowRequired: req.shadowRequired, legacyRequired: req.legacyRequired,
-              queueOnly: c.queueOnly ?? [], passed: passedNames(rows) },
-    base: baseHealthOf(base),
+              queueOnly: c.queueOnly ?? [], passed: passedChecks(rows) },
+    base: baseHealthOf(base, { complete: baseRead?.ok === true, inHead }),
     reviewers, rounds, threads, cleared: facts.cleared,
     bodyFindings: facts.bodyFindings, unreadableBodies: facts.unreadableBodies,
     ledgerBlockers,
@@ -1014,7 +1054,7 @@ export function requirementsOn({ rules, branch, protection = null }, context, { 
   const verdictOf = (answers) => (answers.includes(true) ? true : answers.includes(null) ? null : false);
   const others = [], unevaluated = [], every = [];
   const settlesAlone = [];
-  let byRules = null, byProtection = null, threadResolution = false, strict = false, whole = true;
+  let byRules = null, byProtection = null, threadResolution = false, strict = false, whole = true, mergeQueue = false;
   // A required check is reeve's, another App's, or, bound to an App reeve can't
   // name, both: GitHub waits for whichever App it is.
   const required = (answers, c, bound) => {
@@ -1032,6 +1072,8 @@ export function requirementsOn({ rules, branch, protection = null }, context, { 
   if (Array.isArray(list)) {
     const answers = [];
     for (const r of list) {
+      // Every merge goes through the queue: only rules can require one.
+      if (r?.type === "merge_queue") mergeQueue = true;
       if (r?.type === "required_status_checks") {
         for (const c of r.parameters?.required_status_checks ?? []) required(answers, c?.context, c?.integration_id);
         strict ||= r.parameters?.strict_required_status_checks_policy === true;
@@ -1074,8 +1116,11 @@ export function requirementsOn({ rules, branch, protection = null }, context, { 
   const own = byRules === true || byProtection === true ? true : byRules === null || byProtection === null ? null : false;
   const checks = Array.isArray(list) && b
     ? every.filter((c, i) => every.findIndex((d) => d.context === c.context && d.app === c.app) === i) : null;
-  return whole ? { own, others, threadResolution, strict, unevaluated, settlesAlone, checks }
-    : { own, others: null, threadResolution: null, strict: null, unevaluated: null, settlesAlone: null, checks };
+  // Whether every merge goes through a merge queue, from the rules alone, as
+  // classic protection can't require one: null where they couldn't be read.
+  const queue = Array.isArray(list) ? mergeQueue : null;
+  return whole ? { own, others, threadResolution, strict, unevaluated, settlesAlone, checks, mergeQueue: queue }
+    : { own, others: null, threadResolution: null, strict: null, unevaluated: null, settlesAlone: null, checks, mergeQueue: queue };
 }
 
 const parsed = (r) => { try { return r?.ok ? JSON.parse(r.out || "{}") : undefined; } catch { return undefined; } };
@@ -1125,16 +1170,31 @@ const REQUIRED_CHECKS = new Map();
  * minute. Null when either couldn't be read.
  */
 export function requiredChecksOnBase({ nwo, base, gh = ghJson, now = Date.now() }) {
+  return baseRequirements({ nwo, base, gh, now }).checks;
+}
+
+/**
+ * Whether the base's rules send every merge through a merge queue: true, false,
+ * or null where they couldn't be read (#286). Read with its required checks.
+ * @param {{ nwo: string, base: string, gh?: typeof ghJson, now?: number }} o
+ */
+export function mergeQueueOnBase({ nwo, base, gh = ghJson, now = Date.now() }) {
+  return baseRequirements({ nwo, base, gh, now }).mergeQueue;
+}
+
+/** A base's required checks and whether it requires a merge queue, read together and kept for a minute. */
+function baseRequirements({ nwo, base, gh = ghJson, now = Date.now() }) {
   const key = `${nwo}\u0000${base}`;
   const hit = REQUIRED_CHECKS.get(key);
-  if (hit && now - hit.at < REQUIRED_TTL_MS) return hit.checks;
-  const { checks } = requirementsOn({
+  if (hit && now - hit.at < REQUIRED_TTL_MS) return hit;
+  const { checks, mergeQueue } = requirementsOn({
     rules: gh(["--paginate", `repos/${nwo}/rules/branches/${encodeURIComponent(base)}`, "--jq", ".[]"]),
     branch: gh([`repos/${nwo}/branches/${encodeURIComponent(base)}`]),
   }, POLICY_CONTEXT);
   if (REQUIRED_CHECKS.size > 256) REQUIRED_CHECKS.clear();
-  if (checks !== null) REQUIRED_CHECKS.set(key, { at: now, checks });
-  return checks;
+  const got = { at: now, checks, mergeQueue };
+  if (checks !== null) REQUIRED_CHECKS.set(key, got);
+  return got;
 }
 
 /** Whether reeve's check is required on a base: requirementsOnBase's `own`. */

@@ -576,6 +576,9 @@ export function validate(profile) {
     // can never be satisfied. Measured live: "Scaffold smoke (${{ matrix.os }})".
     if (c.includes("${{")) errors.push(`ci.requiredChecks contains an unexpanded matrix expression: ${c}`);
   }
+  // And a queue-only check is matched by the name GitHub reports, as a required one is (#286).
+  for (const c of get(profile, "ci.queueOnlyChecks") ?? [])
+    if (typeof c === "string" && c.includes("${{")) errors.push(`ci.queueOnlyChecks contains an unexpanded matrix expression: ${c}`);
 
   return { ok: errors.length === 0, errors, warnings };
 }

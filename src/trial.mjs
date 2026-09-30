@@ -85,8 +85,9 @@ export function trialReport(db, { repo, since, now, merged, seeded = null }) {
     if (over) down.push({ from: a.at, to: b.at });
     else running += gap;
   }
-  // No tick at all is no running, however short the time.
-  if (!ended.length && !started.length) running = 0;
+  // No tick at all is no running, however short the time; one under way as
+  // the report starts is a tick.
+  if (!ended.length && !started.length && !marks[0].start) running = 0;
   const wasDown = (/** @type {number} */ t) => down.some((d) => t > d.from && t < d.to);
 
   const decided = events(db, "pr.decided", since, now);

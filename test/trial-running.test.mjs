@@ -139,3 +139,14 @@ test("a tick under way for over an hour as the report starts is downtime, though
   s.db.close();
   assert.deepEqual(r.running.down, [{ from: T0, to: T0 + 10 * MIN }]);
 });
+
+// ── #301's second review ─────────────────────────────────────────────────────
+
+test("a report that falls inside one tick still running is running throughout", () => {
+  const s = store();
+  s.tick(T0 - 5 * MIN, null);
+  const r = report(s.db, T0, T0 + 10 * MIN);
+  s.db.close();
+  assert.deepEqual(r.running.down, []);
+  assert.ok(Math.abs(r.running.hours - 10 / 60) < 0.001, `${r.running.hours} hours`);
+});

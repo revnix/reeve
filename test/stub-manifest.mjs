@@ -12796,7 +12796,7 @@ export const STUBS = [
     test: "test/trial-report.test.mjs",
     expectRed: "with no tick at all, the daemon didn't run, however short the time",
     edits: [{ file: "src/trial.mjs",
-              find: "  if (!ended.length && !started.length) running = 0;\n",
+              find: "  if (!ended.length && !started.length && !marks[0].start) running = 0;\n",
               replace: "" }],
   },
   {
@@ -13608,5 +13608,14 @@ export const STUBS = [
     edits: [{ file: "src/trial.mjs",
               find: "b.at - a.from > TICK_LIMIT_SECONDS",
               replace: "b.at - a.at > TICK_LIMIT_SECONDS" }],
+  },
+  {
+    name: "tick-window-inside-one",
+    why: "take a report falling inside one tick still running for one with no tick at all, and count none of its time",
+    test: "test/trial-running.test.mjs",
+    expectRed: "a report that falls inside one tick still running is running throughout",
+    edits: [{ file: "src/trial.mjs",
+              find: " && !marks[0].start) running = 0;",
+              replace: ") running = 0;" }],
   },
 ];

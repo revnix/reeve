@@ -125,7 +125,8 @@ const thread = (id, author, body, over = {}) => ({
 const review = (id, author, body, head, at, state = "COMMENTED") => ({
   source: author, external_id: `review:${id}`, kind: "review",
   head_sha: head, event_at: at, edited_at: null,
-  payload: { login: author, state, commit_id: head, body },
+  // As GitHub's REST API reports these reviewers, Apps all: a person's body isn't read as findings (#286).
+  payload: { login: `${author}[bot]`, state, commit_id: head, body },
 });
 
 noteHead(db, NWO, 1, HEAD_A, T);

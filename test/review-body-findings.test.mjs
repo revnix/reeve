@@ -65,7 +65,8 @@ const PROFILE = (over = {}) => ({
 const review = (id, author, body, head, at, state = "COMMENTED") => ({
   source: author, external_id: `review:${id}`, kind: "review",
   head_sha: head, event_at: at, edited_at: null,
-  payload: { login: author, state, commit_id: head, body },
+  // As GitHub's REST API reports these reviewers, Apps all: a person's body isn't read as findings (#286).
+  payload: { login: `${author}[bot]`, state, commit_id: head, body },
 });
 const thread = (id, author, body, over = {}) => ({
   source: author, external_id: `thread:${id}`, kind: "review_thread",
@@ -625,7 +626,8 @@ ingest(db, NWO, 1, [
   noteHead(db2, NWO, 2, HEAD_A, T);
   ingest(db2, NWO, 2, [
     review(1, "codex", BODY_TWO, HEAD_A, T),
-    review(2, "a-human", "I think this whole approach is wrong.", HEAD_A, T + 10),
+    // A bot, as an App's login ends in [bot]: a person's body isn't read as findings (#286).
+    review(2, "a-stranger-bot", "I think this whole approach is wrong.", HEAD_A, T + 10),
   ], { at: T });
   const p = PROFILE();
   derivePr(db2, NWO, 2, p, { at: T, head: HEAD_A });
@@ -641,7 +643,7 @@ ingest(db, NWO, 1, [
   // severity nobody can read.
   const sentinel = (st.unreadableBodies ?? []).find(b => /cannot read/.test(b.excerpt));
   check(!!sentinel, "an unreadable body is reported as its own fact", JSON.stringify(st.unreadableBodies));
-  check(/a-human/.test(String(sentinel?.reviewer)),
+  check(/a-stranger-bot/.test(String(sentinel?.reviewer)),
     "attributed to the reviewer whose body could not be read", String(sentinel?.reviewer));
   check(/whole approach is wrong/.test(String(sentinel?.excerpt)),
     "and carrying the text, so a person can see what was said", String(sentinel?.excerpt).slice(0, 80));
@@ -664,22 +666,22 @@ ingest(db, NWO, 1, [
     JSON.stringify(facts.unspilledCritical));
 
   // AND IT IS NOT SCOPED TO BLOCKING REVIEWERS, which is the whole difference
-  // between this fact and the findings beside it. `a-human` is in no roster at
+  // between this fact and the findings beside it. `a-stranger-bot` is in no roster at
   // all. Blocking-ness answers whose OPINION gates a merge; this is not an
   // opinion, it is reeve reporting that it does not know what was said, and a
   // stranger's unread body is exactly as unread as a configured reviewer's.
   check(facts.unreadableBodies.readable === true && facts.unreadableBodies.open === 1,
     "an UNROSTERED author's unreadable body still reaches the decision path",
     JSON.stringify(facts.unreadableBodies));
-  check(facts.unreadableBodies.reviewers.includes("a-human"),
+  check(facts.unreadableBodies.reviewers.includes("a-stranger-bot"),
     "and names them, because the fix is a line of profile describing that reviewer",
     JSON.stringify(facts.unreadableBodies.reviewers));
   // Control: the findings clause beside it IS scoped, so the two really are being
   // treated differently rather than both happening to include everyone.
   // Control: the findings clause beside it carries codex, who IS blocking, and not
-  // `a-human`, who is not — so the two facts really are scoped differently rather
+  // `a-stranger-bot`, who is not — so the two facts really are scoped differently rather
   // than both happening to include everyone.
-  check(!facts.bodyFindings.reviewers.includes("a-human") && facts.bodyFindings.reviewers.includes("codex"),
+  check(!facts.bodyFindings.reviewers.includes("a-stranger-bot") && facts.bodyFindings.reviewers.includes("codex"),
     "control: while the findings clause stays scoped to blocking reviewers, so the two differ by design",
     JSON.stringify(facts.bodyFindings));
 

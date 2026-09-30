@@ -285,6 +285,10 @@ export const FIELDS = {
   "ci.appSlug":            [false, isStr],
   "ci.provider":            [true,  isStr],            // "github-actions" | "none"
   "ci.requiredChecks":      [false, isArr(isStr)],     // LITERAL names: matrix names expand at runtime
+  // Required checks that run only in the merge queue, as a repository's
+  // independent review of the queued revision does: skipped at a pull request's
+  // head by design, and judged at the queue's commit, where they must pass (#286).
+  "ci.queueOnlyChecks":     [false, isArr(isStr)],
   // Commit-status contexts published by REVIEWERS. Excluded from check
   // classification entirely: a rate-limited CodeRabbit reports state=success with
   // the truth in the description, so a reviewer's status read as CI is a fail-open

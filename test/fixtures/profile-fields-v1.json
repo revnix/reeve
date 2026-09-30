@@ -25,6 +25,7 @@
     "builder.provider.preemptAtBoundary",
     "ci.appSlug",
     "ci.provider",
+    "ci.queueOnlyChecks",
     "ci.requiredChecks",
     "ci.reviewerStatusContexts",
     "identity.baseBranch",
@@ -79,7 +80,7 @@
     "worker.isolation",
     "worker.maxOutputBytes"
   ],
-  "count": 76,
-  "reference_sha256": "ad1e65f4db3e49929e98e76519b3de197d789faf68861fb486d22c081ce50ea8",
+  "count": 77,
+  "reference_sha256": "a44b387d538c4eeb17f742e0db693059b8ec5a27973d3a285bc7b2dd24890131",
   "note": "a new key is deliberate: add it, regenerate the reference, and update both halves here"
 }

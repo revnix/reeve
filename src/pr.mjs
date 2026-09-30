@@ -184,8 +184,9 @@ export function evaluateQueueEntry({ nwo, entry, input, baseRef, profile, db = n
     ? { ...r, reviewedHead: entry.sha, coveredAt: r.reviewedHead } : r));
   const queued = { ...input, reviewers, head: entry.sha,
     checks: { verdict: s.verdict, settled: s.settled, why: s.why, readable: c.readable !== false, failing: c.failing, inherited: [],
-              impostors: got?.impostors ?? [], shadowRequired: req.shadowRequired, legacyRequired: req.legacyRequired },
-    base: { verdict: base.verdict, readable: base.readable !== false } };
+              impostors: got?.impostors ?? [], shadowRequired: req.shadowRequired, legacyRequired: req.legacyRequired,
+              passed: passedNames(got?.rows) },
+    base: baseHealthOf(base) };
   return { ok: true, input: queued, verdict: computeVerdict(queued) };
 }
 
@@ -316,8 +317,8 @@ export function requiredChecksOf({ nwo, baseRef, profile = /** @type {CiProfile}
  * passes nothing, since the surface that went unread may hold a failure, and
  * says so with `readable: false`; but a failure it did read is one, and stays RED.
  */
-export function classifyRead(read, { required = [], known = true } = {}, { evidence = true } = {}) {
-  const c = classify(read?.rows ?? [], required, { requiredKnown: known, evidence });
+export function classifyRead(read, { required = [], known = true, queueOnly = [] } = {}, { evidence = true } = {}) {
+  const c = classify(read?.rows ?? [], required, { requiredKnown: known, evidence, queueOnly });
   // Checks judged while the base's requirements couldn't be read are read again,
   // whatever else left them unknown, no check reported yet say: only reading
   // the requirements again settles them.
@@ -718,6 +719,31 @@ export function prAnchor({ nwo, pr }) {
            authorLogin };
 }
 
+/**
+ * A base's health as a verdict reads it: its verdict, whether it could be read,
+ * and the names of the checks failing there, so the pull request that repairs a
+ * red base can be told from one that would hide its next failure (#286).
+ * @param {{ verdict: string, readable?: boolean, failing?: { name?: string }[] }} base
+ */
+export const baseHealthOf = (base) => ({ verdict: base.verdict, readable: base.readable !== false,
+                                         failing: [...new Set((base.failing ?? []).map((r) => r?.name).filter(Boolean))] });
+
+/**
+ * The names of the checks that passed at a commit: completed with success, not
+ * merely skipped or neutral, as only a run that passed shows a failure fixed.
+ * @param {{ name?: string, state?: string, conclusion?: string }[] | undefined} rows
+ */
+export const passedNames = (rows) => [...new Set((rows ?? []).filter((r) => r?.state === "completed" && r.conclusion === "success").map((r) => String(r.name)))];
+
+/**
+ * What a pull request's head is judged against: the required checks, and those
+ * the profile says run only in the merge queue, which are skipped at a head by
+ * design and judged at the queue's commit instead (#286). Only a head's: the
+ * queue's commit is judged against the required checks alone.
+ * @param {{ required?: any[], known?: boolean }} req @param {any} profile
+ */
+export const headCheckRequirements = (req, profile) => ({ ...req, queueOnly: profile?.ci?.queueOnlyChecks ?? [] });
+
 export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}, hold = null }) {
   // Reuses the caller's anchor when it has one, so the head is pinned ONCE per
   // pull request per tick and the fold and the evaluation cannot disagree about
@@ -732,9 +758,10 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   const read = readChecks(nwo, pin.sha, { reviewerContexts });
   const { rows } = read;
   // Required: what the profile names and what the base requires. A skipped
-  // required check didn't run, and a read that isn't whole is UNKNOWN.
+  // required check didn't run, and a read that isn't whole is UNKNOWN. Except
+  // one that runs only in the merge queue, skipped here by design (#286).
   const req = requiredChecksOf({ nwo, baseRef, profile });
-  const c = classifyRead(read, req);
+  const c = classifyRead(read, headCheckRequirements(req, profile));
   // ONE reading, folded into what the previous tick recorded. Settlement is about
   // the check SET being stable ACROSS TIME, so it can only be established by
   // successive ticks -- this used to call settle() three times over the same
@@ -854,8 +881,9 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     // waiting for the checks to settle never does.
     checks: { verdict: s.verdict, settled: s.settled, why: s.why, readable: c.readable !== false, failing: c.failing, inherited: c.inherited,
               // Another App's check under reeve's own name: kept, never dropped.
-              impostors: read.impostors ?? [], shadowRequired: req.shadowRequired, legacyRequired: req.legacyRequired },
-    base: { verdict: base.verdict, readable: base.readable !== false },
+              impostors: read.impostors ?? [], shadowRequired: req.shadowRequired, legacyRequired: req.legacyRequired,
+              queueOnly: c.queueOnly ?? [], passed: passedNames(rows) },
+    base: baseHealthOf(base),
     reviewers, rounds, threads, cleared: facts.cleared,
     bodyFindings: facts.bodyFindings, unreadableBodies: facts.unreadableBodies,
     ledgerBlockers,

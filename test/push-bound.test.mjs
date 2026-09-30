@@ -52,13 +52,13 @@ exec ${real} "$@"
   return dir;
 }
 
-/** `publishRunWork` of the worker's fix to `main`, expected at `expected`, in a node of its own, with `bin` first on its PATH and a bound of three seconds. */
+/** `publishRunWork` of the worker's fix to `main`, expected at `expected`, in a node of its own, with `bin` first on its PATH and a bound of 0.8 seconds, well above a local push. */
 function publish(/** @type {ReturnType<typeof repos>} */ r, /** @type {string} */ bin, /** @type {string | null} */ expected = r.was) {
   const mod = JSON.stringify(new URL("../src/checkout.mjs", import.meta.url).href);
   const src = `const m = await import(${mod});
     console.log(JSON.stringify(m.publishRunWork({ repoRoot: ${JSON.stringify(r.founder)}, path: ${JSON.stringify(r.worker)}, branch: "main", expectedRemote: ${JSON.stringify(expected)} })));`;
   const p = spawnSync(process.execPath, ["--input-type=module", "-e", src], {
-    encoding: "utf8", timeout: 30_000, env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, REEVE_NET_TIMEOUT_MS: "3000" } });
+    encoding: "utf8", timeout: 30_000, env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, REEVE_NET_TIMEOUT_MS: "800" } });
   let out = null;
   try { out = JSON.parse(p.stdout.trim()); } catch { /* said below */ }
   return { out, err: p.stderr.trim() };
@@ -80,7 +80,7 @@ test("a push stopped at the bound, the remote still where it was, isn't known to
   assert.equal(g(r.origin, "rev-parse", "main"), r.was, "control: the push hadn't landed when the remote was read");
   assert.equal(out.ok, false);
   assert.equal(out.unknown, true, JSON.stringify(out));
-  assert.match(String(out.why), /didn't answer within 3 seconds, and whether it landed isn't known: the remote was still at [0-9a-f]{10} when read again, and the push may yet land/);
+  assert.match(String(out.why), /didn't answer within 0\.8 seconds, and whether it landed isn't known: the remote was still at [0-9a-f]{10} when read again, and the push may yet land/);
   assert.doesNotMatch(String(out.why), /refused|not published/);
 });
 

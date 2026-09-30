@@ -12358,4 +12358,13 @@ export const STUBS = [
               find: "  try { return { ok: true, out: execFileSync(\"gh\", args, { encoding: \"utf8\", stdio: [\"ignore\", \"pipe\", \"pipe\"], timeout: netTimeoutMs(), killSignal: \"SIGKILL\" }).trim() }; }",
               replace: "  try { return { ok: true, out: execFileSync(\"gh\", args, { encoding: \"utf8\", stdio: [\"ignore\", \"pipe\", \"pipe\"] }).trim() }; }" }],
   },
+  {
+    name: "net-bound-checkout-remote",
+    why: "fetch from, read and push to the origin with no bound. A git that never answers there would stop the daemon",
+    test: "test/net-bound.test.mjs",
+    expectRed: "the checkout's reads and writes of the origin are bounded, so a git that never answers there can't stop the daemon",
+    edits: [{ file: "src/checkout.mjs",
+              find: "  return run(cwd, GIT_NEUTRALISE_FOUNDER, args, founderGitEnv(), { timeout: netTimeoutMs() });",
+              replace: "  return run(cwd, GIT_NEUTRALISE_FOUNDER, args, founderGitEnv());" }],
+  },
 ];

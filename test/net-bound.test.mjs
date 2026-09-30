@@ -19,15 +19,15 @@ function silent() {
 }
 
 /**
- * `src` run as a module in a node of its own, with those first on its PATH and
+ * `src` run as a module in a node of its own, with those, or `first`'s, first on its PATH and
  * a bound of 300 milliseconds. Its answer, or `stopped` where it gave none in
  * fifteen seconds.
  * @param {string} src
  */
-function within(src) {
+function within(src, first = silent()) {
   const r = spawnSync(process.execPath, ["--input-type=module", "-e", src], {
     encoding: "utf8", timeout: 15_000,
-    env: { ...process.env, PATH: `${silent()}:${process.env.PATH}`, REEVE_NET_TIMEOUT_MS: "300" },
+    env: { ...process.env, PATH: `${first}:${process.env.PATH}`, REEVE_NET_TIMEOUT_MS: "300" },
   });
   return { stopped: r.signal !== null || r.error?.code === "ETIMEDOUT", out: r.stdout.trim(), err: r.stderr.trim() };
 }
@@ -75,4 +75,24 @@ test("the merge-health reads are bounded, so a gh that never answers can't stop 
   const r = within(`const m = await import(${mod("status.mjs")}); console.log(JSON.stringify(m.cleanMergeRate("o/r", 20)));`);
   assert.equal(r.stopped, false, `it answered: ${r.err}`);
   assert.ok(r.out.length > 0, `and it said what it could: ${r.out}`);
+});
+
+/** A folder holding a `git` that never answers where it would reach a remote, and is git otherwise. */
+function silentRemote() {
+  const dir = tempDir("reeve-net-remote-");
+  const real = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+  writeFileSync(join(dir, "git"), `#!/bin/sh\nfor a in "$@"; do case "$a" in fetch|ls-remote|push) exec sleep 30;; esac; done\nexec ${real} "$@"\n`);
+  chmodSync(join(dir, "git"), 0o755);
+  return dir;
+}
+
+test("the checkout's reads and writes of the origin are bounded, so a git that never answers there can't stop the daemon", () => {
+  const repo = tempDir("reeve-net-repo-"), runs = tempDir("reeve-net-runs-");
+  const r = within(`const m = await import(${mod("checkout.mjs")});
+    const fetched = m.prepareRunCheckout({ repoRoot: ${JSON.stringify(repo)}, root: ${JSON.stringify(runs)}, pr: 42, runId: "r1", branch: "main" });
+    const published = m.publishRunWork({ repoRoot: ${JSON.stringify(repo)}, path: ${JSON.stringify(repo)}, branch: "main", expectedRemote: "a".repeat(40) });
+    console.log(JSON.stringify({ fetched, published }));`, silentRemote());
+  assert.equal(r.stopped, false, `it answered: ${r.err}`);
+  assert.match(r.out, /could not fetch main: it didn't answer within 0\.3 seconds/);
+  assert.match(r.out, /could not read the remote head: it didn't answer within 0\.3 seconds/);
 });

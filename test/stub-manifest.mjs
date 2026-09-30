@@ -12374,7 +12374,7 @@ export const STUBS = [
     expectRed: "a required check the profile says runs only in the merge queue, skipped at a pull request's head, doesn't block it there",
     edits: [{ file: "src/github/reconciler.mjs",
               find: "  const deferred = notRunRequired.filter(c => queueOnly.includes(c.context) && meeting(c).every(r => r.conclusion === \"skipped\"));",
-              replace: "  const deferred = notRunRequired.filter(c => queueOnly.includes(c.context));" }],
+              replace: "  const deferred = []; void queueOnly;" }],
   },
   {
     name: "queue-only-just-skipped",

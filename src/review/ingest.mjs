@@ -30,6 +30,7 @@
 import { canonical } from "../db/ops.mjs";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { netTimeoutMs, netFailure } from "../net-bound.mjs";
 
 const THREADS_QUERY = `query($o:String!,$r:String!,$n:Int!,$c:String){
   repository(owner:$o,name:$r){ pullRequest(number:$n){
@@ -48,8 +49,8 @@ const THREADS_QUERY = `query($o:String!,$r:String!,$n:Int!,$c:String){
     } } } }`;
 
 function gh(args) {
-  try { return { ok: true, out: execFileSync("gh", ["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() }; }
-  catch (e) { return { ok: false, out: "", err: String(e.stderr || e.message).trim() }; }
+  try { return { ok: true, out: execFileSync("gh", ["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim() }; }
+  catch (e) { return { ok: false, out: "", err: netFailure(e) }; }
 }
 
 const secs = t => (t ? Math.floor(new Date(t).getTime() / 1000) || null : null);

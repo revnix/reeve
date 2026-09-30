@@ -11,9 +11,12 @@
 
 import { execFileSync } from "node:child_process";
 import { netTimeoutMs, netFailure } from "./net-bound.mjs";
+import { TICK_STARTED, TICK_STOPPED } from "./status.mjs";
 
 /** A gap between ticks longer than this is downtime, as #158 says. */
 export const GAP_SECONDS = 15 * 60;
+/** A tick longer than this is downtime too: a daemon stopped partway, not one running (#297). */
+export const TICK_LIMIT_SECONDS = 60 * 60;
 export const FLOOR_HOURS = 72;
 export const PASSES_NEEDED = 10;
 
@@ -52,20 +55,47 @@ const events = (db, op, since, now) => /** @type {any[]} */ (db.prepare(
  *           seeded?: import("./seeded.mjs").Result[] | null }} o
  */
 export function trialReport(db, { repo, since, now, merged, seeded = null }) {
-  // Running time, from the ticks: each gap between ticks, and from the start to
-  // the first and from the last to now, is running up to GAP_SECONDS, and past
-  // it, downtime.
-  const ticks = events(db, "daemon.tick", since, now).map((e) => e.at);
-  const marks = [since, ...ticks, now];
+  // Running time, from the ticks, recorded as each starts and as it ends
+  // (#297). The time inside a tick, from its start to its end, or to now for one
+  // still running, is running while the tick has taken no more than
+  // TICK_LIMIT_SECONDS from its start, however long that was. A tick that
+  // started and never ended, halted, stopped or unable to read GitHub, judged
+  // nothing, so the time from its start to the next start is downtime, however
+  // short. Every other gap, between one tick and the next, from the start to the
+  // first and from the last to now, is running up to GAP_SECONDS, and past it,
+  // downtime. So is the time from a tick that stopped without judging, halted,
+  // unable to list the pull requests or thrown, to the next start (#301), a
+  // report made before it included. A store written before starts were
+  // recorded holds only ends, and every gap there is between ticks.
+  const ended = events(db, "daemon.tick", since, now);
+  const started = events(db, TICK_STARTED, since, now);
+  const stopped = events(db, TICK_STOPPED, since, now);
+  // A tick under way as the report starts, the last recorded before it began,
+  // and when it started, which its limit counts from.
+  const before = /** @type {any} */ (db.prepare(`SELECT op, at FROM event WHERE op IN ('daemon.tick', ?, ?) AND at < ? ORDER BY seq DESC LIMIT 1`).get(TICK_STARTED, TICK_STOPPED, since));
+  const marks = [{ at: since, from: before?.op === TICK_STARTED ? Number(before.at) : since, start: before?.op === TICK_STARTED, end: false, stopped: before?.op === TICK_STOPPED },
+                 ...[...started.map((e) => ({ seq: e.seq, at: e.at, from: e.at, start: true, end: false, stopped: false })),
+                     ...ended.map((e) => ({ seq: e.seq, at: e.at, from: e.at, start: false, end: true, stopped: false })),
+                     ...stopped.map((e) => ({ seq: e.seq, at: e.at, from: e.at, start: false, end: false, stopped: true }))].sort((a, b) => a.seq - b.seq),
+                 { at: now, from: now, start: false, end: true, stopped: false }];
   /** @type {{ from: number, to: number }[]} */ const down = [];
   let running = 0;
   for (let i = 1; i < marks.length; i++) {
-    const gap = marks[i] - marks[i - 1];
-    if (gap > GAP_SECONDS) down.push({ from: marks[i - 1], to: marks[i] });
+    const [a, b] = [marks[i - 1], marks[i]];
+    const gap = b.at - a.at;
+    const over = a.stopped ? gap > 0
+      : a.start && b.end ? b.at - a.from > TICK_LIMIT_SECONDS
+      : a.start ? gap > 0
+      : gap > GAP_SECONDS;
+    // One stretch of downtime, however many marks it spans.
+    const last = down.at(-1);
+    if (over && last?.to === a.at) last.to = b.at;
+    else if (over) down.push({ from: a.at, to: b.at });
     else running += gap;
   }
-  // No tick at all is no running, however short the time.
-  if (!ticks.length) running = 0;
+  // No tick at all is no running, however short the time; one under way as
+  // the report starts is a tick.
+  if (!ended.length && !started.length && !marks[0].start) running = 0;
   const wasDown = (/** @type {number} */ t) => down.some((d) => t > d.from && t < d.to);
 
   const decided = events(db, "pr.decided", since, now);
@@ -158,7 +188,7 @@ export function trialReport(db, { repo, since, now, merged, seeded = null }) {
   ];
   // Ready for a person's audit once every condition the records can show holds;
   // passed only once that audit is recorded, which nothing here does.
-  return { since, now, running: { hours, ticks: ticks.length, down }, merges, passedFinal: passedFinal.length, kinds, toAudit, seeded, conditions,
+  return { since, now, running: { hours, ticks: ended.length, down }, merges, passedFinal: passedFinal.length, kinds, toAudit, seeded, conditions,
            ready: conditions.every((c) => c.met !== false), passed: conditions.every((c) => c.met === true) };
 }
 

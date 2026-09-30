@@ -33,7 +33,7 @@ import { claimProvider, releaseProvider, bindProviderLease, noteRateLimit, heart
 import { openHold } from "./build/holds.mjs";
 import { hubSession, NO_HUB } from "./build/hubsession.mjs";
 import { resolveRepoId } from "./build/repoid.mjs";
-import { readState, noteTick, cleanMergeRate } from "./status.mjs";
+import { readState, noteTick, noteTickStart, noteTickStopped, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify, printable } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects, reap, canonical, durably } from "./db/ops.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
@@ -1400,7 +1400,21 @@ const RATE_LIMIT_COOLDOWN_SECONDS = 600;
  */
 export const CANARY_PAGE = "guardian:sandbox:canary-failed";
 
+/**
+ * One tick, its start and end recorded (#297). One that stops without judging,
+ * halted, unable to list the pull requests, or thrown, is recorded as stopped
+ * (#301): a report made before the next tick would otherwise take it for a tick
+ * still running.
+ */
 export async function tick(ctx) {
+  let r;
+  try { r = await tickOnce(ctx); }
+  catch (err) { noteTickStopped(ctx.db); throw err; }
+  if (r?.halted || r?.unreadable) noteTickStopped(ctx.db);
+  return r;
+}
+
+async function tickOnce(ctx) {
   // The code a verdict is recorded as judged by, taken before anything is read
   // or evaluated: a checkout that moves during the tick's reads doesn't change
   // what this process loaded (#165).
@@ -1408,6 +1422,9 @@ export async function tick(ctx) {
   // Which tick this is, for what counts only in a row.
   const tickNo = ctx.tickNo = (ctx.tickNo ?? 0) + 1;
   const { nwo, profile, db, execute = false, shadow = true } = ctx;
+  // Recorded as it starts, and again as it ends: the time between is running,
+  // however long the tick takes (#297).
+  noteTickStart(db);
   // Absolute, once, before ANYTHING derives from it. A relative `--log` made
   // every state path relative — the run dir, the worker's tmp, its git config and
   // the `--settings` argument — and those are consumed after the worker's cwd has
@@ -2127,8 +2144,8 @@ export async function tick(ctx) {
         // stops.
         //
         // This catch is reachable in a way the `ok:false` branch is not:
-        // `authenticate` can THROW rather than return -- `apiAsApp` uses an
-        // uncaught `fetch`, so a DNS, TLS or connection failure arrives here. And
+        // `authenticate` can still THROW rather than return -- on an answer that
+        // isn't JSON, say; a request that got no answer fails it (#296). And
         // silence would be worse than a missing alert: on an otherwise complete
         // tick, a standing authentication escalation that this tick did not
         // re-raise is CLEARED, so a persistent outage would announce itself once
@@ -4376,8 +4393,12 @@ export async function tick(ctx) {
           const pushed = (ctx.publishWork ?? publishRunWork)({ repoRoot: repoCheckout, path: worktree,
                                                                branch: e.headRef, expectedRemote: e.head });
           if (!pushed.ok) {
-            log(logPath, `  #${e.pr}: NOT published — ${pushed.why}`);
-            raise(`#${e.pr}: a fix was produced but could not be published — ${pushed.why}`);
+            // A push stopped at the network bound, the remote unreadable after,
+            // may have landed (#284): said as not known, never as unpublished.
+            // Its checkout is kept either way, as nothing says the remote holds it.
+            log(logPath, `  #${e.pr}: ${pushed.unknown ? "published or not, it isn't known" : "NOT published"} — ${pushed.why}`);
+            raise(pushed.unknown ? `#${e.pr}: a fix was produced, and whether it was published isn't known — ${pushed.why}`
+                                 : `#${e.pr}: a fix was produced but could not be published — ${pushed.why}`);
           } else {
             log(logPath, `  #${e.pr}: published ${changed.length} file(s)` + (refused.length ? ` (${refused.length} call(s) refused along the way)` : ""));
             // Published, and still escalated: CI at the new head is the check that

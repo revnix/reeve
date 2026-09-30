@@ -5,7 +5,7 @@ GENERATED from `src/profile/schema.mjs`. Do not edit by hand: run
 `test/profile-validate.test.mjs` fails while it is stale, and
 `node scripts/profile-reference.mjs --check` reports staleness without writing.
 
-76 keys. 35 carry a description.
+77 keys. 36 carry a description.
 
 `requirement` is what an operator must AUTHOR, not the validator's raw flag:
 the loader applies defaults before validating, so a `defaulted` key may be
@@ -40,6 +40,7 @@ else to put it, which is the point.
 | `ci.appSlug` | optional | a non-empty string |
 | `ci.provider` | required | a non-empty string |
 | `ci.requiredChecks` | optional | a list of a non-empty string |
+| `ci.queueOnlyChecks` | optional | a list of a non-empty string |
 | `ci.reviewerStatusContexts` | optional | a list of a non-empty string |
 | `merge.method` | required | one of squash, merge, rebase |
 | `merge.deleteBranch` | optional | true or false |
@@ -141,6 +142,12 @@ Which App publishes this project's CI. Used to decide when the provider has FINI
 **optional**
 
 LITERAL names: matrix names expand at runtime
+
+### `ci.queueOnlyChecks`
+
+**optional**
+
+Required checks that run only in the merge queue, as a repository's independent review of the queued revision does: skipped at a pull request's head by design, and judged at the queue's commit, where they must pass (#286).
 
 ### `ci.reviewerStatusContexts`
 

@@ -111,7 +111,12 @@ export function computeVerdict(i) {
   // A read that failed is not a set still settling: only reading again settles it.
   else if (i.checks.readable === false) add("ci", UNKNOWN, i.checks.why ?? "the head's checks couldn't be read", "retry", "read the head's checks again");
   else if (!i.checks.settled) add("ci", UNKNOWN, `checks not settled: ${i.checks.verdict}${i.checks.why ? ` (${i.checks.why})` : ""}`, "waiting", "look again once the checks settle");
-  else if (i.checks.verdict === "GREEN") add("ci", PASS, "all checks passing at the pinned head");
+  else if (i.checks.verdict === "GREEN") {
+    // Named, so a pass here is never read as the queue's own check having run (#286).
+    const q = i.checks.queueOnly ?? [];
+    add("ci", PASS, "all checks passing at the pinned head" +
+      (q.length ? `; ${q.join(" and ")} ${q.length === 1 ? "runs" : "run"} only in the merge queue, and ${q.length === 1 ? "is" : "are"} judged at its commit` : ""));
+  }
   else if (i.checks.verdict === "MISSING_REQUIRED" || i.checks.verdict === "SKIPPED_REQUIRED") add("ci", BLOCK, i.checks.why);
   else if (i.checks.verdict === "RED") {
     const names = (i.checks.failing ?? []).map(f => f?.name).filter(Boolean).join(", ") || "an unnamed check";
@@ -124,8 +129,26 @@ export function computeVerdict(i) {
   // 2. The base's own health. GitHub does not check this when strict is false, so
   //    a PR can merge cleanly into a branch that is already broken.
   if (!i.base) add("base", UNKNOWN, "base health not read", "retry", "read the base branch's checks again");
-  else if (i.base.verdict === "GREEN") add("base", PASS, "base is green");
-  else if (i.base.verdict === "RED") add("base", BLOCK, "the base branch is red; merging into it hides the next failure");
+  else if (i.base.verdict === "GREEN") {
+    // A workflow no rule requires, failing there, is named, not held against the pull request (#288).
+    const beside = i.base.ancillaryFailing ?? [];
+    add("base", PASS, "base is green" + (beside.length ? `; ${beside.join(", ")} failing there, which no rule requires` : ""));
+  }
+  else if (i.base.verdict === "RED") {
+    // The pull request that repairs a red base passes, at its own green head,
+    // every check failing there. Blocked, it would leave the base red for good,
+    // as nothing else could merge either (#286). A base failing a check the head
+    // doesn't show passing, one that runs only there say, still blocks.
+    // The same check, from the same App: another's of one name shows nothing.
+    // And only from a base read whole, which a part may hide more failures on,
+    // at a commit the head contains: one from before shows nothing repaired.
+    /** @type {{ name: string, app: string | null }[]} */ const failing = i.base.failing ?? [];
+    /** @type {{ name: string, app: string | null }[]} */ const passed = i.checks?.passed ?? [];
+    if (failing.length && i.base.complete === true && i.base.inHead === true && i.checks?.verdict === "GREEN" && i.checks.settled
+        && failing.every((f) => passed.some((p) => p.name === f.name && p.app === f.app)))
+      add("base", PASS, `the base branch is red, and this pull request passes every check failing there (${[...new Set(failing.map((f) => f.name))].join(", ")}), so it repairs it`);
+    else add("base", BLOCK, "the base branch is red; merging into it hides the next failure");
+  }
   else if (i.base.readable === false) add("base", UNKNOWN, "the base branch's checks couldn't be read", "retry", "read the base branch's checks again");
   else add("base", UNKNOWN, `base verdict ${i.base.verdict}`, "waiting", "look again once the base branch's checks settle");
 

@@ -83,6 +83,14 @@ export function baselineStatement(digests) {
 }
 
 /**
+ * A baseline's fingerprint, as its statement names it: sha256 over the records
+ * it names, sorted, one per line. The host's anchor holds it while it's being
+ * bound to a store (#281).
+ * @param {string[]} digests
+ */
+export const baselineFingerprint = (digests) => baselineStatement(digests).subject[0].digest.sha256;
+
+/**
  * Entry `n` of a pull request's signed order of decisions (#274): the record that
  * became its latest decision then, numbered from 1, so which record is latest is
  * signed too, not read from the store's own order. With every other record kept
@@ -101,6 +109,17 @@ export function latestStatement({ repo, pr, n, digest, records = [], store = nul
     predicate: { repo, pr, n, digest, records: [...records].sort(), store, seq },
   };
 }
+
+/**
+ * An entry's seal: sha256 over its statement, which holds all it says, its
+ * repository without case, as GitHub's names don't tell case apart. The host's
+ * anchor keeps it for the entry it noted last of a pull request's order (#279):
+ * another entry under that number, naming the same record and other records,
+ * doesn't pass for it.
+ * @param {{ repo: string, pr: number, n: number, digest: string, records?: string[], store?: string | null, seq?: number | null }} entry
+ */
+export const entrySeal = (entry) =>
+  createHash("sha256").update(canonical(latestStatement({ ...entry, repo: String(entry.repo).toLowerCase() }))).digest("hex");
 
 /**
  * The signing key in `dir`, the credentials folder. With `create`, one is made

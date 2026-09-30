@@ -11,7 +11,8 @@ import { computeVerdict } from "./verdict.mjs";
 import { joinEvidence, asJson, policyOf } from "./evidence.mjs";
 import { canonical } from "./db/ops.mjs";
 import { latestDecision, decisionsFor, decisionOf, evidenceBy, policyRecord, storeIdentity, BASELINE_OP, LATEST_OP, FILED } from "./db/records.mjs";
-import { checkSignature, checkEnvelope, baselineStatement, latestStatement } from "./signing.mjs";
+import { checkSignature, checkEnvelope, baselineStatement, baselineFingerprint, latestStatement, entrySeal } from "./signing.mjs";
+import { reservedSeal } from "./anchor.mjs";
 
 /** @typedef {import("node:sqlite").DatabaseSync} Db */
 /** @typedef {Map<string, { key: import("node:crypto").KeyObject, where: string }>} Keys */
@@ -74,11 +75,13 @@ export function signingState(db, keys, anchor = null) {
  * twice. With no store to check against, none is taken while the store holds any
  * entry. `top` is its highest entry and
  * `digest` the record that names as latest; 0 and null when the store holds
- * none. `digests` is every record it names, as latest or kept, and `seq` where
- * in the store's sequence its top entry's latest was seen, null where it doesn't say.
- * `entries` is the record each entry names as latest, by its number.
+ * none. `digests` is every record it names, as latest or kept, `entries` the
+ * record each entry names as latest, by number, `seals` each entry's seal, by
+ * number, and `seq` where in the store's sequence its top entry's latest was
+ * seen, null where it doesn't say.
  * @param {Db} db @param {string} repo @param {number} pr @param {Keys} keys @param {string | null} [store]
- * @returns {{ top: number, digest: string | null, digests: Set<string>, seq: number | null, entries: Map<number, string> } | { corrupt: string }}
+ * @returns {{ top: number, digest: string | null, digests: Set<string>, entries: Map<number, string>, seals: Map<number, string>, seq: number | null }
+ *         | { corrupt: string }}
  */
 export function signedOrder(db, repo, pr, keys, store = storeIdentity(db)) {
   // An entry filed under anything but a pull request's own name is found by no
@@ -92,6 +95,7 @@ export function signedOrder(db, repo, pr, keys, store = storeIdentity(db)) {
   if (store == null && db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(LATEST_OP))
     return { corrupt: "this store holds entries of signed orders, but no identity to check them against: it was taken away" };
   /** @type {Map<number, string>} */ const byN = new Map();
+  /** @type {Map<number, string>} */ const seals = new Map();
   /** @type {Map<number, number | null>} */ const seqs = new Map();
   /** @type {Set<string>} */ const named = new Set();
   for (const r of /** @type {any[]} */ (db.prepare(`SELECT payload FROM event WHERE op = ? AND subject = ? ORDER BY seq`).all(LATEST_OP, `pr:${pr}`))) {
@@ -106,19 +110,20 @@ export function signedOrder(db, repo, pr, keys, store = storeIdentity(db)) {
     if (p.repo.toLowerCase() !== String(repo).toLowerCase()) return { corrupt: `entry ${n} of its signed order is of ${p.repo}, not of ${repo}` };
     // Another store's, however well signed: another host's, say, whose key is published.
     if (store && p.store !== store) return { corrupt: `entry ${n} of its signed order is another store's` };
-    const sig = typeof p.envelope === "string"
-      ? checkEnvelope(p.envelope, latestStatement({ repo: p.repo, pr, n, digest: p.digest, records: p.records, store: p.store ?? null, seq: p.seq ?? null }), keys, "entry")
+    const entry = { repo: p.repo, pr, n, digest: p.digest, records: p.records, store: p.store ?? null, seq: p.seq ?? null };
+    const sig = typeof p.envelope === "string" ? checkEnvelope(p.envelope, latestStatement(entry), keys, "entry")
       : { state: "corrupt", why: "it isn't signed" };
     if (sig.state !== "signed") return { corrupt: `entry ${n} of its signed order doesn't hold: ${"why" in sig ? sig.why : ""}` };
     if (byN.has(n)) return { corrupt: `its signed order names entry ${n} twice` };
     byN.set(n, p.digest);
+    seals.set(n, entrySeal(entry));
     seqs.set(n, p.seq ?? null);
     named.add(p.digest);
     for (const d of p.records) named.add(d);
   }
   const top = byN.size ? Math.max(...byN.keys()) : 0;
   for (let n = 1; n <= top; n++) if (!byN.has(n)) return { corrupt: `its signed order is missing entry ${n}` };
-  return { top, digest: top ? /** @type {string} */ (byN.get(top)) : null, digests: named, seq: top ? seqs.get(top) ?? null : null, entries: byN };
+  return { top, digest: top ? /** @type {string} */ (byN.get(top)) : null, digests: named, entries: byN, seals, seq: top ? seqs.get(top) ?? null : null };
 }
 
 /**
@@ -216,6 +221,62 @@ export function anchorForStore(db, anchor, repo) {
 const orderStore = (db, anchor) => anchor?.anchor?.store ?? storeIdentity(db);
 
 /**
+ * Whether the store holds a record whole: its row there, reading as the record
+ * its digest names. The record names its pull request, so a row moved to
+ * another, like one changed, doesn't read whole, and is no more held than one
+ * taken away.
+ * @param {Db} db @returns {(digest: string) => boolean}
+ */
+export function holdsWhole(db) {
+  const rowOf = db.prepare(`SELECT * FROM decision WHERE digest = ?`);
+  return (digest) => {
+    const row = rowOf.get(digest);
+    return Boolean(row) && !decisionOf(row).corrupt;
+  };
+}
+
+/**
+ * What the host's anchor says of a pull request's signed order besides how far
+ * it goes (#279), as why the store isn't current: an entry at its top, or one
+ * reserved, that isn't the one the host noted or reserved, naming another
+ * record or other records besides, as a copy of the store signed another under
+ * that number; an entry reserved that the store's order doesn't hold yet, until
+ * a reeve completes it; and each record this host kept and pinned that the
+ * store no longer holds and no entry names, taken away though the reeve that
+ * kept it stopped before ordering it.
+ * @param {{ top: number, digests: Set<string>, entries: Map<number, string>, seals: Map<number, string> }} order
+ * @param {number} pr @param {AnchorRead | null} anchor @param {(digest: string) => boolean} held @param {string} repo
+ * @returns {string[]}
+ */
+function anchoredFaults(order, pr, anchor, held, repo) {
+  const a = anchor?.anchor;
+  if (!a) return [];
+  /** @type {string[]} */ const out = [];
+  const anchored = a.latest.get(pr) ?? 0;
+  const noted = a.named?.get(pr), sealed = a.sealed?.get(pr);
+  const another = "a copy of this store signed another entry under that number";
+  if (anchored && noted && order.top >= anchored && order.entries.get(anchored) !== noted)
+    out.push(`entry ${anchored} of its signed order names record ${short(String(order.entries.get(anchored)))}, though this host noted record ${short(noted)} there: ` +
+             "a copy of this store signed another record under that number");
+  else if (anchored && sealed && order.top >= anchored && order.seals.get(anchored) !== sealed)
+    out.push(`entry ${anchored} of its signed order names record ${short(String(order.entries.get(anchored)))}, as this host noted, but isn't the entry this host noted there: ${another}`);
+  const r = a.reserved?.get(pr);
+  if (r && order.top >= r.n && order.entries.get(r.n) !== r.digest)
+    out.push(`entry ${r.n} of its signed order names record ${short(String(order.entries.get(r.n)))}, though this host reserved it for record ${short(r.digest)}: ` +
+             "a copy of this store signed another record under that number");
+  else if (r && order.top >= r.n && order.seals.get(r.n) !== reservedSeal(repo, a.store, pr, r))
+    out.push(`entry ${r.n} of its signed order names record ${short(r.digest)}, as this host reserved it, but isn't the entry this host reserved: ${another}`);
+  else if (r && order.top < r.n)
+    out.push(`this host reserved entry ${r.n} of its signed order for record ${short(r.digest)}, which its order doesn't hold yet` +
+             `${held(r.digest) ? ", until a reeve completes it" : ", and the store doesn't hold that record: a copy of this store may have signed it"}`);
+  const gone = [...(a.pinned?.get(pr) ?? [])].filter((d) => !order.digests.has(d) && !held(d));
+  if (gone.length)
+    out.push(`this host kept ${gone.length === 1 ? "record" : `${gone.length} records`} ${gone.map(short).join(", ")} for it, which the store no longer holds ` +
+             "and no entry of its signed order names: taken away, or a reeve stopped before its store committed it");
+  return out;
+}
+
+/**
  * What a pull request's signed order, and the host's anchor, say of which
  * record is its latest (#274): why `digest` can't be trusted as that, or null
  * when it can. `order` null is no order read, when the repository isn't known.
@@ -224,14 +285,19 @@ const orderStore = (db, anchor) => anchor?.anchor?.store ?? storeIdentity(db);
  * @param {number} anchored  the highest entry the host signed, 0 for none
  * @param {AnchorRead | null} anchor
  * @param {(digest: string) => boolean} held  whether the store holds a record
+ * @param {number} pr
+ * @param {(digest: string) => boolean} heldHere  whether it holds a record whole
+ * @param {string} repo
  */
-function notLatest(digest, order, anchored, anchor, held) {
+function notLatest(digest, order, anchored, anchor, held, pr, heldHere, repo) {
   if (anchor?.why) return anchor.why;
   if (!order) return null;
   if ("corrupt" in order) return order.corrupt;
   if (order.top < anchored)
     return `its signed order ends at entry ${order.top}, though this host signed up to entry ${anchored}: ` +
            "newer records were taken away, or the store restored from before";
+  const faults = anchoredFaults(order, pr, anchor, heldHere, repo);
+  if (faults.length) return faults.join("; and ");
   if (order.digest && order.digest !== digest)
     return `its signed order ends at record ${short(order.digest)}${held(order.digest) ? "" : ", which the store no longer holds"}`;
   return null;
@@ -281,6 +347,7 @@ export function explainDecision(db, pr, { head = null, keys = null, repo = null,
   // anchor: read whether or not the store still holds any record of it.
   const order = keys && repo && head === null ? signedOrder(db, repo, pr, keys, orderStore(db, anchor)) : null;
   const anchored = anchor?.anchor?.latest.get(pr) ?? 0;
+  const heldHere = holdsWhole(db);
   if (!d) {
     if (head !== null || !keys) return null;
     // Every record of it gone: taken away, or the store restored from before
@@ -288,7 +355,12 @@ export function explainDecision(db, pr, { head = null, keys = null, repo = null,
     if (anchor?.why) return `  the store holds no decision record for it, and whether it should can't be told: ${anchor.why}`;
     if (order && "corrupt" in order) return `  the store holds no decision record for it, and ${order.corrupt}`;
     const top = order && "top" in order ? order.top : 0;
-    if (!top && !anchored) return null;
+    // Where no order or entry says so, the host's anchor may: a record it kept
+    // and pinned, or an entry it reserved, that the store no longer holds.
+    if (!top && !anchored) {
+      const faults = order && "entries" in order ? anchoredFaults(order, pr, anchor, heldHere, String(repo)) : [];
+      return faults.length ? `  the store holds no decision record for it, though ${faults.join("; and ")}` : null;
+    }
     return `  the store holds no decision record for it, though ` +
            [top ? `its signed order names ${top} entr${top === 1 ? "y" : "ies"}` : "", anchored ? `this host signed up to entry ${anchored} of its order` : ""]
              .filter(Boolean).join(", and ") +
@@ -299,7 +371,7 @@ export function explainDecision(db, pr, { head = null, keys = null, repo = null,
   if (d.corrupt) out.push(`  this record can't be trusted: ${d.corrupt} (record ${short(d.digest)}); it was changed after it was kept`);
   else if (sig?.state === "corrupt") out.push(`  this record can't be trusted: ${sig.why} (record ${short(d.digest)})`);
   const held = (/** @type {string} */ digest) => Boolean(db.prepare(`SELECT 1 FROM decision WHERE digest = ? LIMIT 1`).get(digest));
-  const notIt = keys && head === null ? notLatest(d.digest, order, anchored, anchor, held) : null;
+  const notIt = keys && head === null ? notLatest(d.digest, order, anchored, anchor, held, pr, heldHere, String(repo)) : null;
   if (notIt) out.push(`  this record can't be trusted as the latest: ${notIt}`);
   // A record that doesn't hold may not read as one at all, or be none: what
   // can't be shown of it is said, rather than stopping at it (#280).
@@ -501,12 +573,16 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
     // a rollback takes the very records the date would have matched.
     for (const r of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ? AND subject GLOB 'pr:[1-9]*' AND substr(subject, 4) NOT GLOB '*[^0-9]*' AND length(subject) <= 18`).all(LATEST_OP))) prs.add(Number(String(r.subject).slice(3)));
     for (const pr of anchor?.anchor?.latest.keys() ?? []) prs.add(pr);
+    // And every one the anchor reserved an entry of, or pinned a record for (#279).
+    for (const pr of anchor?.anchor?.reserved?.keys() ?? []) prs.add(pr);
+    for (const pr of anchor?.anchor?.pinned?.keys() ?? []) prs.add(pr);
   }
   // Each record an order names, as the store holds it: a row that isn't that
   // record, or is another pull request's, is no more held than one taken away,
   // though what was asked for left it out of the replay. One replayed above as
   // this pull request's was checked whole there.
   const rowOf = db.prepare(`SELECT * FROM decision WHERE digest = ?`);
+  const whole = holdsWhole(db);
   const checked = new Set(replayed.map((r) => `${r.pr} ${r.digest}`));
   /** @type {Replayed[]} */ const out = [];
   const store = orderStore(db, anchor);
@@ -517,6 +593,7 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
     if (order.top < anchored)
       out.push(fault(pr, order.digest ?? "", `its signed order ends at entry ${order.top}, though this host signed up to entry ${anchored}: ` +
                                              "newer records were taken away, or the store restored from before"));
+    for (const why of anchoredFaults(order, pr, anchor, whole, repo)) out.push(fault(pr, order.digest ?? "", why));
     for (const digest of order.digests) {
       if (checked.has(`${pr} ${digest}`)) continue;
       const row = rowOf.get(digest);
@@ -532,6 +609,13 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
   // was kept, and no order names: taken away or changed before its first entry,
   // it's found by nothing else, unless replayed above. The baseline says no pull
   // request, so it's read replaying the whole store, or since a date.
+  // And a binding the host's anchor began for this store (#281): its baseline
+  // must be the one it was begun with, signed by a key this host knows, or where
+  // there's none, the store must hold every record it was begun with. A store
+  // stripped of its baseline and some of those records would otherwise read as
+  // one that never began signing.
+  const begun = which.pr == null ? bindingDiffers(db, anchor, keys) : null;
+  if (begun) out.push(fault(0, "", begun));
   if (which.pr == null) for (const lost of baselineLost(db, repo, keys, store, new Set(replayed.map((r) => r.digest))))
     out.push(fault(0, lost.digest, `the store's baseline names this record, kept before it began signing, and no signed order names it, but ${lost.why}`));
   return out;
@@ -627,6 +711,33 @@ export function publishedChecked(db, which, { keys, repo, anchor: read = null, p
     faults.push(fault(0, "", `the merge policy published at ${mostEntries.head.slice(0, 8)} that this store's signed orders held ${mostEntries.n} entries in all, ` +
                              `but this copy's hold ${entries}: entries were taken away, or the copy is from before`));
   return { faults, results, prs: prs.size, unchecked };
+}
+
+/**
+ * Why a binding the host's anchor began for this store (#281) doesn't hold, or
+ * null: the store's baseline isn't the one the binding was begun with, signed
+ * by a key this host knows, as binding reads it; or where it has none, the
+ * store doesn't hold exactly the records the binding was begun with, each as it
+ * was kept, as no record is kept while its baseline waits. A binding begun for
+ * another store isn't this one's to say.
+ * @param {Db} db @param {AnchorRead | null} anchor @param {Keys} keys @returns {string | null}
+ */
+function bindingDiffers(db, anchor, keys) {
+  const p = anchor?.anchor?.pending;
+  if (!p) return null;
+  const id = storeIdentity(db);
+  if (id && id !== p.store) return null;
+  const begun = "the host's anchor was being bound to this store";
+  const other = `${begun}, holding other records than it holds now: records were taken away, or the store restored from before`;
+  if (db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(BASELINE_OP)) {
+    // The first, as the store's signing reads it.
+    const { baseline, why } = signingState(db, keys);
+    if (!baseline) return `${begun}, and ${why ?? "its baseline doesn't hold"}`;
+    return baselineFingerprint([...baseline]) === p.baseline ? null : other;
+  }
+  const whole = holdsWhole(db);
+  const held = /** @type {any[]} */ (db.prepare(`SELECT digest FROM decision`).all()).map((r) => String(r.digest));
+  return baselineFingerprint(held) === p.baseline && p.digests.every((d) => whole(d)) ? null : other;
 }
 
 /**

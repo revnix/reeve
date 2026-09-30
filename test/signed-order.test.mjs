@@ -3,7 +3,7 @@
 // short, or restored from before, doesn't pass for the one the host kept.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -59,6 +59,10 @@ async function ticks(evals, ctx, dbPath = null) {
 const anchorOf = (dir) => { try { return { anchor: readAnchor(dir, REPO), why: null }; } catch (e) { return { anchor: null, why: e.message }; } };
 /** The same, checked against the store it's read beside, as bin/reeve gives it. */
 const anchorFor = (db, dir) => anchorForStore(db, anchorOf(dir), REPO);
+/** An anchor as read, with the parts #279 and #281 added empty unless given. */
+const anchorAs = (a) => ({ named: new Map(), sealed: new Map(), reserved: new Map(), pinned: new Map(), pending: null, ...a });
+/** What the host's reeve is given, but no entry can be reserved on its anchor: a tick keeps its records, pinned, and orders none, as one that stopped first would. */
+const unordered = (dir) => ({ ...host(dir), anchor: { ...fileAnchor(dir), reserve: () => false } });
 /** The digests of #42's records, oldest first. */
 const digestsOf = (db) => db.prepare("SELECT digest FROM decision WHERE pr = ? ORDER BY first_seq").all(PR).map((r) => r.digest);
 
@@ -135,7 +139,7 @@ test("the host's anchor is written whole, its folder and every folder made for i
   assert.equal(anchor.note(REPO, 7, 1), true, "control: it was written");
   const file = anchorPath(dir, REPO);
   for (const d of [dirname(file), dirname(dirname(file)), dir]) assert.ok(seen.includes(d), `${d} synced: ${JSON.stringify(seen)}`);
-  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { began: true, latest: { 7: 1 }, store: null });
+  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { began: true, latest: { 7: 1 }, store: null, named: {}, sealed: {}, reserved: {}, pinned: {}, pending: null });
   // And by a writer that made none of them, as a reeve after a restart is: a
   // sync that failed before it started is made again.
   const again = [];
@@ -149,7 +153,7 @@ test("the host's anchor only moves forward", () => {
   anchor.note(REPO, 7, 3);
   anchor.note(REPO, 7, 2);
   anchor.note(REPO, 9, 1);
-  assert.deepEqual(readAnchor(dir, REPO), { began: true, latest: new Map([[7, 3], [9, 1]]), store: null });
+  assert.deepEqual(readAnchor(dir, REPO), anchorAs({ began: true, latest: new Map([[7, 3], [9, 1]]), store: null }));
 });
 
 test("an anchor that can't be read vouches for nothing, and isn't written over", async () => {
@@ -305,7 +309,7 @@ test("an anchor that isn't one, or isn't a file, is never read as one", () => {
     assert.throws(() => readAnchor(dir, REPO), /can't be read: it isn't an anchor/, text);
   }
   writeFileSync(file, '{"began":true,"latest":{"7":2}}');
-  assert.deepEqual(readAnchor(dir, REPO), { began: true, latest: new Map([[7, 2]]), store: null }, "control: an anchor reads as one");
+  assert.deepEqual(readAnchor(dir, REPO), anchorAs({ began: true, latest: new Map([[7, 2]]), store: null }), "control: an anchor reads as one");
 });
 
 test("an anchor that's a pipe is refused before it's opened, so reading it can't wait for ever", () => {
@@ -399,7 +403,7 @@ test("a store the host's anchor is bound to says there that it began signing, th
   // Bound to the store and saying nothing more. Binding says the store began
   // too, so no reeve leaves it so; whatever did, the next tick says it.
   writeFileSync(anchorPath(dir, REPO), JSON.stringify({ began: false, latest: {}, store: id }));
-  assert.deepEqual(readAnchor(dir, REPO), { began: false, latest: new Map(), store: id }, "control: bound, and saying nothing more");
+  assert.deepEqual(readAnchor(dir, REPO), anchorAs({ began: false, latest: new Map(), store: id }), "control: bound, and saying nothing more");
   // No keys to check an order with, so none is extended or noted.
   await run({ evaluate: () => at(A), dbPath, ...host(dir), keys: () => null });
   const a = readAnchor(dir, REPO);
@@ -527,9 +531,14 @@ test("while another reeve holds the host's lock on the repository's anchor, a ti
   try { r = await run({ evaluate: () => at(A, "RED"), dbPath, ...host(dir) }); } finally { other.release(); }
   let db = open(dbPath);
   const held = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n;
+  const kept = digestsOf(db).length;
   db.close();
   assert.equal(held, 1, "no entry signed while another held the lock");
   assert.match(r.log, /another reeve holds the host's lock on o\/r's anchor, so no signed order is extended/);
+  // Nor is a record kept that couldn't be pinned: taken away before an entry
+  // named it, it would leave nothing to show it was kept (#279).
+  assert.equal(kept, 1, "the verdict's record isn't kept this tick");
+  assert.match(r.log, /#42: its decision record isn't kept this tick, as it couldn't be pinned on the host's anchor — the host's lock on the anchor wasn't held/);
   await run({ evaluate: () => at(A, "RED"), dbPath, ...host(dir) });
   db = open(dbPath);
   const after = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n;
@@ -663,10 +672,14 @@ test("the host's anchor is one store's: another store of the repository extends 
 test("an entry committed before the host's anchor could be moved to it is noted at the next tick", async () => {
   const dir = credentials();
   const dbPath = await ticks([at(A)], host(dir));
-  // The anchor's write fails before it's renamed into place: the entry is
-  // committed, and the anchor stays at the entry before, as it would were the
-  // process to stop between the two.
-  const stuck = { ...host(dir), anchor: fileAnchor(dir, { write: () => { throw new Error("no space left on device"); } }) };
+  // The note's write fails before it's renamed into place: the entry is
+  // reserved and committed, and the anchor stays at the entry before, as it
+  // would were the process to stop between the two.
+  const noting = (/** @type {Buffer} */ buf) => /"latest":\{"42":2\}/.test(buf.toString());
+  const stuck = { ...host(dir), anchor: fileAnchor(dir, { write: (fd, buf, offset, length) => {
+    if (noting(buf)) throw new Error("no space left on device");
+    return writeSync(fd, buf, offset, length);
+  } }) };
   const r = await run({ evaluate: () => at(A, "RED"), dbPath, ...stuck });
   assert.match(r.log, /the host's anchor couldn't be moved to entry 2 of its order/, "control: the note failed");
   assert.equal(readAnchor(dir, REPO)?.latest.get(PR), 1, "control: the anchor stayed behind");
@@ -740,9 +753,14 @@ test("the host's anchor, once bound to a store, is never bound to another", () =
 test("a pull request whose order a tick couldn't extend, as another held the lock, is ordered by the next, though never judged again", async () => {
   const dir = credentials();
   const dbPath = await ticks([at(A)], host(dir));
-  const other = fileAnchor(dir).lock(REPO);
-  assert.ok(other && "release" in other, "control: the lock was taken");
-  try { await run({ evaluate: () => at(A, "RED"), dbPath, ...host(dir) }); } finally { other.release(); }
+  // Another reeve takes the host's lock once this one has kept its record, pinned.
+  const real = fileAnchor(dir);
+  /** @type {any} */ let other = null;
+  const kept = () => { const db = open(dbPath); try { return digestsOf(db).length; } finally { db.close(); } };
+  const anchor = { ...real, lock: (/** @type {string} */ repo) => { if (!other && kept() > 1) other = real.lock(repo); return real.lock(repo); } };
+  let r;
+  try { r = await run({ evaluate: () => at(A, "RED"), dbPath, ...host(dir), anchor }); } finally { other?.release?.(); }
+  assert.match(r.log, /another reeve holds the host's lock on o\/r's anchor, so no signed order is extended/, "control: it couldn't order the record it kept");
   // Gone from the open list, merged, and never judged again.
   await run({ openPrs: () => [], evaluate: () => at(A), dbPath, prState: () => "MERGED", prIsFinished: () => true, ...host(dir) });
   const db = open(dbPath);
@@ -777,9 +795,14 @@ test("a repository whose name starts with a dot keeps an anchor", () => {
 test("an order that ran ahead of the host's anchor is noted there by a later tick, though its pull request is never judged again", async () => {
   const dir = credentials();
   const dbPath = await ticks([at(A)], host(dir));
-  const stuck = { ...host(dir), anchor: fileAnchor(dir, { write: () => { throw new Error("no space left on device"); } }) };
+  // Its entry committed, and the note never made, as by a disk that filled in between.
+  const stuck = { ...host(dir), anchor: { ...fileAnchor(dir), note: () => false } };
   await run({ evaluate: () => at(A, "RED"), dbPath, ...stuck });
   assert.equal(readAnchor(dir, REPO)?.latest.get(PR), 1, "control: the anchor stayed behind the order");
+  const db = open(dbPath);
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  db.close();
+  assert.equal("top" in order && order.top, 2, "control: the order ran ahead of it");
   await run({ openPrs: () => [], evaluate: () => at(A), dbPath, prState: () => "CLOSED", prIsFinished: () => true, ...host(dir) });
   assert.equal(readAnchor(dir, REPO)?.latest.get(PR), 2);
 });
@@ -972,7 +995,8 @@ test("replay reports a record an order names that the store holds as another pul
 test("a tick that can't list the repository's pull requests still notes an order that ran ahead of the host's anchor", async () => {
   const dir = credentials();
   const dbPath = await ticks([at(A)], host(dir));
-  const stuck = { ...host(dir), anchor: fileAnchor(dir, { write: () => { throw new Error("no space left on device"); } }) };
+  // Its entry committed, and the note never made.
+  const stuck = { ...host(dir), anchor: { ...fileAnchor(dir), note: () => false } };
   await run({ evaluate: () => at(A, "RED"), dbPath, ...stuck });
   assert.equal(readAnchor(dir, REPO)?.latest.get(PR), 1, "control: the anchor stayed behind the order");
   const r = await run({ openPrs: () => null, evaluate: () => at(A), dbPath, ...host(dir) });
@@ -1026,7 +1050,10 @@ test("a store with no order to extend says nothing on the host's anchor, so anot
 
 test("a baseline made while another reeve holds the host's lock is committed synced to disk all the same", async () => {
   const dir = credentials();
-  const dbPath = await ticks([at(A)], {});
+  // Over no record: one that vouches for records begins the anchor's binding,
+  // and waits for the lock (#281).
+  const dbPath = join(tempDir("reeve-order-empty-"), "s.db");
+  open(dbPath).close();
   const seen = [];
   const count = (db) => db.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n;
   const watched = (db, fn) => durably(db, () => {
@@ -1049,12 +1076,11 @@ test("a baseline made while another reeve holds the host's lock is committed syn
 test("an older record a store edit raises isn't signed as the latest, whether or not its pull request is judged again", async () => {
   const dir = credentials();
   const dbPath = await ticks([at(A), at(A, "RED")], host(dir));
-  // A record kept while another held the host's lock, by a reeve that stopped
-  // before ordering it: the one record no entry names yet.
-  const other = fileAnchor(dir).lock(REPO);
-  try { await run({ evaluate: () => at(B, "RED"), dbPath, ...host(dir) }); } finally { other.release(); }
+  // A record kept by a reeve that couldn't order it: the one record no entry names yet.
+  await run({ evaluate: () => at(B, "RED"), dbPath, ...unordered(dir) });
   let db = open(dbPath);
-  const [green, red] = digestsOf(db);
+  const [green, red, unnamed] = digestsOf(db);
+  assert.ok(unnamed, "control: it was kept");
   db.prepare("UPDATE decision SET last_seq = 1000000 WHERE digest = ?").run(green);
   db.close();
   // Closed, and never judged again: the reeve ordering it kept none of its records.
@@ -1097,11 +1123,8 @@ test("where more than one record no entry names is kept, the store's own order d
   const dir = credentials();
   const C = "c".repeat(40);
   const dbPath = await ticks([at(A, "RED")], host(dir));
-  // Two records kept while another held the host's lock, each by a reeve that stopped before ordering it.
-  for (const head of [B, C]) {
-    const other = fileAnchor(dir).lock(REPO);
-    try { await run({ evaluate: () => at(head, "RED"), dbPath, ...host(dir) }); } finally { other.release(); }
-  }
+  // Two records kept, each by a reeve that couldn't order it.
+  for (const head of [B, C]) await run({ evaluate: () => at(head, "RED"), dbPath, ...unordered(dir) });
   await closedTick(dbPath, host(dir));
   const db = open(dbPath);
   const [first, ...kept] = digestsOf(db);
@@ -1115,11 +1138,11 @@ test("where more than one record no entry names is kept, the store's own order d
 test("an entry that doesn't check never counts as naming a record, so the order it's in is checked and said not to hold", async () => {
   const dir = credentials();
   const dbPath = await ticks([at(A)], host(dir));
-  // A record kept while another held the host's lock, so no entry names it yet.
-  const other = fileAnchor(dir).lock(REPO);
-  try { await run({ evaluate: () => at(A, "RED"), dbPath, ...host(dir) }); } finally { other.release(); }
+  // A record kept by a reeve that couldn't order it, so no entry names it yet.
+  await run({ evaluate: () => at(A, "RED"), dbPath, ...unordered(dir) });
   let db = open(dbPath);
   const [, red] = digestsOf(db);
+  assert.ok(red, "control: it was kept");
   // A store edit: an entry, unsigned, that names it, numbered as no entry is.
   db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
     .run(3, "daemon", "decision.latest", `pr:${PR}`, JSON.stringify({ repo: REPO, n: "x", digest: red, records: [red], store: null, envelope: "{}" }));
@@ -1132,16 +1155,16 @@ test("a record this reeve kept, taken away before an entry named it, is named al
   const dir = credentials();
   const dbPath = join(tempDir("reeve-order-taken-first-"), "s.db");
   open(dbPath).close();
-  let tick = 0, lock = null, gone = [];
-  await run({ ticks: 4, dbPath, ...host(dir), prState: () => "CLOSED", prIsFinished: () => true,
+  let tick = 0, gone = [];
+  // The second and third ticks' records aren't ordered, as no entry can be reserved.
+  const real = fileAnchor(dir);
+  const anchor = { ...real, reserve: (/** @type {any[]} */ ...args) => (tick === 2 || tick === 3 ? false : real.reserve(...args)) };
+  await run({ ticks: 4, dbPath, ...host(dir), anchor, prState: () => "CLOSED", prIsFinished: () => true,
               evaluate: () => (tick === 1 ? at(A) : at(tick === 2 ? A : B, "RED")),
               openPrs: () => {
                 tick++;
-                // The second and third ticks' records aren't ordered, as another holds the lock.
-                if (tick === 2) lock = fileAnchor(dir).lock(REPO);
                 if (tick < 4) return [PR];
                 // Then both are taken away, the latest and the one it superseded, before a tick orders them.
-                lock?.release?.();
                 const s = open(dbPath);
                 gone = s.prepare("SELECT digest FROM decision WHERE pr = ? AND digest NOT IN (SELECT json_extract(payload, '$.digest') FROM event WHERE op = 'decision.latest')").all(PR).map((r) => r.digest);
                 s.prepare(`DELETE FROM decision WHERE digest IN (${gone.map(() => "?").join(",")})`).run(...gone);
@@ -1173,19 +1196,19 @@ test("a reeve doesn't sign what it kept as the latest over a record another reev
   const dir = credentials();
   const C = "c".repeat(40);
   const dbPath = await ticks([at(A, "RED")], host(dir));
-  let tick = 0, lock = null;
-  // The first reeve keeps a record and can't order it, as another holds the
-  // lock. Before its next tick, a second reeve keeps a newer one and orders both.
-  await run({ ticks: 2, dbPath, ...host(dir), prState: () => "CLOSED", prIsFinished: () => true,
+  let tick = 0;
+  // The first reeve keeps a record and can't order it, as no entry can be
+  // reserved. Before its next tick, a second reeve keeps a newer one and orders both.
+  const real = fileAnchor(dir);
+  const anchor = { ...real, reserve: (/** @type {any[]} */ ...args) => (tick === 1 ? false : real.reserve(...args)) };
+  await run({ ticks: 2, dbPath, ...host(dir), anchor, prState: () => "CLOSED", prIsFinished: () => true,
               evaluate: () => at(B, "RED"),
               openPrs: () => {
                 tick++;
-                if (tick === 1) { lock = fileAnchor(dir).lock(REPO); return [PR]; }
-                return [];
+                return tick === 1 ? [PR] : [];
               },
               afterTick: async (i) => {
                 if (i !== 0) return;
-                lock?.release?.();
                 await run({ evaluate: () => at(C, "RED"), dbPath, ...host(dir) });
               } });
   const db = open(dbPath);
@@ -1276,7 +1299,7 @@ test("an entry filed under another spelling of a pull request's name fails every
   const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: null });
   const replayed = replayDecisions(db, {}, { keys, repo: REPO, anchor: null });
   db.close();
-  rmSync(anchorPath(dir, REPO));
+  rmSync(anchorPath(dir, REPO), { force: true });
   const r = await closedTick(dbPath, host(dir));
   db = open(dbPath);
   const after = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n;
@@ -1451,7 +1474,7 @@ test("binding the host's anchor to a store says there that the store began signi
   const dir = credentials();
   const id = "a".repeat(32);
   assert.equal(fileAnchor(dir).bind(REPO, id), true, "control: bound");
-  assert.deepEqual(readAnchor(dir, REPO), { began: true, latest: new Map(), store: id });
+  assert.deepEqual(readAnchor(dir, REPO), anchorAs({ began: true, latest: new Map(), store: id }));
 });
 
 test("a store stripped while its reeve was down, after a tick that bound the host's anchor and noted no entry, isn't given a baseline again", async () => {
@@ -1529,7 +1552,8 @@ test("reeve restore doesn't write over a store a reeve is running on, a reeve ti
 
 /**
  * A store kept before signing, with records of #42 and #43, that begins signing
- * while another reeve holds the host's lock, so no order names either yet; then
+ * under a reeve whose reservations fail, so no order names either yet (a
+ * baseline over records now waits for the host's lock, #281); then
  * `edit` is made, #43's record taken away unless it says otherwise. Answers the
  * store, and that record.
  */
@@ -1539,8 +1563,7 @@ async function lostBeforeOrdered(dir, edit = "DELETE FROM decision WHERE pr = 43
   const k = recordOf(REPO, 43, B);
   saveDecision(db, { at: 1, seq: 1000, pr: 43, head: B, ...k });
   db.close();
-  const other = fileAnchor(dir).lock(REPO);
-  try { await closedTick(dbPath, host(dir)); } finally { other.release(); }
+  await closedTick(dbPath, { ...host(dir), anchor: { ...fileAnchor(dir), reserve: () => false } });
   db = open(dbPath);
   const baseline = JSON.parse(db.prepare("SELECT payload FROM event WHERE op = 'signing.baseline'").get()?.payload ?? "{}").digests ?? [];
   const entries = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n;
@@ -1800,7 +1823,7 @@ test("the host's anchor notes only a pull request's number and an entry's, so it
   const anchor = fileAnchor(dir);
   assert.equal(anchor.note(REPO, 7, 1), true, "control: a pull request's entry is noted");
   for (const [pr, n] of [[0, 1], [-3, 1], [1.5, 1], [7, 0]]) assert.equal(anchor.note(REPO, pr, n), false, `#${pr}, entry ${n}`);
-  assert.deepEqual(anchorOf(dir), { anchor: { began: true, latest: new Map([[7, 1]]), store: null }, why: null }, "and the anchor reads as it was");
+  assert.deepEqual(anchorOf(dir), { anchor: anchorAs({ began: true, latest: new Map([[7, 1]]), store: null }), why: null }, "and the anchor reads as it was");
 });
 
 test("two restores of a store that's gone run one at a time", () => {

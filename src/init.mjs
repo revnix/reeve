@@ -21,7 +21,7 @@ import { validate, withDefaults } from "./profile/schema.mjs";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, linkSync, rmSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { resolveHome } from "./home.mjs";
-import { statePathFor, legacyStatePathFor, adoptLegacyStore, clearMoveLock } from "./paths.mjs";
+import { statePathFor, earlierStorePath, adoptLegacyStore, clearMoveLock } from "./paths.mjs";
 import { open } from "./db/ops.mjs";
 
 /**
@@ -301,7 +301,7 @@ export function renderPlan({ nwo, proposal, questions, notes, profile, unanswere
  * "missing".
  */
 export function storeStatus(home, nwo) {
-  const path = statePathFor(home, nwo), legacy = legacyStatePathFor(home, nwo);
+  const path = statePathFor(home, nwo), legacy = earlierStorePath(home, nwo);
   if (existsSync(path)) return { state: "exists", path };
   if (existsSync(legacy)) return { state: "legacy", path, legacy };
   return { state: "missing", path };

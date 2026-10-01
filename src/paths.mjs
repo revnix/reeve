@@ -29,18 +29,44 @@ const parts = nwo => {
   return [safe(owner ?? "unknown"), safe(repo ?? "unknown")];
 };
 
-/** The state database for one repository. */
-export function statePathFor(home, nwo) {
-  const [owner, repo] = parts(nwo);
-  return join(home, "state", owner, `${repo}.db`);
-}
-
 /**
  * A name, every character but a letter, a digit, `-` and `_` written as its
  * percent code: one name for each, which no two share and none walks out of the
  * folder, as `.github` and `-github` would share `safe`'s.
  */
 const exact = s => encodeURIComponent(String(s)).replace(/[.!~*'()]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+
+/**
+ * A repository's owner or name as one segment of a store's or a dashboard's
+ * path (#310): kept as it is where `safe` would keep it, letters, digits, `.`,
+ * `_` and `-` with no dot first, and percent-coded as `exact` codes it where
+ * not. One name for each: one kept holds no `%`, and one coded always does. So
+ * `.github` and `-github`, which `safe` made alike, are kept apart, and a store
+ * already at its path for any other name stays where it is.
+ */
+const named = s => (/^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(String(s)) ? String(s) : exact(s));
+/** The name a path's segment was made from by `named`: one that holds no `%` is as it is. */
+const unnamed = s => { if (!s.includes("%")) return s; try { return decodeURIComponent(s); } catch { return s; } };
+
+/** The owner and name a store's or a dashboard's path is made of. */
+const segments = nwo => {
+  const [owner, repo] = String(nwo).split("/");
+  return [named(owner ?? "unknown"), named(repo ?? "unknown")];
+};
+
+/** The state database for one repository. */
+export function statePathFor(home, nwo) {
+  const [owner, repo] = segments(nwo);
+  return join(home, "state", owner, `${repo}.db`);
+}
+
+/**
+ * The repository a store at `state/<owner>/<file>` is of: its owner's folder
+ * and its file named as `statePathFor` names them, the `.db` taken off.
+ */
+export function storeRepo(owner, file) {
+  return `${unnamed(owner)}/${unnamed(String(file).replace(/\.db$/, ""))}`;
+}
 
 /**
  * Where a person's audits of one repository's shadow trial are kept (#294),
@@ -54,7 +80,7 @@ export function auditDirFor(home, nwo) {
 
 /** The dashboard for one repository. */
 export function dashPathFor(home, nwo) {
-  const [owner, repo] = parts(nwo);
+  const [owner, repo] = segments(nwo);
   return join(home, "dash", owner, `${repo}.html`);
 }
 
@@ -68,6 +94,32 @@ export function dashPathFor(home, nwo) {
 export function legacyStatePathFor(home, nwo) {
   const [, repo] = parts(nwo);
   return join(home, "state", `${repo}.db`);
+}
+
+/**
+ * Where an earlier reeve kept the store for `nwo`, for it to be found and moved
+ * (#310). Before #310, the owner and name were made safe for the path, and
+ * names that made alike, `.github` and `-github`, shared a store there: one
+ * found there is this repository's only where every decision record it holds,
+ * and at least one, is of this repository, so another's isn't taken. Otherwise,
+ * the store under the name alone, from before stores were kept by owner.
+ */
+export function earlierStorePath(home, nwo) {
+  const [owner, repo] = parts(nwo);
+  const shared = join(home, "state", owner, `${repo}.db`);
+  if (shared !== statePathFor(home, nwo) && existsSync(shared) && holdsOnly(shared, nwo)) return shared;
+  return legacyStatePathFor(home, nwo);
+}
+
+/** Whether the store at `path` holds decision records, and only of `nwo`. One that can't be read can't be told. */
+function holdsOnly(path, nwo) {
+  let db = null;
+  try {
+    db = new DatabaseSync(path, { readOnly: true });
+    const repos = db.prepare(`SELECT DISTINCT CASE WHEN json_valid(record) THEN json_extract(record, '$.subject.repo') END AS repo FROM decision`).all();
+    return repos.length > 0 && repos.every(r => r.repo === nwo);
+  } catch { return false; }
+  finally { try { db?.close(); } catch { /* never opened */ } }
 }
 
 /** Likewise for the dashboard, which sat directly in the reeve home. */

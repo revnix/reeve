@@ -25,6 +25,7 @@ import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync
 import { randomBytes } from "node:crypto";
 import { join, dirname, basename } from "node:path";
 import { open as openStore, exportJsonl, storeLock } from "./db/ops.mjs";
+import { storeRepo } from "./paths.mjs";
 import { syncFolder, running } from "./signing.mjs";
 // Task 8's subset. `tablesAt` and `HUB_TABLES` are what a snapshot's table set
 // is validated against; Task 9 adds the locks, replay and hubEvent imports when
@@ -168,7 +169,8 @@ export function everyStore(home) {
     try { files = readdirSync(join(root, o.name)); } catch { continue; }
     for (const f of files) {
       if (!f.endsWith(".db")) continue;
-      out.push({ nwo: `${o.name}/${f.slice(0, -3)}`, path: join(root, o.name, f), kind: "repo" });
+      // The repository it's of, as its path names it (#310).
+      out.push({ nwo: storeRepo(o.name, f), path: join(root, o.name, f), kind: "repo" });
     }
   }
   return out;

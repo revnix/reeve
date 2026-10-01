@@ -26,7 +26,7 @@ import { randomBytes } from "node:crypto";
 import { join, dirname, basename } from "node:path";
 import { open as openStore, exportJsonl, storeLock } from "./db/ops.mjs";
 import { syncFolder, running } from "./signing.mjs";
-import { auditsCopy, putBackAudits, storeIsOf } from "./trial.mjs";
+import { auditsCopy, putBackAudits } from "./trial.mjs";
 import { auditDirFor, auditNotesFor, storeRepo, backupDirFor } from "./paths.mjs";
 // Task 8's subset. `tablesAt` and `HUB_TABLES` are what a snapshot's table set
 // is validated against; Task 9 adds the locks, replay and hubEvent imports when
@@ -64,23 +64,35 @@ const snapshotsIn = dir => {
 
 /**
  * Whether the snapshot at `path` is `nwo`'s, by the repository its decision
- * records name, as `storeIsOf` tells a store's (#319). `named`: one holding no
- * record can't be told, and isn't. `{ ok }`, or why it isn't, with `other`
- * where its records name another repository: the one answer that rules it out
- * as `nwo`'s, rather than leaving it untold.
+ * records name (#319), spelled as reeve keeps them.
+ * `named`: one holding no record can't be told, and isn't. `{ ok }`, or why it
+ * isn't, with `other` only where a record names another repository: the one
+ * answer that rules it out as `nwo`'s. A record that names none, or a file that
+ * can't be read, leaves it untold, not another's.
  * @param {string} path @param {string} nwo @param {{ named?: boolean }} [o]
  */
 export function snapshotIsOf(path, nwo, { named = false } = {}) {
-  let db = null;
-  const said = (/** @type {any} */ of) => `the snapshot ${String(of.why).replace(/^this store /, "")}`;
+  let db = null, repos;
   try {
     db = new DatabaseSync(path, { readOnly: true });
-    const of = storeIsOf(db, nwo, { named: false });
-    if (!of.ok) return { ok: false, other: true, why: said(of) };
-    const told = named ? storeIsOf(db, nwo, { named: true }) : of;
-    return told.ok ? told : { ok: false, why: said(told) };
+    repos = /** @type {any[]} */ (db.prepare(
+      `SELECT DISTINCT CASE WHEN json_valid(record) THEN json_extract(record, '$.subject.repo') END AS repo FROM decision`).all())
+      .map(r => (typeof r.repo === "string" ? r.repo : null));
   } catch (e) { return { ok: false, why: `whose records ${path} holds couldn't be read: ${e.message}` }; }
   finally { try { db?.close(); } catch { /* read only: nothing to lose */ } }
+  const others = /** @type {string[]} */ (repos.filter(r => r !== null && r !== String(nwo)));
+  if (others.length) {
+    // Spelled in other letters' case, it may be this repository to GitHub, but
+    // reeve keeps each spelling's store, audits and backups apart: restored
+    // under this one, it would land where nothing keeping the other reads it.
+    // So it's refused, saying the spelling that restores it.
+    const respell = others.length === 1 && String(others[0]).toLowerCase() === String(nwo).toLowerCase()
+      ? `: if it's this repository, restore it as ${others[0]}, as its records spell it` : "";
+    return { ok: false, other: true, why: `the snapshot holds decision records of ${others.join(", ")}, not ${nwo}${respell}` };
+  }
+  if (repos.includes(null)) return { ok: false, why: `the snapshot holds decision records whose repository can't be read, so whose it is can't be told` };
+  if (named && !repos.length) return { ok: false, why: `the snapshot holds no decision record, so which repository it's of can't be told` };
+  return { ok: true };
 }
 
 /**
@@ -147,17 +159,24 @@ export function snapshot(db, root, nwo, at = Math.floor(Date.now() / 1000), { ke
   // be mid-VACUUM. `kill(pid, 0)` only asks whether the pid exists, and a
   // REUSED pid simply means the file is not reaped this time -- leaking is the
   // safe direction, deleting a live writer's temp is not.
-  try {
-    for (const f of readdirSync(dir)) {
-      const m = /^\.(\d+)\.(\d+)\.tmp$/.exec(f);
-      if (!m) continue;
-      const owner = Number(m[2]);
-      if (owner === process.pid) continue;              // ours, handled above
-      try { process.kill(owner, 0); continue; }          // still running: leave it
-      catch (e) { if (e.code === "EPERM") continue; }    // exists, not ours to judge
-      rmSync(join(dir, f), { force: true });
-    }
-  } catch { /* reaping is housekeeping and must never fail a backup */ }
+  //
+  // In the folder an earlier reeve kept this repository's snapshots in too
+  // (#319): the last backup there may have been killed the same way, and no
+  // snapshot is written there again to reap it. Only its temporaries: the
+  // snapshots kept there stay.
+  for (const folder of [dir, ...(nwo === "hub" ? [] : [join(root, slug(nwo))])]) {
+    try {
+      for (const f of readdirSync(folder)) {
+        const m = /^\.(\d+)\.(\d+)\.tmp$/.exec(f);
+        if (!m) continue;
+        const owner = Number(m[2]);
+        if (owner === process.pid) continue;              // ours, handled above
+        try { process.kill(owner, 0); continue; }          // still running: leave it
+        catch (e) { if (e.code === "EPERM") continue; }    // exists, not ours to judge
+        rmSync(join(folder, f), { force: true });
+      }
+    } catch { /* reaping is housekeeping and must never fail a backup */ }
+  }
   try {
     // Quoted and escaped: a path is data here, not syntax.
     db.exec(`VACUUM INTO '${temp.replace(/'/g, "''")}'`);

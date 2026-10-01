@@ -176,3 +176,55 @@ test("a snapshot in a shared folder that can't be read still counts for the back
   db.close();
   assert.deepEqual(backup.snapshotCandidates(root, "a-b/c"), [join(shared, `${T}.db`)]);
 });
+
+test("a snapshot in a shared folder whose record names no repository counts for the backup audit, not as another's, and isn't restored", () => {
+  const root = tempDir("reeve-bk-root-");
+  const shared = join(root, "a-b-c");
+  mkdirSync(shared, { recursive: true });
+  // The file opens; only the record that would say whose it is can't be read.
+  const db = open(join(tempDir("reeve-bk-"), "s.db"));
+  db.prepare("INSERT INTO decision(digest,pr,head,record,first_at,last_at,first_seq,last_seq) VALUES(?,?,?,?,?,?,?,?)")
+    .run(`x#1@${HEAD}`, 1, HEAD, JSON.stringify({ subject: { pr: 1, head: HEAD } }), T, T, 1, 1);
+  db.exec(`VACUUM INTO '${join(shared, `${T}.db`)}'`);
+  db.close();
+  const path = join(shared, `${T}.db`);
+  assert.equal(backup.snapshotIsOf(path, "a-b/c").other, undefined, "not another's: whose it is can't be told");
+  assert.deepEqual(backup.snapshotCandidates(root, "a-b/c"), [path]);
+  assert.equal(backup.latestSnapshot(root, "a-b/c"), null);
+});
+
+test("a snapshot of the repository spelled in other letters' case is refused, saying how its records spell it, as reeve keeps each spelling's store apart", () => {
+  const root = tempDir("reeve-bk-root-");
+  const db = storeOf("A-B/C");
+  const path = String(backup.snapshot(db, root, "A-B/C", T).path);
+  db.close();
+  // Restored as a-b/c, it would land at a-b/c's store, where nothing that keeps A-B/C's reads it.
+  /** @type {any} */ let r;
+  try { r = backup.restore(path, join(tempDir("reeve-bk-state-"), "s.db"), { nwo: "a-b/c", isDaemonRunning: () => null }); } catch (err) { r = { threw: String(err) }; }
+  assert.equal(r.ok, false, "refused under another spelling: " + JSON.stringify(r));
+  assert.match(r.why, /holds decision records of A-B\/C, not a-b\/c: if it's this repository, restore it as A-B\/C, as its records spell it/);
+  // As its records spell it, it restores.
+  assert.equal(backup.restore(path, join(tempDir("reeve-bk-state-"), "s.db"), { nwo: "A-B/C", isDaemonRunning: () => null }).ok, true);
+  // Control: another repository's says nothing of spelling.
+  const theirs = backup.snapshotIsOf(path, "a/b-c");
+  assert.equal(theirs.other, true);
+  assert.doesNotMatch(String(theirs.why), /restore it as/);
+});
+
+test("a backup's abandoned temporary left in a shared folder before is reaped, and the snapshots kept there aren't", () => {
+  const root = tempDir("reeve-bk-root-");
+  const shared = join(root, "o-r");
+  mkdirSync(shared, { recursive: true });
+  // A process that has ended: its temporary is abandoned.
+  const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+  const abandoned = join(shared, `.${T}.${dead}.tmp`);
+  writeFileSync(abandoned, "a partial copy");
+  const kept = storeOf("o/r");
+  kept.exec(`VACUUM INTO '${join(shared, `${T}.db`)}'`);
+  kept.close();
+  const db = storeOf("o/r");
+  backup.snapshot(db, root, "o/r", T + 10);
+  db.close();
+  assert.equal(existsSync(abandoned), false, "reaped");
+  assert.equal(existsSync(join(shared, `${T}.db`)), true, "the snapshot kept there stays");
+});

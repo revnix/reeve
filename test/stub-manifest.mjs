@@ -17264,8 +17264,8 @@ export const STUBS = [
     test: "test/store-paths-apart.test.mjs",
     expectRed: "each store is backed up as the repository its path names, the names a path codes read back",
     edits: [{ file: "src/backup.mjs",
-              find: "      out.push({ nwo: storeRepo(o.name, f), path: join(root, o.name, f), kind: \"repo\" });",
-              replace: "      out.push({ nwo: `${o.name}/${f.slice(0, -3)}`, path: join(root, o.name, f), kind: \"repo\" }); void storeRepo;" }],
+              find: "      out.push({ nwo: storeRepo(o.name, f), path: join(root, o.name, f), kind: \"repo\", ...(ambiguous ? { ambiguous: true } : {}) });",
+              replace: "      out.push({ nwo: `${o.name}/${f.slice(0, -3)}`, path: join(root, o.name, f), kind: \"repo\", ...(ambiguous ? { ambiguous: true } : {}) }); void storeRepo;" }],
   },
   {
     name: "paths-lookup-refuses-earlier",

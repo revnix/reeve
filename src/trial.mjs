@@ -17,6 +17,7 @@ import { basename, dirname, join } from "node:path";
 import { netTimeoutMs, netFailure } from "./net-bound.mjs";
 import { syncFolder } from "./signing.mjs";
 import { TICK_STARTED, TICK_STOPPED } from "./status.mjs";
+import { sameCode } from "./decisions.mjs";
 
 /** A gap between ticks longer than this is downtime, as #158 says. */
 export const GAP_SECONDS = 15 * 60;
@@ -341,6 +342,34 @@ export function trialGate(report, { since }) {
   if (report.passed) return { ok: true };
   const short = report.conditions.filter((c) => c.met !== true).map((c) => `${c.name}: ${c.detail}`);
   return { ok: false, why: `the shadow trial from ${when(since)} hasn't passed: ${short.join("; ")}` };
+}
+
+/**
+ * Whether every judgment the shadow trial saw, from `since` to `until`, was made
+ * by `code` under `policy`, the code and policy about to enforce (#166): a trial
+ * vouches only for what it watched, so a deploy or a policy changed since begins
+ * it again. One whose code or policy can't be told is no proof it's the same.
+ * `{ ok }`, or why not, with when the last judgment made otherwise was: the
+ * trial would begin again after it.
+ * @param {any} db @param {{ since: number, until: number, code: any, policy: string | null }} o
+ * @returns {{ ok: true } | { ok: false, why: string, after: number }}
+ */
+export function trialRanOn(db, { since, until, code, policy }) {
+  const rows = /** @type {{ record: string, last_at: number }[]} */ (db.prepare(
+    "SELECT record, last_at FROM decision WHERE last_at >= ? AND first_at <= ? ORDER BY last_at").all(since, until));
+  let other = 0, untold = 0, after = 0;
+  for (const row of rows) {
+    /** @type {any} */ let record = null;
+    try { record = JSON.parse(row.record); } catch { /* untold, below */ }
+    const same = record ? sameCode(record.code, code) : null;
+    if (same === true && policy != null && record.policy === policy) continue;
+    if (same === null || policy == null || record?.policy == null) untold++; else other++;
+    after = Math.max(after, Number(row.last_at));
+  }
+  if (!other && !untold) return { ok: true };
+  const said = [other ? `${other} judgment(s) made by other code or under another policy than this reeve would enforce with` : "",
+                untold ? `${untold} judgment(s) whose code or policy can't be told` : ""].filter(Boolean).join(", and ");
+  return { ok: false, after, why: `the shadow trial from ${when(since)} saw ${said}` };
 }
 
 /**

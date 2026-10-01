@@ -144,3 +144,42 @@ test("the shadow trial's report runs to when the store's lock is held, so a call
   assert.equal(r.status, 1, r.stdout + r.stderr);
   assert.match(r.stderr, /no false call on audit: 1 call\(s\) on 1 pull request\(s\) to audit/, "the call is in the trial: " + r.stderr.slice(-800));
 });
+
+test("the shadow trial counts toward enforcing only where every judgment it saw was made by the code and under the policy about to enforce", () => {
+  assert.equal(typeof T.trialRanOn, "function", "src/trial.mjs has no trialRanOn");
+  const db = open(join(tempDir("reeve-trial-ran-on-"), "s.db"));
+  const code = { commit: "c".repeat(40), tree: "t".repeat(40), dirty: false };
+  const judged = (/** @type {number} */ at, /** @type {any} */ over = {}) => db.prepare(
+    "INSERT INTO decision(digest,pr,head,record,first_at,last_at,first_seq,last_seq) VALUES(?,?,?,?,?,?,?,?)")
+    .run(`d${at}`, 1, "a".repeat(40), JSON.stringify({ subject: { repo: "acme/widget", pr: 1, head: "a".repeat(40) }, code, policy: "p1", ...over }), at, at, at, at);
+  judged(SINCE + 100); judged(SINCE + 200);
+  assert.deepEqual(T.trialRanOn(db, { since: SINCE, until: SINCE + 1000, code, policy: "p1" }), { ok: true });
+  // Before the trial began: not the trial's.
+  judged(SINCE - 100, { code: { ...code, commit: "o".repeat(40) } });
+  assert.deepEqual(T.trialRanOn(db, { since: SINCE, until: SINCE + 1000, code, policy: "p1" }), { ok: true });
+  // Other code within it, and another policy after that.
+  judged(SINCE + 300, { code: { ...code, commit: "o".repeat(40) } });
+  judged(SINCE + 400, { policy: "p0" });
+  const other = T.trialRanOn(db, { since: SINCE, until: SINCE + 1000, code, policy: "p1" });
+  assert.equal(other.ok, false);
+  assert.equal(other.after, SINCE + 400, "the trial would begin again after the last judgment made otherwise");
+  assert.match(other.why, /2 judgment\(s\) made by other code or under another policy/);
+  // Code that can't be told is no proof it's the same.
+  const unreadable = T.trialRanOn(db, { since: SINCE, until: SINCE + 1000, code: { commit: null }, policy: "p1" });
+  assert.equal(unreadable.ok, false);
+  assert.match(unreadable.why, /can't be told/);
+  db.close();
+});
+
+test("reeve run --enforce refuses a trial made by other code than it runs, saying when the trial would begin again", () => {
+  const r = runEnforcing(["--trial-since", "2026-09-30T09:14Z"], (_home, db) => {
+    const s = open(db);
+    s.prepare("INSERT INTO decision(digest,pr,head,record,first_at,last_at,first_seq,last_seq) VALUES(?,?,?,?,?,?,?,?)")
+      .run("d1", 1, "a".repeat(40), JSON.stringify({ subject: { repo: "acme/widget", pr: 1, head: "a".repeat(40) },
+        code: { commit: "o".repeat(40), tree: "t".repeat(40), dirty: false }, policy: "p0" }), SINCE + 600, SINCE + 600, 1, 1);
+    s.close();
+  });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stderr, /the shadow trial from 2026-09-30 09:14Z saw 1 judgment\(s\) made by other code or under another policy than this reeve would enforce with/);
+  assert.match(r.stderr, /run the trial again on this code and policy, from after 2026-09-30 09:24Z/);
+});

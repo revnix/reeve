@@ -2597,10 +2597,12 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     // --db (#166). Then every reason to refuse, at once.
     if (enforcing) {
       const { e, base, sinceAt, trialSince, seeded } = enforcing;
-      const { trialReport, trialGate, mergedSince, readAudits, storeIsOf } = await import("../src/trial.mjs");
+      const { trialReport, trialGate, trialRanOn, mergedSince, readAudits, storeIsOf } = await import("../src/trial.mjs");
+      const { runningCode } = await import("../src/daemon.mjs");
+      const { policyHashFor } = await import("../src/decisions.mjs");
       const kept = readAudits(auditDirFor(HOME, nwo), nwo, { notes: auditNotesFor(HOME, nwo) });
       const trialDb = open(dbPath);
-      let report = null, bound;
+      let report = null, bound, ranOn = null;
       try {
         bound = storeIsOf(trialDb, nwo, { named: opt("db") != null });
         // The trial runs to now, taken with the lock held, or to the store's
@@ -2608,15 +2610,20 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
         // store recorded before it let go is left out of it.
         const newest = Number(/** @type {any} */ (trialDb.prepare("SELECT MAX(at) AS at FROM event").get())?.at) || 0;
         const nowAt = Math.max(Math.floor(Date.now() / 1000), newest);
-        if (bound.ok)
+        if (bound.ok) {
           report = trialReport(trialDb, { repo: nwo, since: sinceAt, now: nowAt, merged: mergedSince(nwo, sinceAt, { until: nowAt }), seeded,
                                           audits: kept.ok ? kept.audits : { why: kept.why } });
+          // And made by the code and under the policy this reeve would enforce
+          // with: a trial vouches only for what it watched.
+          ranOn = trialRanOn(trialDb, { since: sinceAt, until: nowAt, code: runningCode(), policy: policyHashFor(profile, nwo) });
+        }
       } finally { trialDb.close(); }
       const passed = report ? trialGate(report, { since: sinceAt }) : null;
       const refusals = [
         ...(e.state === "enforced" ? [] : [`${e.why}. To enforce, ${e.fix ?? `make ${base} enforce what reeve publishes`}`]),
         ...(bound.ok ? [] : [`${dbPath} isn't ${nwo}'s to read its shadow trial from: ${bound.why}`]),
         ...(passed && "why" in passed ? [`${passed.why}. To enforce, run the trial until it passes: reeve trial ${nwo} --since ${trialSince} --seeded says what's short`] : []),
+        ...(ranOn && "why" in ranOn ? [`${ranOn.why}. To enforce, run the trial again on this code and policy, from after ${new Date(ranOn.after * 1000).toISOString().replace(/:\d\d\.\d+Z$/, "Z").replace("T", " ")}`] : []),
       ];
       if (refusals.length) {
         console.error(`reeve ${cmd}: --enforce refused: ${refusals.join(". And ")}. Then run this again; until then, run without --enforce, in shadow mode`);

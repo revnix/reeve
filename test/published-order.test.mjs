@@ -981,7 +981,9 @@ test("evidence committing over every entry of each order reads back as written, 
 
 test("a copy whose entry before an order's top was swapped for one the host signed, its top as published, is caught by the commitment over every entry", async () => {
   const dir = credentials();
-  const { path, published } = await ticks([at(A), at(A, "RED"), at(B), at(B, "RED")], host(dir));
+  // Entry 2 is made while #42 is at B, where each result published since writes over the last: none left
+  // published commits to entry 2 as its order's top, so only a commitment over every entry covers it.
+  const { path, published } = await ticks([at(A), at(B), at(B, "RED"), at(B)], host(dir));
   const db = open(path);
   const two = JSON.parse(db.prepare("SELECT payload FROM event WHERE op = 'decision.latest' AND subject = ? AND json_extract(payload, '$.n') = 2").get(`pr:${PR}`).payload);
   const top = db.prepare("SELECT MAX(json_extract(payload, '$.n')) AS n FROM event WHERE op = 'decision.latest' AND subject = ?").get(`pr:${PR}`).n;

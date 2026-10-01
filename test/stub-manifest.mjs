@@ -14763,15 +14763,6 @@ export const STUBS = [
               replace: "    if (false) {" }],
   },
   {
-    name: "order-pending-sealed",
-    why: "leave an order whose entry at the host's top isn't the one sealed to its next judging",
-    test: "test/anchor-pins.test.mjs",
-    expectRed: "a copy of the store whose entry at the host's top names that record and others isn't current, and isn't extended",
-    edits: [{ file: "src/daemon.mjs",
-              find: "    for (const [pr, s] of a.sealed) { const o = orders.get(pr); if (!o || !(\"seals\" in o) || o.seals.get(a.latest.get(pr) ?? 0) !== s) prs.add(pr); }\n",
-              replace: "" }],
-  },
-  {
     name: "order-note-seal",
     why: "note an entry on the host's anchor without its seal",
     test: "test/anchor-pins.test.mjs",

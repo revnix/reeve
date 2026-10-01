@@ -1939,7 +1939,8 @@ async function tickOnce(ctx) {
     // reported every tick, though its pull request is never judged again.
     for (const pr of a.reserved.keys()) prs.add(pr);
     for (const [pr, d] of a.named) { const o = orders.get(pr); if (!o || !("entries" in o) || o.entries.get(a.latest.get(pr) ?? 0) !== d) prs.add(pr); }
-    for (const [pr, s] of a.sealed) { const o = orders.get(pr); if (!o || !("seals" in o) || o.seals.get(a.latest.get(pr) ?? 0) !== s) prs.add(pr); }
+    // The chain to the noted top covers its seal too (#303), and an anchor
+    // holding a seal without a chain is noted again below.
     for (const [pr, c] of a.chained) { const o = orders.get(pr); if (!o || !("seals" in o) || orderChain(o.seals, a.latest.get(pr) ?? 0) !== c) prs.add(pr); }
     // And each the anchor holds an entry of without its record, seal or chain,
     // as an anchor written before #279, or #303, does: noted again, from its

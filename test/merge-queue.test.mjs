@@ -430,3 +430,17 @@ test("an enforcing PASS at the head that a shadow publication couldn't supersede
   await run({ evaluate: evaluated, publish, withdraw, dbPath: enforcedBefore(HEAD, { queue: false }) });
   assert.ok(withdrawn.some(a => a.pr === 42 && a.head === HEAD && a.name === "merge-policy"), JSON.stringify(withdrawn));
 });
+
+test("enforcing, a queue commit on a base where nothing requires reeve's check gets its verdict in shadow, as its pull request's head does", async () => {
+  const published = [];
+  const publish = async ({ verdict, shadow }) => { published.push([verdict.head, shadow]); return { ok: true, id: published.length }; };
+  const measured = (e) => async () => e;
+  await run({ evaluate: evaluated, readQueue: queued(), evaluateQueue: judged, publish, shadow: false,
+              enforcement: measured({ state: "advisory", why: "main doesn't require merge-policy from reeve's App", fix: "x", required: false }) });
+  assert.deepEqual(published, [[HEAD, true], [QUEUED, true]], "nothing there requires reeve's check, so neither goes out enforcing");
+  // Control: where a rule requires it, both go out enforcing.
+  published.length = 0;
+  await run({ evaluate: evaluated, readQueue: queued(), evaluateQueue: judged, publish, shadow: false,
+              enforcement: measured({ state: "enforced", why: "", fix: null, required: true }) });
+  assert.deepEqual(published, [[HEAD, false], [QUEUED, false]]);
+});

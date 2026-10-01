@@ -183,8 +183,10 @@ const publish = (gh, over = {}) => publishVerdict({ nwo: NWO, verdict, shadow: t
   const gh = github({ rules: FORBIDDEN, branch: FORBIDDEN });
   const r = await publishVerdict({ nwo: NWO, verdict, shadow: false, context: CONTEXT, base: "main-enforce", auth: gh.auth, api: gh.api });
   const post = gh.writes.find((w) => w.verb === "POST");
-  check(post?.name === CONTEXT && post.conclusion === "failure" && !r.held && !gh.reads.some((x) => x.path.includes("/rules/")),
-    "control: enforcing, the real conclusion is published under the policy's name, and no rule is read", JSON.stringify(gh.writes));
+  // The rules are read enforcing too, to say whether the base enforces it (#166),
+  // and nothing is held for them.
+  check(post?.name === CONTEXT && post.conclusion === "failure" && !r.held && r.enforcement?.state === "unknown",
+    "control: enforcing, the real conclusion is published under the policy's name, nothing is held, and the base's rules unread leave its enforcement unknown", JSON.stringify(gh.writes));
 }
 
 // ── whether the enforcement check is required, and whose it is ───────────────

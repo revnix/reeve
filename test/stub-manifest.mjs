@@ -18272,7 +18272,7 @@ export const STUBS = [
     test: "test/enforce-after-trial.test.mjs",
     expectRed: "reeve run --enforce needs to be told when the shadow trial began, and refuses a date it can't read",
     edits: [{ file: "bin/reeve",
-              find: "      if (!Number.isFinite(sinceAt) || sinceAt > nowAt) {",
+              find: "      if (!Number.isFinite(sinceAt) || sinceAt > Math.floor(Date.now() / 1000)) {",
               replace: "      if (false) {" }],
   },
   {
@@ -18362,8 +18362,8 @@ export const STUBS = [
     test: "test/enforce-after-trial.test.mjs",
     expectRed: "the shadow trial is read only once the store's lock is held, so a reeve running on it is never written under",
     edits: [{ file: "bin/reeve",
-              find: "      enforcing = { e, base, sinceAt, nowAt, trialSince, seeded };",
-              replace: "      enforcing = { e, base, sinceAt, nowAt, trialSince, seeded }; if (e.state !== \"enforced\") { console.error(`reeve ${cmd}: --enforce refused: ${e.why}`); process.exit(1); }" }],
+              find: "      enforcing = { e, base, sinceAt, trialSince, seeded };",
+              replace: "      enforcing = { e, base, sinceAt, trialSince, seeded }; if (e.state !== \"enforced\") { console.error(`reeve ${cmd}: --enforce refused: ${e.why}`); process.exit(1); }" }],
   },
   {
     name: "help-says-trial-since",

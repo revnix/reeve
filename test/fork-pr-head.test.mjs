@@ -27,7 +27,7 @@ test("a fork's pull request is pinned from refs/pull/<n>/head, and one from a br
   const { asked, run } = lsRemote();
   /** @type {any} */ let got;
   try {
-    got = [reconciler.pinPrHead("o/r", 7, "fix/x", "fork/r", run), reconciler.pinPrHead("o/r", 7, "fix/x", "O/R", run), reconciler.pinPrHead("o/r", 7, "fix/x", "", run)];
+    got = [reconciler.pinPrHead("o/r", 7, "fix/x", "fork/r", "o/r", run), reconciler.pinPrHead("o/r", 7, "fix/x", "O/R", "o/r", run), reconciler.pinPrHead("o/r", 7, "fix/x", "", "o/r", run)];
   } catch (err) { got = { threw: String(err) }; }
   assert.ok(Array.isArray(got), JSON.stringify(got));
   assert.ok(got.every((/** @type {any} */ p) => p.ok && p.sha === SHA), JSON.stringify(got));
@@ -38,19 +38,22 @@ test("a fork's pull request is pinned from refs/pull/<n>/head, and one from a br
 test("a fork's pull request is anchored at the head its refs/pull/<n>/head names, and said to be a fork's", () => {
   const { asked, run } = lsRemote();
   /** @type {string[]} */ const read = [];
-  const meta = (/** @type {string} */ headRepo) => (/** @type {string[]} */ args) => { read.push(args.join(" ")); return { ok: true, out: ["fix/x", "main", "open", "t", "2026-10-01T00:00:00Z", "someone", headRepo].join("\t") }; };
-  const pin = (/** @type {string} */ n, /** @type {number} */ p, /** @type {string} */ h, /** @type {string} */ r) => reconciler.pinPrHead(n, p, h, r, run);
-  /** @type {any} */ let fork, own;
+  const meta = (/** @type {string} */ headRepo, baseRepo = "o/r") => (/** @type {string[]} */ args) => { read.push(args.join(" ")); return { ok: true, out: ["fix/x", "main", "open", "t", "2026-10-01T00:00:00Z", "someone", headRepo, baseRepo].join("\t") }; };
+  const pin = (/** @type {string} */ n, /** @type {number} */ p, /** @type {string} */ h, /** @type {string} */ r, /** @type {string} */ b) => reconciler.pinPrHead(n, p, h, r, b, run);
+  /** @type {any} */ let fork, own, renamed;
   try {
     fork = pr.prAnchor({ nwo: "o/r", pr: 7 }, { read: meta("fork/r"), pin });
     own = pr.prAnchor({ nwo: "o/r", pr: 8 }, { read: meta("o/r"), pin });
-  } catch (err) { fork = own = { threw: String(err) }; }
+    // The repository renamed since reeve was told its name: its own branch is no fork's.
+    renamed = pr.prAnchor({ nwo: "o/r", pr: 9 }, { read: meta("new/name", "new/name"), pin });
+  } catch (err) { fork = own = renamed = { threw: String(err) }; }
   assert.equal(fork.ok, true, JSON.stringify(fork));
   assert.equal(fork.head, SHA);
   assert.equal(fork.fork, true);
   assert.equal(own.fork, false);
-  assert.deepEqual(asked, ["refs/pull/7/head", "refs/heads/fix/x"]);
-  assert.match(read[0], /\.head\.repo\.full_name/, "whose repository the head is in is read with the pull request");
+  assert.equal(renamed.fork, false, JSON.stringify(renamed));
+  assert.deepEqual(asked, ["refs/pull/7/head", "refs/heads/fix/x", "refs/heads/fix/x"]);
+  assert.match(read[0], /\.head\.repo\.full_name[\s\S]*\.base\.repo\.full_name/, "whose repositories the head and the base are is read with the pull request");
 });
 
 test("evaluatePr carries a fork's anchor through, so the tick knows the pull request it judged is a fork's", () => {
@@ -81,7 +84,7 @@ test("evaluatePr carries a fork's anchor through, so the tick knows the pull req
 });
 
 /** A tick whose one pull request, #42, is red on CI and wants a worker to fix it; `fork` where its head is a fork's. */
-async function redTick(/** @type {boolean} */ fork) {
+async function redTick(/** @type {boolean} */ fork, containment = { credentialRead: "closed", why: "test" }) {
   const stateDir = tempDir("rf-");
   const clone = tempDir("rf-clone-");
   execFileSync("git", ["-C", clone, "init", "-q"]);
@@ -92,7 +95,7 @@ async function redTick(/** @type {boolean} */ fork) {
     rounds: { n: 1, softCap: 5, hardCap: 10, unspilledCritical: 0 },
     checks: { verdict: "RED", caused: ["CI Gate"], failing: [{ name: "CI Gate", id: "99" }] },
     reviewers: [], threads: {}, settled: { settled: true } };
-  let prepared = 0;
+  let prepared = 0, canaries = 0;
   mkdirSync(stateDir, { recursive: true });
   const ctx = {
     ...OFFLINE_READS,
@@ -102,18 +105,19 @@ async function redTick(/** @type {boolean} */ fork) {
                ci: { provider: "github-actions", requiredChecks: [] }, watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 } },
     execute: true, shadow: true, running: 0,
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
-    containment: { credentialRead: "closed", why: "test" }, keychain: { measured: true, items: [], why: null },
+    containment, keychain: { measured: true, items: [], why: null },
     claudeBin: "/bin/sh", cliVersion: "test",
     openPrs: () => [42], evaluate: () => evaluation, publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
     resolveCause: () => ({ ok: true, job: "CI Gate", step: "Test", cause: [{ where: "src/x.ts:1", message: "boom" }] }),
     observe: () => ({ ok: false, observations: [], incomplete: true, threads: { readable: false, total: null, unresolved: 0, seen: 0 } }),
     oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    canary: async () => { canaries++; return { ok: true, id: "t", why: null, evidence: {} }; },
     prepareCheckout: () => { prepared++; return { ok: false, path: null, why: "this test prepares none" }; },
     spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s1" }),
   };
   await daemon.tick(ctx);
   ctx.db.close();
-  return { prepared, logged: readFileSync(ctx.logPath, "utf8") };
+  return { prepared, canaries, logged: readFileSync(ctx.logPath, "utf8") };
 }
 
 test("a fork's pull request is never handed to a worker, as its fix couldn't be pushed to the fork, and the log says why", async () => {
@@ -122,4 +126,52 @@ test("a fork's pull request is never handed to a worker, as its fix couldn't be 
   assert.match(fork.logged, /#42: NOT dispatching FIX_CI — its head is a fork's branch, which reeve can't push to/, fork.logged.slice(-1500));
   const own = await redTick(false);
   assert.equal(own.prepared, 1, `control: one from a branch of the base repository is: ${own.logged.slice(-800)}`);
+});
+
+test("a fork's repair asks for no worker's containment, so an open one doesn't stand in for the fork's reason, and no canary runs for it", async () => {
+  const open = { credentialRead: "open", why: "a worker could read a credential, in this test" };
+  const fork = await redTick(true, open);
+  assert.match(fork.logged, /#42: NOT dispatching FIX_CI — its head is a fork's branch/, fork.logged.slice(-1500));
+  assert.doesNotMatch(fork.logged, /a worker could read a credential, in this test/, "the worker gate spoke for a fork's pull request");
+  assert.equal(fork.canaries, 0);
+  const own = await redTick(false, open);
+  assert.match(own.logged, /a worker could read a credential, in this test/, `control: one from the base repository meets the gate: ${own.logged.slice(-800)}`);
+});
+
+test("a fork's pull request is skipped by the dispatch, though another wants a worker the same tick", async () => {
+  const stateDir = tempDir("rf2-");
+  const clone = tempDir("rf2-clone-");
+  execFileSync("git", ["-C", clone, "init", "-q"]);
+  const cl = (/** @type {string} */ id, /** @type {string} */ state, detail = "") => ({ id, state, detail });
+  const red = (/** @type {number} */ n, /** @type {boolean} */ fork) => ({ ok: true, pr: n, state: "open", head: String(n % 10).repeat(40), title: "t", headRef: `f${n}`, baseRef: "main", fork,
+    verdict: { state: "BLOCK", summary: "ci is red",
+               clauses: ["ci", "base", "review", "rounds", "threads", "findings", "mergeable"].map((id) => (id === "ci" ? cl("ci", "BLOCK", "failing: CI Gate") : cl(id, "PASS"))) },
+    rounds: { n: 1, softCap: 5, hardCap: 10, unspilledCritical: 0 },
+    checks: { verdict: "RED", caused: ["CI Gate"], failing: [{ name: "CI Gate", id: "99" }] },
+    reviewers: [], threads: {}, settled: { settled: true } });
+  /** @type {number[]} */ const prepared = [];
+  mkdirSync(stateDir, { recursive: true });
+  const ctx = {
+    ...OFFLINE_READS,
+    nwo: "o/r", db: open(join(stateDir, "e.db")), logPath: join(stateDir, "reeve.log"), dbPath: join(stateDir, "e.db"),
+    profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: tempDir("rf2-root-"), checkout: clone },
+               authority: { policy: "propose_and_merge" }, rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+               ci: { provider: "github-actions", requiredChecks: [] }, watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 } },
+    execute: true, shadow: true, running: 0,
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    containment: { credentialRead: "closed", why: "test" }, keychain: { measured: true, items: [], why: null },
+    claudeBin: "/bin/sh", cliVersion: "test",
+    openPrs: () => [41, 42], evaluate: (/** @type {any} */ a) => red(a.pr, a.pr === 42), publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    resolveCause: () => ({ ok: true, job: "CI Gate", step: "Test", cause: [{ where: "src/x.ts:1", message: "boom" }] }),
+    observe: () => ({ ok: false, observations: [], incomplete: true, threads: { readable: false, total: null, unresolved: 0, seen: 0 } }),
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    prepareCheckout: (/** @type {any} */ a) => { prepared.push(a.pr); return { ok: false, path: null, why: "this test prepares none" }; },
+    spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s1" }),
+  };
+  await daemon.tick(ctx);
+  ctx.db.close();
+  const logged = readFileSync(ctx.logPath, "utf8");
+  assert.ok(prepared.includes(41), `control: the base repository's pull request is prepared for: ${logged.slice(-800)}`);
+  assert.ok(!prepared.includes(42), "the fork's was prepared for too");
+  assert.match(logged, /#42: NOT dispatching FIX_CI — its head is a fork's branch/);
 });

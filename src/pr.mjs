@@ -725,17 +725,20 @@ export function prAnchor({ nwo, pr }, { read = ghJson, pin: pinIt = pinPrHead } 
   // It is GitHub's timestamp, so a change reeve has not seen yet still triggers a
   // read -- unlike a local clock, which would skip whatever it slept through.
   // `.user.login` rides along for the builder classification below, and the
-  // head's repository for a fork's (#320). Appended rather than inserted: the
-  // destructuring below is positional, so a new field in the middle silently
-  // shifts every one after it.
-  const meta = read([`repos/${nwo}/pulls/${pr}`, "--jq", "[.head.ref,.base.ref,.state,.title,.updated_at,.user.login,(.head.repo.full_name // \"\")]|@tsv"]);
+  // head's repository and the base's for a fork's (#320): told against the
+  // base's own name, as GitHub gives it now, so a repository renamed since
+  // reeve was told its name doesn't make every pull request a fork's.
+  // Appended rather than inserted: the destructuring below is positional, so a
+  // new field in the middle silently shifts every one after it.
+  const meta = read([`repos/${nwo}/pulls/${pr}`, "--jq", "[.head.ref,.base.ref,.state,.title,.updated_at,.user.login,(.head.repo.full_name // \"\"),(.base.repo.full_name // \"\")]|@tsv"]);
   if (!meta.ok) return { ok: false, why: meta.err.split("\n")[0] };
-  const [headRef, baseRef, state, title, updatedAt, authorLogin, headRepo] = meta.out.split("\t");
+  const [headRef, baseRef, state, title, updatedAt, authorLogin, headRepo, baseRepo] = meta.out.split("\t");
+  const base = baseRepo || nwo;
 
-  const pin = pinIt(nwo, pr, headRef, headRepo);
+  const pin = pinIt(nwo, pr, headRef, headRepo, base);
   if (!pin.ok) return { ok: false, why: `could not pin head: ${pin.why}` };
   return { ok: true, headRef, baseRef, state, title, updatedAt, head: pin.sha, pin,
-           authorLogin, fork: isFork(nwo, headRepo) };
+           authorLogin, fork: isFork(base, headRepo) };
 }
 
 /**

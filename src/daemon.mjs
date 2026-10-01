@@ -3459,8 +3459,16 @@ async function tickOnce(ctx) {
   // A REQUEST_REVIEW reeve performs itself is not a worker task, so it must not
   // count towards the worker gates -- otherwise an open containment blocks a
   // comment that no worker was ever going to post.
-  const wanted = decisions.filter(d => WORKER_ACTIONS.includes(d.decision.action)
-                                    && !(d.decision.action === "REQUEST_REVIEW" && execute && reviewActionsOn(profile)));
+  // Nor does a fork's pull request (#320): its branch is in the fork, which
+  // reeve can't push to, so a worker's fix could never be published there. It
+  // asks for no containment or canary, and is said here, whatever those say.
+  const forWorker = (/** @type {any} */ d) => WORKER_ACTIONS.includes(d.decision.action)
+                                               && !(d.decision.action === "REQUEST_REVIEW" && execute && reviewActionsOn(profile));
+  const wanted = decisions.filter(d => forWorker(d) && !d.e.fork);
+  if (execute) for (const d of decisions.filter(x => forWorker(x) && x.e.fork)) {
+    log(logPath, `  #${d.e.pr}: NOT dispatching ${d.decision.action} — its head is a fork's branch, which reeve can't push to`);
+    raise(`#${d.e.pr}: ${d.decision.action.toLowerCase().replace("_", " ")} is for its author: its head is a fork's branch, which reeve can't push to`);
+  }
 
   // Whether this tick will ask for a canary lease at all. Declared ONCE and read
   // by both the queued sweep below and the canary block further down: two
@@ -3794,13 +3802,8 @@ async function tickOnce(ctx) {
         raise(`#${e.pr}: ${decision.action.toLowerCase().replace("_", " ")} needs a GitHub effect reeve does not yet perform`);
         continue;
       }
-      // A fork's pull request (#320): its branch is in the fork, which reeve
-      // can't push to, so a worker's fix could never be published there.
-      if (e.fork && WORKER_ACTIONS.includes(decision.action)) {
-        log(logPath, `  #${e.pr}: NOT dispatching ${decision.action} — its head is a fork's branch, which reeve can't push to`);
-        raise(`#${e.pr}: ${decision.action.toLowerCase().replace("_", " ")} is for its author: its head is a fork's branch, which reeve can't push to`);
-        continue;
-      }
+      // A fork's pull request, said before the worker gates (#320).
+      if (e.fork) continue;
       const prepKey = e.pr;
       const backoff = PREP_BACKOFF.get(prepKey);
       if (backoff && backoff.until > Date.now() && WORKER_ACTIONS.includes(decision.action)) {

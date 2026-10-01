@@ -85,12 +85,13 @@ export const isFork = (nwo, headRepo) => String(headRepo ?? "").toLowerCase() !=
  * A pull request's head, pinned as `pinHead` pins it (#320): its branch in the
  * base repository, or, where its head is a fork's, whose branch the base
  * repository doesn't hold, `refs/pull/<n>/head`, which GitHub keeps there for
- * every pull request.
+ * every pull request. Told against `base`, the base repository's name as
+ * GitHub gives it with the pull request, where it's known.
  * @param {string} nwo @param {number | string} pr @param {string} headRef @param {string | null | undefined} headRepo
- * @param {typeof sh} [run]
+ * @param {string} [base] @param {typeof sh} [run]
  */
-export function pinPrHead(nwo, pr, headRef, headRepo, run = sh) {
-  return pinRef(nwo, isFork(nwo, headRepo) ? `refs/pull/${pr}/head` : `refs/heads/${headRef}`, run);
+export function pinPrHead(nwo, pr, headRef, headRepo, base = nwo, run = sh) {
+  return pinRef(nwo, isFork(base, headRepo) ? `refs/pull/${pr}/head` : `refs/heads/${headRef}`, run);
 }
 
 /**

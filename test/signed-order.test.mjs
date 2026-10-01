@@ -60,7 +60,7 @@ const anchorOf = (dir) => { try { return { anchor: readAnchor(dir, REPO), why: n
 /** The same, checked against the store it's read beside, as bin/reeve gives it. */
 const anchorFor = (db, dir) => anchorForStore(db, anchorOf(dir), REPO);
 /** An anchor as read, with the parts #279 and #281 added empty unless given. */
-const anchorAs = (a) => ({ named: new Map(), sealed: new Map(), reserved: new Map(), pinned: new Map(), pending: null, ...a });
+const anchorAs = (a) => ({ named: new Map(), sealed: new Map(), chained: new Map(), reserved: new Map(), pinned: new Map(), pending: null, ...a });
 /** What the host's reeve is given, but no entry can be reserved on its anchor: a tick keeps its records, pinned, and orders none, as one that stopped first would. */
 const unordered = (dir) => ({ ...host(dir), anchor: { ...fileAnchor(dir), reserve: () => false } });
 /** The digests of #42's records, oldest first. */
@@ -139,7 +139,7 @@ test("the host's anchor is written whole, its folder and every folder made for i
   assert.equal(anchor.note(REPO, 7, 1), true, "control: it was written");
   const file = anchorPath(dir, REPO);
   for (const d of [dirname(file), dirname(dirname(file)), dir]) assert.ok(seen.includes(d), `${d} synced: ${JSON.stringify(seen)}`);
-  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { began: true, latest: { 7: 1 }, store: null, named: {}, sealed: {}, reserved: {}, pinned: {}, pending: null });
+  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { began: true, latest: { 7: 1 }, store: null, named: {}, sealed: {}, chained: {}, reserved: {}, pinned: {}, pending: null });
   // And by a writer that made none of them, as a reeve after a restart is: a
   // sync that failed before it started is made again.
   const again = [];

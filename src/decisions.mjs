@@ -12,7 +12,7 @@ import { joinEvidence, asJson, policyOf } from "./evidence.mjs";
 import { createHash } from "node:crypto";
 import { canonical } from "./db/ops.mjs";
 import { latestDecision, decisionsFor, decisionOf, evidenceBy, policyRecord, storeIdentity, BASELINE_OP, LATEST_OP, FILED } from "./db/records.mjs";
-import { checkSignature, checkEnvelope, baselineStatement, baselineFingerprint, latestStatement, entrySeal } from "./signing.mjs";
+import { checkSignature, checkEnvelope, baselineStatement, baselineFingerprint, latestStatement, entrySeal, orderChain } from "./signing.mjs";
 import { reservedSeal } from "./anchor.mjs";
 
 /** @typedef {import("node:sqlite").DatabaseSync} Db */
@@ -283,13 +283,18 @@ function anchoredFaults(order, pr, anchor, held, repo) {
   if (!a) return [];
   /** @type {string[]} */ const out = [];
   const anchored = a.latest.get(pr) ?? 0;
-  const noted = a.named?.get(pr), sealed = a.sealed?.get(pr);
+  const noted = a.named?.get(pr), sealed = a.sealed?.get(pr), chained = a.chained?.get(pr);
   const another = "a copy of this store signed another entry under that number";
   if (anchored && noted && order.top >= anchored && order.entries.get(anchored) !== noted)
     out.push(`entry ${anchored} of its signed order names record ${short(String(order.entries.get(anchored)))}, though this host noted record ${short(noted)} there: ` +
              "a copy of this store signed another record under that number");
   else if (anchored && sealed && order.top >= anchored && order.seals.get(anchored) !== sealed)
     out.push(`entry ${anchored} of its signed order names record ${short(String(order.entries.get(anchored)))}, as this host noted, but isn't the entry this host noted there: ${another}`);
+  // Entries name none before them, so an earlier one swapped for a variant the
+  // host's key signed passes beneath a top as noted (#303): the chain over
+  // every entry to the top says so.
+  else if (anchored && chained && order.top >= anchored && orderChain(order.seals, anchored) !== chained)
+    out.push(`its signed order to entry ${anchored} isn't the one this host noted, though entry ${anchored} is: an entry before it was swapped for another, as a copy of this store signed`);
   const r = a.reserved?.get(pr);
   if (r && order.top >= r.n && order.entries.get(r.n) !== r.digest)
     out.push(`entry ${r.n} of its signed order names record ${short(String(order.entries.get(r.n)))}, though this host reserved it for record ${short(r.digest)}: ` +

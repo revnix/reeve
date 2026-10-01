@@ -60,6 +60,7 @@ import { BASELINE_OP, LATEST_OP, STORE_ID_OP, FILED, latestDecision, storeIdenti
 import { signedOrder, strayEntry, baselineLost, otherRepository, signingState, holdsWhole, ordersCommitment, lastEntrySeq } from "./decisions.mjs";
 import { noAnchor, reservedSeal } from "./anchor.mjs";
 
+import { gh as runGh, takeCalls } from "./github/calls.mjs";
 /** The worker actions whose result is pushed to the pull request's head branch, which a fork's isn't reeve's to push to (#320). */
 const FIX_ACTIONS = Object.freeze(["FIX_CI", "FIX_FINDINGS"]);
 
@@ -771,7 +772,7 @@ export function log(logPath, line) {
 /** A pull request's state, "OPEN", "CLOSED" or "MERGED", or null when it can't be read. */
 export function prStateOf(nwo, pr) {
   try {
-    return execFileSync("gh", ["pr", "view", String(pr), "--repo", nwo,
+    return runGh(["pr", "view", String(pr), "--repo", nwo,
       "--json", "state", "--jq", ".state"], { encoding: "utf8", timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim() || null;
   } catch { return null; }
 }
@@ -843,7 +844,7 @@ export function finishedSubjects(db, nwo, open, io = {}) {
 
 export function openPrs(nwo, limit = 20) {   // bounded; the caller LOGS when the bound bites
   try {
-    const out = execFileSync("gh", ["pr", "list", "--repo", nwo, "--state", "open",
+    const out = runGh(["pr", "list", "--repo", nwo, "--state", "open",
       "--limit", String(limit), "--json", "number", "--jq", ".[].number"], { encoding: "utf8", timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim();
     return out ? out.split("\n").map(Number) : [];
   } catch { return null; }   // null means "could not ask", which is not "none"
@@ -1428,6 +1429,8 @@ async function tickOnce(ctx) {
   // Recorded as it starts, and again as it ends: the time between is running,
   // however long the tick takes (#297).
   noteTickStart(db);
+  // The GitHub calls counted from here are this tick's (#168).
+  takeCalls();
   // Enforcing, a base where no rule requires reeve's check gets its results in
   // shadow (#166): enforcing there would say it gates what it can't. Where a
   // rule requires it, its results go out enforcing, though someone can bypass
@@ -4875,6 +4878,15 @@ async function tickOnce(ctx) {
   if (ctx.reviewIngest !== false) {
     try { (ctx.deriveSupply ?? deriveSupply)(db, nwo, profile, { at: now() }); }
     catch (err) { log(logPath, `supply derive failed — ${err.message}`); }
+  }
+
+  // The GitHub calls this tick made, in all and per pull request it read
+  // (#168): measured, before they're cut.
+  {
+    const made = takeCalls();
+    const who = Object.entries(made.byWho).sort(([a], [b]) => a.localeCompare(b)).map(([w, n]) => `${w} ${n}`).join(", ");
+    log(logPath, `github: ${made.total} call(s) this tick, ${(prs.length ? made.total / prs.length : 0).toFixed(1)} per pull request` +
+                 (who ? ` (${who})` : ""));
   }
 
   noteTick(db);

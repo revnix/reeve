@@ -29,9 +29,9 @@
 
 import { canonical } from "../db/ops.mjs";
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { netTimeoutMs, netFailure } from "../net-bound.mjs";
 
+import { gh as runGh } from "../github/calls.mjs";
 const THREADS_QUERY = `query($o:String!,$r:String!,$n:Int!,$c:String){
   repository(owner:$o,name:$r){ pullRequest(number:$n){
     reviewThreads(first:100, after:$c){
@@ -49,7 +49,7 @@ const THREADS_QUERY = `query($o:String!,$r:String!,$n:Int!,$c:String){
     } } } }`;
 
 function gh(args) {
-  try { return { ok: true, out: execFileSync("gh", ["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim() }; }
+  try { return { ok: true, out: runGh(["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim() }; }
   catch (e) { return { ok: false, out: "", err: netFailure(e) }; }
 }
 

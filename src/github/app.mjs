@@ -12,11 +12,11 @@
 
 import { createSign } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
-import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { resolveHome } from "../home.mjs";
 import { netTimeoutMs } from "../net-bound.mjs";
 
+import { gh as runGh } from "./calls.mjs";
 // A FUNCTION, not a constant. As a module-level constant this was evaluated
 // at import -- before `bin/reeve` had resolved `--home` -- and it consulted
 // `homedir()` rather than the reeve home at all, so no home setting of any
@@ -138,7 +138,7 @@ export async function mintInstallationToken(jwt, installationId, o = {}) {
  */
 export function apiAsInstallation(token, args, { timeoutMs = 60_000, maxBuffer = 64 * 1024 * 1024 } = {}) {
   try {
-    const out = execFileSync("gh", ["api", ...args], {
+    const out = runGh(["api", ...args], {
       encoding: "utf8",
       env: { ...process.env, GH_TOKEN: token, GITHUB_TOKEN: token },
       stdio: ["ignore", "pipe", "pipe"],
@@ -157,7 +157,7 @@ export function apiAsInstallation(token, args, { timeoutMs = 60_000, maxBuffer =
       // reads a failed read as "not found" acts on the wrong answer.
       timeout: timeoutMs,
       maxBuffer,
-    });
+    }, { who: "app" });
     return { ok: true, out: out.trim() };
   } catch (e) {
     // `code`, and only `code`. Measured on node v24.17.0, both failures set

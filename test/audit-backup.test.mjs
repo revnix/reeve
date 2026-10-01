@@ -102,7 +102,7 @@ test("every store's snapshot carries its repository's audits, and one whose audi
   assert.equal(next?.ok, false, JSON.stringify(next));
   assert.equal(next?.escalate, "builder:backup:failed");
   assert.match(String(next?.why), /its audits couldn't be put in it whole, so it wasn't taken: .*ENOTDIR/);
-  assert.deepEqual(readdirSync(join(root, "o-r")), ["2000.db"], "nothing taken, and the one before kept");
+  assert.deepEqual(readdirSync(join(root, "repos", "o", "r")), ["2000.db"], "nothing taken, and the one before kept");
 });
 
 test("a restore puts back the audits a snapshot holds, as recorded, leaves those recorded since, and refuses where one there isn't the snapshot's", () => {
@@ -345,5 +345,5 @@ test("a snapshot whose audits can't be put in it isn't taken, and leaves nothing
   h.db.close();
   assert.equal(taken.ok, false, JSON.stringify(taken));
   assert.match(String(taken.why), /its audits couldn't be put in it whole, so it wasn't taken: disk full/);
-  assert.deepEqual(readdirSync(join(h.root, "o-r")), [], "no snapshot, and no file of its own left");
+  assert.deepEqual(readdirSync(join(h.root, "repos", "o", "r")), [], "no snapshot, and no file of its own left");
 });

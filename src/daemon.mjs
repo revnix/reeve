@@ -1642,18 +1642,19 @@ async function tickOnce(ctx) {
     if (!ordering || !begun.began || ctx.unnamedPinned) return;
     withOrderLock((held) => {
       if (!held) return;
-      if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
-      if (!orderKeys) return;
+      // Read for itself: the tick's keys are read where its orders are extended.
+      const keys = orderKeys ?? ctx.keys?.() ?? null;
+      if (!keys) return;
       try {
         const a = ctx.anchor.read(nwo) ?? noAnchor();
         const id = storeIdentity(db);
         if (!id || a.store !== id) return;
-        const { baseline } = signingState(db, /** @type {any} */ (orderKeys));
+        const { baseline } = signingState(db, /** @type {any} */ (keys));
         const whole = holdsWhole(db);
         /** @type {Map<number, Set<string>>} */ const named = new Map();
         const namedBy = (/** @type {number} */ pr) => {
           let n = named.get(pr);
-          if (!n) { const o = signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), id); named.set(pr, (n = "digests" in o ? o.digests : new Set())); }
+          if (!n) { const o = signedOrder(db, nwo, pr, /** @type {any} */ (keys), id); named.set(pr, (n = "digests" in o ? o.digests : new Set())); }
           return n;
         };
         /** @type {Map<number, string[]>} */ const unnamed = new Map();

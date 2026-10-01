@@ -11977,8 +11977,8 @@ export const STUBS = [
     test: "test/signed-order.test.mjs",
     expectRed: "an order goes on across a change of this host's key, the reeve still running",
     edits: [{ file: "src/daemon.mjs",
-              find: "      if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;\n      if (!orderKeys) return;\n      (ctx.durably",
-              replace: "      if (orderKeys === undefined) orderKeys = (ctx.orderKeysOnce ??= ctx.keys?.() ?? null);\n      if (!orderKeys) return;\n      (ctx.durably" }],
+              find: "      if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;",
+              replace: "      if (orderKeys === undefined) orderKeys = (ctx.orderKeysOnce ??= ctx.keys?.() ?? null);" }],
   },
   {
     name: "restart-never-raises",

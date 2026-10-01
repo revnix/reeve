@@ -14,7 +14,8 @@ import { snapshot, restore, latestSnapshot, exportEvents,
          snapshotAll, restoreHub, validateSnapshot, settleRestores } from "../src/backup.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick, measuredContainment, withdrawStanding, tellStuck, runningCode } from "../src/daemon.mjs";
-import { replayDecisions, renderReplay } from "../src/decisions.mjs";
+import { replayDecisions, renderReplay, publishedChecked } from "../src/decisions.mjs";
+import { readPublished, listPullRequests } from "../src/published.mjs";
 import { knownKeys, fileSigner, signingKey, PUBLIC_FILE } from "../src/signing.mjs";
 import { fileAnchor, readAnchor } from "../src/anchor.mjs";
 import { SelectorError } from "../src/db/records.mjs";
@@ -238,6 +239,7 @@ const FLAGS = {
   execute:        { value: false, what: "actually act, rather than observe" },
   enforce:        { value: false, what: "publish the merge policy as enforcing" },
   events:         { value: false, what: "export the event log too" },
+  published:      { value: false, what: "for replay, check the store against what the merge policy published on GitHub" },
   health:         { value: false, what: "report health only" },
   open:           { value: false, what: "open the result" },
   tick:           { value: false, what: "run a single tick and exit" },
@@ -996,10 +998,19 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     if (pr != null && !/^\d+$/.test(pr)) { console.error(`reeve replay: --pr takes a pull request number, got ${JSON.stringify(pr)}`); process.exit(1); }
     if (since != null && !Number.isFinite(sinceAt)) { console.error(`reeve replay: --since takes a date, got ${JSON.stringify(since)}`); process.exit(1); }
     const profile = nwo ? loadProfile(nwo, { orNull: true }) : null;
-    let results;
+    let results, checked = null;
     try {
-      results = replayDecisions(open(dbPath), { pr: pr == null ? null : Number(pr), since: sinceAt, digest: opt("record") ?? null },
-                                { code: runningCode(), profile, keys: signingKeys(), repo: nwo, anchor: anchorFor(nwo) });
+      const db = open(dbPath), which = { pr: pr == null ? null : Number(pr), since: sinceAt, digest: opt("record") ?? null };
+      results = replayDecisions(db, which, { code: runningCode(), profile, keys: signingKeys(), repo: nwo, anchor: anchorFor(nwo) });
+      // And against what the merge policy published (#274), read from GitHub as
+      // the person running this reads it: a copy away from the host has no
+      // anchor, and this is what it's checked against instead.
+      if (flag("published")) {
+        checked = publishedChecked(db, which, { keys: signingKeys(), repo: nwo, anchor: anchorFor(nwo),
+                                                published: (n, heads) => readPublished(nwo, n, heads),
+                                                listed: () => listPullRequests(nwo) });
+        results.push(...checked.faults);
+      }
     } catch (e) {
       // A record named by a start that isn't hexadecimal, or that more than one
       // shares, is refused rather than replayed as a pattern.
@@ -1009,6 +1020,13 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     }
     if (!results.length) { console.log("no decision records match, so nothing was replayed"); process.exit(3); }
     console.log(renderReplay(results));
+    if (checked) {
+      console.log(`checked against ${checked.results} result(s) the merge policy published for ${checked.prs} pull request(s)`);
+      // Said, not passed over: those were checked by the orders' commitment alone.
+      if (checked.unchecked.length)
+        console.log(`${checked.unchecked.length} pull request(s) had nothing published to check their records against, judged before it began say: ` +
+                    checked.unchecked.slice(0, 20).map((n) => `#${n}`).join(", ") + (checked.unchecked.length > 20 ? ", …" : ""));
+    }
     process.exit(results.every(r => r.outcome === "same") ? 0 : 1);
   }
 
@@ -2619,6 +2637,8 @@ function usage() {
                         evidence it was judged from, then the trail  (--head <sha>)
   replay [owner/repo]   recompute recorded verdicts with this code and compare them
                         (--pr <n>, --since <date>, --record <digest>;
+                         --published checks the store against what the merge policy
+                         published on GitHub, as a copy away from the host is checked;
                          0 all the same · 1 one differs or can't be replayed · 3 none)
   trial [owner/repo]    the shadow trial against its conditions  (--since <date> it started, --json;
                          0 it has passed · 1 not yet)

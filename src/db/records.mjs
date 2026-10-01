@@ -91,7 +91,7 @@ export function storeIdentity(db) {
 }
 
 /**
- * @typedef {{ digest: string, pr: number, head: string, record: Record<string, any>, corrupt: string | null,
+ * @typedef {{ digest: string, pr: number, head: string, record: Record<string, any> | null, corrupt: string | null,
  *             first_at: number, last_at: number, first_seq: number, last_seq: number,
  *             envelope: string | null, unsigned: string | null }} Decision
  */
@@ -99,11 +99,15 @@ export function storeIdentity(db) {
 /**
  * A decision row, and why it can't be trusted, if it can't. Its record must match
  * its digest, and the pull request and commit the row is found by, which sit
- * outside the digest, must be the ones its record names.
+ * outside the digest, must be the ones its record names. One whose record can't
+ * be read has none, and says so: never thrown, as that's the damage `why` and
+ * `replay` report (#280).
  * @param {any} row @returns {Decision}
  */
 export const decisionOf = row => {
-  const record = JSON.parse(row.record);
+  let record;
+  try { record = JSON.parse(row.record); }
+  catch (err) { return { ...row, record: null, corrupt: `its record can't be read: ${/** @type {Error} */ (err).message}` }; }
   const subject = record?.subject ?? {};
   const corrupt = digestOf(record) !== row.digest ? "its record doesn't match its digest"
     : subject.pr !== row.pr ? `its row names pull request ${row.pr}, but its record ${subject.pr}`
@@ -174,7 +178,9 @@ export function evidenceBy(db, digests) {
   for (const d of digests) {
     const r = /** @type {any} */ (get.get(d));
     if (!r) { missing.push(d); continue; }
-    const statement = JSON.parse(r.statement);
+    // One that can't be read is no more its digest's than one that reads otherwise (#280).
+    let statement;
+    try { statement = JSON.parse(r.statement); } catch { corrupt.push(d); continue; }
     if (evidenceDigestOf(statement) !== d) { corrupt.push(d); continue; }
     found.push({ ...r, statement });
   }
@@ -191,7 +197,9 @@ export function evidenceBy(db, digests) {
 export function policyRecord(db, hash) {
   const r = /** @type {any} */ (db.prepare(`SELECT body FROM policy WHERE hash = ?`).get(hash));
   if (!r) return null;
-  const body = JSON.parse(r.body);
+  // One that can't be read doesn't match its hash either (#280).
+  let body;
+  try { body = JSON.parse(r.body); } catch { return { body: null, corrupt: true }; }
   return { body, corrupt: digestOf(body) !== hash };
 }
 

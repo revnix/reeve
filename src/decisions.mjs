@@ -9,6 +9,7 @@
 
 import { computeVerdict } from "./verdict.mjs";
 import { joinEvidence, asJson, policyOf } from "./evidence.mjs";
+import { createHash } from "node:crypto";
 import { canonical } from "./db/ops.mjs";
 import { latestDecision, decisionsFor, decisionOf, evidenceBy, policyRecord, storeIdentity, BASELINE_OP, LATEST_OP, FILED } from "./db/records.mjs";
 import { checkSignature, checkEnvelope, baselineStatement, baselineFingerprint, latestStatement, entrySeal } from "./signing.mjs";
@@ -78,12 +79,13 @@ export function signingState(db, keys, anchor = null) {
  * none. `digests` is every record it names, as latest or kept, `entries` the
  * record each entry names as latest, by number, `seals` each entry's seal, by
  * number, and `seq` where in the store's sequence its top entry's latest was
- * seen, null where it doesn't say.
- * @param {Db} db @param {string} repo @param {number} pr @param {Keys} keys @param {string | null} [store]
+ * seen, null where it doesn't say. With `upTo`, the order as it stood at that
+ * event of the store's: its entries recorded up to it.
+ * @param {Db} db @param {string} repo @param {number} pr @param {Keys} keys @param {string | null} [store] @param {number | null} [upTo]
  * @returns {{ top: number, digest: string | null, digests: Set<string>, entries: Map<number, string>, seals: Map<number, string>, seq: number | null }
  *         | { corrupt: string }}
  */
-export function signedOrder(db, repo, pr, keys, store = storeIdentity(db)) {
+export function signedOrder(db, repo, pr, keys, store = storeIdentity(db), upTo = null) {
   // An entry filed under anything but a pull request's own name is found by no
   // pull request's order: its own would read as shorter than it is. So none is
   // taken as checked while one is.
@@ -98,7 +100,8 @@ export function signedOrder(db, repo, pr, keys, store = storeIdentity(db)) {
   /** @type {Map<number, string>} */ const seals = new Map();
   /** @type {Map<number, number | null>} */ const seqs = new Map();
   /** @type {Set<string>} */ const named = new Set();
-  for (const r of /** @type {any[]} */ (db.prepare(`SELECT payload FROM event WHERE op = ? AND subject = ? ORDER BY seq`).all(LATEST_OP, `pr:${pr}`))) {
+  for (const r of /** @type {any[]} */ (db.prepare(`SELECT payload FROM event WHERE op = ? AND subject = ? AND (? IS NULL OR seq <= ?) ORDER BY seq`)
+    .all(LATEST_OP, `pr:${pr}`, upTo, upTo))) {
     let p;
     try { p = JSON.parse(r.payload); } catch { return { corrupt: "an entry of its signed order can't be read" }; }
     const n = p?.n;
@@ -126,6 +129,33 @@ export function signedOrder(db, repo, pr, keys, store = storeIdentity(db)) {
   return { top, digest: top ? /** @type {string} */ (byN.get(top)) : null, digests: named, entries: byN, seals, seq: top ? seqs.get(top) ?? null : null };
 }
 
+/** The store's last event that's an entry of a signed order, 0 where it holds none. @param {Db} db */
+export const lastEntrySeq = (db) => Number(/** @type {any} */ (db.prepare(`SELECT COALESCE(MAX(seq), 0) AS n FROM event WHERE op = ?`).get(LATEST_OP))?.n ?? 0);
+
+/**
+ * A commitment to every signed order the store held at its event `upTo`
+ * (#285): sha256 over each pull request's number, top entry and that entry's
+ * seal, in number order. Two stores commit alike only where they held the same
+ * entries at the top of the same orders, so a copy with one pull request's
+ * order taken away, another's swapped in, or its newest entries taken, doesn't
+ * commit as the store did, whatever it counts. `corrupt` where an order doesn't
+ * hold, or another is filed where no order finds it, and then it commits to
+ * nothing.
+ * @param {Db} db @param {string} repo @param {Keys} keys @param {string | null} store @param {number} upTo
+ * @returns {{ orders: string } | { corrupt: string }}
+ */
+export function ordersCommitment(db, repo, keys, store, upTo) {
+  /** @type {[number, number, string][]} */ const tops = [];
+  for (const { subject } of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ? AND seq <= ?`).all(LATEST_OP, upTo))) {
+    const pr = Number(String(subject).slice(3));
+    const order = signedOrder(db, repo, pr, keys, store, upTo);
+    if ("corrupt" in order) return { corrupt: `#${pr}: ${order.corrupt}` };
+    if (order.top) tops.push([pr, order.top, /** @type {string} */ (order.seals.get(order.top))]);
+  }
+  tops.sort((a, b) => a[0] - b[0]);
+  return { orders: createHash("sha256").update(canonical(tops)).digest("hex") };
+}
+
 /**
  * The name of an entry of a signed order filed under anything but a pull
  * request's own, `pr:` and its number as reeve writes it, or null where there's
@@ -139,16 +169,6 @@ export function strayEntry(db) {
     AND NOT (COALESCE(subject, '') GLOB 'pr:[1-9]*' AND substr(subject, 4) NOT GLOB '*[^0-9]*' AND length(subject) <= 18) LIMIT 1`).get(LATEST_OP));
   return r ? String(r.subject) : null;
 }
-
-/**
- * A decision row as `decisionOf` reads it, or, where its record can't be read,
- * one said not to hold: never thrown, as that's the damage replay reports.
- * @param {any} row @returns {{ pr: number, corrupt: string | null }}
- */
-const readDecision = (row) => {
-  try { return decisionOf(row); }
-  catch (err) { return { pr: Number(row.pr), corrupt: `its record can't be read: ${/** @type {Error} */ (err).message}` }; }
-};
 
 /**
  * The records the store's signed baseline names, kept before it began signing,
@@ -170,7 +190,7 @@ export function baselineLost(db, repo, keys, store = storeIdentity(db), skip = n
     // Its row, whole: one kept under the digest's name but changed since, its
     // record, pull request or commit, is no more held than one taken away.
     const row = rowOf.get(digest);
-    const d = row ? readDecision(row) : null;
+    const d = row ? decisionOf(row) : null;
     const lost = !d ? "the store no longer holds it" : d.corrupt ? `the store's copy of it doesn't hold: ${d.corrupt}` : null;
     if (lost) unheld.push({ digest, why: lost });
   }
@@ -202,7 +222,7 @@ export function otherRepository(db, repo) {
   const unfiled = /** @type {any} */ (db.prepare(`SELECT pr FROM decision WHERE NOT ${FILED} LIMIT 1`).get());
   if (unfiled) return `a record filed under ${unfiled.pr}, which is no pull request's number`;
   for (const row of /** @type {any} */ (db.prepare(`SELECT * FROM decision`)).iterate()) {
-    const d = readDecision(row);
+    const d = decisionOf(row);
     if (d.corrupt) return `a record of ${repo} that doesn't hold as it was kept (${d.corrupt})`;
   }
   return null;
@@ -241,7 +261,7 @@ export function holdsWhole(db) {
   const rowOf = db.prepare(`SELECT * FROM decision WHERE digest = ?`);
   return (digest) => {
     const row = rowOf.get(digest);
-    return Boolean(row) && !readDecision(row).corrupt;
+    return Boolean(row) && !decisionOf(row).corrupt;
   };
 }
 
@@ -376,9 +396,6 @@ export function explainDecision(db, pr, { head = null, keys = null, repo = null,
              .filter(Boolean).join(", and ") +
            ": its records were taken away, or the store restored from before";
   }
-  const r = d.record;
-  /** @type {{ id: string, state: string, detail?: string, kind?: string, next?: string }[]} */
-  const clauses = r.verdict.clauses ?? [];
   const out = [];
   const sig = keys ? trustOf(d, keys, signingState(db, keys, anchor), repo) : null;
   if (d.corrupt) out.push(`  this record can't be trusted: ${d.corrupt} (record ${short(d.digest)}); it was changed after it was kept`);
@@ -386,6 +403,29 @@ export function explainDecision(db, pr, { head = null, keys = null, repo = null,
   const held = (/** @type {string} */ digest) => Boolean(db.prepare(`SELECT 1 FROM decision WHERE digest = ? LIMIT 1`).get(digest));
   const notIt = keys && head === null ? notLatest(d.digest, order, anchored, anchor, held, pr, heldHere, String(repo)) : null;
   if (notIt) out.push(`  this record can't be trusted as the latest: ${notIt}`);
+  // A record that doesn't hold may not read as one at all, or be none: what
+  // can't be shown of it is said, rather than stopping at it (#280).
+  try { return [...out, ...shownRecord(db, pr, d, { head, sig, notIt, order })].join("\n"); }
+  catch (err) {
+    if (!d.corrupt) throw err;
+    return [...out, `  nothing more of it can be shown, as it doesn't read as a record`].join("\n");
+  }
+}
+
+/**
+ * The lines `explainDecision` shows of a record: its verdict and every clause,
+ * the evidence it was judged from, and the policy and code that judged it.
+ * Thrown where it doesn't read as a record.
+ * @param {Db} db @param {number} pr @param {import("./db/records.mjs").Decision} d
+ * @param {{ head: string | null, sig: import("./signing.mjs").Signature | null, notIt: string | null,
+ *           order: ReturnType<typeof signedOrder> | null }} o
+ * @returns {string[]}
+ */
+function shownRecord(db, pr, d, { head, sig, notIt, order }) {
+  const r = /** @type {Record<string, any>} */ (d.record);
+  /** @type {{ id: string, state: string, detail?: string, kind?: string, next?: string }[]} */
+  const clauses = r.verdict.clauses ?? [];
+  const out = [];
   out.push(`${r.verdict.state} at ${short(r.subject.head)}, tree ${short(r.subject.tree)}, judged ${span(d.first_at, d.last_at)} (record ${short(d.digest)})`);
   if (sig?.state === "signed") out.push(`  signed by key ${short(sig.keyid)}, ${sig.where}`);
   else if (sig?.state === "unsigned") out.push(`  unsigned: ${sig.why}`);
@@ -408,7 +448,7 @@ export function explainDecision(db, pr, { head = null, keys = null, repo = null,
   out.push(`  policy ${short(r.policy)}, code ${short(c.commit)} (tree ${short(c.tree)})` +
            (c.dirty === null || c.dirty === undefined ? ", whether it differed from that commit is unknown"
             : c.dirty ? `, with uncommitted changes ${short(c.diff)}` : ""));
-  return out.join("\n");
+  return out;
 }
 
 /**
@@ -487,15 +527,21 @@ export function replayDecisions(db, which = {}, { code = null, profile = null, c
   const results = [];
   const state = keys ? signingState(db, keys, anchor) : null;
   for (const d of decisionsFor(db, which)) {
-    const r = d.record;
+    // A record, evidence or policy that doesn't match its digest is not the one
+    // its key names, so what it would replay to proves nothing either way. Nor
+    // what it says it was: it may not read as a record at all (#280).
+    if (d.corrupt) {
+      const was = /** @type {any} */ (d.record)?.verdict?.state;
+      results.push({ digest: d.digest, pr: d.pr, head: d.head, recorded: typeof was === "string" ? was : "unknown",
+                     codeChanged: null, policyChanged: null, outcome: "unreplayable", why: d.corrupt });
+      continue;
+    }
+    const r = /** @type {Record<string, any>} */ (d.record);
     const base = { digest: d.digest, pr: d.pr, head: d.head, recorded: r.verdict.state,
                    codeChanged: code ? ((same) => (same === null ? null : !same))(sameCode(r.code, code)) : null,
                    // Per decision, against a profile only for the repository its
                    // record names: a store chosen with --db may be another's.
                    policyChanged: ((current) => (current === null ? null : r.policy !== current))(policyHashFor(profile, r.subject?.repo)) };
-    // A record, evidence or policy that doesn't match its digest is not the one
-    // its key names, so what it would replay to proves nothing either way.
-    if (d.corrupt) { results.push({ ...base, outcome: "unreplayable", why: d.corrupt }); continue; }
     const sig = keys && state ? trustOf(d, keys, state, repo) : null;
     if (sig?.state === "corrupt") { results.push({ ...base, outcome: "unreplayable", why: sig.why }); continue; }
     const { found, missing, corrupt } = evidenceBy(db, Object.values(r.evidence));
@@ -525,6 +571,13 @@ export function replayDecisions(db, which = {}, { code = null, profile = null, c
 }
 
 /**
+ * What a store's orders, or what was published of them, say it should hold and
+ * it doesn't, as a replay result: of no commit, and never passed over (#274).
+ * @param {number} pr @param {string} digest @param {string} why @returns {Replayed}
+ */
+const fault = (pr, digest, why) => ({ digest, pr, head: "", recorded: "unknown", outcome: "unreplayable", why, codeChanged: null, policyChanged: null });
+
+/**
  * What each pull request's signed order says the store should hold, and the
  * host's anchor (#274), as replay results: an order that doesn't hold, one cut
  * short of what the host signed, and each record it names that the store no
@@ -539,8 +592,6 @@ export function replayDecisions(db, which = {}, { code = null, profile = null, c
  * @returns {Replayed[]}
  */
 function orderReplayed(db, replayed, which, keys, repo, anchor) {
-  /** @param {number} pr @param {string} digest @param {string} why @returns {Replayed} */
-  const fault = (pr, digest, why) => ({ digest, pr, head: "", recorded: "unknown", outcome: "unreplayable", why, codeChanged: null, policyChanged: null });
   if (anchor?.why) return [fault(which.pr ?? 0, "", anchor.why)];
   const stray = strayEntry(db);
   if (stray !== null) return [fault(which.pr ?? 0, "", `an entry of a signed order in this store is filed under ${JSON.stringify(stray)}, not a pull request's name`)];
@@ -576,7 +627,7 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
     for (const digest of order.digests) {
       if (checked.has(`${pr} ${digest}`)) continue;
       const row = rowOf.get(digest);
-      const d = row ? readDecision(row) : null;
+      const d = row ? decisionOf(row) : null;
       const why = !d ? "the store no longer holds it"
         : d.corrupt ? `the store's copy of it doesn't hold: ${d.corrupt}`
         : d.pr !== pr ? `the store holds it as pull request ${d.pr}'s`
@@ -598,6 +649,111 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
   if (which.pr == null) for (const lost of baselineLost(db, repo, keys, store, new Set(replayed.map((r) => r.digest))))
     out.push(fault(0, lost.digest, `the store's baseline names this record, kept before it began signing, and no signed order names it, but ${lost.why}`));
   return out;
+}
+
+/**
+ * A copy of a store checked against what the merge policy published of it
+ * (#274). Each result it posts on a pull request's head names the record kept
+ * for its verdict, where the pull request's signed order stood, and a
+ * commitment to every order the store held up to an event of its own (#285);
+ * GitHub keeps that out of reach of whoever can change the store. So a copy
+ * checked away from the host, with no anchor to check it against, still shows
+ * as cut short, restored from before or edited: each published record must be
+ * held whole, as its pull request's; each published entry reached, naming the
+ * published record; and the copy's orders up to each published event must
+ * commit as the store's did, so a pull request whose orders were taken away,
+ * or swapped for others, shows in what was published for any other. The pull
+ * requests read are every one the copy holds records or an order of, and every
+ * one GitHub lists, as `listed` reads them, so one the copy no longer names is
+ * read all the same; or the one asked for. `published` and `listed` read
+ * GitHub, and one that can't be read is a fault, never a pass; so is a copy
+ * nothing published could be checked against. `results` counts the published
+ * results checked, `prs` the pull requests read, and `unchecked` names those
+ * of the copy's with nothing published to check against, judged before it
+ * began say.
+ * @param {Db} db
+ * @param {{ pr?: number | null, digest?: string | null }} which
+ * @param {{ keys: Keys, repo: string, anchor?: AnchorRead | null,
+ *           published: (pr: number, heads: string[]) => { evidence: (import("./published.mjs").Evidence & { head: string })[] } | { why: string },
+ *           listed?: (() => number[] | { why: string }) | null }} o
+ * @returns {{ faults: Replayed[], results: number, prs: number, unchecked: number[] }}
+ */
+export function publishedChecked(db, which, { keys, repo, anchor: read = null, published, listed = null }) {
+  const anchor = anchorForStore(db, read, repo);
+  /** @type {Set<number>} */ const prs = new Set();
+  /** @type {Set<number>} */ const own = new Set();
+  /** @type {Replayed[]} */ const faults = [];
+  if (which.pr != null) own.add(which.pr);
+  else if (which.digest != null) for (const d of decisionsFor(db, { digest: which.digest })) own.add(d.pr);
+  else {
+    // Each it holds records of, and each it holds an order of, its records taken away or not.
+    for (const { pr } of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT pr FROM decision WHERE ${FILED}`).all())) own.add(Number(pr));
+    for (const { subject } of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ? AND subject GLOB 'pr:[1-9]*' AND substr(subject, 4) NOT GLOB '*[^0-9]*' AND length(subject) <= 18`).all(LATEST_OP))) own.add(Number(String(subject).slice(3)));
+    // And each GitHub lists: one the copy no longer names, taken away with every
+    // record and entry of it, is read all the same (#285).
+    const got = listed ? listed() : [];
+    if ("why" in got) faults.push(fault(0, "", `the repository's pull requests couldn't be listed from GitHub, so one this copy no longer names may be missed: ${got.why}`));
+    else for (const n of got) prs.add(n);
+  }
+  for (const n of own) prs.add(n);
+  const rowOf = db.prepare(`SELECT * FROM decision WHERE digest = ?`);
+  const headsOf = db.prepare(`SELECT DISTINCT head FROM decision WHERE pr = ? ORDER BY head`);
+  const store = orderStore(db, anchor);
+  // The same result is often published at more than one head, and said once.
+  const said = new Set();
+  const say = (/** @type {number} */ pr, /** @type {string} */ digest, /** @type {string} */ why) => {
+    if (!said.has(`${pr} ${digest} ${why}`)) { said.add(`${pr} ${digest} ${why}`); faults.push(fault(pr, digest, why)); }
+  };
+  let results = 0;
+  /** @type {number[]} */ const unchecked = [];
+  // Each commitment published, to the event it covers, and where it was first read.
+  /** @type {Map<string, { to: number, orders: string, head: string, pr: number }>} */ const commitments = new Map();
+  for (const pr of [...prs].sort((a, b) => a - b)) {
+    const heads = /** @type {any[]} */ (headsOf.all(pr)).map((r) => String(r.head)).filter((h) => /^[0-9a-f]{40}$/.test(h));
+    const got = published(pr, heads);
+    if ("why" in got) { say(pr, "", `what the merge policy published for it couldn't be read, so this copy wasn't checked against it: ${got.why}`); continue; }
+    const order = signedOrder(db, repo, pr, keys, store);
+    if (!got.evidence.length && own.has(pr)) unchecked.push(pr);
+    for (const e of got.evidence) {
+      results++;
+      const key = `${e.store.to} ${e.store.orders}`;
+      if (!commitments.has(key)) commitments.set(key, { ...e.store, head: e.head, pr });
+      const at = e.head.slice(0, 8);
+      const row = rowOf.get(e.record);
+      const d = row ? decisionOf(row) : null;
+      const why = !d ? "this copy doesn't hold it"
+        : d.corrupt ? `this copy's doesn't hold: ${d.corrupt}`
+        : d.pr !== pr ? `this copy holds it as pull request ${d.pr}'s`
+        : null;
+      if (why) say(pr, e.record, `the merge policy published this record for it at ${at}, but ${why}`);
+      // An order that doesn't hold is the replay's to report.
+      if (!e.order || "corrupt" in order) continue;
+      const named = order.entries.get(e.order.n);
+      if (order.top < e.order.n)
+        say(pr, e.order.names, `the merge policy published entry ${e.order.n} of its signed order at ${at}, but this copy's ends at entry ${order.top}: ` +
+                               "newer records were taken away, or the copy is from before");
+      else if (named !== e.order.names)
+        say(pr, e.order.names, `the merge policy published entry ${e.order.n} of its signed order at ${at} naming ${short(e.order.names)}, but this copy's entry ${e.order.n} names ${short(named)}`);
+    }
+  }
+  if (!results && !faults.length)
+    faults.push(fault(which.pr ?? 0, "", "no result the merge policy published names a record of these pull requests, so this copy wasn't checked against GitHub"));
+  // Every order the copy held up to each event a result published, committed as
+  // that result committed the store's (#285): an order taken away, swapped in,
+  // or cut short shows, whichever pull request's result carried it. One that
+  // doesn't hold commits to nothing, and what was published can't be checked:
+  // a fault, as a check of one pull request doesn't read another's order.
+  for (const c of [...commitments.values()].sort((a, b) => a.to - b.to)) {
+    const mine = ordersCommitment(db, repo, keys, store, c.to);
+    if ("corrupt" in mine) {
+      faults.push(fault(0, "", `this copy's signed orders to its event ${c.to} can't be committed to, so what the merge policy published with #${c.pr}'s result at ${c.head.slice(0, 8)} can't be checked: ${mine.corrupt}`));
+      continue;
+    }
+    if (mine.orders !== c.orders)
+      faults.push(fault(0, "", `the merge policy published with #${c.pr}'s result at ${c.head.slice(0, 8)} the signed orders this store held to its event ${c.to}, ` +
+                               "but this copy's orders to that event aren't those: an order was taken away, changed or swapped in, or the copy is from before"));
+  }
+  return { faults, results, prs: prs.size, unchecked };
 }
 
 /**

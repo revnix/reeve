@@ -8923,8 +8923,8 @@ export const STUBS = [
     expectRed: "a stub that sends a test's write into its home writes into a home of its own",
     edits: [
       { file: "scripts/stub-sweep.mjs",
-        find: "  const env = { ...process.env, HOME: home, REEVE_TEST_GH_LOG: ghLog,",
-        replace: "  const env = { ...process.env, REEVE_TEST_GH_LOG: ghLog," },
+        find: "  const env = { ...unsharded(process.env), HOME: home, REEVE_TEST_GH_LOG: ghLog,",
+              replace: "  const env = { ...unsharded(process.env), REEVE_TEST_GH_LOG: ghLog," },
     ],
   },
   {
@@ -8934,8 +8934,8 @@ export const STUBS = [
     expectRed: "the escape probe keeps the real gh, as CI gives it",
     edits: [
       { file: "scripts/stub-sweep.mjs",
-        find: "  if (basename(file) === \"escape.test.mjs\") return { env: process.env, home: null, ghLog: null };",
-        replace: "  // the escape probe offline too" },
+        find: "  if (basename(file) === \"escape.test.mjs\") return { env: unsharded(process.env), home: null, ghLog: null };",
+              replace: "  // the escape probe offline too" },
     ],
   },
   {

@@ -1105,3 +1105,65 @@ test("a store whose binding was begun, holding an identity that can't be read, m
   assert.equal(baselines(dbPath), 0);
   assert.equal(anchorRead(dir)?.store ?? null, null);
 });
+
+// ── #304: records kept before #299 ───────────────────────────────────────────
+
+/** A store whose second record of #42 was kept as a reeve before #299 kept it: not pinned, and, its reservations failing, not ordered. */
+async function keptUnpinned() {
+  const dir = credentials();
+  const dbPath = store();
+  await tick(dbPath, at(A), host(dir));
+  await tick(dbPath, at(A, "RED"), host(dir, { ...fileAnchor(dir), pin: () => true, reserve: () => false }));
+  const db = open(dbPath);
+  const [green, red] = digestsOf(db);
+  db.close();
+  return { dir, dbPath, green, red };
+}
+
+test("a record kept before #299 that no order names is pinned on the host's anchor by the next tick, before a pull request is judged", async () => {
+  const { dir, dbPath, red } = await keptUnpinned();
+  assert.equal(anchorRead(dir)?.pinned?.get(PR)?.has(red) ?? false, false, "control: kept unpinned");
+  /** @type {boolean | null} */ let atJudging = null;
+  // Its reservations failing still, so nothing orders it and unpins it after.
+  const r = await tick(dbPath, at(A, "RED"), { ...host(dir, { ...fileAnchor(dir), reserve: () => false }),
+    evaluate: () => { atJudging ??= anchorRead(dir)?.pinned?.get(PR)?.has(red) ?? false; return at(A, "RED"); } });
+  assert.equal(atJudging, true, "pinned before the pull request was judged");
+  assert.ok(anchorRead(dir)?.pinned?.get(PR)?.has(red), "and still pinned, unordered");
+  assert.match(r.log, /signing: pinned 1 record\(s\) this store holds that no signed order or baseline names, kept before records were pinned/);
+});
+
+test("a record kept before #299, pinned since, and taken away while no reeve ran, is said by the tick", async () => {
+  const { dir, dbPath, red } = await keptUnpinned();
+  await tick(dbPath, null, host(dir, { ...fileAnchor(dir), reserve: () => false }));
+  let db = open(dbPath);
+  db.prepare("DELETE FROM decision WHERE digest = ?").run(red);
+  db.close();
+  const r = await tick(dbPath, null, host(dir));
+  assert.match(r.log, new RegExp(`#42: this host kept 1 record\\(s\\) that this store no longer holds, and no entry of its signed order names: they were taken away, or a reeve stopped before its store committed them — ${red.slice(0, 12)}`));
+  db = open(dbPath);
+  db.close();
+});
+
+test("a record a signed order or the store's baseline names, or one that doesn't hold as it was kept, isn't pinned", async () => {
+  // Two records kept before the store began signing, which its baseline names, and no order yet: its reservations fail.
+  const dir = credentials();
+  const dbPath = store();
+  await tick(dbPath, at(A));
+  await tick(dbPath, at(A, "RED"));
+  const refusing = () => host(dir, { ...fileAnchor(dir), reserve: () => false });
+  await tick(dbPath, null, refusing());
+  let db = open(dbPath);
+  const order = signedOrder(db, REPO, PR, knownKeys({ local: dir }));
+  db.close();
+  assert.ok("top" in order && order.top === 0, `control: no order names them: ${JSON.stringify(order)}`);
+  assert.equal(anchorRead(dir)?.store, (() => { const d = open(dbPath); const id = storeIdentity(d); d.close(); return id; })(), "control: the anchor is this store's");
+  await tick(dbPath, null, refusing());
+  assert.deepEqual([...(anchorRead(dir)?.pinned?.get(PR) ?? [])], [], "neither pinned: the baseline names them");
+  // One kept unpinned and unordered, then changed in place: not this host's record as it was kept.
+  const kept = await keptUnpinned();
+  db = open(kept.dbPath);
+  db.prepare("UPDATE decision SET record = json_set(record, '$.subject.pr', 9) WHERE digest = ?").run(kept.red);
+  db.close();
+  await tick(kept.dbPath, null, host(kept.dir, { ...fileAnchor(kept.dir), reserve: () => false }));
+  assert.equal(anchorRead(kept.dir)?.pinned?.get(PR)?.has(kept.red) ?? false, false, "a record changed in place isn't pinned");
+});

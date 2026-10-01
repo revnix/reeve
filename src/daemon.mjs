@@ -1631,6 +1631,45 @@ async function tickOnce(ctx) {
       } catch (err) { log(logPath, `signing: #${pr}: a record whose commit failed couldn't be unpinned from the host's anchor — ${err.message}`); }
     });
   };
+  // A record a reeve before #299 kept wasn't pinned, and one it stopped before
+  // ordering would show nowhere, taken away while no reeve ran: a record the
+  // store holds already counts as pinned or ordered, and isn't pinned again
+  // (#304). So, before any record is kept, each the store holds whole that no
+  // signed order or the store's baseline names, and the host's anchor doesn't
+  // pin, is pinned, where the anchor is this store's. Once in a process; again
+  // each tick until it's done. Ordered at a tick's end, it's unpinned.
+  const pinUnnamed = () => {
+    if (!ordering || !begun.began || ctx.unnamedPinned) return;
+    withOrderLock((held) => {
+      if (!held) return;
+      if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
+      if (!orderKeys) return;
+      try {
+        const a = ctx.anchor.read(nwo) ?? noAnchor();
+        const id = storeIdentity(db);
+        if (!id || a.store !== id) return;
+        const { baseline } = signingState(db, /** @type {any} */ (orderKeys));
+        const whole = holdsWhole(db);
+        /** @type {Map<number, Set<string>>} */ const named = new Map();
+        const namedBy = (/** @type {number} */ pr) => {
+          let n = named.get(pr);
+          if (!n) { const o = signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), id); named.set(pr, (n = "digests" in o ? o.digests : new Set())); }
+          return n;
+        };
+        /** @type {Map<number, string[]>} */ const unnamed = new Map();
+        for (const r of /** @type {any[]} */ (db.prepare(`SELECT pr, digest FROM decision WHERE ${FILED}`).all())) {
+          const pr = Number(r.pr), d = String(r.digest);
+          if (baseline?.has(d) || a.pinned.get(pr)?.has(d) || namedBy(pr).has(d) || !whole(d)) continue;
+          unnamed.set(pr, [...(unnamed.get(pr) ?? []), d]);
+        }
+        for (const [pr, ds] of unnamed)
+          if (!ctx.anchor.pin(nwo, id, pr, ds)) { log(logPath, `signing: #${pr}: records kept before records were pinned couldn't be pinned on the host's anchor; it's tried again next tick`); return; }
+        const n = [...unnamed.values()].reduce((x, ds) => x + ds.length, 0);
+        if (n) log(logPath, `signing: pinned ${n} record(s) this store holds that no signed order or baseline names, kept before records were pinned`);
+        ctx.unnamedPinned = true;
+      } catch (err) { log(logPath, `signing: records kept before records were pinned couldn't be pinned on the host's anchor — ${err.message}; it's tried again next tick`); }
+    });
+  };
   /**
    * A decision record committed with its pin: a record new to the store is
    * pinned first, and unpinned where `commit` failed, whether it threw or
@@ -2709,6 +2748,7 @@ async function tickOnce(ctx) {
         : prAnchor);
 
   const waiting = new Set();
+  pinUnnamed();
   for (const pr of prs) {
     if (halted(ctx.haltMarker)) {
       await takeBackAll("the merge policy is halted");

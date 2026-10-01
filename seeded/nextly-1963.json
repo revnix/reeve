@@ -1,5 +1,5 @@
 {
- "about": "nextlyhq/nextly#1963 at fae4c95bd6, as GitHub answered for it, and as it stood at 2026-09-30T06:07:27Z: approved by a person, every check green, and merged through the queue at 06:10 UTC. Its review tools are renamed. Recorded with scripts/capture-seeded.mjs.",
+ "about": "nextlyhq/nextly#1963 at fae4c95bd6, as GitHub answered for it, and as it stood at 2026-09-30T06:07:27Z: approved by a person, every check green, and merged through the queue at 06:10 UTC. Its review tools are renamed. Recorded with scripts/capture-seeded.mjs. The head's and the base's repositories, read with the pull request since #320, were added to that read on 2026-10-01, as GitHub answered then.",
  "repo": "nextlyhq/nextly",
  "pr": 1963,
  "head": "fae4c95bd6387a5c220152a2436ce69ff6a97386",
@@ -142,10 +142,10 @@
     "api",
     "repos/nextlyhq/nextly/pulls/1963",
     "--jq",
-    "[.head.ref,.base.ref,.state,.title,.updated_at,.user.login]|@tsv"
+    "[.head.ref,.base.ref,.state,.title,.updated_at,.user.login,(.head.repo.full_name // \"\"),(.base.repo.full_name // \"\")]|@tsv"
    ],
    "status": 0,
-   "stdout": "ci/reviewer-leaner-protocol\tmain\topen\tci: give the reviewer a leaner protocol, with the pull request prefetched\t2026-09-30T06:15:06Z\tagent-app[bot]\n",
+   "stdout": "ci/reviewer-leaner-protocol\tmain\topen\tci: give the reviewer a leaner protocol, with the pull request prefetched\t2026-09-30T06:15:06Z\tagent-app[bot]\tnextlyhq/nextly\tnextlyhq/nextly\n",
    "stderr": "",
    "edited": "merged since: its state as it stood, open"
   },

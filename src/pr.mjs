@@ -7,7 +7,7 @@
 // publishes `neutral`, which GitHub renders but never blocks on, so a week of
 // them says exactly what the gate WOULD have refused.
 
-import { pinHead, readChecks, classify, settle, inheritedOrCaused, readTimeline, lastForcePush, suitesComplete } from "./github/reconciler.mjs";
+import { pinHead, pinPrHead, isFork, readChecks, classify, settle, inheritedOrCaused, readTimeline, lastForcePush, suitesComplete } from "./github/reconciler.mjs";
 import { loadSettlement, saveSettlement } from "./db/ops.mjs";
 import { rootCause } from "./ci-rootcause.mjs";
 import { computeVerdict, renderVerdict, coversHead, PASS, BLOCK, UNKNOWN } from "./verdict.mjs";
@@ -712,21 +712,33 @@ export function treeOf(nwo, sha) {
   return tree;
 }
 
-export function prAnchor({ nwo, pr }) {
+/**
+ * A pull request's anchor for this tick: its head, pinned from the ref, and
+ * what's read with it. `fork` where its head is a fork's (#320), pinned from
+ * `refs/pull/<n>/head`. `read` and `pin` are the two reads it makes: a test's
+ * stand-ins.
+ * @param {{ nwo: string, pr: number }} p
+ * @param {{ read?: typeof ghJson, pin?: typeof pinPrHead }} [io]
+ */
+export function prAnchor({ nwo, pr }, { read = ghJson, pin: pinIt = pinPrHead } = {}) {
   // updated_at rides along so ingest can skip a pull request that has not moved.
   // It is GitHub's timestamp, so a change reeve has not seen yet still triggers a
   // read -- unlike a local clock, which would skip whatever it slept through.
-  // `.user.login` rides along for the builder classification below. Appended
-  // rather than inserted: the destructuring below is positional, so a new field
-  // in the middle silently shifts every one after it.
-  const meta = ghJson([`repos/${nwo}/pulls/${pr}`, "--jq", "[.head.ref,.base.ref,.state,.title,.updated_at,.user.login]|@tsv"]);
+  // `.user.login` rides along for the builder classification below, and the
+  // head's repository and the base's for a fork's (#320): told against the
+  // base's own name, as GitHub gives it now, so a repository renamed since
+  // reeve was told its name doesn't make every pull request a fork's.
+  // Appended rather than inserted: the destructuring below is positional, so a
+  // new field in the middle silently shifts every one after it.
+  const meta = read([`repos/${nwo}/pulls/${pr}`, "--jq", "[.head.ref,.base.ref,.state,.title,.updated_at,.user.login,(.head.repo.full_name // \"\"),(.base.repo.full_name // \"\")]|@tsv"]);
   if (!meta.ok) return { ok: false, why: meta.err.split("\n")[0] };
-  const [headRef, baseRef, state, title, updatedAt, authorLogin] = meta.out.split("\t");
+  const [headRef, baseRef, state, title, updatedAt, authorLogin, headRepo, baseRepo] = meta.out.split("\t");
+  const base = baseRepo || nwo;
 
-  const pin = pinHead(nwo, headRef);
+  const pin = pinIt(nwo, pr, headRef, headRepo, base);
   if (!pin.ok) return { ok: false, why: `could not pin head: ${pin.why}` };
   return { ok: true, headRef, baseRef, state, title, updatedAt, head: pin.sha, pin,
-           authorLogin };
+           authorLogin, fork: isFork(base, headRepo) };
 }
 
 /**
@@ -799,7 +811,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // which revision they are talking about.
   const a = anchor ?? prAnchor({ nwo, pr });
   if (!a.ok) return { ok: false, why: a.why };
-  const { headRef, baseRef, state, title, updatedAt, pin } = a;
+  const { headRef, baseRef, state, title, updatedAt, pin, fork = false } = a;
 
   // A reviewer's commit status is never CI evidence: a rate-limited CodeRabbit
   // reports success. Excluded at the read, for the head AND the base alike.
@@ -955,7 +967,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   };
   const verdict = computeVerdict(input);
 
-  return { ok: true, pr, title, headRef, baseRef, state, head: pin.sha, verdict, input,
+  return { ok: true, pr, title, headRef, baseRef, state, head: pin.sha, fork, verdict, input,
            reviewers, threads, rounds, forcePushedAt, updatedAt, checks: c, settled: s,
            // The open threads themselves, for the actions that act ON them. An
            // empty array and an unreadable projection are different facts, so the

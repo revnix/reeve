@@ -60,6 +60,9 @@ import { BASELINE_OP, LATEST_OP, STORE_ID_OP, FILED, latestDecision, storeIdenti
 import { signedOrder, strayEntry, baselineLost, otherRepository, signingState, holdsWhole, ordersCommitment, lastEntrySeq } from "./decisions.mjs";
 import { noAnchor, reservedSeal } from "./anchor.mjs";
 
+/** The worker actions whose result is pushed to the pull request's head branch, which a fork's isn't reeve's to push to (#320). */
+const FIX_ACTIONS = Object.freeze(["FIX_CI", "FIX_FINDINGS"]);
+
 const now = () => Math.floor(Date.now() / 1000);
 
 // The code this process runs, read once: a record carries the version loaded at
@@ -3470,8 +3473,19 @@ async function tickOnce(ctx) {
   // A REQUEST_REVIEW reeve performs itself is not a worker task, so it must not
   // count towards the worker gates -- otherwise an open containment blocks a
   // comment that no worker was ever going to post.
-  const wanted = decisions.filter(d => WORKER_ACTIONS.includes(d.decision.action)
-                                    && !(d.decision.action === "REQUEST_REVIEW" && execute && reviewActionsOn(profile)));
+  // Nor does a fork's fix (#320): its branch is in the fork, which reeve can't
+  // push to, so a worker's fix could never be published there. It asks for no
+  // containment or canary, and is said here, whatever those say. Only a fix:
+  // what a worker does on GitHub itself, a spill or a review asked, isn't
+  // pushed to the branch.
+  const forWorker = (/** @type {any} */ d) => WORKER_ACTIONS.includes(d.decision.action)
+                                               && !(d.decision.action === "REQUEST_REVIEW" && execute && reviewActionsOn(profile));
+  const forksFix = (/** @type {any} */ d) => d.e.fork && FIX_ACTIONS.includes(d.decision.action);
+  const wanted = decisions.filter(d => forWorker(d) && !forksFix(d));
+  if (execute) for (const d of decisions.filter(x => forWorker(x) && forksFix(x))) {
+    log(logPath, `  #${d.e.pr}: NOT dispatching ${d.decision.action} — its head is a fork's branch, which reeve can't push to`);
+    raise(`#${d.e.pr}: ${d.decision.action.toLowerCase().replace("_", " ")} is for its author: its head is a fork's branch, which reeve can't push to`);
+  }
 
   // Whether this tick will ask for a canary lease at all. Declared ONCE and read
   // by both the queued sweep below and the canary block further down: two
@@ -3805,6 +3819,8 @@ async function tickOnce(ctx) {
         raise(`#${e.pr}: ${decision.action.toLowerCase().replace("_", " ")} needs a GitHub effect reeve does not yet perform`);
         continue;
       }
+      // A fork's fix, said before the worker gates (#320).
+      if (e.fork && FIX_ACTIONS.includes(decision.action)) continue;
       const prepKey = e.pr;
       const backoff = PREP_BACKOFF.get(prepKey);
       if (backoff && backoff.until > Date.now() && WORKER_ACTIONS.includes(decision.action)) {

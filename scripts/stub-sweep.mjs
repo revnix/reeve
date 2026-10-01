@@ -1110,6 +1110,13 @@ for (const entry of entries) {
 if (process.env.STUB_SWEEP_RESULTS && !combining)
   writeFileSync(process.env.STUB_SWEEP_RESULTS, JSON.stringify({
     shard: shard ? `${shard.index}/${shard.count}` : null, head: headOf(), wanted, results }));
+// A shard given no entries, as a sweep asked for fewer entries than it has
+// shards gives, measured nothing and failed nothing: its report says so, and
+// the combine, which checks every entry was measured once, gives the verdict.
+if (shard && !entries.length) {
+  console.log(`stub-sweep: shard ${shard.index}/${shard.count} has no entries; the shards' reports, combined, give the verdict`);
+  process.exit(0);
+}
 
 const s = summarise(results);
 console.log(`\n${s.caught}/${s.total} stub(s) caught by the assertion they name.`);

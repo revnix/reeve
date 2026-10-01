@@ -17672,4 +17672,13 @@ export const STUBS = [
               find: "  delete e.STUB_SWEEP_SHARD;\n  delete e.STUB_SWEEP_RESULTS;\n",
               replace: "" }],
   },
+  {
+    name: "empty-shard-defers-to-combine",
+    why: "fail a shard that was given no entries. A run asked for fewer entries than shards would be red though every entry was caught",
+    test: "test/stubsweep-shards.test.mjs",
+    expectRed: "a shard given no entries, as a sweep asked for fewer than it has shards gives, reports so and leaves the verdict to the combine",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: "if (shard && !entries.length) {",
+              replace: "if (false) {" }],
+  },
 ];

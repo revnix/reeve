@@ -104,6 +104,9 @@ jobs:
           path: ${{ runner.temp }}/stub-sweep-shard-${{ matrix.shard }}.json
           if-no-files-found: ignore
           retention-days: 7
+          # A shard run again replaces the report it left before, which is
+          # refused otherwise, so a rerun can recover the sweep.
+          overwrite: true
 
   combine:
     name: Stub sweep

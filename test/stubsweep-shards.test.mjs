@@ -160,3 +160,20 @@ test("a test the sweep runs gets none of the sweep's own shard or report setting
   assert.match(r.out, /3\/3 stub\(s\) caught/);
   assert.deepEqual(readOr(report)?.results?.map((/** @type {any} */ x) => x.verdict), ["CAUGHT", "CAUGHT", "CAUGHT"]);
 });
+
+test("a shard given no entries, as a sweep asked for fewer than it has shards gives, reports so and leaves the verdict to the combine", () => {
+  const { root, reports } = fixture();
+  // Two entries asked for, over three shards: the third gets none.
+  const shard = (/** @type {number} */ i) => run(root, ["object", "null"], { STUB_SWEEP_SHARD: `${i}/3`, STUB_SWEEP_RESULTS: join(reports, `shard-${i}.json`) });
+  const ran = [shard(1), shard(2), shard(3)];
+  assert.equal(ran[2].exit, 0, "an empty shard isn't a failed one: " + ran[2].out.slice(-400));
+  assert.match(ran[2].out, /shard 3\/3 has no entries/);
+  assert.deepEqual(readOr(join(reports, "shard-3.json"))?.results, []);
+  const both = run(root, ["--combine", ...[1, 2, 3].map((i) => join(reports, `shard-${i}.json`))]);
+  assert.equal(both.exit, 0, both.out.slice(-600));
+  assert.match(both.out, /2\/2 stub\(s\) caught/);
+  // Control: a sweep that isn't a shard, given no entries, still fails.
+  writeFileSync(join(root, "test", "stub-manifest.mjs"), "export const STUBS = [];\n");
+  execFileSync("git", ["commit", "-qam", "no entries"], { cwd: root });
+  assert.notEqual(run(root, []).exit, 0, "measuring nothing never passes");
+});

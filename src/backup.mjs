@@ -65,8 +65,9 @@ export const AUDITS_TABLE = "trial_audit";
  * without them would count among those kept, and in time push out every one
  * that holds them. The snapshots there are kept as they are. They're read
  * before the store is copied, so every judgment they cover is in the copy.
+ * `carry` puts them in it, as `carryAudits` does: a test's faults.
  */
-export function snapshot(db, root, nwo, at = Math.floor(Date.now() / 1000), { keep = 14, audits = null } = {}) {
+export function snapshot(db, root, nwo, at = Math.floor(Date.now() / 1000), { keep = 14, audits = null, carry = carryAudits } = {}) {
   const dir = join(root, slug(nwo));
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${at}.db`);
@@ -109,7 +110,7 @@ export function snapshot(db, root, nwo, at = Math.floor(Date.now() / 1000), { ke
     return { ok: false, path: null, mine: false, why: `could not snapshot: ${e.message}` };
   }
   if (copy) {
-    const auditsWhy = carryAudits(temp, nwo, copy.audits);
+    const auditsWhy = carry(temp, nwo, copy.audits);
     if (auditsWhy) {
       for (const s of ["", "-wal", "-shm", "-journal"]) { try { rmSync(temp + s, { force: true }); } catch {} }
       return { ok: false, path: null, mine: false, why: `its audits couldn't be put in it whole, so it wasn't taken: ${auditsWhy}`, auditsWhy };

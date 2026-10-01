@@ -259,7 +259,7 @@ test("reeve backup takes the audits with the store, and reeve restore puts back 
   assert.match(kept.stdout, /put back 2 audit\(s\) of o\/r from .*\.db/);
   assert.match(kept.stdout, /refused: .* exists; pass overwrite/);
   assert.deepEqual(audits(dir), was);
-  assert.deepEqual(readdirSync(auditNotesFor(home, R)).sort(), ["000001.sha256", "000002.sha256"]);
+  assert.deepEqual(existsSync(auditNotesFor(home, R)) ? readdirSync(auditNotesFor(home, R)).sort() : [], ["000001.sha256", "000002.sha256"]);
   // Restored to a store that's gone, with one audit there that isn't the snapshot's: nothing is restored.
   writeFileSync(join(dir, "000001.json"), was["000002.json"]);
   const fresh = join(tempDir("reeve-audit-restore-"), "r.db");
@@ -309,7 +309,7 @@ test("a restore notes each audit it puts back where the host lost its notes, and
   /** @type {any} */ let put;
   try { put = backup.restoreAudits(path, h.dir, R, { notes: h.notes }); } catch (err) { put = { threw: String(err) }; }
   assert.deepEqual(put, { ok: true, put: 2 });
-  assert.deepEqual(readdirSync(h.notes).sort(), ["000001.sha256", "000002.sha256"], "noted again");
+  assert.deepEqual(existsSync(h.notes) ? readdirSync(h.notes).sort() : [], ["000001.sha256", "000002.sha256"], "noted again");
   rmSync(join(h.dir, "000002.json"));
   assert.match(JSON.stringify(trial.readAudits(h.dir, R, { notes: h.notes })), /000002\.json, noted on the host as recorded, is missing/, "so the newest lost is told again");
   // A note that isn't the snapshot's: which was recorded can't be told.
@@ -333,4 +333,17 @@ test("a restore notes each audit it puts back where the host lost its notes, and
   try { unnoted = backup.restoreAudits(path, h.dir, R, { notes: h.notes }); } catch (err) { unnoted = { threw: String(err) }; } finally { chmodSync(h.notes, 0o700); }
   assert.equal(unnoted.put, 1, JSON.stringify(unnoted));
   assert.match(String(unnoted.unnoted), /EACCES/);
+});
+
+// ── the audits put in a snapshot ─────────────────────────────────────────────
+
+test("a snapshot whose audits can't be put in it isn't taken, and leaves nothing behind", () => {
+  const h = homeWith(1);
+  /** @type {any} */ let taken;
+  try { taken = backup.snapshot(h.db, h.root, R, 1000, { keep: 5, audits: { dir: h.dir, notes: h.notes }, carry: () => "disk full" }); }
+  catch (err) { taken = { threw: String(err) }; }
+  h.db.close();
+  assert.equal(taken.ok, false, JSON.stringify(taken));
+  assert.match(String(taken.why), /its audits couldn't be put in it whole, so it wasn't taken: disk full/);
+  assert.deepEqual(readdirSync(join(h.root, "o-r")), [], "no snapshot, and no file of its own left");
 });

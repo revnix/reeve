@@ -199,7 +199,7 @@ test("a published result carries its evidence after the verdict, however long th
  * What publishing `evidence` writes at a head whose result already carries
  * `prior`'s evidence (none where null), and whether it says the store is behind.
  */
-async function publishOver(prior, evidence, { entryAt = null, commitAt = null, name = "merge-policy (shadow)", conclusion = "neutral", also = [] } = {}) {
+async function publishOver(prior, evidence, { entryAt = null, commitAt = null, holds = null, shadow = true, name = "merge-policy (shadow)", conclusion = "neutral", also = [] } = {}) {
   const calls = [];
   const run0 = [...(prior ? [{ name, id: 5, conclusion, evidence: prior }] : []), ...also]
     .map((r, i) => JSON.stringify({ name: r.name, id: r.id ?? 6 + i, conclusion: r.conclusion, app: "merge-policy", summary: `BLOCK: ci\n${evidenceText(r.evidence)}` })).join("\n");
@@ -209,10 +209,10 @@ async function publishOver(prior, evidence, { entryAt = null, commitAt = null, n
     if (args.join(" ").includes("/check-runs?")) return { ok: true, out: run0 };
     return { ok: true, out: "" };
   };
-  const r = await publishVerdict({ nwo: REPO, verdict: { head: A, state: "BLOCK", summary: "ci", clauses: [] }, shadow: true, evidence, entryAt, commitAt,
-                                   auth: async () => ({ ok: true, token: "t" }), api });
+  const r = await publishVerdict({ nwo: REPO, verdict: { head: A, state: "BLOCK", summary: "ci", clauses: [] }, shadow, evidence, entryAt, commitAt,
+                                   ...(holds ? { holds } : {}), auth: async () => ({ ok: true, token: "t" }), api });
   const summaryOf = (a) => String(a.find((x) => typeof x === "string" && x.startsWith("output[summary]=")) ?? "").slice("output[summary]=".length);
-  // The shadow result written: a new one, or the one at this head updated. A superseded result is written apart.
+  // The result written: a new one, or the one at this head updated. A superseded result is written apart.
   const write = calls.find((a) => a.includes("POST") || (a.includes("PATCH") && !a.includes("conclusion=cancelled"))) ?? [];
   const superseded = calls.find((a) => a.includes("conclusion=cancelled"));
   return { written: readEvidence(summaryOf(write)), behind: r.behind ?? null, ...(superseded ? { superseded: readEvidence(summaryOf(superseded)) } : {}) };
@@ -768,4 +768,136 @@ test("each result the daemon publishes says what the store's orders commit to at
   } });
   assert.ok(seen.some((x) => x.queue) && seen.some((x) => !x.queue), `control: results were published at a head and on the queue's commit: ${JSON.stringify(seen)}`);
   for (const x of seen) assert.equal(x.at, x.orders);
+});
+
+// ── #285's fourth review ─────────────────────────────────────────────────────
+
+/** A merge queue holding #42 alone at Q. */
+const queueOfOne = () => ({ ok: true, queue: true, entries: [{ pr: PR, sha: Q, baseSha: QBASE, state: "AWAITING_CHECKS" }] });
+/** The highest entry of a signed order that names a record the queue's commit was judged with, in the store at `path`. */
+const queueEntryAt = (path) => {
+  const db = open(path);
+  const queued = new Set(db.prepare("SELECT digest FROM decision WHERE head = ?").all(Q).map((r) => r.digest));
+  const seqs = db.prepare("SELECT seq, payload FROM event WHERE op = 'decision.latest'").all()
+    .filter((r) => { const p = JSON.parse(r.payload); return queued.has(p.digest) || p.records.some((d) => queued.has(d)); }).map((r) => r.seq);
+  db.close();
+  return Math.max(0, ...seqs);
+};
+
+test("the daemon raises a store behind what the merge policy published on a merge queue's commit", async () => {
+  const path = join(tempDir("reeve-pub-qbehind-"), "s.db");
+  open(path).close();
+  const r = await run({ openPrs: () => [PR], evaluate: () => at(A), dbPath: path, ticks: 1, ...host(credentials()), evaluateQueue: judgedAtQueue, readQueue: queueOfOne,
+                        publish: async (args) => ({ ok: true, id: 1, conclusion: "neutral",
+                                                    ...(args.queue ? { behind: "at cccccccc, its signed orders go to its event 1, where orders to event 9 were published, so what was published there is kept" } : {}) }) });
+  assert.match(r.esc, /#42: the store is behind what the merge policy published at cccccccc, its signed orders go to its event 1, where orders to event 9 were published/);
+  assert.match(r.log, /#42: the store is behind what was published at cccccccc/);
+});
+
+test("an enforcing result is held to the evidence a shadow result carries at its head, as a shadow one is to an enforcing one's", async () => {
+  const shadowed = ev(X, { n: 3, names: X }, st(9));
+  const r = await publishOver(shadowed, ev(Y, { n: 2, names: Y }, st(8)), { shadow: false });
+  assert.deepEqual(r.written, shadowed, "the enforcing result carries the shadow one's evidence, not the store's older evidence");
+  assert.match(String(r.behind), /ends at entry 2, where entry 3 was published/);
+  const ahead = ev(Y, { n: 4, names: Y }, st(10, "f"));
+  assert.deepEqual(await publishOver(shadowed, ahead, { shadow: false }), { written: ahead, behind: null }, "control: evidence ahead of it is written");
+});
+
+test("a result is published with the record its verdict kept, and none where pinning kept none", async () => {
+  const dir = credentials();
+  const path = join(tempDir("reeve-pub-unpinned-"), "s.db");
+  open(path).close();
+  /** @type {any[]} */ const published = [];
+  let tick = 0;
+  const publish = async (/** @type {any} */ args) => { published.push({ tick, ...args }); return { ok: true, id: 1, conclusion: "neutral" }; };
+  await run({ openPrs: () => { tick++; return [PR]; }, evaluate: () => at(A), dbPath: path, ticks: 1, ...host(dir), publish });
+  // Judged again, red, where the host's anchor reads but won't take a pin.
+  await run({ openPrs: () => { tick++; return [PR]; }, evaluate: () => at(A, "RED"), dbPath: path, ticks: 1, ...host(dir), anchor: { ...fileAnchor(dir), pin: () => false }, publish });
+  const db = open(path);
+  const held = new Set(digestsOf(db));
+  db.close();
+  assert.equal(held.size, 1, "control: the red verdict's record wasn't kept");
+  assert.ok(published.some((p) => p.tick === 2 && p.verdict.state === "BLOCK"), "control: the red verdict was published");
+  for (const p of published) if (p.evidence) assert.ok(held.has(p.evidence.record), `tick ${p.tick} published ${p.evidence.record.slice(0, 12)}, a record the store doesn't hold`);
+});
+
+test("a merge queue's PASS is published once the orders, extended with the records its commit was judged with, are published at a pull request's head", async () => {
+  const dir = credentials();
+  const { path, published } = await ticksOf(() => [PR, 7], 1, { ...host(dir), evaluateQueue: judgedAtQueue,
+    readQueue: () => ({ ok: true, queue: true, entries: [{ pr: PR, sha: Q, baseSha: QBASE, state: "AWAITING_CHECKS" }, { pr: 7, sha: Q, baseSha: QBASE, state: "AWAITING_CHECKS" }] }) });
+  const pass = published.findIndex((p) => p.queue && p.verdict.state === "PASS");
+  assert.ok(pass > 0, `control: the queue's commit passed: ${JSON.stringify(published.map((p) => [p.queue, p.verdict.state]))}`);
+  const entry = queueEntryAt(path);
+  assert.ok(entry > 0, "control: an order names the queue's records");
+  const before = published.slice(0, pass).filter((p) => !p.queue && p.evidence);
+  assert.ok(before.some((p) => p.evidence.store.to >= entry), `a head carried them first: ${entry} ${JSON.stringify(before.map((p) => p.evidence.store.to))}`);
+});
+
+test("a merge queue's PASS whose records couldn't be published at a pull request's head first isn't published", async () => {
+  const dir = credentials();
+  const path = join(tempDir("reeve-pub-qwit-"), "s.db");
+  open(path).close();
+  /** @type {any[]} */ const published = [];
+  const seen = new Set();
+  const r = await run({ openPrs: () => [PR], evaluate: () => at(A), dbPath: path, ticks: 1, ...host(dir), evaluateQueue: judgedAtQueue, readQueue: queueOfOne,
+                        publish: async (args) => {
+                          published.push(args);
+                          // A head's result goes out, and fails when it goes out again with its orders.
+                          const key = `${args.evidence?.pr}@${args.verdict.head}`;
+                          if (!args.queue && args.evidence && seen.has(key)) return { ok: false, why: "HTTP 502" };
+                          seen.add(key);
+                          return { ok: true, id: 1, conclusion: "neutral" };
+                        } });
+  assert.ok(published.some((p) => !p.queue && p.verdict.head === A), "control: the head was published");
+  assert.deepEqual(published.filter((p) => p.queue && p.verdict.state === "PASS"), [], "no PASS went to the queue's commit");
+  assert.match(r.log, /queue commit cccccccccc \(#42\): could not publish PASS — the store's signed orders, extended with its records, couldn't be published at a pull request's head first/);
+  const db = open(path);
+  const standing = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'pr.published' AND json_extract(payload, '$.head') = ?").get(Q).n;
+  db.close();
+  assert.equal(standing, 0, "nor is a PASS written down as standing there");
+});
+
+test("the orders a tick extended are published again once, not once more at the tick's end with nothing new", async () => {
+  const dir = credentials();
+  const { published } = await ticksOf(() => [PR], 1, { ...host(dir), evaluateQueue: judgedAtQueue, readQueue: queueOfOne });
+  const atHead = published.filter((p) => !p.queue && p.verdict.head === A);
+  assert.ok(published.some((p) => p.queue), "control: the queue's commit was published");
+  assert.equal(atHead.length, 2, `published, then again with the orders extended: ${JSON.stringify(atHead.map((p) => p.evidence?.store.to))}`);
+});
+
+test("a record published at a head stays there until the store holds it, though other evidence is no further behind", async () => {
+  const Z = "f".repeat(64);
+  const published = ev(X, { n: 3, names: Y }, st(9));
+  const other = ev(Z, { n: 3, names: Y }, st(9));
+  const lost = await publishOver(published, other, { holds: (d) => d !== X });
+  assert.deepEqual(lost.written, published, "a store that doesn't hold the record published doesn't write over it");
+  assert.match(String(lost.behind), /the record published there, c{12}, isn't one this store holds/);
+  assert.deepEqual(await publishOver(published, other, { holds: () => true }), { written: other, behind: null }, "control: one that holds it goes on");
+});
+
+test("each result the daemon publishes is asked whether the store holds a record, at a head and on the queue's commit", async () => {
+  const dir = credentials();
+  /** @type {{ queue: boolean, own: boolean | undefined, other: boolean | undefined }[]} */ const seen = [];
+  await ticksOf(() => [PR], 2, { ...host(dir), evaluateQueue: judgedAtQueue, readQueue: queueOfOne,
+    publish: async (/** @type {any} */ args) => {
+      if (args.evidence) seen.push({ queue: Boolean(args.queue), own: args.holds?.(args.evidence.record), other: args.holds?.("0".repeat(64)) });
+      return { ok: true, id: 1, conclusion: "neutral" };
+    } });
+  assert.ok(seen.some((x) => x.queue) && seen.some((x) => !x.queue), `control: published at a head and on the queue's commit: ${JSON.stringify(seen)}`);
+  for (const x of seen) assert.deepEqual([x.own, x.other], [true, false], JSON.stringify(x));
+});
+
+test("where the results at a head can't be read, nothing is written there, as a new result would hide what was published", async () => {
+  for (const shadow of [true, false]) {
+    /** @type {string[][]} */ const calls = [];
+    const api = (/** @type {string} */ _t, /** @type {string[]} */ args) => {
+      calls.push(args);
+      return args.join(" ").includes("/check-runs?") ? { ok: false, out: "", err: "HTTP 502" } : { ok: true, out: JSON.stringify({ id: 9 }) };
+    };
+    const r = await publishVerdict({ nwo: REPO, verdict: { head: A, state: "BLOCK", summary: "ci", clauses: [] }, shadow, evidence: ev(X, { n: 1, names: X }, st(1)),
+                                     auth: async () => ({ ok: true, token: "t" }), api });
+    assert.equal(r.ok, false, `shadow ${shadow}`);
+    assert.match(String(r.why), /the results at aaaaaaaa couldn't be read, so what was published there couldn't be kept/);
+    assert.deepEqual(calls.filter((a) => a.includes("POST") || a.includes("PATCH")), [], `shadow ${shadow}: nothing written`);
+  }
 });

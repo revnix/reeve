@@ -71,11 +71,14 @@ export function readEvidence(text) {
  * published (#285). `entryAt` gives the record the store's order names at an
  * entry, and `commitAt` the store's commitment to its orders up to an event,
  * where each can say; without them, only an entry, or a commitment, at the same
- * number is compared. Null where it doesn't fall short.
+ * number is compared. And a record published that the store doesn't hold, as
+ * one kept by a tick that stopped before its order named it, and taken away
+ * since, where `holds` can say: no order or commitment may name it yet, and the
+ * result published is all that witnesses it. Null where it doesn't fall short.
  * @param {Evidence} e @param {Evidence} prior @param {((n: number) => string | undefined) | null} [entryAt]
- * @param {((to: number) => string | null) | null} [commitAt]
+ * @param {((to: number) => string | null) | null} [commitAt] @param {((digest: string) => boolean) | null} [holds]
  */
-export function evidenceBehind(e, prior, entryAt = null, commitAt = null) {
+export function evidenceBehind(e, prior, entryAt = null, commitAt = null, holds = null) {
   const n = e.order?.n ?? 0, was = prior.order?.n ?? 0;
   const there = !prior.order || n < was ? undefined : entryAt ? entryAt(was) : n === was ? e.order?.names : undefined;
   const short = [
@@ -85,6 +88,8 @@ export function evidenceBehind(e, prior, entryAt = null, commitAt = null) {
     e.store.to < prior.store.to ? `its signed orders go to its event ${e.store.to}, where orders to event ${prior.store.to} were published` : null,
     e.store.to >= prior.store.to && (commitAt ? commitAt(prior.store.to) : e.store.to === prior.store.to ? e.store.orders : prior.store.orders) !== prior.store.orders
       ? `its signed orders to event ${prior.store.to} aren't those published` : null,
+    holds && prior.record !== e.record && !holds(prior.record)
+      ? `the record published there, ${prior.record.slice(0, 12)}, isn't one this store holds` : null,
   ].filter(Boolean);
   return short.length ? short.join("; ") : null;
 }

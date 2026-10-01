@@ -1836,6 +1836,9 @@ async function tickOnce(ctx) {
     const c = ordersCommitment(db, nwo, /** @type {any} */ (orderKeys), storeIdentity(db), to);
     return "corrupt" in c ? null : c.orders;
   };
+  // Whether the store holds a record, for a publication to keep a record
+  // published that it doesn't, as no order may name it yet (#285).
+  const holdsRecord = (/** @type {string} */ digest) => Boolean(db.prepare(`SELECT 1 FROM decision WHERE digest = ?`).get(digest));
   // The last result this tick published at a pull request's head with evidence,
   // under which name, and what it was published with.
   /** @type {{ pr: number, name: string, args: any } | null} */ let lastAtHead = null;
@@ -1846,21 +1849,29 @@ async function tickOnce(ctx) {
   // at a pull request's head goes out again, the same verdict with the orders
   // as they now stand: that pull request's head is where a check reads it, as
   // GitHub lists it. Not where that result no longer stands as it was
-  // published, taken back since, say.
+  // published, taken back since, say. True once the orders as they stand are
+  // published, or where nothing published this tick is to be published again.
   const republishOrders = async () => {
-    if (!lastAtHead || !ordering) return;
+    if (!lastAtHead || !ordering) return true;
     const { pr, name, args } = lastAtHead;
-    if (lastEntrySeq(db) <= args.evidence.store.to) return;
+    if (lastEntrySeq(db) <= args.evidence.store.to) return true;
     let st = null;
-    try { st = standingAt(db, pr).find((x) => x.name === name && x.head === args.verdict.head); } catch { return; }
-    if (st?.op !== "pr.published" || st.state !== args.verdict.state) return;
+    try { st = standingAt(db, pr).find((x) => x.name === name && x.head === args.verdict.head); } catch { return false; }
+    if (st?.op !== "pr.published" || st.state !== args.verdict.state) return false;
     asPublished = undefined;
     const stood = orderAt(pr);
-    if (!stood) return;
+    if (!stood) return false;
+    const again = { ...args, evidence: { ...args.evidence, ...stood }, entryAt: entryAtOf(pr), commitAt };
     let pub;
-    try { pub = await (ctx.publish ?? publishVerdict)({ ...args, evidence: { ...args.evidence, ...stood }, entryAt: entryAtOf(pr), commitAt }); }
+    try { pub = await (ctx.publish ?? publishVerdict)(again); }
     catch (err) { pub = { ok: false, why: err.message }; }
-    if (!pub.ok) log(logPath, `  #${pr}: the store's signed orders, as this tick extended them, couldn't be published — ${pub.why}; the next tick publishes them`);
+    if (!pub.ok) {
+      log(logPath, `  #${pr}: the store's signed orders, as this tick extended them, couldn't be published — ${pub.why}; the next tick publishes them`);
+      return false;
+    }
+    // Published as they now stand: only orders extended since go out again.
+    lastAtHead = { pr, name, args: again };
+    return true;
   };
   // The host's anchor moved to entry `top` of `pr`'s order, with the record it
   // names and every record the order names, which are pinned no longer (#279),
@@ -3045,10 +3056,11 @@ async function tickOnce(ctx) {
         && !note("pr.published", { head: e.head, state: PASS, name, id: was?.id ?? null }))
       pub = { ok: false, why: "its PASS couldn't be written down first, so it isn't published" };
     else {
-      // With the record kept for it, and where its signed order stood, where both can be said.
-      const stood = decided.ok && kept ? orderAt(pr) : undefined;
-      const evidence = stood === undefined ? null : { pr, record: /** @type {any} */ (kept).decision.digest, ...stood };
-      published = { nwo, verdict: e.verdict, shadow, base: e.baseRef, evidence, ...(evidence ? { entryAt: entryAtOf(pr), commitAt } : {}) };
+      // With the record kept for it, and where its signed order stood, where both can be said:
+      // the record pinning let it keep, as one it couldn't pin isn't in the store.
+      const stood = decided.ok && held.kept ? orderAt(pr) : undefined;
+      const evidence = stood === undefined ? null : { pr, record: /** @type {any} */ (held.kept).decision.digest, ...stood };
+      published = { nwo, verdict: e.verdict, shadow, base: e.baseRef, evidence, ...(evidence ? { entryAt: entryAtOf(pr), commitAt, holds: holdsRecord } : {}) };
       try { pub = await (ctx.publish ?? publishVerdict)(published); }
       // A publish that throws, a network error say, fails this pull request's
       // publication, not the tick for every one after it (#161).
@@ -3270,7 +3282,15 @@ async function tickOnce(ctx) {
           || notePublication(db, n, "pr.published", { ...left, head: sha, name: left.name ?? name, queue: true });
       };
       let pub;
-      if (verdict.state === PASS && !prs.every((n) => noteQueued(n, { state: PASS, id: standing.get(n)?.id ?? null })))
+      // A PASS lets the queue merge at once, so the records its commit was
+      // judged with are witnessed first: the orders extended to them, and
+      // published at a pull request's head, where a check of a copy finds them
+      // however far back the copy was rolled (#285). Not published where they
+      // couldn't be: the next tick tries again, and the queue waits.
+      if (verdict.state === PASS) { orderPending(); asPublished = undefined; }
+      if (verdict.state === PASS && !(await republishOrders()))
+        pub = { ok: false, why: "the store's signed orders, extended with its records, couldn't be published at a pull request's head first, so its PASS isn't published" };
+      else if (verdict.state === PASS && !prs.every((n) => noteQueued(n, { state: PASS, id: standing.get(n)?.id ?? null })))
         pub = { ok: false, why: "its PASS couldn't be written down first, so it isn't published" };
       else {
         // With the evidence of its pull request, where the commit is one's: a
@@ -3281,9 +3301,15 @@ async function tickOnce(ctx) {
         const one = judged.length === 1 && judged[0].record ? judged[0] : null;
         const stood = one ? orderAt(one.pr) : undefined;
         const evidence = one && stood !== undefined ? { pr: one.pr, record: /** @type {string} */ (one.record), ...stood } : null;
-        try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict, shadow, base, queue: true, evidence, ...(evidence && one ? { entryAt: entryAtOf(one.pr), commitAt } : {}) }); }
+        try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict, shadow, base, queue: true, evidence, ...(evidence && one ? { entryAt: entryAtOf(one.pr), commitAt, holds: holdsRecord } : {}) }); }
         catch (thrown) { pub = { ok: false, why: thrown.message }; }
       }
+      // The store is behind what was published on this commit, as at a head.
+      if (pub.behind)
+        for (const n of prs) {
+          log(logPath, `  #${n}: the store is behind what was published ${pub.behind}`);
+          raise(`#${n}: the store is behind what the merge policy published ${pub.behind}; it may have been rolled back or restored from before`);
+        }
       // An enforcing PASS a shadow publication superseded here is cancelled, so
       // it's written down as withdrawn, as at a head.
       if (pub.superseded && name !== POLICY_CONTEXT)

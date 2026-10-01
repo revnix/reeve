@@ -1236,8 +1236,12 @@ export const requiredOnBase = (args) => requirementsOnBase(args).own;
  * entry, so a fork signed under a number already published is behind too, and
  * `commitAt` the store's commitment to its orders up to an event, so a store
  * whose orders to a published event aren't those published is behind (#285).
+ * `holds` says whether the store holds a record, so evidence naming another
+ * record never replaces a record published that the store doesn't hold. Where
+ * the results at the head can't be read, nothing is written there: a new
+ * result would hide the one carrying what was published.
  */
-export async function publishVerdict({ nwo, verdict, shadow = true, context = POLICY_CONTEXT, base = null, queue = false, evidence = null, entryAt = null, commitAt = null,
+export async function publishVerdict({ nwo, verdict, shadow = true, context = POLICY_CONTEXT, base = null, queue = false, evidence = null, entryAt = null, commitAt = null, holds = null,
                                       auth: authenticateAs = authenticate, api = apiAsInstallation }) {
   const auth = await authenticateAs(nwo);
   if (!auth.ok) return { ok: false, why: auth.why };
@@ -1261,7 +1265,9 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = PO
   // an UNKNOWN only a person can settle are settled there as anywhere: the last
   // lets the queue go on rather than hold every entry behind it to its timeout.
   const running = queue && !shadow && verdict.state === UNKNOWN && verdict.kind !== "person";
-  const runs = existingRuns(auth.token, nwo, verdict.head, [name, context], api);
+  // Both of reeve's names, whichever it publishes under: either may carry the evidence it's held to.
+  const names = [...new Set([name, context, shadowContextOf(context)])];
+  const runs = existingRuns(auth.token, nwo, verdict.head, names, api);
   const existing = runs?.mine[name]?.id ?? null;
   // The evidence already published at this head is GitHub's witness of the
   // store, kept out of reach of whoever can change it (#274). So it only moves
@@ -1271,11 +1277,11 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = PO
   // commit both are at, is that one's, and is written over. Under either of
   // reeve's names: an enforcing result's evidence is as much a witness as a
   // shadow one's, and a switch between them doesn't drop it.
-  const priors = [...new Set([name, context])].map((n) => readEvidence(runs?.mine[n]?.summary))
+  const priors = names.map((n) => readEvidence(runs?.mine[n]?.summary))
     .filter((w) => w && !("garbled" in w) && (!evidence || w.pr === evidence.pr));
   const prior = /** @type {import("./published.mjs").Evidence | null} */
     (priors.find((p) => priors.every((q) => q === p || !evidenceBehind(/** @type {any} */ (p), /** @type {any} */ (q)))) ?? priors[0] ?? null);
-  const short = prior && evidence ? evidenceBehind(evidence, prior, entryAt, commitAt) : null;
+  const short = prior && evidence ? evidenceBehind(evidence, prior, entryAt, commitAt, holds) : null;
   const behind = short ? `at ${verdict.head.slice(0, 8)}, ${short}, so what was published there is kept` : null;
   const tail = prior && (!evidence || short) ? evidenceText(prior) : evidence ? evidenceText(evidence) : "";
   const fields = [
@@ -1306,7 +1312,10 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = PO
     }
   }
 
-  const res = existing
+  // A result written where the runs couldn't be read would be a new one, and
+  // GitHub's latest: the one carrying what was published would be hidden.
+  const res = !runs ? { ok: false, out: "", err: `the results at ${verdict.head.slice(0, 8)} couldn't be read, so what was published there couldn't be kept` }
+    : existing
     ? api(auth.token, ["-X", "PATCH", `repos/${nwo}/check-runs/${existing}`, ...fields])
     : api(auth.token, ["-X", "POST", `repos/${nwo}/check-runs`,
         "-f", `name=${name}`, "-f", `head_sha=${verdict.head}`, ...fields]);

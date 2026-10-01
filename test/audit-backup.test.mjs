@@ -102,7 +102,7 @@ test("every store's snapshot carries its repository's audits, and one whose audi
   assert.equal(next?.ok, false, JSON.stringify(next));
   assert.equal(next?.escalate, "builder:backup:failed");
   assert.match(String(next?.why), /its audits couldn't be put in it whole, so it wasn't taken: .*ENOTDIR/);
-  assert.deepEqual(readdirSync(join(root, "o-r")), ["2000.db"], "nothing taken, and the one before kept");
+  assert.deepEqual(readdirSync(join(root, "repos", "o", "r")), ["2000.db"], "nothing taken, and the one before kept");
 });
 
 test("a restore puts back the audits a snapshot holds, as recorded, leaves those recorded since, and refuses where one there isn't the snapshot's", () => {
@@ -112,32 +112,32 @@ test("a restore puts back the audits a snapshot holds, as recorded, leaves those
   const { dir } = h;
   const was = audits(dir);
   rmSync(dir, { recursive: true });
-  const put = backup.restoreAudits(path, dir, R);
+  const put = backup.restoreAudits(path, dir, R, { backups: h.root });
   assert.deepEqual(put, { ok: true, put: 2 });
   assert.deepEqual(audits(dir), was, "byte for byte as recorded");
   assert.equal(trial.readAudits(dir, R, { notes: h.notes }).ok, true, "and as the host noted them");
-  assert.deepEqual(backup.restoreAudits(path, dir, R), { ok: true, put: 0 }, "those there already are left");
+  assert.deepEqual(backup.restoreAudits(path, dir, R, { backups: h.root }), { ok: true, put: 0 }, "those there already are left");
   // One recorded since the snapshot is left as it is.
   writeFileSync(join(dir, "000003.json"), was["000001.json"]);
   rmSync(join(dir, "000002.json"));
-  assert.deepEqual(backup.restoreAudits(path, dir, R), { ok: true, put: 1 });
+  assert.deepEqual(backup.restoreAudits(path, dir, R, { backups: h.root }), { ok: true, put: 1 });
   assert.deepEqual(Object.keys(audits(dir)), ["000001.json", "000002.json", "000003.json"]);
   // One there that isn't the snapshot's: refused, and nothing put back.
   rmSync(join(dir, "000002.json"));
   writeFileSync(join(dir, "000001.json"), was["000002.json"]);
-  const refused = backup.restoreAudits(path, dir, R);
+  const refused = backup.restoreAudits(path, dir, R, { backups: h.root });
   assert.equal(refused.ok, false, JSON.stringify(refused));
   assert.match(String(/** @type {any} */ (refused).why), /000001\.json in .* isn't the audit the snapshot holds under that number/);
   assert.equal(existsSync(join(dir, "000002.json")), false, "nothing put back");
   // The folder can't be read: a file stands where it would be.
   rmSync(dir, { recursive: true });
   writeFileSync(dir, "");
-  assert.match(JSON.stringify(backup.restoreAudits(path, dir, R)), /000001\.json in .* can't be read: ENOTDIR/);
+  assert.match(JSON.stringify(backup.restoreAudits(path, dir, R, { backups: h.root })), /000001\.json in .* can't be read: ENOTDIR/);
   // Nor written.
   rmSync(dir);
   mkdirSync(dir, { mode: 0o500 });
   /** @type {any} */ let got;
-  try { got = backup.restoreAudits(path, dir, R); } catch (err) { got = { threw: String(err) }; } finally { chmodSync(dir, 0o700); }
+  try { got = backup.restoreAudits(path, dir, R, { backups: h.root }); } catch (err) { got = { threw: String(err) }; } finally { chmodSync(dir, 0o700); }
   assert.match(JSON.stringify(got), /the audits couldn't be put back in .*: EACCES/);
 });
 
@@ -152,7 +152,7 @@ test("a restore from a snapshot that wouldn't restore puts back none of the audi
   assert.equal(backup.validateSnapshot(path, { kind: "repo" }).ok, false, "control: it wouldn't restore");
   rmSync(h.dir, { recursive: true });
   /** @type {any} */ let got;
-  try { got = backup.restoreAudits(path, h.dir, R); } catch (err) { got = { threw: String(err) }; }
+  try { got = backup.restoreAudits(path, h.dir, R, { backups: h.root }); } catch (err) { got = { threw: String(err) }; }
   assert.equal(got.ok, false, JSON.stringify(got));
   assert.match(String(got.why), /the snapshot is not a usable store/);
   assert.equal(existsSync(h.dir), false, "nothing put back");
@@ -202,7 +202,7 @@ test("a snapshot taken before audits were kept with snapshots restores none, and
   assert.equal(carried(path), null, "control: it carries none");
   const was = audits(h.dir);
   /** @type {any} */ let got;
-  try { got = backup.restoreAudits(path, h.dir, R); } catch (err) { got = { threw: String(err) }; }
+  try { got = backup.restoreAudits(path, h.dir, R, { backups: h.root }); } catch (err) { got = { threw: String(err) }; }
   assert.deepEqual(got, { ok: true, put: 0, none: true });
   assert.deepEqual(audits(h.dir), was);
   // And its store restores as it did.
@@ -233,7 +233,7 @@ test("a copy of the audits that isn't one, is another repository's, or misses on
   const t = new DatabaseSync(path);
   t.exec("UPDATE trial_audit SET repo = 'x/y'");
   t.close();
-  assert.match(JSON.stringify(backup.restoreAudits(path, h.dir, R)), /is of x\/y, not o\/r/);
+  assert.match(JSON.stringify(backup.restoreAudits(path, h.dir, R, { backups: h.root })), /is of x\/y, not o\/r/);
   assert.equal(existsSync(h.dir), false, "nothing put back");
   assert.deepEqual(put(copy), { ok: true, put: 2 }, "control: the copy as it was taken puts them back");
 });
@@ -307,7 +307,7 @@ test("a restore notes each audit it puts back where the host lost its notes, and
   rmSync(h.dir, { recursive: true });
   rmSync(h.notes, { recursive: true });
   /** @type {any} */ let put;
-  try { put = backup.restoreAudits(path, h.dir, R, { notes: h.notes }); } catch (err) { put = { threw: String(err) }; }
+  try { put = backup.restoreAudits(path, h.dir, R, { notes: h.notes, backups: h.root }); } catch (err) { put = { threw: String(err) }; }
   assert.deepEqual(put, { ok: true, put: 2 });
   assert.deepEqual(existsSync(h.notes) ? readdirSync(h.notes).sort() : [], ["000001.sha256", "000002.sha256"], "noted again");
   rmSync(join(h.dir, "000002.json"));
@@ -315,7 +315,7 @@ test("a restore notes each audit it puts back where the host lost its notes, and
   // A note that isn't the snapshot's: which was recorded can't be told.
   writeFileSync(join(h.notes, "000002.sha256"), "0".repeat(64) + "\n");
   /** @type {any} */ let refused;
-  try { refused = backup.restoreAudits(path, h.dir, R, { notes: h.notes }); } catch (err) { refused = { threw: String(err) }; }
+  try { refused = backup.restoreAudits(path, h.dir, R, { notes: h.notes, backups: h.root }); } catch (err) { refused = { threw: String(err) }; }
   assert.equal(refused.ok, false, JSON.stringify(refused));
   assert.match(String(refused.why), /000002\.json in the copy of the audits in .* isn't the audit the host noted under that number/);
   assert.equal(existsSync(join(h.dir, "000002.json")), false, "nothing put back");
@@ -323,14 +323,14 @@ test("a restore notes each audit it puts back where the host lost its notes, and
   rmSync(h.notes, { recursive: true });
   writeFileSync(h.notes, "");
   /** @type {any} */ let unread;
-  try { unread = backup.restoreAudits(path, h.dir, R, { notes: h.notes }); } catch (err) { unread = { threw: String(err) }; }
+  try { unread = backup.restoreAudits(path, h.dir, R, { notes: h.notes, backups: h.root }); } catch (err) { unread = { threw: String(err) }; }
   assert.match(String(unread.why), /the host's notes of the audits recorded, in .*, can't be read: ENOTDIR, so none is put back/);
   assert.equal(existsSync(join(h.dir, "000002.json")), false, "nothing put back");
   // Notes that can't be made: put back, and said.
   rmSync(h.notes);
   mkdirSync(h.notes, { mode: 0o500 });
   /** @type {any} */ let unnoted;
-  try { unnoted = backup.restoreAudits(path, h.dir, R, { notes: h.notes }); } catch (err) { unnoted = { threw: String(err) }; } finally { chmodSync(h.notes, 0o700); }
+  try { unnoted = backup.restoreAudits(path, h.dir, R, { notes: h.notes, backups: h.root }); } catch (err) { unnoted = { threw: String(err) }; } finally { chmodSync(h.notes, 0o700); }
   assert.equal(unnoted.put, 1, JSON.stringify(unnoted));
   assert.match(String(unnoted.unnoted), /EACCES/);
 });
@@ -345,5 +345,5 @@ test("a snapshot whose audits can't be put in it isn't taken, and leaves nothing
   h.db.close();
   assert.equal(taken.ok, false, JSON.stringify(taken));
   assert.match(String(taken.why), /its audits couldn't be put in it whole, so it wasn't taken: disk full/);
-  assert.deepEqual(readdirSync(join(h.root, "o-r")), [], "no snapshot, and no file of its own left");
+  assert.deepEqual(readdirSync(join(h.root, "repos", "o", "r")), [], "no snapshot, and no file of its own left");
 });

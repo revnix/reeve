@@ -17,7 +17,7 @@ import { selfAudit, BROKEN, DEGRADED } from "../src/selfaudit.mjs";
 import { everyStore, snapshotAll, snapshot } from "../src/backup.mjs";
 // The hub half of the audit needs a real hub and a real hub snapshot.
 import { openHub } from "../src/build/hubdb.mjs";
-import { hubPathFor } from "../src/paths.mjs";
+import { hubPathFor, backupDirFor } from "../src/paths.mjs";
 import { open } from "../src/db/ops.mjs";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -40,8 +40,8 @@ const PROFILE = { notify: { provider: "ntfy", url: "https://x", topic: "t" },
 
 // A snapshot that is fresh and readable: the healthy baseline.
 const snapRoot = join(dir, "backups");
-mkdirSync(join(snapRoot, "revnix-reeve"), { recursive: true });
-const goodSnap = join(snapRoot, "revnix-reeve", "1.db");
+mkdirSync(backupDirFor(snapRoot, "revnix/reeve"), { recursive: true });
+const goodSnap = join(backupDirFor(snapRoot, "revnix/reeve"), "1.db");
 {
   const s = open(goodSnap);
   s.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
@@ -82,8 +82,8 @@ check(healthy.length === 0, "control: a healthy reeve produces no findings", JSO
 // ── a snapshot that exists but is not a database ─────────────────────────────
 {
   const junkRoot = join(dir, "junk");
-  mkdirSync(join(junkRoot, "revnix-reeve"), { recursive: true });
-  writeFileSync(join(junkRoot, "revnix-reeve", "1.db"), "this is not a sqlite file");
+  mkdirSync(backupDirFor(junkRoot, "revnix/reeve"), { recursive: true });
+  writeFileSync(join(backupDirFor(junkRoot, "revnix/reeve"), "1.db"), "this is not a sqlite file");
   const f = selfAudit(db, { nwo: NWO, profile: PROFILE, backupRoot: junkRoot, at: NOW, io: fresh });
   check(f.some(x => x.id === "backup.unreadable" || x.id === "backup.empty"),
     "a fresh file that is not a usable store is caught — it is the one a restore reaches for",
@@ -108,7 +108,7 @@ check(healthy.length === 0, "control: a healthy reeve produces no findings", JSO
   // CONTROL: a genuinely empty directory still reports absence. Without it, a
   // fix that renames every backup fault to 'unreadable' passes both lines above.
   const emptyRoot = join(dir, "empty-root");
-  mkdirSync(join(emptyRoot, "revnix-reeve"), { recursive: true });
+  mkdirSync(backupDirFor(emptyRoot, "revnix/reeve"), { recursive: true });
   const e = selfAudit(db, { nwo: NWO, profile: PROFILE, backupRoot: emptyRoot, at: NOW, io: fresh });
   check(e.some(x => x.id === "backup.missing"),
     "control: a directory with no snapshots at all is still reported as never backed up",
@@ -227,8 +227,8 @@ check(healthy.length === 0, "control: a healthy reeve produces no findings", JSO
   }
   // Only the watched one has a snapshot.
   const root = join(twoStores, "backups");
-  mkdirSync(join(root, "owner-a-watched"), { recursive: true });
-  const snap = open(join(root, "owner-a-watched", "1.db"));
+  mkdirSync(backupDirFor(root, "owner-a/watched"), { recursive: true });
+  const snap = open(join(backupDirFor(root, "owner-a/watched"), "1.db"));
   snap.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(NOW, "t", "seed", "x", "{}");
   snap.close();
 

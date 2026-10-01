@@ -56,6 +56,16 @@ const segments = nwo => {
   return [named(owner ?? "unknown"), named(repo ?? "unknown")];
 };
 
+/**
+ * The folder a repository's snapshots are kept in, under the backups' root
+ * (#319): `repos`, then its owner's and its own names as its store's path has
+ * them, so no two repositories share one, nor one the hub's (`hub`).
+ */
+export function backupDirFor(root, nwo) {
+  const [owner, repo] = segments(nwo);
+  return join(root, "repos", owner, repo);
+}
+
 /** The state database for one repository. */
 export function statePathFor(home, nwo) {
   const [owner, repo] = segments(nwo);

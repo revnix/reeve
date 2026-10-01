@@ -112,7 +112,7 @@ let snapPath;
   // that is already the single point of failure.
   for (let t = 1_700_001_000; t < 1_700_001_100; t += 10) snapshot(db, backups, "o/r", t, { keep: 3 });
   const { readdirSync } = await import("node:fs");
-  const kept = readdirSync(join(backups, "o-r")).filter(f => f.endsWith(".db"));
+  const kept = readdirSync(join(backups, "repos", "o", "r")).filter(f => f.endsWith(".db"));
   check(kept.length <= 3, `only the newest few are kept (${kept.length})`, kept.join(", "));
 }
 

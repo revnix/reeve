@@ -1640,10 +1640,11 @@ async function tickOnce(ctx) {
   // store holds already counts as pinned or ordered, and isn't pinned again
   // (#304). So, before any record is kept, each the store holds whole that no
   // signed order or the store's baseline names, and the host's anchor doesn't
-  // pin, is pinned, where the anchor is this store's. Once in a process; again
-  // each tick until it's done. Ordered at a tick's end, it's unpinned.
+  // pin, is pinned, where the anchor is this store's: looked for every tick, as
+  // one may be kept between them by a reeve before #299 on the store. Ordered
+  // at a tick's end, it's unpinned.
   const pinUnnamed = () => {
-    if (!ordering || !begun.began || ctx.unnamedPinned) return;
+    if (!ordering || !begun.began) return;
     withOrderLock((held) => {
       if (!held) return;
       const keys = keysNow();
@@ -1682,7 +1683,6 @@ async function tickOnce(ctx) {
         for (const [pr, ds] of unnamed)
           if (!ctx.anchor.pin(nwo, /** @type {string} */ (id), pr, ds)) { log(logPath, `signing: #${pr}: records kept before records were pinned couldn't be pinned on the host's anchor; it's tried again next tick`); return; }
         if (n) log(logPath, `signing: pinned ${n} record(s) this store holds that no signed order or baseline names, kept before records were pinned`);
-        ctx.unnamedPinned = true;
       } catch (err) { log(logPath, `signing: records kept before records were pinned couldn't be pinned on the host's anchor — ${err.message}; it's tried again next tick`); }
     });
   };
@@ -2696,6 +2696,10 @@ async function tickOnce(ctx) {
   // operator who believes nothing at all is moving will misread the hub. It also
   // withdraws every PASS it has standing, and each withdrawal logs a line of its
   // own before this one.
+  // Before any record is kept, halted or not, and whether or not the pull
+  // requests can be listed: records a reeve before #299 kept are pinned first
+  // (#304), as a halted reeve still finishes what it owes.
+  pinUnnamed();
   if (halted(ctx.haltMarker)) {
     await takeBackAll("the merge policy is halted");
     // Said now, as on the mid-tick HALT: a halted tick returns before the
@@ -2706,9 +2710,6 @@ async function tickOnce(ctx) {
   }
 
 
-  // Before any record is kept, and whether or not the pull requests can be
-  // listed: records a reeve before #299 kept are pinned first (#304).
-  pinUnnamed();
   const prs = (ctx.openPrs ?? openPrs)(nwo, profile.watch?.maxOpenPrs ?? 20);
   if (prs === null) {
     // Could not ask is not none. Returning an empty list here would look exactly

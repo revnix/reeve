@@ -1207,3 +1207,30 @@ test("a record kept before #299 on a store whose anchor is bound to none yet bin
   assert.equal(anchorRead(dir)?.store, identity, "bound to the store");
   assert.ok(anchorRead(dir)?.pinned?.get(PR)?.has(kept), "and the record pinned");
 });
+
+test("records kept before #299 are looked for on every tick, so one kept after the reeve's first is pinned at its next", async () => {
+  const dir = credentials();
+  const dbPath = store();
+  /** @type {Map<number, Set<string>>} */ const atJudging = new Map();
+  let tickNo = 0;
+  const refusing = () => host(dir, { ...fileAnchor(dir), reserve: () => false });
+  await run({ dbPath, ticks: 2, prState: () => "OPEN", prIsFinished: () => false, ...refusing(), openPrs: () => { tickNo++; return [PR]; },
+              evaluate: () => { if (!atJudging.has(tickNo)) atJudging.set(tickNo, new Set(anchorRead(dir)?.pinned?.get(PR) ?? [])); return at(A); },
+              // Between them, a reeve before #299 on the store keeps a record, unpinned and unordered.
+              afterTick: async (i) => { if (i === 0) await tick(dbPath, at(A, "RED"), host(dir, { ...fileAnchor(dir), pin: () => true, reserve: () => false })); } });
+  const db = open(dbPath);
+  const red = db.prepare("SELECT digest FROM decision WHERE pr = ? AND json_extract(record, '$.verdict.state') = 'BLOCK'").get(PR)?.digest;
+  db.close();
+  assert.ok(red, "control: the record was kept");
+  assert.deepEqual([...atJudging.keys()], [1, 2], "control: judged on each tick");
+  assert.ok(atJudging.get(2)?.has(red), "pinned before the next tick judged");
+});
+
+test("a record kept before #299 is pinned though the reeve is halted", async () => {
+  const { dir, dbPath, red } = await keptUnpinned();
+  const marker = join(tempDir("reeve-pins-halt-"), "HALT");
+  writeFileSync(marker, "");
+  const r = await tick(dbPath, at(A, "RED"), { ...host(dir, { ...fileAnchor(dir), reserve: () => false }), haltMarker: marker });
+  assert.match(r.log, /HALTED/, "control: the tick halted");
+  assert.ok(anchorRead(dir)?.pinned?.get(PR)?.has(red), "pinned all the same");
+});

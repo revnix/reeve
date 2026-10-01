@@ -82,8 +82,9 @@ const publish = (gh, over = {}) => publishVerdict({ nwo: NWO, verdict, shadow: t
     "a passing result under the enforcement name that can't be superseded fails the publication, and says why", JSON.stringify(r));
   const blind = github({ runs: { ok: false, err: "gh: HTTP 502" } });
   const b = await publish(blind);
-  check(b.ok === false && /couldn't be read/.test(b.why ?? "") && blind.writes.some((w) => w.verb === "POST" && w.name === shadowContextOf(CONTEXT)),
-    "and so does one that can't read the runs to look for it, though its own result is still published", JSON.stringify({ b, writes: blind.writes }));
+  // Nothing is written there: a new result, GitHub's latest, would hide the one carrying what was published (#285).
+  check(b.ok === false && /couldn't be read/.test(b.why ?? "") && !blind.writes.some((w) => w.verb === "POST" || w.verb === "PATCH"),
+    "and so does one that can't read the runs to look for it, and it writes nothing there", JSON.stringify({ b, writes: blind.writes }));
   const exposed = github({ runs: [{ name: CONTEXT, id: 5, conclusion: "neutral", app: "merge-policy" }], rules: rulesRequiring(CONTEXT, APP),
     refuse: (verb, path) => verb === "PATCH" && path.endsWith("/check-runs/5") });
   const x = await publish(exposed);

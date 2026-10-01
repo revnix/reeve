@@ -369,6 +369,7 @@ test("of two audits recorded in one second, the one recorded after counts, whate
   trial.recordAudit(dir, audit(r, () => true));
   trial.recordAudit(dir, audit(r, (c) => c.pr !== 6));
   const read = /** @type {any} */ (trial.readAudits(dir, R));
+  assert.ok(read.ok, JSON.stringify(read));
   assert.deepEqual(read.audits.map((/** @type {any} */ a) => [a.at, a.seq]), [[T0 + 2 * HOUR, 1], [T0 + 2 * HOUR, 2]], "control: one second, recorded in turn");
   assert.equal(noFalseCall(report([...read.audits].reverse())).met, false, "the later, marking #6 wrong, counts");
   assert.equal(noFalseCall(report(read.audits)).met, false);
@@ -458,6 +459,7 @@ test("an audit recorded after another counts over it, though the clock went back
   // Recorded after, by a clock an hour behind.
   trial.recordAudit(dir, audit(r, (c) => c.pr !== 6, { at: T0 + 2 * HOUR }));
   const read = /** @type {any} */ (trial.readAudits(dir, R));
+  assert.ok(read.ok, JSON.stringify(read));
   assert.equal(read.audits.length, 2, "control");
   assert.equal(noFalseCall(report(read.audits)).met, false, "the later, marking #6 wrong, counts");
 });
@@ -469,7 +471,7 @@ test("an audit in place whose folder can't then be synced is recorded, and says 
   catch (err) { got = { threw: /** @type {any} */ (err).code }; }
   assert.match(String(got.path), /000001\.json$/, JSON.stringify(got));
   assert.match(String(got.unsynced), /EIO/);
-  assert.equal(/** @type {any} */ (trial.readAudits(dir, R)).audits.length, 1, "it's there, and read, so recording it again would make two");
+  assert.equal(/** @type {any} */ (trial.readAudits(dir, R)).audits?.length, 1, "it's there, and read, so recording it again would make two");
 });
 
 test("a sheet is written whole before its audit is recorded: one that can't be written records nothing, and one whose audit can't be recorded is taken away", () => {
@@ -512,7 +514,7 @@ test("audits numbered with one missing among them aren't read: what it marked ca
   const dir = join(tempDir("reeve-audits-"), "audits");
   const r = report([]);
   for (let i = 0; i < 3; i++) trial.recordAudit(dir, audit(r, () => true));
-  assert.equal(/** @type {any} */ (trial.readAudits(dir, R)).audits.length, 3, "control: three, numbered one to three");
+  assert.equal(/** @type {any} */ (trial.readAudits(dir, R)).audits?.length, 3, "control: three, numbered one to three");
   rmSync(join(dir, "000002.json"));
   assert.match(JSON.stringify(trial.readAudits(dir, R)), /the audits recorded go to 000003\.json, but 000002\.json is missing, so what it marked can't be told/);
   const first = join(tempDir("reeve-audits-"), "audits");

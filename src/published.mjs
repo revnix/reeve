@@ -11,12 +11,12 @@ import { netTimeoutMs, netFailure } from "./net-bound.mjs";
 
 /**
  * What one result published: the record kept for its verdict; the pull
- * request's signed order as it stood, `null` where it had no entry yet; and how
- * many pull requests' orders, and entries in all, the store held then, so a
- * pull request whose every record and entry is taken away from a copy still
- * shows, in what was published for any other.
+ * request's signed order as it stood, `null` where it had no entry yet; and a
+ * commitment to every signed order the store held up to its event `to` (#285),
+ * so a pull request whose orders are taken away from a copy, or swapped for
+ * others, still shows, in what was published for any other.
  * @typedef {{ pr: number, record: string, order: { n: number, names: string } | null,
- *             store: { prs: number, entries: number } }} Evidence
+ *             store: { to: number, orders: string } }} Evidence
  */
 
 const HEX = /^[0-9a-f]{64}$/;
@@ -31,13 +31,12 @@ const count = (/** @type {unknown} */ n) => Number.isSafeInteger(n) && /** @type
 export function evidenceText(e) {
   if (!Number.isSafeInteger(e.pr) || e.pr < 1 || !HEX.test(e.record)
       || (e.order && (!Number.isSafeInteger(e.order.n) || e.order.n < 1 || !HEX.test(e.order.names)))
-      || !count(e.store?.prs) || !count(e.store?.entries))
+      || !count(e.store?.to) || !HEX.test(String(e.store?.orders)))
     throw new Error(`not evidence to publish: ${JSON.stringify(e)}`);
-  const { prs, entries } = e.store;
   return ["", HEADING, "",
     `- record of #${e.pr}: \`${e.record}\``,
     e.order ? `- signed order of #${e.pr}: entry ${e.order.n}, naming \`${e.order.names}\`` : `- signed order of #${e.pr}: no entry yet`,
-    `- signed orders of this store: ${prs} pull request${prs === 1 ? "" : "s"}, ${entries} entr${entries === 1 ? "y" : "ies"}`,
+    `- signed orders of this store, to its event ${e.store.to}: \`${e.store.orders}\``,
   ].join("\n");
 }
 
@@ -57,31 +56,35 @@ export function readEvidence(text) {
   const block = lines.slice(at + 1).filter((l) => l.trim() !== "");
   const rec = /^- record of #([1-9]\d{0,14}): `([0-9a-f]{64})`$/.exec(block[0] ?? "");
   const ord = /^- signed order of #([1-9]\d{0,14}): (?:entry ([1-9]\d{0,14}), naming `([0-9a-f]{64})`|no entry yet)$/.exec(block[1] ?? "");
-  const all = /^- signed orders of this store: (0|[1-9]\d{0,14}) pull requests?, (0|[1-9]\d{0,14}) entr(?:y|ies)$/.exec(block[2] ?? "");
+  const all = /^- signed orders of this store, to its event (0|[1-9]\d{0,14}): `([0-9a-f]{64})`$/.exec(block[2] ?? "");
   if (block.length !== 3 || !rec || !ord || !all || ord[1] !== rec[1]) return { garbled: true };
   return { pr: Number(rec[1]), record: rec[2], order: ord[2] ? { n: Number(ord[2]), names: ord[3] } : null,
-           store: { prs: Number(all[1]), entries: Number(all[2]) } };
+           store: { to: Number(all[1]), orders: all[2] } };
 }
 
 /**
  * How evidence `e` falls short of `prior`, published before it for the same
  * pull request: an earlier entry of its order, or another record at the entry
  * published, as a store restored onto a host without its anchor would sign
- * under a number already published; or fewer pull requests' orders or entries
- * in the store. `entryAt` gives the record the store's order names at an entry,
- * where it can say; without it, only an entry of the same number is compared.
- * Null where it doesn't fall short.
+ * under a number already published; or the store's orders committed to an
+ * earlier event than published, or to the published event otherwise than
+ * published (#285). `entryAt` gives the record the store's order names at an
+ * entry, and `commitAt` the store's commitment to its orders up to an event,
+ * where each can say; without them, only an entry, or a commitment, at the same
+ * number is compared. Null where it doesn't fall short.
  * @param {Evidence} e @param {Evidence} prior @param {((n: number) => string | undefined) | null} [entryAt]
+ * @param {((to: number) => string | null) | null} [commitAt]
  */
-export function evidenceBehind(e, prior, entryAt = null) {
+export function evidenceBehind(e, prior, entryAt = null, commitAt = null) {
   const n = e.order?.n ?? 0, was = prior.order?.n ?? 0;
   const there = !prior.order || n < was ? undefined : entryAt ? entryAt(was) : n === was ? e.order?.names : undefined;
   const short = [
     n < was ? `the store's signed order of #${e.pr} ends at entry ${n}, where entry ${was} was published` : null,
     there !== undefined && there !== prior.order?.names
       ? `the store's entry ${was} of #${e.pr}'s signed order names ${String(there).slice(0, 12)}, where ${String(prior.order?.names).slice(0, 12)} was published` : null,
-    e.store.prs < prior.store.prs ? `it holds the signed orders of ${e.store.prs} pull request(s), where ${prior.store.prs} were published` : null,
-    e.store.entries < prior.store.entries ? `it holds ${e.store.entries} entries in all, where ${prior.store.entries} were published` : null,
+    e.store.to < prior.store.to ? `its signed orders go to its event ${e.store.to}, where orders to event ${prior.store.to} were published` : null,
+    e.store.to >= prior.store.to && (commitAt ? commitAt(prior.store.to) : e.store.to === prior.store.to ? e.store.orders : prior.store.orders) !== prior.store.orders
+      ? `its signed orders to event ${prior.store.to} aren't those published` : null,
   ].filter(Boolean);
   return short.length ? short.join("; ") : null;
 }
@@ -91,6 +94,22 @@ function ghApi(args) {
   try { return { ok: true, out: execFileSync("gh", ["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,
                                                                    timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim() }; }
   catch (e) { return { ok: false, out: "", err: netFailure(e) }; }
+}
+
+/**
+ * The pull requests of `nwo` GitHub lists, open and closed, most recently
+ * updated first, to `limit` (#285): read from GitHub, not from any copy of the
+ * store, so one a copy no longer names is found all the same. `why` where
+ * GitHub couldn't be read.
+ * @param {string} nwo @param {{ gh?: (args: string[]) => { ok: boolean, out: string, err?: string }, limit?: number }} [o]
+ * @returns {number[] | { why: string }}
+ */
+export function listPullRequests(nwo, { gh = ghApi, limit = 100 } = {}) {
+  const got = gh([`repos/${nwo}/pulls?state=all&sort=updated&direction=desc&per_page=${Math.min(100, limit)}`, "--jq", ".[].number"]);
+  if (!got.ok) return { why: `the pull requests of ${nwo} couldn't be listed: ${got.err}` };
+  const prs = got.out.split("\n").filter(Boolean).map(Number);
+  if (prs.some((n) => !Number.isSafeInteger(n) || n < 1)) return { why: `the pull requests of ${nwo} don't read as GitHub's` };
+  return prs.slice(0, limit);
 }
 
 /**

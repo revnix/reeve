@@ -15,7 +15,7 @@ import { snapshot, restore, latestSnapshot, exportEvents,
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick, measuredContainment, withdrawStanding, tellStuck, runningCode } from "../src/daemon.mjs";
 import { replayDecisions, renderReplay, publishedChecked } from "../src/decisions.mjs";
-import { readPublished } from "../src/published.mjs";
+import { readPublished, listPullRequests } from "../src/published.mjs";
 import { knownKeys, fileSigner, signingKey, PUBLIC_FILE } from "../src/signing.mjs";
 import { fileAnchor, readAnchor } from "../src/anchor.mjs";
 import { SelectorError } from "../src/db/records.mjs";
@@ -1007,7 +1007,8 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       // anchor, and this is what it's checked against instead.
       if (flag("published")) {
         checked = publishedChecked(db, which, { keys: signingKeys(), repo: nwo, anchor: anchorFor(nwo),
-                                                published: (n, heads) => readPublished(nwo, n, heads) });
+                                                published: (n, heads) => readPublished(nwo, n, heads),
+                                                listed: () => listPullRequests(nwo) });
         results.push(...checked.faults);
       }
     } catch (e) {
@@ -1021,7 +1022,7 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     console.log(renderReplay(results));
     if (checked) {
       console.log(`checked against ${checked.results} result(s) the merge policy published for ${checked.prs} pull request(s)`);
-      // Said, not passed over: those were checked by the store's counts alone.
+      // Said, not passed over: those were checked by the orders' commitment alone.
       if (checked.unchecked.length)
         console.log(`${checked.unchecked.length} pull request(s) had nothing published to check their records against, judged before it began say: ` +
                     checked.unchecked.slice(0, 20).map((n) => `#${n}`).join(", ") + (checked.unchecked.length > 20 ? ", …" : ""));

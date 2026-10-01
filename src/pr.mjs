@@ -1233,9 +1233,11 @@ export const requiredOnBase = (args) => requirementsOnBase(args).own;
  * moves forward: evidence behind what a head already carries, under either of
  * reeve's names, or none, never replaces it, and `behind` says so, for the
  * daemon to raise. `entryAt` gives the record the store's order names at an
- * entry, so a fork signed under a number already published is behind too.
+ * entry, so a fork signed under a number already published is behind too, and
+ * `commitAt` the store's commitment to its orders up to an event, so a store
+ * whose orders to a published event aren't those published is behind (#285).
  */
-export async function publishVerdict({ nwo, verdict, shadow = true, context = POLICY_CONTEXT, base = null, queue = false, evidence = null, entryAt = null,
+export async function publishVerdict({ nwo, verdict, shadow = true, context = POLICY_CONTEXT, base = null, queue = false, evidence = null, entryAt = null, commitAt = null,
                                       auth: authenticateAs = authenticate, api = apiAsInstallation }) {
   const auth = await authenticateAs(nwo);
   if (!auth.ok) return { ok: false, why: auth.why };
@@ -1273,7 +1275,7 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = PO
     .filter((w) => w && !("garbled" in w) && (!evidence || w.pr === evidence.pr));
   const prior = /** @type {import("./published.mjs").Evidence | null} */
     (priors.find((p) => priors.every((q) => q === p || !evidenceBehind(/** @type {any} */ (p), /** @type {any} */ (q)))) ?? priors[0] ?? null);
-  const short = prior && evidence ? evidenceBehind(evidence, prior, entryAt) : null;
+  const short = prior && evidence ? evidenceBehind(evidence, prior, entryAt, commitAt) : null;
   const behind = short ? `at ${verdict.head.slice(0, 8)}, ${short}, so what was published there is kept` : null;
   const tail = prior && (!evidence || short) ? evidenceText(prior) : evidence ? evidenceText(evidence) : "";
   const fields = [

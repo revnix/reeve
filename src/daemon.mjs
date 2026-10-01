@@ -57,7 +57,7 @@ import { codeVersion, policyOf, recordsFor } from "./evidence.mjs";
 import { saveDecision } from "./db/records.mjs";
 import { decisionStatement, baselineStatement, baselineFingerprint, latestStatement, entrySeal } from "./signing.mjs";
 import { BASELINE_OP, LATEST_OP, STORE_ID_OP, FILED, latestDecision, storeIdentity } from "./db/records.mjs";
-import { signedOrder, strayEntry, baselineLost, otherRepository, signingState, holdsWhole } from "./decisions.mjs";
+import { signedOrder, strayEntry, baselineLost, otherRepository, signingState, holdsWhole, ordersCommitment, lastEntrySeq } from "./decisions.mjs";
 import { noAnchor, reservedSeal } from "./anchor.mjs";
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -1784,16 +1784,17 @@ async function tickOnce(ctx) {
   };
   // Where a pull request's signed order stands as its verdict is published,
   // with the record kept for it (#274): its top entry and the record that names,
-  // null for none yet; and how many pull requests' orders, and entries in all,
-  // the store holds, so a copy with one pull request's orders taken away shows
-  // short in what's published for any other. Undefined where that can't be
-  // said, and then nothing is published of it: a reeve that doesn't sign
-  // orders, or a store with any order that doesn't hold, or is cut short of
-  // what this host signed, as its counts would vouch for less than it should
-  // hold. Every order is checked once a tick, as none is extended until its end.
-  // The host's anchor, read with them, says nothing of this store's orders where
-  // another store is bound to it, or it can't be read.
-  /** @type {{ orders: Map<number, { top: number, digest: string | null, entries: Map<number, string> }>, store: { prs: number, entries: number } } | null | undefined} */
+  // null for none yet; and a commitment to every order the store holds, up to
+  // its last entry's event (#285), so a copy with one pull request's orders
+  // taken away, or swapped for others, shows in what's published for any other.
+  // Undefined where that can't be said, and then nothing is published of it: a
+  // reeve that doesn't sign orders, or a store with any order that doesn't
+  // hold, or is cut short of what this host signed, as its commitment would
+  // vouch for less than it should hold. Read once until the tick's orders are
+  // extended, as none is extended before. The host's anchor, read with them,
+  // says nothing of this store's orders where another store is bound to it, or
+  // it can't be read.
+  /** @type {{ orders: Map<number, { top: number, digest: string | null, entries: Map<number, string> }>, store: { to: number, orders: string } } | null | undefined} */
   let asPublished;
   const ordersAsPublished = () => {
     /** @type {import("./anchor.mjs").Anchor} */ let a;
@@ -1804,13 +1805,14 @@ async function tickOnce(ctx) {
     for (const { subject } of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ? AND subject GLOB 'pr:[1-9]*' AND substr(subject, 4) NOT GLOB '*[^0-9]*' AND length(subject) <= 18`).all(LATEST_OP)))
       prs.add(Number(String(subject).slice(3)));
     /** @type {Map<number, { top: number, digest: string | null, entries: Map<number, string> }>} */ const orders = new Map();
-    let entries = 0;
     for (const pr of prs) {
       const order = signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), store);
       if ("corrupt" in order || order.top < (a.latest.get(pr) ?? 0)) return null;
-      if (order.top) { orders.set(pr, order); entries += order.top; }
+      if (order.top) orders.set(pr, order);
     }
-    return { orders, store: { prs: orders.size, entries } };
+    const to = lastEntrySeq(db);
+    const all = ordersCommitment(db, nwo, /** @type {any} */ (orderKeys), store, to);
+    return "corrupt" in all ? null : { orders, store: { to, orders: all.orders } };
   };
   const orderAt = (/** @type {number} */ pr) => {
     if (!ordering) return undefined;
@@ -1823,6 +1825,39 @@ async function tickOnce(ctx) {
   };
   // The record the store's order of `pr` names at entry `n`, as checked with the rest, for a publication to tell a fork from progress.
   const entryAtOf = (/** @type {number} */ pr) => (/** @type {number} */ n) => asPublished?.orders.get(pr)?.entries.get(n);
+  // The store's commitment to its orders up to event `to`, for a publication to
+  // tell a store whose orders to a published event aren't those from one gone
+  // further (#285); null where they don't hold.
+  const commitAt = (/** @type {number} */ to) => {
+    const c = ordersCommitment(db, nwo, /** @type {any} */ (orderKeys), storeIdentity(db), to);
+    return "corrupt" in c ? null : c.orders;
+  };
+  // The last result this tick published at a pull request's head with evidence,
+  // under which name, and what it was published with.
+  /** @type {{ pr: number, name: string, args: any } | null} */ let lastAtHead = null;
+  // What this tick published went out before its orders were extended, at its
+  // end, so their newest entries, a merge queue's among them, would be
+  // witnessed nowhere until the next tick published, or never, were nothing
+  // published again (#285). So once they're extended, the last result published
+  // at a pull request's head goes out again, the same verdict with the orders
+  // as they now stand: that pull request's head is where a check reads it, as
+  // GitHub lists it. Not where that result no longer stands as it was
+  // published, taken back since, say.
+  const republishOrders = async () => {
+    if (!lastAtHead || !ordering) return;
+    const { pr, name, args } = lastAtHead;
+    if (lastEntrySeq(db) <= args.evidence.store.to) return;
+    let st = null;
+    try { st = standingAt(db, pr).find((x) => x.name === name && x.head === args.verdict.head); } catch { return; }
+    if (st?.op !== "pr.published" || st.state !== args.verdict.state) return;
+    asPublished = undefined;
+    const stood = orderAt(pr);
+    if (!stood) return;
+    let pub;
+    try { pub = await (ctx.publish ?? publishVerdict)({ ...args, evidence: { ...args.evidence, ...stood }, entryAt: entryAtOf(pr), commitAt }); }
+    catch (err) { pub = { ok: false, why: err.message }; }
+    if (!pub.ok) log(logPath, `  #${pr}: the store's signed orders, as this tick extended them, couldn't be published — ${pub.why}; the next tick publishes them`);
+  };
   // The host's anchor moved to entry `top` of `pr`'s order, with the record it
   // names and every record the order names, which are pinned no longer (#279),
   // only once the store has committed it: moved before, a transaction that
@@ -2998,6 +3033,7 @@ async function tickOnce(ctx) {
     const name = shadow ? shadowContextOf(POLICY_CONTEXT) : POLICY_CONTEXT;
     const was = under(name);
     let pub;
+    /** @type {any} */ let published = null;
     // A PASS is written down BEFORE it's published, so a crash, a stop or a store
     // that fails in between never leaves one standing that reeve doesn't know
     // of. One the store won't take isn't published: what stood before stays.
@@ -3008,7 +3044,8 @@ async function tickOnce(ctx) {
       // With the record kept for it, and where its signed order stood, where both can be said.
       const stood = decided.ok && kept ? orderAt(pr) : undefined;
       const evidence = stood === undefined ? null : { pr, record: /** @type {any} */ (kept).decision.digest, ...stood };
-      try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict: e.verdict, shadow, base: e.baseRef, evidence, ...(evidence ? { entryAt: entryAtOf(pr) } : {}) }); }
+      published = { nwo, verdict: e.verdict, shadow, base: e.baseRef, evidence, ...(evidence ? { entryAt: entryAtOf(pr), commitAt } : {}) };
+      try { pub = await (ctx.publish ?? publishVerdict)(published); }
       // A publish that throws, a network error say, fails this pull request's
       // publication, not the tick for every one after it (#161).
       catch (err) { pub = { ok: false, why: err.message }; }
@@ -3023,6 +3060,7 @@ async function tickOnce(ctx) {
       failures.delete(pr);
       // Again once published, with the run it went to.
       note("pr.published", { head: e.head, state: e.verdict.state, name: pub.name ?? name, id: pub.id ?? null });
+      if (published?.evidence) lastAtHead = { pr, name: pub.name ?? name, args: published };
     } else {
       log(logPath, `    could not publish: ${pub.why}`);
       // The next tick publishes again, so one failure is a retry away. Three in a
@@ -3239,7 +3277,7 @@ async function tickOnce(ctx) {
         const one = judged.length === 1 && judged[0].record ? judged[0] : null;
         const stood = one ? orderAt(one.pr) : undefined;
         const evidence = one && stood !== undefined ? { pr: one.pr, record: /** @type {string} */ (one.record), ...stood } : null;
-        try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict, shadow, base, queue: true, evidence, ...(evidence && one ? { entryAt: entryAtOf(one.pr) } : {}) }); }
+        try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict, shadow, base, queue: true, evidence, ...(evidence && one ? { entryAt: entryAtOf(one.pr), commitAt } : {}) }); }
         catch (thrown) { pub = { ok: false, why: thrown.message }; }
       }
       // An enforcing PASS a shadow publication superseded here is cancelled, so
@@ -3277,8 +3315,10 @@ async function tickOnce(ctx) {
         await takeBack(n, "the merge queue no longer holds this commit", (x) => x.queue === true && !held.has(x.head));
   }
   // Every record this tick keeps is kept by now: each pull request's signed
-  // order that its latest record came after is extended, to that record.
+  // order that its latest record came after is extended, to that record, and
+  // published as extended.
   orderPending();
+  await republishOrders();
   // And one that arrived during the last publication there.
   if (await haltedNow()) return haltStop("HALTED after the merge queue was checked");
 

@@ -176,3 +176,56 @@ test("a snapshot in a shared folder that can't be read still counts for the back
   db.close();
   assert.deepEqual(backup.snapshotCandidates(root, "a-b/c"), [join(shared, `${T}.db`)]);
 });
+
+test("a snapshot in a shared folder whose record names no repository counts for the backup audit, not as another's, and isn't restored", () => {
+  const root = tempDir("reeve-bk-root-");
+  const shared = join(root, "a-b-c");
+  mkdirSync(shared, { recursive: true });
+  // The file opens; only the record that would say whose it is can't be read.
+  const db = open(join(tempDir("reeve-bk-"), "s.db"));
+  db.prepare("INSERT INTO decision(digest,pr,head,record,first_at,last_at,first_seq,last_seq) VALUES(?,?,?,?,?,?,?,?)")
+    .run(`x#1@${HEAD}`, 1, HEAD, JSON.stringify({ subject: { pr: 1, head: HEAD } }), T, T, 1, 1);
+  db.exec(`VACUUM INTO '${join(shared, `${T}.db`)}'`);
+  db.close();
+  const path = join(shared, `${T}.db`);
+  assert.equal(backup.snapshotIsOf(path, "a-b/c").other, undefined, "not another's: whose it is can't be told");
+  assert.deepEqual(backup.snapshotCandidates(root, "a-b/c"), [path]);
+  assert.equal(backup.latestSnapshot(root, "a-b/c"), null);
+});
+
+test("a repository's name in a snapshot's records is matched as GitHub matches names, whatever their letters' case", () => {
+  const root = tempDir("reeve-bk-root-");
+  const db = storeOf("A-B/C");
+  const path = String(backup.snapshot(db, root, "A-B/C", T).path);
+  db.close();
+  /** @type {any} */ let r;
+  try { r = backup.restore(path, join(tempDir("reeve-bk-state-"), "s.db"), { nwo: "a-b/c", isDaemonRunning: () => null }); } catch (err) { r = { threw: String(err) }; }
+  assert.equal(r.ok, true, "the same repository, spelled otherwise: " + JSON.stringify(r));
+  // Kept in a shared folder before, it's found for it.
+  const shared = join(root, "a-b-c");
+  mkdirSync(shared, { recursive: true });
+  const kept = storeOf("A-B/C");
+  kept.exec(`VACUUM INTO '${join(shared, `${T + 10}.db`)}'`);
+  kept.close();
+  assert.equal(backup.latestSnapshot(root, "a-b/c"), join(shared, `${T + 10}.db`));
+  // Control: another repository's still isn't.
+  assert.equal(backup.snapshotIsOf(path, "a/b-c").other, true);
+});
+
+test("a backup's abandoned temporary left in a shared folder before is reaped, and the snapshots kept there aren't", () => {
+  const root = tempDir("reeve-bk-root-");
+  const shared = join(root, "o-r");
+  mkdirSync(shared, { recursive: true });
+  // A process that has ended: its temporary is abandoned.
+  const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+  const abandoned = join(shared, `.${T}.${dead}.tmp`);
+  writeFileSync(abandoned, "a partial copy");
+  const kept = storeOf("o/r");
+  kept.exec(`VACUUM INTO '${join(shared, `${T}.db`)}'`);
+  kept.close();
+  const db = storeOf("o/r");
+  backup.snapshot(db, root, "o/r", T + 10);
+  db.close();
+  assert.equal(existsSync(abandoned), false, "reaped");
+  assert.equal(existsSync(join(shared, `${T}.db`)), true, "the snapshot kept there stays");
+});

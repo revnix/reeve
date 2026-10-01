@@ -2543,6 +2543,19 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     // nobody. (Codex #4g-[2].)
     const dbPath = resolve(opt("db") ?? stateFor(nwo));
     if (!existsSync(dbPath)) { console.error(`reeve run: ${missingStoreMessage(dbPath, { initCreatesIt: !opt("db"), nwo })}`); process.exit(1); }
+    // Enforcing only where it holds (#166): the default branch must require
+    // reeve's check from reeve's App, in a rule no one can bypass, or what
+    // reeve publishes may block nothing, and saying it enforces would be false.
+    // Measured before anything is held, and refused with what would fix it.
+    if (flag("enforce")) {
+      const base = profile.identity?.defaultBranch ?? "main";
+      const { enforcementNow } = await import("../src/pr.mjs");
+      const e = await enforcementNow({ nwo, base });
+      if (e.state !== "enforced") {
+        console.error(`reeve ${cmd}: --enforce refused: ${e.why}. To enforce, ${e.fix ?? `make ${base} enforce what reeve publishes`}, then run this again; until then, run without --enforce, in shadow mode`);
+        process.exit(1);
+      }
+    }
     // One reeve runs on a store at a time (#274), held until this one ends: a
     // second, on a store another is running on, would keep records whose signed
     // order neither knows whole.

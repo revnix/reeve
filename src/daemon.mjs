@@ -15,7 +15,7 @@
 //     watched is how an unattended run becomes an incident.
 
 import { evaluatePr, publishVerdict, withdrawVerdict, prAnchor, isBuilderPr, clearRequirements, shadowContextOf, treeOf,
-         readMergeQueue, evaluateQueueEntry } from "./pr.mjs";
+         readMergeQueue, evaluateQueueEntry, enforcementNow } from "./pr.mjs";
 import { PASS } from "./verdict.mjs";
 import { nextAction, describe, ACTIONS, ESCALATIONS } from "./watcher.mjs";
 import { POLICY_CONTEXT, reconcilePr } from "./github/reconciler.mjs";
@@ -33,7 +33,7 @@ import { claimProvider, releaseProvider, bindProviderLease, noteRateLimit, heart
 import { openHold } from "./build/holds.mjs";
 import { hubSession, NO_HUB } from "./build/hubsession.mjs";
 import { resolveRepoId } from "./build/repoid.mjs";
-import { readState, noteTick, noteTickStart, noteTickStopped, cleanMergeRate } from "./status.mjs";
+import { readState, noteTick, noteTickStart, noteTickStopped, cleanMergeRate, noteEnforcement } from "./status.mjs";
 import { buildAlert, notify, printable } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects, reap, canonical, durably } from "./db/ops.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
@@ -1428,6 +1428,21 @@ async function tickOnce(ctx) {
   // Recorded as it starts, and again as it ends: the time between is running,
   // however long the tick takes (#297).
   noteTickStart(db);
+  // Enforcing, a base where no rule requires reeve's check gets its results in
+  // shadow (#166): enforcing there would say it gates what it can't. Where a
+  // rule requires it, its results go out enforcing, though someone can bypass
+  // the rule or it can't be read whole, or every pull request there would wait
+  // for a result reeve doesn't publish; that is raised as it's published.
+  // Measured once a tick for each base, and not at all in shadow mode.
+  /** @type {Map<string, Promise<{ state: string, why: string, required: boolean | null }>>} */ const measured = new Map();
+  const shadowOn = async (/** @type {string | null | undefined} */ base) => {
+    if (shadow || !base) return shadow;
+    if (!measured.has(base))
+      measured.set(base, Promise.resolve((ctx.enforcement ?? enforcementNow)({ nwo, base }))
+        .catch((err) => ({ state: "unknown", why: `${base}'s enforcement couldn't be measured: ${err.message}`, required: null })));
+    const e = await /** @type {Promise<any>} */ (measured.get(base));
+    return e.required === false;
+  };
   // Absolute, once, before ANYTHING derives from it. A relative `--log` made
   // every state path relative — the run dir, the worker's tmp, its git config and
   // the `--settings` argument — and those are consumed after the worker's cwd has
@@ -3125,7 +3140,8 @@ async function tickOnce(ctx) {
       at = [...(at ?? []).filter((x) => x.name !== left.name || x.head !== left.head), { ...left, op }];
       return true;
     };
-    const name = shadow ? shadowContextOf(POLICY_CONTEXT) : POLICY_CONTEXT;
+    const shadowHere = await shadowOn(e.baseRef);
+    const name = shadowHere ? shadowContextOf(POLICY_CONTEXT) : POLICY_CONTEXT;
     const was = under(name);
     let pub;
     /** @type {any} */ let published = null;
@@ -3140,7 +3156,7 @@ async function tickOnce(ctx) {
       // the record pinning let it keep, as one it couldn't pin isn't in the store.
       const stood = decided.ok && held.kept ? orderAt(pr) : undefined;
       const evidence = stood === undefined ? null : { pr, record: /** @type {any} */ (held.kept).decision.digest, ...stood };
-      published = { nwo, verdict: e.verdict, shadow, base: e.baseRef, evidence, ...(evidence ? { entryAt: entryAtOf(pr), commitAt, holds: holdsRecord } : {}) };
+      published = { nwo, verdict: e.verdict, shadow: shadowHere, base: e.baseRef, evidence, ...(evidence ? { entryAt: entryAtOf(pr), commitAt, holds: holdsRecord } : {}) };
       try { pub = await (ctx.publish ?? publishVerdict)(published); }
       // A publish that throws, a network error say, fails this pull request's
       // publication, not the tick for every one after it (#161).
@@ -3187,6 +3203,18 @@ async function tickOnce(ctx) {
     if (pub.held) {
       log(logPath, `    shadow: ${pub.held}`);
       raise(`shadow mode: ${pub.held}`);
+    }
+    // Whether the base enforces what's published (#166): noted when it changes,
+    // for status and the dashboard to say, and, enforcing, raised while it
+    // isn't, as a result that blocks nothing is no gate.
+    if (pub.enforcement && e.baseRef) {
+      try { noteEnforcement(db, e.baseRef, pub.enforcement); }
+      catch (err) { log(logPath, `    could not note ${e.baseRef}'s enforcement: ${err.message}`); }
+      if (!shadow && pub.enforcement.state !== "enforced") {
+        const there = shadowHere ? "; its result there is published in shadow" : "";
+        log(logPath, `    enforcing, but ${pub.enforcement.why}${there}`);
+        raise(`enforcing, but ${pub.enforcement.why}${there}`);
+      }
     }
     // The store is behind what the merge policy already published of it (#274):
     // rolled back, or restored from before, perhaps onto a host without its
@@ -3350,7 +3378,8 @@ async function tickOnce(ctx) {
       });
       const verdict = prs.length === 1 ? worst.verdict
         : { ...worst.verdict, summary: `queued together: ${prs.map((n) => `#${n}`).join(", ")}. #${worst.pr}: ${worst.verdict.summary}` };
-      const name = shadow ? shadowContextOf(POLICY_CONTEXT) : POLICY_CONTEXT;
+      const queuedShadow = await shadowOn(base);
+      const name = queuedShadow ? shadowContextOf(POLICY_CONTEXT) : POLICY_CONTEXT;
       const standing = new Map(prs.map((n) => {
         let st;
         try { st = standingAt(db, n); } catch { st = null; }
@@ -3381,7 +3410,7 @@ async function tickOnce(ctx) {
         const one = judged.length === 1 && judged[0].record ? judged[0] : null;
         const stood = one ? orderAt(one.pr) : undefined;
         const evidence = one && stood !== undefined ? { pr: one.pr, record: /** @type {string} */ (one.record), ...stood } : null;
-        try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict, shadow, base, queue: true, evidence, ...(evidence && one ? { entryAt: entryAtOf(one.pr), commitAt, holds: holdsRecord } : {}) }); }
+        try { pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict, shadow: queuedShadow, base, queue: true, evidence, ...(evidence && one ? { entryAt: entryAtOf(one.pr), commitAt, holds: holdsRecord } : {}) }); }
         catch (thrown) { pub = { ok: false, why: thrown.message }; }
       }
       // The store is behind what was published on this commit, as at a head.

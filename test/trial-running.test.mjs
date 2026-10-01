@@ -196,3 +196,15 @@ test("a tick that stopped just before the report's start is downtime from the st
   s.db.close();
   assert.deepEqual(r.running.down, [{ from: T0, to: T0 + 10 * MIN }]);
 });
+
+test("a merge in the first second of downtime was made while the daemon was down, and one in the second it ends is the next tick's", () => {
+  const s = store();
+  ticking(s, T0, T0 + HOUR);
+  s.stopped(T0 + HOUR, T0 + HOUR + MIN);
+  s.tick(T0 + HOUR + 10 * MIN, T0 + HOUR + 15 * MIN);
+  const merged = [T0 + HOUR - 1, T0 + HOUR, T0 + HOUR + 10 * MIN].map((mergedAt, i) => ({ pr: i + 1, mergedAt, head: "a".repeat(40), mergeCommit: null }));
+  const r = trialReport(s.db, { repo: R, since: T0, now: T0 + HOUR + 20 * MIN, merged });
+  s.db.close();
+  assert.deepEqual(r.running.down, [{ from: T0 + HOUR, to: T0 + HOUR + 10 * MIN }], "control: down from the stopped tick's start to the next");
+  assert.deepEqual(r.merges.map((m) => [m.pr, m.down]), [[1, false], [2, true], [3, false]]);
+});

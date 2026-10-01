@@ -55,7 +55,7 @@ import { randomBytes } from "node:crypto";
 import { resolveHome } from "./home.mjs";
 import { codeVersion, policyOf, recordsFor } from "./evidence.mjs";
 import { saveDecision } from "./db/records.mjs";
-import { decisionStatement, baselineStatement, baselineFingerprint, latestStatement, entrySeal } from "./signing.mjs";
+import { decisionStatement, baselineStatement, baselineFingerprint, latestStatement, entrySeal, orderChain, chainStep } from "./signing.mjs";
 import { BASELINE_OP, LATEST_OP, STORE_ID_OP, FILED, latestDecision, storeIdentity } from "./db/records.mjs";
 import { signedOrder, strayEntry, baselineLost, otherRepository, signingState, holdsWhole, ordersCommitment, lastEntrySeq } from "./decisions.mjs";
 import { noAnchor, reservedSeal } from "./anchor.mjs";
@@ -1722,13 +1722,15 @@ async function tickOnce(ctx) {
   // what its entries hold changes, as this process runs.
   /** @type {Map<number, { key: string, order: ReturnType<typeof signedOrder> }>} */
   const orderChecked = (ctx.orderChecked ??= new Map());
-  /** @typedef {{ top: number, named: boolean, digest?: string | null, names?: string[], seal?: string | null }} Extended */
+  /** @typedef {{ top: number, named: boolean, digest?: string | null, names?: string[], seal?: string | null, chain?: string | null }} Extended */
   /** @param {number} pr @param {import("./anchor.mjs").Anchor} a @param {string} store @returns {Extended} */
   const extendOrder = (pr, a, store) => {
     const anchored = a.latest.get(pr) ?? 0;
     const order = signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), store);
     if ("corrupt" in order) { log(logPath, `signing: #${pr}: its signed order doesn't hold, so it isn't extended — ${order.corrupt}`); return { top: 0, named: false }; }
     const topSeal = order.seals.get(order.top) ?? null;
+    // The chain over every entry to its top (#303), extended with each entry made.
+    const topChain = orderChain(order.seals, order.top);
     // Nor one cut short of what the host signed: an entry signed now would take
     // a number the host already signed, and two entries under one number would
     // each pass for the latest.
@@ -1752,6 +1754,15 @@ async function tickOnce(ctx) {
                    "but isn't the entry this host noted there, so it isn't extended");
       return { top: 0, named: false };
     }
+    // Nor one whose entries before that one aren't those the host noted, its
+    // top as noted (#303): an earlier one swapped for a variant the host's key
+    // signed, which a copy of this store could hold.
+    const chained = a.chained.get(pr);
+    if (anchored && chained && orderChain(order.seals, anchored) !== chained) {
+      log(logPath, `signing: #${pr}: its signed order to entry ${anchored} isn't the one this host noted, though entry ${anchored} is: ` +
+                   "an entry before it was swapped for another, as a copy of this store signed, so it isn't extended");
+      return { top: 0, named: false };
+    }
     // The store ahead of the host's anchor: an entry committed and its note
     // never made, by a reeve that stopped in between. It's noted first, and the
     // order extended from there next tick. Where the anchor reserved that entry
@@ -1770,7 +1781,7 @@ async function tickOnce(ctx) {
                      "but isn't the entry this host reserved, so it isn't extended");
         return { top: 0, named: false };
       }
-      return { top: order.top, named: false, digest: order.digest, names: [...order.digests], seal: topSeal };
+      return { top: order.top, named: false, digest: order.digest, names: [...order.digests], seal: topSeal, chain: topChain };
     }
     // An entry reserved and never committed, by a reeve that stopped before
     // committing it: completed as it was reserved, whole, where the store holds
@@ -1809,33 +1820,34 @@ async function tickOnce(ctx) {
       : own ? (order.seq == null || own.seq > order.seq ? [own.latest, own.seq] : [order.digest, order.seq])
       : !order.top ? [stored?.digest ?? null, stored ? Number(stored.last_seq) : null]
       : [order.digest, order.seq];
-    if (!digest) return { top: order.top, named: true, digest: order.digest, names: [...order.digests], seal: topSeal };
+    if (!digest) return { top: order.top, named: true, digest: order.digest, names: [...order.digests], seal: topSeal, chain: topChain };
     unnamed.delete(digest);
     const records = owed ? owed.records : [...unnamed].sort();
-    let top = order.top, latest = order.digest, seal = topSeal;
+    let top = order.top, latest = order.digest, seal = topSeal, chain = topChain;
     // A reserved entry is committed whatever else is new: left open, its
     // reservation would stand for good.
     if (owed || order.digest !== digest || records.length) {
       const n = top + 1;
       const entry = { repo: nwo, pr, n, digest, records, store, seq };
       const s = signWith(latestStatement(entry));
-      if (!s?.envelope) return { top, named: false, digest: latest, names: [...order.digests], seal };
+      if (!s?.envelope) return { top, named: false, digest: latest, names: [...order.digests], seal, chain };
       // Reserved on the host's anchor, whole, synced, before the store commits
       // it: a reeve that stops between the two leaves the number held for it.
       if (!ctx.anchor.reserve(nwo, store, pr, n, digest, records, seq)) {
         log(logPath, `signing: #${pr}: entry ${n} of its signed order couldn't be reserved on the host's anchor, so it isn't extended this tick`);
-        return { top, named: false, digest: latest, names: [...order.digests], seal };
+        return { top, named: false, digest: latest, names: [...order.digests], seal, chain };
       }
       db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
         .run(now(), "daemon", LATEST_OP, `pr:${pr}`, canonical({ repo: nwo, n, digest, records, store, seq, envelope: s.envelope }));
       top = n;
       latest = digest;
       seal = entrySeal(entry);
+      chain = chainStep(top > 1 ? /** @type {string} */ (chain) : "", seal);
     }
     const names = [...order.digests, digest, ...records];
     // A reserved entry completed isn't what this reeve kept last, where it kept
     // another since, or others it doesn't name: they're ordered next tick.
-    return { top, named: !owed || !own || (own.latest === owed.digest && [...own.since].every((d) => names.includes(d))), digest: latest, names, seal };
+    return { top, named: !owed || !own || (own.latest === owed.digest && [...own.since].every((d) => names.includes(d))), digest: latest, names, seal, chain };
   };
   // Where a pull request's signed order stands as its verdict is published,
   // with the record kept for it (#274): its top entry and the record that names,
@@ -1849,7 +1861,7 @@ async function tickOnce(ctx) {
   // extended, as none is extended before. The host's anchor, read with them,
   // says nothing of this store's orders where another store is bound to it, or
   // it can't be read.
-  /** @type {{ orders: Map<number, { top: number, digest: string | null, entries: Map<number, string> }>, store: { to: number, orders: string } } | null | undefined} */
+  /** @type {{ orders: Map<number, { top: number, digest: string | null, entries: Map<number, string> }>, store: { to: number, orders: string, chained: boolean } } | null | undefined} */
   let asPublished;
   const ordersAsPublished = () => {
     /** @type {import("./anchor.mjs").Anchor} */ let a;
@@ -1862,7 +1874,8 @@ async function tickOnce(ctx) {
     // The commitment checks every order the store holds, and one that doesn't
     // hold publishes nothing: an edited order would be published as the host's.
     const to = lastEntrySeq(db);
-    const all = ordersCommitment(db, nwo, /** @type {any} */ (orderKeys), store, to);
+    // Over every entry of each order (#303).
+    const all = ordersCommitment(db, nwo, /** @type {any} */ (orderKeys), store, to, true);
     if ("corrupt" in all) return null;
     /** @type {Map<number, { top: number, digest: string | null, entries: Map<number, string> }>} */ const orders = new Map();
     for (const pr of prs) {
@@ -1871,7 +1884,7 @@ async function tickOnce(ctx) {
       if (order.top < (a.latest.get(pr) ?? 0)) return null;
       if (order.top) orders.set(pr, order);
     }
-    return { orders, store: { to, orders: all.orders } };
+    return { orders, store: { to, orders: all.orders, chained: true } };
   };
   const orderAt = (/** @type {number} */ pr) => {
     if (!ordering) return undefined;
@@ -1887,8 +1900,8 @@ async function tickOnce(ctx) {
   // The store's commitment to its orders up to event `to`, for a publication to
   // tell a store whose orders to a published event aren't those from one gone
   // further (#285); null where they don't hold.
-  const commitAt = (/** @type {number} */ to) => {
-    const c = ordersCommitment(db, nwo, /** @type {any} */ (orderKeys), storeIdentity(db), to);
+  const commitAt = (/** @type {number} */ to, chained = false) => {
+    const c = ordersCommitment(db, nwo, /** @type {any} */ (orderKeys), storeIdentity(db), to, chained);
     return "corrupt" in c ? null : c.orders;
   };
   // Whether the store holds a record whole, as it was kept, for a publication
@@ -1936,7 +1949,7 @@ async function tickOnce(ctx) {
   // failed would leave the anchor ahead of its store, and its order never
   // extended again. A write that failed is made good on a later tick.
   const noteAnchor = (/** @type {number} */ pr, /** @type {Extended} */ r) => {
-    if (r.top && !ctx.anchor.note(nwo, pr, r.top, r.digest ?? null, r.names ?? [], r.seal ?? null))
+    if (r.top && !ctx.anchor.note(nwo, pr, r.top, r.digest ?? null, r.names ?? [], r.seal ?? null, r.chain ?? null))
       log(logPath, `signing: #${pr}: the host's anchor couldn't be moved to entry ${r.top} of its order, so it lags until a later tick`);
   };
   // The pull requests whose order has work, read from their orders as checked
@@ -1981,11 +1994,14 @@ async function tickOnce(ctx) {
     // reported every tick, though its pull request is never judged again.
     for (const pr of a.reserved.keys()) prs.add(pr);
     for (const [pr, d] of a.named) { const o = orders.get(pr); if (!o || !("entries" in o) || o.entries.get(a.latest.get(pr) ?? 0) !== d) prs.add(pr); }
-    for (const [pr, s] of a.sealed) { const o = orders.get(pr); if (!o || !("seals" in o) || o.seals.get(a.latest.get(pr) ?? 0) !== s) prs.add(pr); }
-    // And each the anchor holds an entry of without its record or seal, as an
-    // anchor written before #279 does: noted again, from its order as checked,
-    // so a quiet pull request's top entry is sealed on the first tick after.
-    for (const pr of a.latest.keys()) if (!a.named.has(pr) || !a.sealed.has(pr)) prs.add(pr);
+    // The chain to the noted top covers its seal too (#303), and an anchor
+    // holding a seal without a chain is noted again below.
+    for (const [pr, c] of a.chained) { const o = orders.get(pr); if (!o || !("seals" in o) || orderChain(o.seals, a.latest.get(pr) ?? 0) !== c) prs.add(pr); }
+    // And each the anchor holds an entry of without its record, seal or chain,
+    // as an anchor written before #279, or #303, does: noted again, from its
+    // order as checked, so a quiet pull request's order is sealed and chained
+    // on the first tick after.
+    for (const pr of a.latest.keys()) if (!a.named.has(pr) || !a.sealed.has(pr) || !a.chained.has(pr)) prs.add(pr);
     for (const pr of a.pinned.keys()) prs.add(pr);
     // Only a record filed under a pull request's number: one under 0, say, would
     // have an entry filed where no order finds it, and a note on the host's

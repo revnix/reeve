@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import * as signing from "../src/signing.mjs";
 import { fileSigner, knownKeys, baselineStatement, latestStatement } from "../src/signing.mjs";
 import { fileAnchor, readAnchor, anchorPath } from "../src/anchor.mjs";
 import { open, canonical } from "../src/db/ops.mjs";
@@ -64,7 +65,7 @@ const rewrite = (dir, fn) => {
   const p = anchorPath(dir, REPO);
   const a = JSON.parse(readFileSync(p, "utf8"));
   // What a writer that left them out didn't write, so an edit here fails an assertion rather than the file.
-  a.named ??= {}; a.sealed ??= {}; a.reserved ??= {}; a.pinned ??= {};
+  a.named ??= {}; a.sealed ??= {}; a.chained ??= {}; a.reserved ??= {}; a.pinned ??= {};
   fn(a);
   writeFileSync(p, JSON.stringify(a));
 };
@@ -77,6 +78,8 @@ const entryOf = (db, n) => JSON.parse(db.prepare("SELECT payload FROM event WHER
 const sealOf = (/** @type {any} */ e) => createHash("sha256").update(canonical(latestStatement({ repo: String(e.repo).toLowerCase(), pr: PR, n: e.n, digest: e.digest,
                                                                                           records: e.records ?? [], store: e.store ?? null, seq: e.seq ?? null }))).digest("hex");
 /** An entry reserved on the anchor, as it writes one: whole but for its repository and store. */
+/** The chain to entry 1, the entry `e`, as an anchor that noted it holds it. */
+const chainTo = (/** @type {any} */ e) => signing.orderChain(new Map([[1, sealOf(e)]]), 1);
 const reservedAs = (/** @type {any} */ e) => ({ n: e.n, digest: e.digest, records: e.records ?? [], seq: e.seq ?? null });
 
 // ── the anchor ───────────────────────────────────────────────────────────────
@@ -85,7 +88,7 @@ test("an anchor written before #279 and #281 reads, holding none of what they ad
   const dir = credentials();
   writeAnchor(dir, { began: true, latest: { 42: 2 }, store: ID });
   const a = anchorRead(dir);
-  assert.deepEqual(a, { began: true, latest: new Map([[PR, 2]]), store: ID, named: new Map(), sealed: new Map(), reserved: new Map(), pinned: new Map(), pending: null });
+  assert.deepEqual(a, { began: true, latest: new Map([[PR, 2]]), store: ID, named: new Map(), sealed: new Map(), chained: new Map(), reserved: new Map(), pinned: new Map(), pending: null });
 });
 
 test("the anchor reserves only an order's next entry, for one record, and noting it clears that and unpins what it names", () => {
@@ -290,7 +293,7 @@ test("an entry reserved and never committed is completed for the record it was r
   db.prepare("DELETE FROM event WHERE op = 'decision.latest' AND json_extract(payload, '$.n') = 2").run();
   const sealOne = entryOf(db, 1);
   db.close();
-  rewrite(dir, (a) => { a.latest["42"] = 1; a.named["42"] = green; a.sealed["42"] = sealOf(sealOne); a.reserved = { 42: reservedAs(two) }; });
+  rewrite(dir, (a) => { a.latest["42"] = 1; a.named["42"] = green; a.sealed["42"] = sealOf(sealOne); a.chained["42"] = chainTo(sealOne); a.reserved = { 42: reservedAs(two) }; });
   const keys = knownKeys({ local: dir });
   db = open(dbPath);
   const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: anchorFor(db, dir) });
@@ -486,7 +489,7 @@ test("a store ahead of the host's anchor, its entry naming another record than t
   db.close();
   assert.ok(red, "control: both records were kept");
   // The anchor stopped before noting entry 2, and holds it reserved for another record.
-  rewrite(dir, (a) => { a.latest["42"] = 1; a.named["42"] = green; delete a.sealed["42"]; a.reserved = { 42: reservedAs({ n: 2, digest: "f".repeat(64) }) }; });
+  rewrite(dir, (a) => { a.latest["42"] = 1; a.named["42"] = green; delete a.sealed["42"]; delete a.chained["42"]; a.reserved = { 42: reservedAs({ n: 2, digest: "f".repeat(64) }) }; });
   const r = await tick(dbPath, null, host(dir));
   assert.match(r.log, new RegExp(`#42: its signed order ends at entry 2, naming record ${red.slice(0, 12)}, though this host reserved entry 2 for record ffffffffffff, so it isn't extended`));
   const keys = knownKeys({ local: dir });
@@ -948,7 +951,7 @@ test("a store ahead of the host's anchor, its entry naming the reserved record a
   db.close();
   assert.ok(red && one && two, "control: both entries were kept");
   // The anchor stopped before noting entry 2, reserved for it naming another record besides.
-  rewrite(dir, (a) => { a.latest["42"] = 1; a.named["42"] = green; a.sealed["42"] = sealOf(one); a.reserved = { 42: reservedAs({ ...two, records: ["f".repeat(64)] }) }; });
+  rewrite(dir, (a) => { a.latest["42"] = 1; a.named["42"] = green; a.sealed["42"] = sealOf(one); a.chained["42"] = chainTo(one); a.reserved = { 42: reservedAs({ ...two, records: ["f".repeat(64)] }) }; });
   const r = await tick(dbPath, null, host(dir));
   assert.match(r.log, new RegExp(`#42: its signed order ends at entry 2, naming record ${red.slice(0, 12)}, as this host reserved it, but isn't the entry this host reserved, so it isn't extended`));
   const keys = knownKeys({ local: dir });
@@ -1059,7 +1062,7 @@ test("an anchor written before #279 has each pull request's top entry noted, wit
   const two = entryOf(db, 2);
   db.close();
   // As #278 wrote it: each pull request's top entry, and nothing of what it names.
-  rewrite(dir, (a) => { a.named = {}; a.sealed = {}; });
+  rewrite(dir, (a) => { a.named = {}; a.sealed = {}; a.chained = {}; });
   assert.equal(anchorRead(dir)?.sealed?.size, 0, "control: no seal");
   // Quiet: nothing new kept for it, nor judged.
   await tick(dbPath, null, host(dir));
@@ -1104,6 +1107,95 @@ test("a store whose binding was begun, holding an identity that can't be read, m
   await tick(dbPath, null, host(dir));
   assert.equal(baselines(dbPath), 0);
   assert.equal(anchorRead(dir)?.store ?? null, null);
+});
+
+// ── #303: every entry of an order, not only its top ─────────────────────────
+
+/** Entry `n` of #42's order signed again by this host, the same number and record, naming `records` besides: a copy's own variant. */
+const resignAt = (/** @type {string} */ dbPath, /** @type {string} */ dir, /** @type {number} */ n, /** @type {string[]} */ records) => {
+  const db = open(dbPath);
+  const e = entryOf(db, n);
+  const s = fileSigner(dir)(latestStatement({ repo: e.repo, pr: PR, n, digest: e.digest, records, store: e.store, seq: e.seq }));
+  db.prepare("UPDATE event SET payload = ? WHERE op = 'decision.latest' AND subject = ? AND json_extract(payload, '$.n') = ?")
+    .run(JSON.stringify({ ...e, records, envelope: s.envelope }), `pr:${PR}`, n);
+  db.close();
+};
+
+test("the anchor keeps a chain over every entry it noted to its top, and never another for that top", () => {
+  const dir = credentials();
+  const an = fileAnchor(dir);
+  const one = sealOf({ repo: REPO, n: 1, digest: D1, store: ID });
+  const chain = signing.orderChain(new Map([[1, one]]), 1);
+  assert.match(String(chain), /^[0-9a-f]{64}$/, "control: a chain is a digest");
+  assert.equal(an.note(REPO, PR, 1, D1, [D1], one, chain), true);
+  assert.equal(anchorRead(dir)?.chained?.get(PR), chain);
+  assert.equal(an.note(REPO, PR, 1, D1, [D1], one, "e".repeat(64)), false, "not noted again over other entries");
+  assert.equal(anchorRead(dir)?.chained?.get(PR), chain);
+  assert.equal(an.note(REPO, PR, 2, D2, [D2]), true, "control: a later entry noted without one");
+  assert.equal(anchorRead(dir)?.chained?.has(PR), false, "leaves none for it");
+  // A chain is over each entry's seal in turn, so another earlier entry makes another chain.
+  const two = sealOf({ repo: REPO, n: 2, digest: D2, store: ID });
+  assert.notEqual(signing.orderChain(new Map([[1, one], [2, two]]), 2), signing.orderChain(new Map([[1, "f".repeat(64)], [2, two]]), 2));
+  assert.equal(signing.orderChain(new Map([[2, two]]), 2), null, "nor is there one with an entry missing");
+  assert.equal(an.note(REPO, PR, 3, D3, [D3], null, chain), false, "nor is a chain noted for an entry without its seal");
+  // An anchor holding a chain for an entry it holds no seal of, or one that isn't a digest, isn't read.
+  const bad = credentials();
+  writeAnchor(bad, { began: true, latest: { 42: 1 }, store: ID, named: { 42: D1 }, sealed: {}, chained: { 42: chain } });
+  assert.match(String(anchorRead(bad)?.unreadable), /isn't an anchor/);
+  writeAnchor(bad, { began: true, latest: { 42: 1 }, store: ID, named: { 42: D1 }, sealed: { 42: one }, chained: { 42: "x" } });
+  assert.match(String(anchorRead(bad)?.unreadable), /isn't an anchor/);
+  writeAnchor(bad, { began: true, latest: { 42: 1 }, store: ID, named: { 42: D1 }, sealed: { 42: one }, chained: { 42: chain } });
+  assert.equal(anchorRead(bad)?.chained?.get(PR), chain, "control: one whole reads");
+});
+
+test("an order whose entry before its top was swapped for another the host signed, its top as the host noted, isn't current, in the tick, why and replay", async () => {
+  const dir = credentials();
+  const dbPath = store();
+  await ticks(dbPath, [at(A), at(A, "RED"), at(B)], host(dir));
+  const keys = knownKeys({ local: dir });
+  let db = open(dbPath);
+  const before = signedOrder(db, REPO, PR, keys);
+  db.close();
+  assert.ok("top" in before && before.top === 3, `control: three entries: ${JSON.stringify(before)}`);
+  assert.equal(anchorRead(dir)?.chained?.get(PR), signing.orderChain(/** @type {any} */ (before).seals, 3), "control: the anchor holds the chain to its top");
+  // Entry 2 swapped for a variant this host's key signed, as a copy of the store might have; entry 3 left as it was.
+  resignAt(dbPath, dir, 2, ["f".repeat(64)]);
+  db = open(dbPath);
+  const after = signedOrder(db, REPO, PR, keys);
+  const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: anchorFor(db, dir) });
+  const replayed = replayDecisions(db, { pr: PR }, { keys, repo: REPO, anchor: anchorFor(db, dir) });
+  db.close();
+  assert.ok("seals" in after && after.seals.get(3) === /** @type {any} */ (before).seals.get(3), "control: its top entry is as the host noted it");
+  const why = /its signed order to entry 3 isn't the one this host noted, though entry 3 is: an entry before it was swapped for another, as a copy of this store signed/;
+  assert.match(String(shown), new RegExp(`can't be trusted as the latest: ${why.source}`));
+  assert.ok(replayed.some((x) => x.outcome === "unreplayable" && why.test(String(x.why))), JSON.stringify(replayed));
+  const r = await tick(dbPath, null, host(dir));
+  assert.match(r.log, new RegExp(`#42: ${why.source}, so it isn't extended`));
+  await tick(dbPath, at(B, "RED"), host(dir));
+  db = open(dbPath);
+  const order = signedOrder(db, REPO, PR, keys);
+  db.close();
+  assert.equal("top" in order && order.top, 3, "not extended past it");
+});
+
+test("an anchor written before its entries were chained has them chained on the next tick, and a swap after is caught", async () => {
+  const dir = credentials();
+  const dbPath = store();
+  await ticks(dbPath, [at(A), at(A, "RED"), at(B)], host(dir));
+  // As an anchor written before this: no chain.
+  rewrite(dir, (a) => { delete a.chained; });
+  assert.equal(anchorRead(dir)?.chained?.has(PR), false, "control: no chain");
+  await tick(dbPath, null, host(dir));
+  const keys = knownKeys({ local: dir });
+  let db = open(dbPath);
+  const order = signedOrder(db, REPO, PR, keys);
+  db.close();
+  assert.equal(anchorRead(dir)?.chained?.get(PR), signing.orderChain(/** @type {any} */ (order).seals, 3), "chained from the store's order as it checks");
+  resignAt(dbPath, dir, 1, ["f".repeat(64)]);
+  db = open(dbPath);
+  const shown = explainDecision(db, PR, { keys, repo: REPO, anchor: anchorFor(db, dir) });
+  db.close();
+  assert.match(String(shown), /its signed order to entry 3 isn't the one this host noted, though entry 3 is/);
 });
 
 // ── #304: records kept before #299 ───────────────────────────────────────────

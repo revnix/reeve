@@ -14850,7 +14850,10 @@ export const STUBS = [
     expectRed: "the anchor keeps the seal of the entry it noted last, and never another for it",
     edits: [{ file: "src/anchor.mjs",
               find: "        if (seal) a.sealed.set(pr, seal); else a.sealed.delete(pr);",
-              replace: "        a.sealed.delete(pr);" }],
+              replace: "        a.sealed.delete(pr);" },
+            { file: "src/anchor.mjs",
+              find: "        if (chain) a.chained.set(pr, chain); else a.chained.delete(pr);",
+              replace: "        a.chained.delete(pr);" }],
   },
   {
     name: "anchor-note-seal-other",

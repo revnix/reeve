@@ -1469,6 +1469,10 @@ async function tickOnce(ctx) {
     try { return fn(true); } finally { lock.release(); }
   };
   /** @type {Map<string, any> | null | undefined} */ let orderKeys;
+  // The keys orders are checked with, read once a tick, wherever they're first
+  // asked for, and by every step of the tick from one read: a key changed since
+  // the last tick, this host's own replaced say, is read the next.
+  const keysNow = () => (orderKeys === undefined ? (orderKeys = ctx.keys?.() ?? null) : orderKeys);
   // The host's anchor bound to this store (#281), where it's no store's yet: in
   // the step that makes or finds its baseline, under the host's lock, and only
   // to a store that holds one, of this repository only, every order in it
@@ -1501,7 +1505,7 @@ async function tickOnce(ctx) {
     // be no store's for good.
     if (!had && db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(STORE_ID_OP)) return not("this store holds an identity that can't be read");
     const id = had ?? a.pending?.store ?? randomBytes(16).toString("hex");
-    if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
+    keysNow();
     if (orderKeys) for (const r of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ?`).all(LATEST_OP))) {
       const pr = Number(String(r.subject).slice(3));
       const order = signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), id);
@@ -1642,8 +1646,7 @@ async function tickOnce(ctx) {
     if (!ordering || !begun.began || ctx.unnamedPinned) return;
     withOrderLock((held) => {
       if (!held) return;
-      // Read for itself: the tick's keys are read where its orders are extended.
-      const keys = orderKeys ?? ctx.keys?.() ?? null;
+      const keys = keysNow();
       if (!keys) return;
       try {
         const a = ctx.anchor.read(nwo) ?? noAnchor();
@@ -1860,7 +1863,7 @@ async function tickOnce(ctx) {
   };
   const orderAt = (/** @type {number} */ pr) => {
     if (!ordering) return undefined;
-    if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
+    keysNow();
     if (!orderKeys) return undefined;
     if (asPublished === undefined) asPublished = ordersAsPublished();
     if (!asPublished) return undefined;
@@ -1991,7 +1994,7 @@ async function tickOnce(ctx) {
     if (!ordering || !begun.began) return;
     withOrderLock((held) => {
       if (!held) return;
-      if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
+      keysNow();
       if (!orderKeys) return;
       (ctx.durably ?? durably)(db, () => {
         let id = null, a = null;

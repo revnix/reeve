@@ -11977,8 +11977,8 @@ export const STUBS = [
     test: "test/signed-order.test.mjs",
     expectRed: "an order goes on across a change of this host's key, the reeve still running",
     edits: [{ file: "src/daemon.mjs",
-              find: "      if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;",
-              replace: "      if (orderKeys === undefined) orderKeys = (ctx.orderKeysOnce ??= ctx.keys?.() ?? null);" }],
+              find: "  const keysNow = () => (orderKeys === undefined ? (orderKeys = ctx.keys?.() ?? null) : orderKeys);",
+              replace: "  const keysNow = () => (orderKeys === undefined ? (orderKeys = (ctx.orderKeysOnce ??= ctx.keys?.() ?? null)) : orderKeys);" }],
   },
   {
     name: "restart-never-raises",
@@ -12445,8 +12445,8 @@ export const STUBS = [
     test: "test/published-order.test.mjs",
     expectRed: "no evidence is published where no order can be told",
     edits: [{ file: "src/daemon.mjs",
-              find: "    if (!ordering) return undefined;\n    if (orderKeys === undefined)",
-              replace: "    if (orderKeys === undefined)" }],
+              find: "    if (!ordering) return undefined;\n    keysNow();",
+              replace: "    keysNow();" }],
   },
   {
     name: "evidence-needs-keys",

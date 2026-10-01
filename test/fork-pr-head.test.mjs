@@ -175,3 +175,39 @@ test("a fork's pull request is skipped by the dispatch, though another wants a w
   assert.ok(!prepared.includes(42), "the fork's was prepared for too");
   assert.match(logged, /#42: NOT dispatching FIX_CI — its head is a fork's branch/);
 });
+
+test("a fork's pull request whose action isn't a fix pushed to its branch isn't refused as a fork's, and keeps its own reason", async () => {
+  const stateDir = tempDir("rf3-");
+  const clone = tempDir("rf3-clone-");
+  execFileSync("git", ["-C", clone, "init", "-q"]);
+  const cl = (/** @type {string} */ id, /** @type {string} */ state, detail = "") => ({ id, state, detail });
+  // Threads still open past the round cap, none critical: findings to spill to an issue, nothing to push.
+  const evaluation = { ok: true, pr: 42, state: "open", head: "a".repeat(40), title: "t", headRef: "f", baseRef: "main", fork: true,
+    verdict: { state: "BLOCK", summary: "threads open",
+               clauses: ["ci", "base", "review", "rounds", "threads", "findings", "mergeable"].map((id) => (id === "threads" ? cl("threads", "BLOCK", "1 open") : cl(id, "PASS"))) },
+    rounds: { n: 5, softCap: 5, hardCap: 10, unspilledCritical: 0 },
+    checks: { verdict: "GREEN", caused: [], failing: [] }, reviewers: [], threads: {}, settled: { settled: true } };
+  mkdirSync(stateDir, { recursive: true });
+  const ctx = {
+    ...OFFLINE_READS,
+    nwo: "o/r", db: open(join(stateDir, "e.db")), logPath: join(stateDir, "reeve.log"), dbPath: join(stateDir, "e.db"),
+    profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: tempDir("rf3-root-"), checkout: clone },
+               authority: { policy: "propose_and_merge" }, rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+               ci: { provider: "github-actions", requiredChecks: [] }, watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5, reviewActions: true } },
+    execute: true, shadow: true, running: 0,
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    containment: { credentialRead: "closed", why: "test" }, keychain: { measured: true, items: [], why: null },
+    claudeBin: "/bin/sh", cliVersion: "test",
+    openPrs: () => [42], evaluate: () => evaluation, publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    observe: () => ({ ok: false, observations: [], incomplete: true, threads: { readable: false, total: null, unresolved: 0, seen: 0 } }),
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    prepareCheckout: () => ({ ok: false, path: null, why: "this test prepares none" }),
+    spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s1" }),
+  };
+  await daemon.tick(ctx);
+  ctx.db.close();
+  const logged = readFileSync(ctx.logPath, "utf8");
+  assert.match(logged, /#42 BLOCK +SPILL/, `control: it's to spill: ${logged.slice(-1200)}`);
+  assert.match(logged, /#42: NOT dispatching SPILL — spilling findings to an issue is a GitHub effect reeve does not yet perform itself/);
+  assert.doesNotMatch(logged, /#42: NOT dispatching SPILL — its head is a fork's branch/);
+});

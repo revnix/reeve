@@ -17273,8 +17273,8 @@ export const STUBS = [
     test: "test/fork-pr-head.test.mjs",
     expectRed: "a fork's pull request is never handed to a worker, as its fix couldn't be pushed to the fork, and the log says why",
     edits: [{ file: "src/daemon.mjs",
-              find: "  if (execute) for (const d of decisions.filter(x => forWorker(x) && x.e.fork)) {",
-              replace: "  if (false) for (const d of decisions.filter(x => forWorker(x) && x.e.fork)) {" }],
+              find: "  if (execute) for (const d of decisions.filter(x => forWorker(x) && forksFix(x))) {",
+              replace: "  if (false) for (const d of decisions.filter(x => forWorker(x) && forksFix(x))) {" }],
   },
   {
     name: "fork-left-out-of-worker-demand",
@@ -17282,7 +17282,7 @@ export const STUBS = [
     test: "test/fork-pr-head.test.mjs",
     expectRed: "a fork's repair asks for no worker's containment, so an open one doesn't stand in for the fork's reason, and no canary runs for it",
     edits: [{ file: "src/daemon.mjs",
-              find: "  const wanted = decisions.filter(d => forWorker(d) && !d.e.fork);",
+              find: "  const wanted = decisions.filter(d => forWorker(d) && !forksFix(d));",
               replace: "  const wanted = decisions.filter(d => forWorker(d));" }],
   },
   {
@@ -17291,7 +17291,7 @@ export const STUBS = [
     test: "test/fork-pr-head.test.mjs",
     expectRed: "a fork's pull request is skipped by the dispatch, though another wants a worker the same tick",
     edits: [{ file: "src/daemon.mjs",
-              find: "      if (e.fork) continue;\n",
+              find: "      if (e.fork && FIX_ACTIONS.includes(decision.action)) continue;\n",
               replace: "" }],
   },
   {
@@ -17473,5 +17473,14 @@ export const STUBS = [
     edits: [{ file: "src/backup.mjs",
               find: "    if (ambiguous) {\n      results.push({ nwo, ok: false, outcome: \"failed\", escalate: \"builder:backup:failed\", path: null,",
               replace: "    if (false) {\n      results.push({ nwo, ok: false, outcome: \"failed\", escalate: \"builder:backup:failed\", path: null," }],
+  },
+  {
+    name: "fork-only-fixes-refused",
+    why: "refuse every worker action of a fork's pull request. A spill or a review asked, not pushed to its branch, would be said to be its author's",
+    test: "test/fork-pr-head.test.mjs",
+    expectRed: "a fork's pull request whose action isn't a fix pushed to its branch isn't refused as a fork's, and keeps its own reason",
+    edits: [{ file: "src/daemon.mjs",
+              find: "  const forksFix = (/** @type {any} */ d) => d.e.fork && FIX_ACTIONS.includes(d.decision.action);",
+              replace: "  const forksFix = (/** @type {any} */ d) => d.e.fork; void FIX_ACTIONS;" }],
   },
 ];

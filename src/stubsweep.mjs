@@ -409,7 +409,10 @@ export function combineShards(manifest, reports, { head }) {
     const n = shards.filter(s => s && !("error" in s) && s.count === count && s.index === i).length;
     if (n !== 1) refusals.push(n ? `shard ${i}/${count} reported ${n} times` : `shard ${i}/${count} never reported`);
   }
-  for (const r of reports) if (r?.head !== head) refusals.push(`shard ${r?.shard} swept ${r?.head}, not ${head}`);
+  // A shard stopped before its end, cancelled or timed out, leaves a report
+  // saying so, in place of any an earlier attempt of it left.
+  for (const r of reports) if (r?.incomplete) refusals.push(`shard ${r?.shard} didn't finish`);
+  for (const r of reports) if (!r?.incomplete && r?.head !== head) refusals.push(`shard ${r?.shard} swept ${r?.head}, not ${head}`);
   const wanted = Array.isArray(reports[0]?.wanted) ? reports[0].wanted : [];
   if (reports.some(r => JSON.stringify(r?.wanted ?? []) !== JSON.stringify(wanted))) refusals.push("the shards were asked for different entries");
   const expected = wanted.length ? manifest.filter(e => wanted.includes(e.name)) : manifest;

@@ -93,16 +93,23 @@ jobs:
           # the sweep refuses any name the manifest does not contain.
           # shellcheck disable=SC2086
           node scripts/stub-sweep.mjs $ENTRIES
+      # A shard stopped before its end, cancelled or timed out, wrote no report.
+      # One saying it didn't finish is kept in its place, so it replaces any an
+      # earlier attempt of this shard left, and the combine step refuses it.
+      - name: Say this shard didn't finish, where it wrote no report
+        if: always()
+        env:
+          REPORT: ${{ runner.temp }}/stub-sweep-shard-${{ matrix.shard }}.json
+          SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+        run: test -s "$REPORT" || printf '{"shard":"%s","incomplete":true}\n' "$SHARD" > "$REPORT"
       # Kept whether or not this shard passed: the combine step judges them all.
-      # A shard stopped before its end writes no report, and the combine step
-      # says it never reported.
       - name: Keep this shard's report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: stub-sweep-shard-${{ matrix.shard }}
           path: ${{ runner.temp }}/stub-sweep-shard-${{ matrix.shard }}.json
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 7
           # A shard run again replaces the report it left before, which is
           # refused otherwise, so a rerun can recover the sweep.

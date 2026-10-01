@@ -18095,4 +18095,13 @@ export const STUBS = [
               find: " || daemon.alive !== true }];",
               replace: " }];" }],
   },
+  {
+    name: "combine-shard-finished",
+    why: "take a shard's report that says it didn't finish. A rerun cancelled before its end would leave the verdict to whatever replaced the earlier attempt's report",
+    test: "test/stubsweep-shards.test.mjs",
+    expectRed: "the shards' reports combine into one sweep's results, refused for a shard that didn't report, an entry not measured once, another commit or another ask",
+    edits: [{ file: "src/stubsweep.mjs",
+              find: "  for (const r of reports) if (r?.incomplete) refusals.push(",
+              replace: "  for (const r of reports) if (false) refusals.push(" }],
+  },
 ];

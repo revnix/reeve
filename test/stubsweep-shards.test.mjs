@@ -65,6 +65,8 @@ test("the shards' reports combine into one sweep's results, refused for a shard 
   refused([one, report("1/2", ["a"], { shard: "2/2" }), two], /shard 2\/2 reported 2 times/);
   refused([one, report("2/2", ["b", "c"])], /1 entry measured more than once: c/);
   refused([one, report("2/2", ["b"], { head: "h0" })], /shard 2\/2 swept h0, not h1/);
+  // A shard that never finished leaves a report saying so, which replaces one an earlier attempt left.
+  refused([one, { shard: "2/2", incomplete: true }], /shard 2\/2 didn't finish/);
   refused([one, report("2/2", ["b"], { wanted: ["b"] })], /the shards were asked for different entries/);
   refused([one, report("2/2", ["b", "zz"])], /1 result for an entry this sweep didn't ask for: zz/);
   refused([one, report("2/3", ["b"])], /a report isn't one of 2 shards: "2\/3"/);

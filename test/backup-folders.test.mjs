@@ -10,7 +10,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as backup from "../src/backup.mjs";
@@ -72,7 +72,8 @@ test("a snapshot kept in a shared folder before is found for the repository whos
   kept("a-b/c", T); kept("a/b-c", T + 10); kept(null, T + 20);
   assert.equal(backup.latestSnapshot(root, "a-b/c"), join(shared, `${T}.db`), "its own, not the newest there");
   assert.equal(backup.latestSnapshot(root, "a/b-c"), join(shared, `${T + 10}.db`));
-  assert.deepEqual(backup.snapshotCandidates(root, "a-b/c"), [join(shared, `${T}.db`)], "nor counted as another's backup");
+  // For the backup audit, every one there but another's: the one holding no record can't be told, so it isn't ruled out.
+  assert.deepEqual(backup.snapshotCandidates(root, "a-b/c"), [join(shared, `${T + 20}.db`), join(shared, `${T}.db`)], "never counted as another's backup");
   // One taken since, in its own folder, comes first.
   const db = storeOf("a-b/c");
   const taken = backup.snapshot(db, root, "a-b/c", T + 30);
@@ -116,4 +117,62 @@ test("reeve restore refuses another repository's snapshot before it puts anythin
   assert.match(r.stdout + r.stderr, /refused: .*holds decision records of a\/b-c, not a-b\/c/);
   assert.equal(existsSync(target), false);
   assert.equal(existsSync(join(home, "audits")), false, "nothing put back");
+});
+
+test("a snapshot holding no decision record is restored only from the repository's own folder, since whose it is can't otherwise be told", () => {
+  const root = tempDir("reeve-bk-root-");
+  const empty = storeOf(null);
+  const theirs = String(backup.snapshot(empty, root, "a/b-c", T).path);
+  const own = String(backup.snapshot(empty, root, "a-b/c", T).path);
+  empty.close();
+  const io = { isDaemonRunning: () => null };
+  const audits = () => ({ dir: join(tempDir("reeve-bk-audits-"), "a"), notes: join(tempDir("reeve-bk-notes-"), "n") });
+  /** @type {any} */ let r;
+  try { r = backup.restore(theirs, join(tempDir("reeve-bk-state-"), "s.db"), { nwo: "a-b/c", backups: root, ...io }); } catch (err) { r = { threw: String(err) }; }
+  assert.equal(r.ok, false, "another's folder, and no record to say whose: " + JSON.stringify(r));
+  assert.match(r.why, /holds no decision record/);
+  const a = audits();
+  assert.equal(backup.restoreAudits(theirs, a.dir, "a-b/c", { notes: a.notes, backups: root }).ok, false);
+  // Without the backups' root, nothing vouches for its folder either.
+  assert.equal(backup.restore(own, join(tempDir("reeve-bk-state-"), "s.db"), { nwo: "a-b/c", ...io }).ok, false);
+  // From its own folder, which only it writes, it's the repository's.
+  const mine = backup.restore(own, join(tempDir("reeve-bk-state-"), "s.db"), { nwo: "a-b/c", backups: root, ...io });
+  assert.equal(mine.ok, true, mine.why);
+  const b = audits();
+  assert.equal(backup.restoreAudits(own, b.dir, "a-b/c", { notes: b.notes, backups: root }).ok, true);
+});
+
+test("reeve restore refuses a snapshot given by path that holds no decision record and isn't in the repository's own folder", () => {
+  const home = tempDir("reeve-bk-home-");
+  const empty = storeOf(null);
+  const theirs = String(backup.snapshot(empty, join(home, "backups"), "a/b-c", T).path);
+  empty.close();
+  const target = join(home, "restored.db");
+  const r = spawnSync(process.execPath, [REEVE, "restore", "a-b/c", "--from", theirs, "--db", target], { encoding: "utf8", cwd: home,
+    env: { ...offlineEnv(), REEVE_HOME: home }, timeout: 60_000 });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout + r.stderr, /refused: .*holds no decision record/);
+  assert.equal(existsSync(target), false);
+  // From its own folder it restores. --force only so a reeve running elsewhere on this machine doesn't stop the test.
+  const own = storeOf(null);
+  const mine = String(backup.snapshot(own, join(home, "backups"), "a-b/c", T).path);
+  own.close();
+  const ok = spawnSync(process.execPath, [REEVE, "restore", "a-b/c", "--from", mine, "--db", target, "--force"], { encoding: "utf8", cwd: home,
+    env: { ...offlineEnv(), REEVE_HOME: home }, timeout: 60_000 });
+  assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+  assert.equal(existsSync(target), true);
+});
+
+test("a snapshot in a shared folder that can't be read still counts for the backup audit, though it's never restored", () => {
+  const root = tempDir("reeve-bk-root-");
+  const shared = join(root, "a-b-c");
+  mkdirSync(shared, { recursive: true });
+  writeFileSync(join(shared, `${T}.db`), "not a store");
+  assert.deepEqual(backup.snapshotCandidates(root, "a-b/c"), [join(shared, `${T}.db`)], "a backup there that fails, not none");
+  assert.equal(backup.latestSnapshot(root, "a-b/c"), null);
+  // One whose records are another's isn't counted for it.
+  const db = storeOf("a/b-c");
+  db.exec(`VACUUM INTO '${join(shared, `${T + 10}.db`)}'`);
+  db.close();
+  assert.deepEqual(backup.snapshotCandidates(root, "a-b/c"), [join(shared, `${T}.db`)]);
 });

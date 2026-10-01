@@ -65,18 +65,33 @@ const snapshotsIn = dir => {
 /**
  * Whether the snapshot at `path` is `nwo`'s, by the repository its decision
  * records name, as `storeIsOf` tells a store's (#319). `named`: one holding no
- * record can't be told, and isn't. `{ ok }`, or why it isn't.
+ * record can't be told, and isn't. `{ ok }`, or why it isn't, with `other`
+ * where its records name another repository: the one answer that rules it out
+ * as `nwo`'s, rather than leaving it untold.
  * @param {string} path @param {string} nwo @param {{ named?: boolean }} [o]
  */
 export function snapshotIsOf(path, nwo, { named = false } = {}) {
   let db = null;
+  const said = (/** @type {any} */ of) => `the snapshot ${String(of.why).replace(/^this store /, "")}`;
   try {
     db = new DatabaseSync(path, { readOnly: true });
-    const of = storeIsOf(db, nwo, { named });
-    return of.ok ? of : { ok: false, why: `the snapshot ${String(of.why).replace(/^this store /, "")}` };
+    const of = storeIsOf(db, nwo, { named: false });
+    if (!of.ok) return { ok: false, other: true, why: said(of) };
+    const told = named ? storeIsOf(db, nwo, { named: true }) : of;
+    return told.ok ? told : { ok: false, why: said(told) };
   } catch (e) { return { ok: false, why: `whose records ${path} holds couldn't be read: ${e.message}` }; }
   finally { try { db?.close(); } catch { /* read only: nothing to lose */ } }
 }
+
+/**
+ * Whether `path` is a snapshot in `nwo`'s own folder under the backups' root
+ * `root`: one only it writes, so a snapshot there is its own whatever records
+ * it holds (#319). False where the root isn't given or can't be read.
+ */
+const inOwnFolder = (path, root, nwo) => {
+  if (!root) return false;
+  try { return realpathSync(dirname(path)) === realpathSync(folderOf(root, nwo)); } catch { return false; }
+};
 
 /**
  * A repository's snapshots, newest first: those in its own folder, then, at
@@ -582,9 +597,11 @@ export function snapshotAll(home, root, { at = Math.floor(Date.now() / 1000), ke
  * path is how the two drift.
  */
 export function snapshotCandidates(root, nwo) {
-  // One kept in a shared folder before counts only where its records are this
-  // repository's (#319): another's isn't one of its backups, usable or not.
-  return snapshotsOf(root, nwo).filter(f => !f.shared || snapshotIsOf(f.path, nwo, { named: true }).ok).map(f => f.path);
+  // One kept in a shared folder before counts unless its records are another
+  // repository's (#319): another's isn't one of its backups, but one that can't
+  // be read, or holds no record, may be, and a backup there that fails isn't
+  // one never taken. `latestSnapshot` still restores neither.
+  return snapshotsOf(root, nwo).filter(f => !f.shared || !snapshotIsOf(f.path, nwo).other).map(f => f.path);
 }
 
 /**
@@ -653,13 +670,16 @@ export function latestSnapshot(root, nwo, { deep = false } = {}) {
  * `none`, and the audits are left as they are. With the host's `notes`, each
  * is checked against them, and noted where it isn't.
  * @param {string} snapshotPath @param {string} dir @param {string} repo
- * @param {{ notes?: string | null, syncDir?: (dir: string) => void }} [io]
+ * `backups`, the backups' root: from the repository's own folder there, a
+ * snapshot holding no record is its own (#319).
+ * @param {{ notes?: string | null, syncDir?: (dir: string) => void, backups?: string | null }} [io]
  */
 export function restoreAudits(snapshotPath, dir, repo, io = {}) {
   const valid = validateSnapshot(snapshotPath, { kind: "repo" });
   if (!valid.ok) return { ok: false, why: `the snapshot is not a usable store: ${String(valid.why).replace(/^not a usable store: /, "")}` };
-  // Nor from another repository's snapshot (#319): its audits aren't this one's.
-  const of = snapshotIsOf(snapshotPath, repo);
+  // Nor from another repository's snapshot (#319): its audits aren't this
+  // one's. One holding no record is this one's only from its own folder.
+  const of = snapshotIsOf(snapshotPath, repo, { named: !inOwnFolder(snapshotPath, io.backups, repo) });
   if (!of.ok) return { ok: false, why: of.why };
   let rows = null, probe = null;
   try {
@@ -690,7 +710,7 @@ function dropAudits(path) {
 }
 
 export function restore(snapshotPath, dbPath, { overwrite = false, force = false, isDaemonRunning = daemonRunning, copy = copyFileSync,
-                                                 syncDir = syncFolder, rename = renameSync, nwo = null } = {}) {
+                                                 syncDir = syncFolder, rename = renameSync, nwo = null, backups = null } = {}) {
   if (!existsSync(snapshotPath)) return { ok: false, why: `no snapshot at ${snapshotPath}` };
   if (existsSync(dbPath) && !overwrite)
     return { ok: false, why: `${dbPath} exists; pass overwrite to replace it, which discards anything newer than the snapshot` };
@@ -716,8 +736,10 @@ export function restore(snapshotPath, dbPath, { overwrite = false, force = false
   if (!v.ok) return { ok: false, why: `the snapshot is not a usable store: ${String(v.why).replace(/^not a usable store: /, "")}` };
   // Nor, for a repository named, a snapshot whose decision records are
   // another's (#319): two repositories' snapshots could once share a folder.
+  // One holding no record can't say whose it is, so it's this one's only from
+  // its own folder under `backups`, which only it writes.
   if (nwo) {
-    const of = snapshotIsOf(snapshotPath, nwo);
+    const of = snapshotIsOf(snapshotPath, nwo, { named: !inOwnFolder(snapshotPath, backups, nwo) });
     if (!of.ok) return { ok: false, why: of.why };
   }
 

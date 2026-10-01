@@ -819,7 +819,8 @@ switch (cmd) {
     // ...the existing per-repo restore, unchanged, below.
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
     if (!nwo) { console.error("reeve restore: no repo."); process.exit(1); }
-    const from = opt("from") ?? latestSnapshot(opt("to") ?? join(HOME, "backups"), nwo);
+    const backups = opt("to") ?? join(HOME, "backups");
+    const from = opt("from") ?? latestSnapshot(backups, nwo);
     if (!from) { console.error(`reeve restore: no snapshot for ${nwo}`); process.exit(1); }
     const dbPath = opt("db") ?? stateFor(nwo);
     // The audits of its trial the snapshot carries go back first, where
@@ -827,12 +828,12 @@ switch (cmd) {
     // the store, and a store refused here, as one already there is, is no
     // reason to leave them lost. A snapshot that wouldn't restore, or an audit
     // there that isn't the snapshot's, restores nothing.
-    const put = restoreAudits(from, auditDirFor(HOME, nwo), nwo, { notes: auditNotesFor(HOME, nwo) });
+    const put = restoreAudits(from, auditDirFor(HOME, nwo), nwo, { notes: auditNotesFor(HOME, nwo), backups });
     if (!put.ok) { console.log(`refused: ${put.why}`); process.exit(1); }
     if (put.put) console.log(`put back ${put.put} audit(s) of ${nwo} from ${from}` +
                              (put.unsynced ? `, but a folder couldn't be synced (${put.unsynced}), so a power loss could undo it` : ""));
     if (put.unnoted) console.log(`the host couldn't note the audits of ${nwo} the snapshot carries (${put.unnoted}), so the loss of one couldn't be told`);
-    const r = restore(from, dbPath, { overwrite: flag("overwrite"), force: flag("force"), nwo });
+    const r = restore(from, dbPath, { overwrite: flag("overwrite"), force: flag("force"), nwo, backups });
     console.log(r.ok ? `restored ${from} -> ${dbPath}` : `refused: ${r.why}`);
     process.exit(r.ok ? 0 : 1);
   }

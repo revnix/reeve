@@ -86,7 +86,7 @@ export function snapshotIsOf(path, nwo, { named = false } = {}) {
     // reeve keeps each spelling's store, audits and backups apart: restored
     // under this one, it would land where nothing keeping the other reads it.
     // So it's refused, saying the spelling that restores it.
-    const respell = others.length === 1 && others[0].toLowerCase() === String(nwo).toLowerCase()
+    const respell = others.length === 1 && String(others[0]).toLowerCase() === String(nwo).toLowerCase()
       ? `: if it's this repository, restore it as ${others[0]}, as its records spell it` : "";
     return { ok: false, other: true, why: `the snapshot holds decision records of ${others.join(", ")}, not ${nwo}${respell}` };
   }

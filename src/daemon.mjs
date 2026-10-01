@@ -3794,6 +3794,13 @@ async function tickOnce(ctx) {
         raise(`#${e.pr}: ${decision.action.toLowerCase().replace("_", " ")} needs a GitHub effect reeve does not yet perform`);
         continue;
       }
+      // A fork's pull request (#320): its branch is in the fork, which reeve
+      // can't push to, so a worker's fix could never be published there.
+      if (e.fork && WORKER_ACTIONS.includes(decision.action)) {
+        log(logPath, `  #${e.pr}: NOT dispatching ${decision.action} — its head is a fork's branch, which reeve can't push to`);
+        raise(`#${e.pr}: ${decision.action.toLowerCase().replace("_", " ")} is for its author: its head is a fork's branch, which reeve can't push to`);
+        continue;
+      }
       const prepKey = e.pr;
       const backoff = PREP_BACKOFF.get(prepKey);
       if (backoff && backoff.until > Date.now() && WORKER_ACTIONS.includes(decision.action)) {

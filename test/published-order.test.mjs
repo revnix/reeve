@@ -370,6 +370,15 @@ test("no evidence is published where no order can be told", async () => {
   const first = await ticks([at(A)], host(unread));
   writeFileSync(anchorPath(unread, REPO), "{");
   assert.deepEqual(await publishedOnce(first.path, host(unread)), [null], "a host's anchor that can't be read");
+  // Read to pin the verdict's record, and unreadable after: the record is kept, and where its order stands can't be told.
+  const late = credentials();
+  const held = await ticks([at(A)], host(late));
+  const real = fileAnchor(late);
+  let pinned = false;
+  const flaky = { ...real, pin: (/** @type {any[]} */ ...args) => { const r = real.pin(...args); pinned = true; return r; },
+                  read: (/** @type {any[]} */ ...args) => { if (pinned) throw new Error("the host's anchor can't be read"); return real.read(...args); } };
+  assert.deepEqual(await publishedOnce(held.path, { ...host(late), anchor: flaky }), [null], "a host's anchor that can't be read once the verdict's record is pinned");
+  assert.ok(pinned, "control: the record was pinned");
 
   const other = credentials();
   fileAnchor(other).bind(REPO, "f".repeat(32));

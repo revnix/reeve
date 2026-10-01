@@ -170,7 +170,7 @@ export function everyStore(home) {
     for (const f of files) {
       if (!f.endsWith(".db")) continue;
       // The repository it's of, as its path names it (#310).
-      out.push({ nwo: storeRepo(o.name, f), path: join(root, o.name, f), kind: "repo" });
+      out.push({ nwo: storeRepo(o.name, f, join(root, o.name, f)), path: join(root, o.name, f), kind: "repo" });
     }
   }
   return out;

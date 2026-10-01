@@ -21,7 +21,7 @@ import { validate, withDefaults } from "./profile/schema.mjs";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, linkSync, rmSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { resolveHome } from "./home.mjs";
-import { statePathFor, earlierStorePath, adoptStore, clearMoveLock } from "./paths.mjs";
+import { storeLookup, adoptStore, clearMoveLock } from "./paths.mjs";
 import { open } from "./db/ops.mjs";
 
 /**
@@ -297,11 +297,13 @@ export function renderPlan({ nwo, proposal, questions, notes, profile, unanswere
 
 /**
  * The repository's state database, as init sees it, without changing anything:
- * "exists", "legacy" (a store at the old path, to be moved into place) or
- * "missing".
+ * "exists", "legacy" (a store at the old path, to be moved into place),
+ * "missing", or "unusable" with why, where whose a store found is can't be
+ * told, or is another's (#310): init makes none in its place.
  */
 export function storeStatus(home, nwo) {
-  const path = statePathFor(home, nwo), legacy = earlierStorePath(home, nwo);
+  const { path, earlier: legacy, refused } = storeLookup(home, nwo);
+  if (refused) return { state: "unusable", path, why: refused };
   if (existsSync(path)) return { state: "exists", path };
   if (existsSync(legacy)) return { state: "legacy", path, legacy };
   return { state: "missing", path };
@@ -321,6 +323,7 @@ export function ensureStore(home, nwo, { openStore = open, log = () => {} } = {}
   // An existing store is left alone, apart from a move lock a killed mover left
   // beside it, which nothing else would look for.
   if (status.state === "exists") { clearMoveLock(status.path); return { changed: false, line: null }; }
+  if (status.state === "unusable") return { changed: false, failed: true, line: status.why };
   if (status.state === "legacy") {
     let said = null, used;
     try { used = adoptStore(home, nwo, { log: (m) => { said = m; log(m); } }); }
@@ -412,7 +415,8 @@ export function init({ root = process.cwd(), answers = {}, write = false, home =
   if (!profileChanged && store.state === "exists") return { code: 0, output: output + "\n\nnothing to do", path };
   if (!write) {
     const plan = store.state === "missing" ? `\n\nthe state database will be created at ${store.path}`
-      : store.state === "legacy" ? `\n\nthe state database will be moved from ${store.legacy} to ${store.path}` : "";
+      : store.state === "legacy" ? `\n\nthe state database will be moved from ${store.legacy} to ${store.path}`
+      : store.state === "unusable" ? `\n\nthe state database can't be used: ${store.why}` : "";
     return { code: 2, output: output + plan + `\n\n-> reeve init --write   to apply`, path };
   }
 

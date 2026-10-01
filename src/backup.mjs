@@ -64,7 +64,7 @@ const snapshotsIn = dir => {
 
 /**
  * Whether the snapshot at `path` is `nwo`'s, by the repository its decision
- * records name (#319), as GitHub matches names, whatever their letters' case.
+ * records name (#319), spelled as reeve keeps them.
  * `named`: one holding no record can't be told, and isn't. `{ ok }`, or why it
  * isn't, with `other` only where a record names another repository: the one
  * answer that rules it out as `nwo`'s. A record that names none, or a file that
@@ -80,9 +80,16 @@ export function snapshotIsOf(path, nwo, { named = false } = {}) {
       .map(r => (typeof r.repo === "string" ? r.repo : null));
   } catch (e) { return { ok: false, why: `whose records ${path} holds couldn't be read: ${e.message}` }; }
   finally { try { db?.close(); } catch { /* read only: nothing to lose */ } }
-  const same = (/** @type {string} */ r) => r.toLowerCase() === String(nwo).toLowerCase();
-  const others = /** @type {string[]} */ (repos.filter(r => r !== null && !same(r)));
-  if (others.length) return { ok: false, other: true, why: `the snapshot holds decision records of ${others.join(", ")}, not ${nwo}` };
+  const others = /** @type {string[]} */ (repos.filter(r => r !== null && r !== String(nwo)));
+  if (others.length) {
+    // Spelled in other letters' case, it may be this repository to GitHub, but
+    // reeve keeps each spelling's store, audits and backups apart: restored
+    // under this one, it would land where nothing keeping the other reads it.
+    // So it's refused, saying the spelling that restores it.
+    const respell = others.length === 1 && others[0].toLowerCase() === String(nwo).toLowerCase()
+      ? `: if it's this repository, restore it as ${others[0]}, as its records spell it` : "";
+    return { ok: false, other: true, why: `the snapshot holds decision records of ${others.join(", ")}, not ${nwo}${respell}` };
+  }
   if (repos.includes(null)) return { ok: false, why: `the snapshot holds decision records whose repository can't be read, so whose it is can't be told` };
   if (named && !repos.length) return { ok: false, why: `the snapshot holds no decision record, so which repository it's of can't be told` };
   return { ok: true };

@@ -193,23 +193,22 @@ test("a snapshot in a shared folder whose record names no repository counts for 
   assert.equal(backup.latestSnapshot(root, "a-b/c"), null);
 });
 
-test("a repository's name in a snapshot's records is matched as GitHub matches names, whatever their letters' case", () => {
+test("a snapshot of the repository spelled in other letters' case is refused, saying how its records spell it, as reeve keeps each spelling's store apart", () => {
   const root = tempDir("reeve-bk-root-");
   const db = storeOf("A-B/C");
   const path = String(backup.snapshot(db, root, "A-B/C", T).path);
   db.close();
+  // Restored as a-b/c, it would land at a-b/c's store, where nothing that keeps A-B/C's reads it.
   /** @type {any} */ let r;
   try { r = backup.restore(path, join(tempDir("reeve-bk-state-"), "s.db"), { nwo: "a-b/c", isDaemonRunning: () => null }); } catch (err) { r = { threw: String(err) }; }
-  assert.equal(r.ok, true, "the same repository, spelled otherwise: " + JSON.stringify(r));
-  // Kept in a shared folder before, it's found for it.
-  const shared = join(root, "a-b-c");
-  mkdirSync(shared, { recursive: true });
-  const kept = storeOf("A-B/C");
-  kept.exec(`VACUUM INTO '${join(shared, `${T + 10}.db`)}'`);
-  kept.close();
-  assert.equal(backup.latestSnapshot(root, "a-b/c"), join(shared, `${T + 10}.db`));
-  // Control: another repository's still isn't.
-  assert.equal(backup.snapshotIsOf(path, "a/b-c").other, true);
+  assert.equal(r.ok, false, "refused under another spelling: " + JSON.stringify(r));
+  assert.match(r.why, /holds decision records of A-B\/C, not a-b\/c: if it's this repository, restore it as A-B\/C, as its records spell it/);
+  // As its records spell it, it restores.
+  assert.equal(backup.restore(path, join(tempDir("reeve-bk-state-"), "s.db"), { nwo: "A-B/C", isDaemonRunning: () => null }).ok, true);
+  // Control: another repository's says nothing of spelling.
+  const theirs = backup.snapshotIsOf(path, "a/b-c");
+  assert.equal(theirs.other, true);
+  assert.doesNotMatch(String(theirs.why), /restore it as/);
 });
 
 test("a backup's abandoned temporary left in a shared folder before is reaped, and the snapshots kept there aren't", () => {

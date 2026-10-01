@@ -25,8 +25,9 @@ import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync
 import { randomBytes } from "node:crypto";
 import { join, dirname, basename } from "node:path";
 import { open as openStore, exportJsonl, storeLock } from "./db/ops.mjs";
-import { storeRepo } from "./paths.mjs";
 import { syncFolder, running } from "./signing.mjs";
+import { auditsCopy, putBackAudits } from "./trial.mjs";
+import { auditDirFor, auditNotesFor, storeRepo } from "./paths.mjs";
 // Task 8's subset. `tablesAt` and `HUB_TABLES` are what a snapshot's table set
 // is validated against; Task 9 adds the locks, replay and hubEvent imports when
 // `restoreHub` needs them, and not before -- ESM resolves at instantiation, so
@@ -47,13 +48,25 @@ export { openStore as open };
 /** A repository name that is safe as one path segment. */
 const slug = nwo => String(nwo).replace(/[^A-Za-z0-9._-]/g, "-");
 
+/** The table a snapshot of a repository's store carries its audits in (#311), each as recorded, under its name. */
+export const AUDITS_TABLE = "trial_audit";
+
 /**
  * Write a consistent copy of the store.
  *
  * `VACUUM INTO` fails if the target exists, which is the behaviour we want: a
  * snapshot never silently overwrites another.
+ *
+ * With `audits`, the repository's audits folder and the host's notes of them,
+ * the audits of its trial, as recorded, are put in the snapshot's own file
+ * before it's published (#311): one file, published whole, so it's never there
+ * without the audits it was taken with. Audits that can't be copied whole, as a
+ * report reads them, take no snapshot, and say why as `auditsWhy`: one taken
+ * without them would count among those kept, and in time push out every one
+ * that holds them. The snapshots there are kept as they are. They're read
+ * before the store is copied, so every judgment they cover is in the copy.
  */
-export function snapshot(db, root, nwo, at = Math.floor(Date.now() / 1000), { keep = 14 } = {}) {
+export function snapshot(db, root, nwo, at = Math.floor(Date.now() / 1000), { keep = 14, audits = null } = {}) {
   const dir = join(root, slug(nwo));
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${at}.db`);
@@ -62,6 +75,9 @@ export function snapshot(db, root, nwo, at = Math.floor(Date.now() / 1000), { ke
   // `/^\d+\.db$/` filter, which is what makes the partial file unobservable.
   const temp = join(dir, `.${at}.${process.pid}.tmp`);
   try { rmSync(temp, { force: true }); } catch {}
+  const copy = audits ? auditsCopy(audits.dir, nwo, { notes: audits.notes ?? null }) : null;
+  if (copy && "why" in copy)
+    return { ok: false, path: null, mine: false, why: `its audits couldn't be put in it whole, so it wasn't taken: ${copy.why}`, auditsWhy: copy.why };
   // ABANDONED temporaries, from a process killed between `VACUUM INTO` and the
   // publish. Each is a full database copy, and nothing else will ever remove
   // one: `prune` and every candidate reader filter on `/^\d+\.db$/` precisely
@@ -92,6 +108,13 @@ export function snapshot(db, root, nwo, at = Math.floor(Date.now() / 1000), { ke
     try { rmSync(temp, { force: true }); } catch {}
     return { ok: false, path: null, mine: false, why: `could not snapshot: ${e.message}` };
   }
+  if (copy) {
+    const auditsWhy = carryAudits(temp, nwo, copy.audits);
+    if (auditsWhy) {
+      for (const s of ["", "-wal", "-shm", "-journal"]) { try { rmSync(temp + s, { force: true }); } catch {} }
+      return { ok: false, path: null, mine: false, why: `its audits couldn't be put in it whole, so it wasn't taken: ${auditsWhy}`, auditsWhy };
+    }
+  }
   let mine;
   try {
     // ATOMIC and EXCLUSIVE. `renameSync` here would replace a file another
@@ -115,6 +138,28 @@ export function snapshot(db, root, nwo, at = Math.floor(Date.now() / 1000), { ke
   // change behaviour for the per-repo `backup` route, which is not this fix.
   prune(dir, keep);
   return { ok: true, path, mine, why: mine ? null : "already taken this second" };
+}
+
+/**
+ * Puts `audits` of `nwo`, each as it was recorded, in the store at `path`, a
+ * snapshot not yet published, in a transaction its commit syncs to disk. Why
+ * they couldn't be, or null.
+ * @param {string} path @param {string} nwo @param {{ name: string, text: string }[]} audits
+ * @returns {string | null}
+ */
+function carryAudits(path, nwo, audits) {
+  let t = null;
+  try {
+    t = new DatabaseSync(path);
+    t.exec("BEGIN");
+    t.exec(`DROP TABLE IF EXISTS ${AUDITS_TABLE}`);
+    t.exec(`CREATE TABLE ${AUDITS_TABLE} (name TEXT PRIMARY KEY, repo TEXT NOT NULL, text TEXT NOT NULL)`);
+    const put = t.prepare(`INSERT INTO ${AUDITS_TABLE} (name, repo, text) VALUES (?, ?, ?)`);
+    for (const a of audits) put.run(a.name, nwo, a.text);
+    t.exec("COMMIT");
+    return null;
+  } catch (e) { return e.message; }
+  finally { try { t?.close(); } catch {} }
 }
 
 /**
@@ -382,7 +427,7 @@ export function snapshotAll(home, root, { at = Math.floor(Date.now() / 1000), ke
       // `{ ok: true, path, mine: false, why: "already taken this second" }`
       // WITHOUT this block validating or deleting it -- `taken.mine` is false,
       // and only a snapshot this process wrote is one this process may judge.
-      const taken = snapshot(db, root, nwo, at, { keep: Infinity });
+      const taken = snapshot(db, root, nwo, at, { keep: Infinity, audits: nwo === "hub" ? null : { dir: auditDirFor(home, nwo), notes: auditNotesFor(home, nwo) } });
       // The LOSER reports neither success nor failure, and this branch exists
       // because it previously fell through to `results.push({ nwo, ...taken })`
       // and reported `ok: true` for a file it never validated and does not own.
@@ -461,7 +506,9 @@ export function snapshotAll(home, root, { at = Math.floor(Date.now() / 1000), ke
             : validateSnapshot(p, { kind: "repo" })).ok,
         });
       }
-      results.push({ nwo, outcome: taken.ok ? "taken" : "failed", ...taken });
+      // One whose audits couldn't be put in it wasn't taken (#311): a backup
+      // that failed, escalated until one is.
+      results.push({ nwo, outcome: taken.ok ? "taken" : "failed", ...taken, ...(taken.auditsWhy ? { escalate: "builder:backup:failed" } : {}) });
     } catch (e) {
       results.push({ nwo, ok: false, outcome: "failed", escalate: "builder:backup:failed",
                      why: `could not open ${path}: ${e.message}` });
@@ -545,6 +592,48 @@ export function latestSnapshot(root, nwo, { deep = false } = {}) {
   return null;
 }
 
+/**
+ * Puts back in `dir` the audits of `repo` the snapshot at `snapshotPath`
+ * carries, that `dir` is missing, as they were recorded (#311), as
+ * `putBackAudits` does. Only from a snapshot that would restore: one that
+ * wouldn't is no recovery point for its audits either, and nothing is put
+ * back. A snapshot taken before audits were kept with snapshots carries none:
+ * `none`, and the audits are left as they are. With the host's `notes`, each
+ * is checked against them, and noted where it isn't.
+ * @param {string} snapshotPath @param {string} dir @param {string} repo
+ * @param {{ notes?: string | null, syncDir?: (dir: string) => void }} [io]
+ */
+export function restoreAudits(snapshotPath, dir, repo, io = {}) {
+  const valid = validateSnapshot(snapshotPath, { kind: "repo" });
+  if (!valid.ok) return { ok: false, why: `the snapshot is not a usable store: ${String(valid.why).replace(/^not a usable store: /, "")}` };
+  let rows = null, probe = null;
+  try {
+    probe = new DatabaseSync(snapshotPath, { readOnly: true });
+    if (probe.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(AUDITS_TABLE))
+      rows = probe.prepare(`SELECT name, repo, text FROM ${AUDITS_TABLE} ORDER BY name`).all();
+  } catch (e) { return { ok: false, why: `the audits ${snapshotPath} carries can't be read: ${e.message}` }; }
+  finally { try { probe?.close(); } catch {} }
+  if (!rows) return { ok: true, put: 0, none: true };
+  const other = rows.find(r => r.repo !== repo);
+  return putBackAudits({ repo: other ? String(other.repo) : repo, audits: rows.map(r => ({ name: r.name, text: r.text })) }, snapshotPath, dir, repo, io);
+}
+
+/**
+ * Takes the audits a snapshot carries out of `path`, a restore's copy of it:
+ * they go back to the audits folder, not into the store, where nothing reads
+ * them and the next snapshot would carry them again.
+ * @param {string} path
+ */
+function dropAudits(path) {
+  // Read and written, not read only: closed, a connection that writes takes
+  // the log and index it made beside a store kept in WAL mode with it.
+  const t = new DatabaseSync(path);
+  try {
+    if (!t.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(AUDITS_TABLE)) return;
+    t.exec(`DROP TABLE ${AUDITS_TABLE}`);
+  } finally { t.close(); }
+}
+
 export function restore(snapshotPath, dbPath, { overwrite = false, force = false, isDaemonRunning = daemonRunning, copy = copyFileSync,
                                                  syncDir = syncFolder, rename = renameSync } = {}) {
   if (!existsSync(snapshotPath)) return { ok: false, why: `no snapshot at ${snapshotPath}` };
@@ -612,6 +701,8 @@ export function restore(snapshotPath, dbPath, { overwrite = false, force = false
   let placed = false, synced = false;
   try {
     copy(snapshotPath, temp);
+    // Without the audits it carries (#311), which a restore puts back apart.
+    dropAudits(temp);
     const fd = openSync(temp, "r");
     try { fsyncSync(fd); } finally { closeSync(fd); }
     // The copy's name synced into its folder before the store's log is moved

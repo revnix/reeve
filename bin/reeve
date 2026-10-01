@@ -6,12 +6,12 @@
 // it might one day become.
 import { runDoctor, render, checkAppIdentity, hubFindings, renderHub } from "../src/doctor.mjs";
 import { open, storeLock } from "../src/db/ops.mjs";
-import { statePathFor, dashPathFor, auditDirFor, adoptStore, legacyDashPathFor, hubPathFor, adoptLegacyStore, missingStoreMessage } from "../src/paths.mjs";
+import { statePathFor, dashPathFor, auditDirFor, auditNotesFor, adoptStore, legacyDashPathFor, hubPathFor, adoptLegacyStore, missingStoreMessage } from "../src/paths.mjs";
 import { hubAccess } from "../src/build/hubaccess.mjs";
 import { resolveRepoIdAt } from "../src/build/repoid.mjs";
 import { loadRegistry } from "../src/build/registryio.mjs";
 import { snapshot, restore, latestSnapshot, exportEvents,
-         snapshotAll, restoreHub, validateSnapshot, settleRestores } from "../src/backup.mjs";
+         snapshotAll, restoreHub, validateSnapshot, settleRestores, restoreAudits } from "../src/backup.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick, measuredContainment, withdrawStanding, tellStuck, runningCode } from "../src/daemon.mjs";
 import { replayDecisions, renderReplay, publishedChecked } from "../src/decisions.mjs";
@@ -249,6 +249,7 @@ const FLAGS = {
   "audit-sheet":  { value: true,  what: "write the trial's calls to a sheet, for a person to mark each one right or not" },
   audited:        { value: true,  what: "record the audit a person marked on a sheet" },
   by:             { value: true,  what: "who made the audit recorded" },
+  until:          { value: true,  what: "for trial, the date its count ended" },
   test:           { value: false, what: "send a test alert through every configured channel" },
   help:           { value: false, what: "show this help" },
 };
@@ -661,7 +662,8 @@ switch (cmd) {
       console.log(r.ok ? `${r.count} event(s) -> ${r.path}` : `failed: ${r.why}`);
       process.exit(r.ok ? 0 : 1);
     }
-    const r = snapshot(db, root, nwo);
+    // With the audits of its trial in it (#311).
+    const r = snapshot(db, root, nwo, undefined, { audits: { dir: auditDirFor(HOME, nwo), notes: auditNotesFor(HOME, nwo) } });
     console.log(r.ok ? `snapshot -> ${r.path}` : `failed: ${r.why}`);
     process.exit(r.ok ? 0 : 1);
   }
@@ -820,6 +822,16 @@ switch (cmd) {
     const from = opt("from") ?? latestSnapshot(opt("to") ?? join(HOME, "backups"), nwo);
     if (!from) { console.error(`reeve restore: no snapshot for ${nwo}`); process.exit(1); }
     const dbPath = opt("db") ?? stateFor(nwo);
+    // The audits of its trial the snapshot carries go back first, where
+    // they're missing, as they were recorded (#311): they're kept apart from
+    // the store, and a store refused here, as one already there is, is no
+    // reason to leave them lost. A snapshot that wouldn't restore, or an audit
+    // there that isn't the snapshot's, restores nothing.
+    const put = restoreAudits(from, auditDirFor(HOME, nwo), nwo, { notes: auditNotesFor(HOME, nwo) });
+    if (!put.ok) { console.log(`refused: ${put.why}`); process.exit(1); }
+    if (put.put) console.log(`put back ${put.put} audit(s) of ${nwo} from ${from}` +
+                             (put.unsynced ? `, but a folder couldn't be synced (${put.unsynced}), so a power loss could undo it` : ""));
+    if (put.unnoted) console.log(`the host couldn't note the audits of ${nwo} the snapshot carries (${put.unnoted}), so the loss of one couldn't be told`);
     const r = restore(from, dbPath, { overwrite: flag("overwrite"), force: flag("force") });
     console.log(r.ok ? `restored ${from} -> ${dbPath}` : `refused: ${r.why}`);
     process.exit(r.ok ? 0 : 1);
@@ -977,6 +989,14 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       fail("usage", `reeve trial: --since takes the date the trial's count started from, as 2026-09-30T09:14Z${since == null ? "" : `, got ${JSON.stringify(since)}`}`);
     const now = Math.floor(Date.now() / 1000);
     if (sinceAt > now) fail("usage", `reeve trial: --since ${since} is after now, and a trial can't have begun after now`);
+    // A trial's count ends (#314): reported to --until, a period's sheet and its
+    // audit stay as they were made, though the daemon judges on after it.
+    const until = opt("until");
+    const untilAt = until == null ? now : Math.floor(Date.parse(until) / 1000);
+    if (!Number.isFinite(untilAt))
+      fail("usage", `reeve trial: --until takes the date the trial's count ended, as 2026-10-03T09:14Z, got ${JSON.stringify(until)}`);
+    if (untilAt > now) fail("usage", `reeve trial: --until ${until} is after now, and a trial can't have ended after now`);
+    if (until != null && untilAt <= sinceAt) fail("usage", `reeve trial: --until ${until} isn't after --since ${since}`);
     const { trialReport, renderTrial, mergedSince, storeIsOf, auditSheet, readSheet, auditOf, recordAudit, readAudits, sheetThenRecord } = await import("../src/trial.mjs");
     // The sheet marked, read before anything runs.
     let marks = null;
@@ -996,15 +1016,16 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     // this one, and forks share pull request numbers and heads.
     const bound = storeIsOf(db, nwo, { named: opt("db") != null });
     if (!bound.ok) fail("store_unusable", `reeve trial: ${bound.why}`);
-    const merged = mergedSince(nwo, sinceAt, { until: now });
-    const auditDir = auditDirFor(HOME, nwo);
+    const merged = mergedSince(nwo, sinceAt, { until: untilAt });
+    // Each audit noted on the host, in its credentials folder (#314).
+    const auditDir = auditDirFor(HOME, nwo), notes = auditNotesFor(HOME, nwo);
     const reportOf = (/** @type {any} */ adding = null) => {
-      const kept = readAudits(auditDir, nwo);
-      return trialReport(db, { repo: nwo, since: sinceAt, now, merged, seeded, audits: kept.ok ? [...kept.audits, ...(adding ? [adding] : [])] : { why: kept.why } });
+      const kept = readAudits(auditDir, nwo, { notes });
+      return trialReport(db, { repo: nwo, since: sinceAt, now: untilAt, merged, seeded, audits: kept.ok ? [...kept.audits, ...(adding ? [adding] : [])] : { why: kept.why } });
     };
     let report = reportOf();
     // Taken of the calls as this report lists them, and only those.
-    const made = marks ? auditOf(report.toAudit, marks, { repo: nwo, by: opt("by"), at: now }) : null;
+    const made = marks ? auditOf(report.toAudit, marks, { repo: nwo, by: opt("by"), at: now, judgment: report.judgment }) : null;
     if (made && !made.ok) fail("usage", `reeve trial: ${auditedPath}: ${made.why}`, { exit: EXITS.misuse });
     const audit = made?.ok ? made.audit : null;
     // With a sheet asked for, it's written whole first, carrying the audit as
@@ -1012,7 +1033,7 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     // written records nothing, and one whose audit can't be recorded is taken
     // away. Never over a file already there: it may be a sheet a person is
     // marking, or the one being recorded.
-    const record = () => (audit ? recordAudit(auditDir, audit) : null);
+    const record = () => (audit ? recordAudit(auditDir, audit, { notes }) : null);
     let recorded = null;
     try {
       recorded = sheetPath == null ? record()
@@ -1021,12 +1042,14 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       if (sheetPath != null && e.code === "EEXIST" && e.stage === undefined)
         fail("usage", `reeve trial: won't write over ${sheetPath}: name a new file for the sheet, or record the one marked with --audited`, { exit: EXITS.misuse });
       if (sheetPath == null || e.stage === "record")
-        fail("audit_unrecorded", `reeve trial: the audit couldn't be recorded in ${auditDir}${sheetPath != null ? ", so no sheet was written" : ""}: ${e.code ?? e.message}`);
+        fail("audit_unrecorded", `reeve trial: the audit couldn't be recorded in ${auditDir}${sheetPath != null ? ", so no sheet was written" : ""}: ${e.code ?? e.message}` +
+             (e.unsynced ? `; the sheet was taken away, but its folder couldn't be synced (${e.unsynced}): if ${sheetPath} is there after a power loss, remove it before recording again` : ""));
       fail("usage", `reeve trial: the sheet couldn't be written to ${sheetPath}${audit ? ", so the audit wasn't recorded" : ""}: ${e.code ?? e.message}`, { exit: EXITS.misuse });
     }
     if (recorded && audit) {
       console.error(`audit recorded in ${recorded.path}: ${audit.calls.length} call(s) marked by ${audit.by}` +
-                    (recorded.unsynced ? `, but a folder couldn't be synced (${recorded.unsynced}), so it may not outlast a power loss` : ""));
+                    (recorded.unsynced ? `, but a folder couldn't be synced (${recorded.unsynced}), so it may not outlast a power loss` : "") +
+                    (recorded.unnoted ? `, but the host couldn't note it (${recorded.unnoted}), so its loss couldn't be told` : ""));
       report = reportOf();
     }
     if (sheetPath != null)
@@ -2696,7 +2719,8 @@ function usage() {
                          --published checks the store against what the merge policy
                          published on GitHub, as a copy away from the host is checked;
                          0 all the same · 1 one differs or can't be replayed · 3 none)
-  trial [owner/repo]    the shadow trial against its conditions  (--since <date> it started, --json,
+  trial [owner/repo]    the shadow trial against its conditions  (--since <date> it started,
+                         --until <date> it ended, --json,
                          --seeded, --audit-sheet <file> to mark its calls on,
                          --audited <file> --by <name> to record the sheet marked;
                          0 it has passed · 1 not yet)

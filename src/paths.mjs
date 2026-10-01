@@ -87,6 +87,16 @@ export function auditDirFor(home, nwo) {
   return join(home, "audits", exact(owner ?? ""), exact(repo ?? ""));
 }
 
+/**
+ * Where the host notes each audit of one repository's trial recorded (#314):
+ * in its credentials folder, which no worker reaches, apart from the audits,
+ * so the newest lost with them, or one changed, can be told.
+ */
+export function auditNotesFor(home, nwo) {
+  const [owner, repo] = String(nwo).split("/");
+  return join(home, "credentials", "audit-notes", exact(owner ?? ""), exact(repo ?? ""));
+}
+
 /** The dashboard for one repository. */
 export function dashPathFor(home, nwo) {
   const [owner, repo] = segments(nwo);

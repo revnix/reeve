@@ -4,6 +4,9 @@
  *
  * Usage:  node scripts/stub-sweep.mjs [name ...]
  *         node scripts/stub-sweep.mjs                 # every stub in the manifest
+ *         STUB_SWEEP_SHARD=i/n STUB_SWEEP_RESULTS=<file> node scripts/stub-sweep.mjs [name ...]
+ *                                                     # the i-th of n shards, its report to <file>
+ *         node scripts/stub-sweep.mjs --combine <file ...>   # the shards' reports, judged as one sweep
  *
  * Exit:   0  every stub was CAUGHT by the assertion it names
  *         1  at least one stub was not caught, or could not be measured
@@ -39,7 +42,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdit, validateManifest, classify, summarise, parsePorcelainZ, fingerprint,
          CAUGHT, UNRUNNABLE, TIMED_OUT_EXIT,
          coverage, coverageLine, changedFiles, grandfatherGate,
-         listGrowth, unresolvedAnchors } from "../src/stubsweep.mjs";
+         listGrowth, unresolvedAnchors, parseShard, shardOf, combineShards } from "../src/stubsweep.mjs";
 
 // Overridable so the runner can be pointed at a throwaway repository built by its
 // own test. The cleanliness guard then applies to THAT tree, so the real one is
@@ -367,12 +370,24 @@ for (const e of manifest)
            "runs before any test so a rotted anchor does not cost twenty minutes to discover.");
 }
 
-const wanted = process.argv.slice(2);
-const entries = wanted.length ? manifest.filter(e => wanted.includes(e.name)) : manifest;
-if (wanted.length && entries.length !== wanted.length) {
+// Every entry, the named ones, or one shard of either (#324): the whole manifest
+// no longer fits one CI job's time limit, so the nightly sweep runs it as shards.
+// `--combine` runs none: it reads the reports the shards wrote, and judges them
+// as one sweep, a whole one where they were asked for every entry.
+const args = process.argv.slice(2);
+const combining = args[0] === "--combine";
+const wanted = combining ? [] : args;
+const shard = parseShard(process.env.STUB_SWEEP_SHARD);
+if (shard && "error" in shard) die(2, `stub-sweep: ${shard.error}`);
+if (combining && shard) die(2, "stub-sweep: --combine judges every shard of a sweep, so it isn't one of them; unset STUB_SWEEP_SHARD");
+if (combining && args.length < 2) die(2, "stub-sweep: --combine needs the shards' reports, as files");
+const named = wanted.length ? manifest.filter(e => wanted.includes(e.name)) : manifest;
+if (wanted.length && named.length !== wanted.length) {
   const missing = wanted.filter(w => !manifest.some(e => e.name === w));
   die(2, `stub-sweep: no such stub(s): ${missing.join(", ")}`);
 }
+const entries = combining ? [] : shard ? shardOf(named, shard) : named;
+const headOf = () => execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8" }).trim();
 
 // ASYNCHRONOUS, and that is what makes the signal handlers work at all.
 //
@@ -507,13 +522,22 @@ mkdirSync(OFFLINE_GH_DIR);
 copyFileSync(fileURLToPath(new URL("../test/fixtures/offline-gh/gh", import.meta.url)), join(OFFLINE_GH_DIR, "gh"));
 process.on("exit", () => { try { rmSync(offlineDir, { recursive: true, force: true }); } catch { /* best effort: it holds no work */ } });
 let childRuns = 0;
+// This sweep's shard and report are its own, never a test's (#324): a test that
+// runs a sweep of its own, as the sweep's tests do, would otherwise run a shard
+// of it, and write its report over this one's.
+const unsharded = env => {
+  const e = { ...env };
+  delete e.STUB_SWEEP_SHARD;
+  delete e.STUB_SWEEP_RESULTS;
+  return e;
+};
 const childEnv = file => {
-  if (basename(file) === "escape.test.mjs") return { env: process.env, home: null, ghLog: null };
+  if (basename(file) === "escape.test.mjs") return { env: unsharded(process.env), home: null, ghLog: null };
   const n = ++childRuns;
   const home = join(offlineDir, `home-${n}`);
   mkdirSync(home);
   const ghLog = join(offlineDir, `gh-${n}.log`);
-  const env = { ...process.env, HOME: home, REEVE_TEST_GH_LOG: ghLog,
+  const env = { ...unsharded(process.env), HOME: home, REEVE_TEST_GH_LOG: ghLog,
                 PATH: `${OFFLINE_GH_DIR}${delimiter}${process.env.PATH ?? ""}` };
   delete env.REEVE_HOME;
   return { env, home, ghLog };
@@ -854,7 +878,26 @@ const treeState = () => {
   } catch { return null; }
 };
 
-const results = [];
+// The shards' reports, refused unless they are one sweep, whole as asked.
+let combined = null;
+if (combining) {
+  let reports;
+  try { reports = args.slice(1).map(p => JSON.parse(readFileSync(p, "utf8"))); }
+  catch (err) { die(2, `stub-sweep: a shard's report couldn't be read: ${err.message}`); }
+  combined = combineShards(manifest, reports, { head: headOf() });
+  if (combined.refusals.length) {
+    console.log("stub-sweep: the shards' reports aren't one sweep, so together they prove nothing:");
+    for (const r of combined.refusals) console.log(`  · ${r}`);
+    process.exit(1);
+  }
+  for (const r of combined.results) if (r.verdict !== CAUGHT) {
+    console.log(`FAIL ${String(r.name).padEnd(28)} ${r.verdict}`);
+    console.log(`       reintroduces: ${r.reintroduces}`);
+    console.log(`       ${r.why}`);
+  }
+}
+
+const results = combined ? [...combined.results] : [];
 for (const entry of entries) {
   const files = [...new Set(entry.edits.map(e => join(ROOT, e.file)))];
 
@@ -1060,6 +1103,21 @@ for (const entry of entries) {
   }
 }
 
+// A shard's report, for --combine: which shard, the commit it swept, the
+// entries the sweep was asked for, and each result. Written after the last
+// entry, so a shard stopped early by a signal or a timeout writes none, and the
+// combine says it never reported.
+if (process.env.STUB_SWEEP_RESULTS && !combining)
+  writeFileSync(process.env.STUB_SWEEP_RESULTS, JSON.stringify({
+    shard: shard ? `${shard.index}/${shard.count}` : null, head: headOf(), wanted, results }));
+// A shard given no entries, as a sweep asked for fewer entries than it has
+// shards gives, measured nothing and failed nothing: its report says so, and
+// the combine, which checks every entry was measured once, gives the verdict.
+if (shard && !entries.length) {
+  console.log(`stub-sweep: shard ${shard.index}/${shard.count} has no entries; the shards' reports, combined, give the verdict`);
+  process.exit(0);
+}
+
 const s = summarise(results);
 console.log(`\n${s.caught}/${s.total} stub(s) caught by the assertion they name.`);
 // THE RATIO, on every run. Measured 2026-08-30: 48 entries over 3 of 106 test files,
@@ -1073,7 +1131,7 @@ console.log(`\n${s.caught}/${s.total} stub(s) caught by the assertion they name.
   // Only a run that covered the WHOLE manifest can say how many entries are proven;
   // a subset run knows nothing about the ones it did not attempt, and reporting its
   // count as the ratio would understate rather than overstate.
-  const whole = entries.length === manifest.length;
+  const whole = combined ? combined.whole : entries.length === manifest.length;
   // The CAUGHT entries themselves, not just how many: the file-level count needs to
   // know WHICH tests have a working guard, and a count cannot say that.
   const provenEntries = whole

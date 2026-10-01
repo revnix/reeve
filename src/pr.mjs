@@ -1229,7 +1229,7 @@ export function enforcementOf(req, { base = null, context = POLICY_CONTEXT } = {
     // that requires it. Who's who across kinds of actor, a team's members or an
     // organisation's admins, can't be told from the rules, so only one named in
     // every list is one who can.
-    const lists = pinned.map((s) => /** @type {{ key: string, name: string }[]} */ (s.bypass));
+    const lists = pinned.map((s) => /** @type {{ key: string, name: string }[]} */ (s.bypass ?? []));
     const common = lists[0].filter((b) => lists.every((l) => l.some((x) => x.key === b.key)));
     if (common.length)
       return advisory(`${on} requires ${context} from reeve's App, but ${common.map((b) => b.name).join(", ")} can bypass ${pinned.map(where).join(" and ")}, so a merge there needn't wait for reeve's result`,

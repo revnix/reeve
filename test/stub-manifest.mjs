@@ -17687,7 +17687,7 @@ export const STUBS = [
     test: "test/stubsweep-shards.test.mjs",
     expectRed: "the shards' reports combine into one sweep's results, refused for a shard that didn't report, an entry not measured once, another commit or another ask",
     edits: [{ file: "src/stubsweep.mjs",
-              find: "  for (const r of reports) if (r?.head !== head) refusals.push(",
+              find: "  for (const r of reports) if (!r?.incomplete && r?.head !== head) refusals.push(",
               replace: "  for (const r of reports) if (false) refusals.push(" }],
   },
   {

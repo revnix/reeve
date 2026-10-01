@@ -2553,6 +2553,7 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     // `reeve trial` builds it, from when it began, every condition met and a
     // person's audit finding no false call. Both are measured, and every reason
     // to refuse is said at once, so a person sees all that's missing.
+    /** @type {any} */ let enforcing = null;
     if (flag("enforce")) {
       const trialSince = opt("trial-since");
       if (trialSince == null) {
@@ -2568,24 +2569,10 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       const base = profile.identity?.defaultBranch ?? "main";
       const { enforcementNow } = await import("../src/pr.mjs");
       const e = await enforcementNow({ nwo, base });
-      const { trialReport, trialGate, mergedSince, readAudits } = await import("../src/trial.mjs");
       const seeded = await (await import("../src/seeded.mjs")).runSeeded();
-      const kept = readAudits(auditDirFor(HOME, nwo), nwo, { notes: auditNotesFor(HOME, nwo) });
-      const trialDb = open(dbPath);
-      let report;
-      try {
-        report = trialReport(trialDb, { repo: nwo, since: sinceAt, now: nowAt, merged: mergedSince(nwo, sinceAt, { until: nowAt }), seeded,
-                                        audits: kept.ok ? kept.audits : { why: kept.why } });
-      } finally { trialDb.close(); }
-      const passed = trialGate(report, { since: sinceAt });
-      const refusals = [
-        ...(e.state === "enforced" ? [] : [`${e.why}. To enforce, ${e.fix ?? `make ${base} enforce what reeve publishes`}`]),
-        ...("why" in passed ? [`${passed.why}. To enforce, run the trial until it passes: reeve trial ${nwo} --since ${trialSince} --seeded says what's short`] : []),
-      ];
-      if (refusals.length) {
-        console.error(`reeve ${cmd}: --enforce refused: ${refusals.join(". And ")}. Then run this again; until then, run without --enforce, in shadow mode`);
-        process.exit(1);
-      }
+      // The store is read for the trial only once its lock is held and what a
+      // killed restore left is put right, below: opening it can write it.
+      enforcing = { e, base, sinceAt, nowAt, trialSince, seeded };
     }
     // One reeve runs on a store at a time (#274), held until this one ends: a
     // second, on a store another is running on, would keep records whose signed
@@ -2602,6 +2589,32 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     // doesn't run, as the store would run without what it committed there.
     const settled = settleRestores(dbPath);
     if (!settled.ok) { console.error(`reeve ${cmd}: ${settled.why}`); process.exit(1); }
+    // Enforcing, the shadow trial's report from the store, now its lock is held
+    // and it's settled: only this repository's, never another's named with
+    // --db (#166). Then every reason to refuse, at once.
+    if (enforcing) {
+      const { e, base, sinceAt, nowAt, trialSince, seeded } = enforcing;
+      const { trialReport, trialGate, mergedSince, readAudits, storeIsOf } = await import("../src/trial.mjs");
+      const kept = readAudits(auditDirFor(HOME, nwo), nwo, { notes: auditNotesFor(HOME, nwo) });
+      const trialDb = open(dbPath);
+      let report = null, bound;
+      try {
+        bound = storeIsOf(trialDb, nwo, { named: opt("db") != null });
+        if (bound.ok)
+          report = trialReport(trialDb, { repo: nwo, since: sinceAt, now: nowAt, merged: mergedSince(nwo, sinceAt, { until: nowAt }), seeded,
+                                          audits: kept.ok ? kept.audits : { why: kept.why } });
+      } finally { trialDb.close(); }
+      const passed = report ? trialGate(report, { since: sinceAt }) : null;
+      const refusals = [
+        ...(e.state === "enforced" ? [] : [`${e.why}. To enforce, ${e.fix ?? `make ${base} enforce what reeve publishes`}`]),
+        ...(bound.ok ? [] : [`${dbPath} isn't ${nwo}'s to read its shadow trial from: ${bound.why}`]),
+        ...(passed && "why" in passed ? [`${passed.why}. To enforce, run the trial until it passes: reeve trial ${nwo} --since ${trialSince} --seeded says what's short`] : []),
+      ];
+      if (refusals.length) {
+        console.error(`reeve ${cmd}: --enforce refused: ${refusals.join(". And ")}. Then run this again; until then, run without --enforce, in shadow mode`);
+        process.exit(1);
+      }
+    }
     // Resolved before the context so the REASON survives. A project that is
     // simply not registered is `{ project: null, why: null }` -- an ordinary
     // state. A registry that could not be parsed is a fault that says so.
@@ -2810,7 +2823,9 @@ function usage() {
   run [owner/repo]      the daemon: watch, publish, decide, on a loop
       --tick                one pass and exit, in shadow mode only
       --execute             dispatch workers (default: report only)
-      --enforce             publish real conclusions (default: shadow/neutral)
+      --enforce --trial-since <date>
+                            publish real conclusions, once the shadow trial begun
+                            then has passed (default: shadow/neutral)
       --interval <seconds>  default 90
       --halt <path>         marker file that stops everything (default ~/.reeve/HALT)
   withdraw [owner/repo] withdraw every PASS reeve left standing there; systemd runs it

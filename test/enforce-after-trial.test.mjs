@@ -9,11 +9,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as trial from "../src/trial.mjs";
-import { open } from "../src/db/ops.mjs";
+import { open, storeLock } from "../src/db/ops.mjs";
 import { statePathFor } from "../src/paths.mjs";
 import { withDefaults } from "../src/profile/schema.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
@@ -41,8 +42,8 @@ test("the shadow trial lets reeve enforce only once its report has passed, and s
   assert.equal(T.trialGate({ passed: false, ready: true, conditions: [condition("no false call on audit", null, "3 call(s) to audit")] }, { since: SINCE }).ok, false);
 });
 
-/** A home whose App can't be signed in to, with acme/widget's store and profile, and `reeve run` there. */
-function runEnforcing(/** @type {string[]} */ extra) {
+/** A home whose App can't be signed in to, with acme/widget's store and profile, and `reeve run` there; `before` readies it. */
+function runEnforcing(/** @type {string[]} */ extra, /** @type {(home: string, db: string) => (() => void) | void} */ before = () => {}) {
   const home = tempDir("reeve-trial-gate-home-");
   const db = statePathFor(home, "acme/widget");
   mkdirSync(dirname(db), { recursive: true });
@@ -53,8 +54,11 @@ function runEnforcing(/** @type {string[]} */ extra) {
     authority: { permission: "admin", policy: "propose_only", profileLocation: "sidecar" },
     state: { mode: "in-repo" }, units: [{ id: "root", root: ".", language: "javascript", packageManager: "npm", commands: {} }],
     ci: { provider: "github-actions" }, merge: { method: "squash", enforcement: "attested" }, reviewers: [] })));
-  return spawnSync(process.execPath, [REEVE, "run", "acme/widget", "--enforce", ...extra], { encoding: "utf8", cwd: home,
-    env: { ...offlineEnv(), REEVE_HOME: home }, timeout: 120_000 });
+  const after = before(home, db);
+  try {
+    return spawnSync(process.execPath, [REEVE, "run", "acme/widget", "--enforce", ...extra], { encoding: "utf8", cwd: home,
+      env: { ...offlineEnv(), REEVE_HOME: home }, timeout: 120_000 });
+  } finally { if (after) after(); }
 }
 
 test("reeve run --enforce needs to be told when the shadow trial began, and refuses a date it can't read", () => {
@@ -75,4 +79,40 @@ test("reeve run --enforce refuses until the shadow trial has passed, saying what
   assert.match(r.stderr, /the shadow trial from 2026-09-30 09:14Z hasn't passed: .*no false call on audit/);
   assert.match(r.stderr, /reeve trial acme\/widget --since 2026-09-30T09:14Z --seeded/, "how to see what's short");
   assert.doesNotMatch(r.stdout + r.stderr, /daemon starting/);
+});
+
+test("the shadow trial is read only from the repository's own store, never another's named with --db", () => {
+  const r = runEnforcing(["--trial-since", "2026-09-30T09:14Z", "--db", "other.db"], (home) => {
+    const other = open(join(home, "other.db"));
+    other.prepare("INSERT INTO decision(digest,pr,head,record,first_at,last_at,first_seq,last_seq) VALUES(?,?,?,?,?,?,?,?)")
+      .run("x", 1, "a".repeat(40), JSON.stringify({ subject: { repo: "some/other", pr: 1, head: "a".repeat(40) } }), SINCE, SINCE, 1, 1);
+    other.close();
+  });
+  // --db other.db, in the home it runs in.
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stderr, /--enforce refused: .*holds decision records of some\/other, not acme\/widget/);
+  assert.doesNotMatch(r.stdout + r.stderr, /daemon starting/);
+});
+
+test("the shadow trial is read only once the store's lock is held, so a reeve running on it is never written under", () => {
+  /** @type {string} */ let before = "";
+  /** @type {string} */ let path = "";
+  const digest = (/** @type {string} */ p) => createHash("sha256").update(readFileSync(p)).digest("hex");
+  const r = runEnforcing(["--trial-since", "2026-09-30T09:14Z"], (_home, db) => {
+    path = db;
+    before = digest(db);
+    const held = storeLock(db);
+    assert.ok(!("why" in held), JSON.stringify(held));
+    return () => /** @type {any} */ (held).release();
+  });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stderr, /another reeve is running on/, "the lock first, before the store is opened for the trial");
+  assert.doesNotMatch(r.stderr, /shadow trial/);
+  assert.equal(digest(path), before, "the store as it was");
+});
+
+test("reeve run's help and the README say --enforce needs --trial-since", () => {
+  const help = spawnSync(process.execPath, [REEVE, "help"], { encoding: "utf8", env: { ...offlineEnv(), REEVE_HOME: tempDir("reeve-help-") }, timeout: 60_000 });
+  assert.match(help.stdout + help.stderr, /--enforce --trial-since <date>/);
+  assert.match(readFileSync(fileURLToPath(new URL("../README.md", import.meta.url)), "utf8"), /--enforce --trial-since/);
 });

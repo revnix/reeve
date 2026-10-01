@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import * as pr from "../src/pr.mjs";
 import * as daemon from "../src/daemon.mjs";
 import { open } from "../src/db/ops.mjs";
-import { readState, render as renderStatus, noteEnforcement, ENFORCEMENT_OP } from "../src/status.mjs";
+import { readState, render as renderStatus, noteEnforcement, noteTick, ENFORCEMENT_OP } from "../src/status.mjs";
 import { renderHtml } from "../src/dash.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 import { OFFLINE_READS, offlineEnv } from "./fixtures/offline-github.mjs";
@@ -36,6 +36,11 @@ const rulesFrom = (/** @type {number} */ id, /** @type {string} */ context, /** 
 const rulesetWith = (/** @type {any[] | undefined} */ bypass_actors) => (/** @type {number} */ id) =>
   ({ ok: true, out: JSON.stringify({ id, name: `rs-${id}`, enforcement: "active", ...(bypass_actors ? { bypass_actors } : {}) }) });
 const ORG_ADMIN = { actor_id: null, actor_type: "OrganizationAdmin", bypass_mode: "pull_request" };
+const TEAM = (/** @type {number} */ id) => ({ actor_id: id, actor_type: "Team", bypass_mode: "always" });
+// The rules of several rulesets, each requiring the check from reeve's App, and a reader of each one's bypass list.
+const rulesFromEach = (/** @type {number[]} */ ids) => ({ ok: true, out: ids.map((id) => JSON.stringify({ type: "required_status_checks", ruleset_id: id,
+  parameters: { required_status_checks: [{ context: POLICY_CONTEXT, integration_id: Number(APP) }] } })).join("\n") });
+const rulesetsWith = (/** @type {Record<number, any[] | undefined>} */ byId) => (/** @type {number} */ id) => rulesetWith(byId[id])(id);
 // Classic protection requiring `context`, bound to an App or to none, and the rest of it, administrators held to it or not.
 const protectedRequiring = (/** @type {string} */ context, /** @type {number | null} */ app_id) =>
   ({ ok: true, out: JSON.stringify({ protected: true, protection: { enabled: true, required_status_checks: { contexts: [context], checks: [{ context, app_id }] } } }) });
@@ -121,11 +126,12 @@ test("each result reeve publishes says whether its base enforces it, and why, en
 });
 
 /** A tick of o/r with one pull request, #42, blocked on CI and published by `publish`; `shadow` as the daemon runs. */
-async function tickWith(/** @type {(a: any) => Promise<any>} */ publish, /** @type {boolean} */ shadow, db = null) {
+async function tickWith(/** @type {(a: any) => Promise<any>} */ publish, /** @type {boolean} */ shadow, db = null,
+                        /** @type {{ baseRef?: string, enforcement?: (a: any) => Promise<any> }} */ { baseRef = "main", enforcement = undefined } = {}) {
   const stateDir = tempDir("re-");
   mkdirSync(stateDir, { recursive: true });
   const cl = (/** @type {string} */ id, /** @type {string} */ state, detail = "") => ({ id, state, detail });
-  const evaluation = { ok: true, pr: 42, state: "open", head: "a".repeat(40), title: "t", headRef: "f", baseRef: "main",
+  const evaluation = { ok: true, pr: 42, state: "open", head: "a".repeat(40), title: "t", headRef: "f", baseRef,
     verdict: { state: "BLOCK", summary: "ci is red", head: "a".repeat(40),
                clauses: ["ci", "base", "review", "rounds", "threads", "findings", "mergeable"].map((id) => (id === "ci" ? cl("ci", "BLOCK", "failing: CI Gate") : cl(id, "PASS"))) },
     rounds: { n: 1, softCap: 5, hardCap: 10, unspilledCritical: 0 },
@@ -139,7 +145,7 @@ async function tickWith(/** @type {(a: any) => Promise<any>} */ publish, /** @ty
                rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 }, ci: { provider: "github-actions", requiredChecks: [] },
                watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 } },
     execute: false, shadow, running: 0,
-    openPrs: () => [42], evaluate: () => evaluation, publish,
+    openPrs: () => [42], evaluate: () => evaluation, publish, ...(enforcement ? { enforcement } : {}),
     observe: () => ({ ok: false, observations: [], incomplete: true, threads: { readable: false, total: null, unresolved: 0, seen: 0 } }),
   };
   await daemon.tick(ctx);
@@ -244,8 +250,7 @@ test("a base whose rule requiring reeve's check can be bypassed doesn't enforce 
   assert.match(got.adminsHeld.why, /in branch protection, which no one can bypass/);
   assert.equal(got.protectionUnread.state, "unknown");
   assert.equal(got.heldElsewhere.state, "enforced");
-  assert.equal(got.bothBypassable.state, "advisory");
-  assert.match(got.bothBypassable.why, /OrganizationAdmin \(pull_request\) can bypass ruleset 7, and administrators can bypass branch protection/);
+  assert.equal(got.bothBypassable.state, "unknown", "whether the organisation's admins are the branch's administrators can't be told from the rules");
   assert.equal(got.heldUnwhole.state, "enforced");
 });
 
@@ -291,8 +296,142 @@ test("a base's enforcement is noted again once its note is an hour old, and one 
   // Control: measured within the two hours, it stands.
   const fresh = open(join(tempDir("re-fresh-"), "e.db"));
   older(fresh, 30 * 60, ENFORCED);
+  noteTick(fresh);
   const now = readState(fresh);
   fresh.close();
   assert.equal(/** @type {any} */ (now.enforcement?.[0])?.stale, false);
   assert.match(renderStatus({ nwo: "o/r", state: now, health: {} }), /enforcement {2}enforced: main requires/);
+});
+
+test("a base whose rules requiring reeve's check can each be bypassed is advisory only where one actor can bypass them all, and unknown where that can't be told", () => {
+  const of = (/** @type {any} */ rules, /** @type {any} */ ruleset) =>
+    pr.enforcementOf(pr.requirementsOn({ rules, branch: NOT_PROTECTED, ruleset }, POLICY_CONTEXT, { appId: APP }), { base: "main" });
+  /** @type {any} */ let got;
+  try {
+    got = {
+      common: of(rulesFromEach([7, 8]), rulesetsWith({ 7: [ORG_ADMIN], 8: [TEAM(1), ORG_ADMIN] })),
+      // GitHub requires both rules: a member of only one team waits for reeve on the other.
+      disjoint: of(rulesFromEach([7, 8]), rulesetsWith({ 7: [TEAM(1)], 8: [TEAM(2)] })),
+      oneHeld: of(rulesFromEach([7, 8]), rulesetsWith({ 7: [TEAM(1)], 8: [] })),
+    };
+  } catch (err) { got = { threw: String(err) }; }
+  assert.equal(got.disjoint?.state, "unknown", "someone in both teams could bypass both, and no one in one only: " + JSON.stringify(got));
+  assert.match(got.disjoint.why, /whether anyone can bypass every rule that requires it can't be told/);
+  assert.equal(got.common.state, "advisory");
+  assert.match(got.common.why, /OrganizationAdmin \(pull_request\) can bypass ruleset 7 and ruleset 8/);
+  assert.equal(got.oneHeld.state, "enforced");
+});
+
+test("a reading whose bypass list couldn't be read is kept for its reader only, so reeve's App reads it afresh", async () => {
+  let reads = 0;
+  const read = (/** @type {any} */ ruleset) => (/** @type {string[]} */ args) => {
+    const path = String(args.find((a) => a.startsWith("repos/")));
+    reads++;
+    if (path.includes("/rules/branches/")) return PINNED.rules;
+    if (/\/rulesets\/\d+$/.test(path)) return ruleset(Number(path.split("/").pop()));
+    return NOT_PROTECTED;
+  };
+  const ask = (/** @type {any} */ gh, /** @type {any} */ o = {}) =>
+    pr.enforcementOf(pr.requirementsOnBase({ nwo: NWO, base: "kept-1", context: POLICY_CONTEXT, gh, appId: APP, now: 1_000, ...o }), { base: o.base ?? "kept-1" });
+  assert.equal(ask(read(rulesetWith(undefined))).state, "unknown", "first read with a credential that can't see who can bypass it");
+  assert.equal(ask(read(rulesetWith([])), { reader: "app" }).state, "enforced", "then by reeve's App, which can: read afresh, not the unknown kept");
+  // The same reader within the minute reads nothing again, whole or not.
+  const before = reads;
+  assert.equal(ask(read(rulesetWith(undefined)), { reader: "app" }).state, "enforced");
+  assert.equal(reads, before, "kept for the minute");
+  // Measuring and publishing, reeve's App reads afresh what another credential couldn't.
+  const app = github(PINNED);
+  assert.equal(ask(read(rulesetWith(undefined)), { base: "kept-2", now: Date.now() }).state, "unknown");
+  assert.equal((await pr.enforcementNow({ nwo: NWO, base: "kept-2", auth: app.auth, api: app.api })).state, "enforced", "measuring");
+  assert.equal(ask(read(rulesetWith(undefined)), { base: "kept-3", now: Date.now() }).state, "unknown");
+  /** @type {any} */ const r = await pr.publishVerdict({ nwo: NWO, verdict, shadow: false, base: "kept-3", auth: app.auth, api: app.api });
+  assert.equal(r.enforcement?.state, "enforced", "publishing");
+});
+
+test("a base's enforcement shows as stale once the daemon has stopped ticking, though it was measured within the two hours", () => {
+  const db = open(join(tempDir("re-stopped-"), "e.db"));
+  noteTick(db, Math.floor(Date.now() / 1000) - 20 * 60);
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(unixepoch() - 1200,?,?,?,?)")
+    .run("daemon", ENFORCEMENT_OP, "base:main", JSON.stringify({ base: "main", state: "enforced", why: "main requires merge-policy from reeve's App, in ruleset 7, which no one can bypass" }));
+  const state = readState(db);
+  db.close();
+  assert.equal(state.daemon?.alive, false);
+  assert.equal(/** @type {any} */ (state.enforcement?.[0])?.stale, true, "measured by a daemon that has stopped, it isn't what stands: " + JSON.stringify(state.enforcement));
+  assert.match(renderStatus({ nwo: "o/r", state, health: {} }), /enforcement {2}stale: enforced when measured 20m ago, and not measured since/);
+  assert.match(renderHtml({ nwo: "o/r", state, health: {} }), /enforcement: <b>stale<\/b>: enforced when measured 20m ago/);
+});
+
+test("enforcing, a pull request on a base that doesn't require reeve's check gets its result in shadow; one where it's required, if bypassable or unread, still gets it enforcing", async () => {
+  /** @type {any[]} */ const sent = [];
+  const pub = async (/** @type {any} */ a) => {
+    sent.push(a);
+    const enforcement = a.base === "release" ? { state: "advisory", why: "release doesn't require merge-policy from reeve's App, so what reeve publishes there blocks nothing" } : ADVISORY;
+    return { ok: true, id: 1, conclusion: a.shadow ? "neutral" : "failure", name: a.shadow ? "merge-policy (shadow)" : "merge-policy", enforcement };
+  };
+  const measured = (/** @type {any} */ e) => async () => e;
+  const release = await tickWith(pub, false, null, { baseRef: "release",
+    enforcement: measured({ state: "advisory", why: "release doesn't require merge-policy from reeve's App", fix: "x", required: false }) });
+  release.db.close();
+  assert.equal(sent.at(-1)?.shadow, true, "nothing there requires reeve's check, so its result goes out in shadow: " + JSON.stringify(sent.at(-1)) + release.logged.slice(-800));
+  assert.match(release.logged, /NEEDS YOU: enforcing, but release doesn't require merge-policy from reeve's App, so what reeve publishes there blocks nothing; its result there is published in shadow/);
+  // Required there, though bypassable or unread: published enforcing, or every pull request there waits for a result reeve doesn't publish.
+  for (const e of [{ state: "advisory", why: "someone can bypass it", fix: "x", required: true }, { state: "unknown", why: "can't be read", fix: "x", required: null }]) {
+    const t = await tickWith(pub, false, null, { enforcement: measured(e) });
+    t.db.close();
+    assert.equal(sent.at(-1)?.shadow, false, JSON.stringify(e));
+  }
+  // In shadow mode nothing is measured first, and nothing changes.
+  let asked = 0;
+  const shadow = await tickWith(pub, true, null, { enforcement: async () => { asked++; return { state: "enforced", why: "", fix: null, required: true }; } });
+  shadow.db.close();
+  assert.equal(sent.at(-1)?.shadow, true);
+  assert.equal(asked, 0);
+  // What the daemon goes by: whether a rule requires reeve's result there at all.
+  const required = (/** @type {any} */ rules) =>
+    pr.enforcementOf(pr.requirementsOn({ rules, branch: NOT_PROTECTED }, POLICY_CONTEXT, { appId: APP }), { base: "main" }).required;
+  assert.equal(required(RULES_NONE), false);
+  assert.equal(required(rulesRequiring(POLICY_CONTEXT, 999)), false, "required only of another App, reeve's result meets nothing");
+  assert.equal(required(rulesRequiring(POLICY_CONTEXT, null)), true);
+  assert.equal(required(FORBIDDEN), null);
+});
+
+/** reeve run --enforce on a home whose App can't be signed in to, as it refuses. */
+function refusedRun() {
+  const home = tempDir("reeve-enforce-home-");
+  const db = statePathFor(home, "acme/widget");
+  mkdirSync(dirname(db), { recursive: true });
+  open(db).close();
+  mkdirSync(join(home, "profiles", "acme"), { recursive: true });
+  writeFileSync(join(home, "profiles", "acme", "widget.json"), JSON.stringify(withDefaults({ schemaVersion: 1, project: { kind: "product" },
+    identity: { key: "acme/widget", defaultBranch: "main", visibility: "public" },
+    authority: { permission: "admin", policy: "propose_only", profileLocation: "sidecar" },
+    state: { mode: "in-repo" }, units: [{ id: "root", root: ".", language: "javascript", packageManager: "npm", commands: {} }],
+    ci: { provider: "github-actions" }, merge: { method: "squash", enforcement: "attested" }, reviewers: [] })));
+  return spawnSync(process.execPath, [REEVE, "run", "acme/widget", "--enforce"], { encoding: "utf8", cwd: home, env: { ...offlineEnv(), REEVE_HOME: home }, timeout: 60_000 });
+}
+
+test("--enforce refused says what would fix it, for the reason it's refused", async () => {
+  const of = (/** @type {any} */ rules, /** @type {any} */ o = {}) =>
+    pr.enforcementOf(pr.requirementsOn({ rules, branch: NOT_PROTECTED, ...o }, POLICY_CONTEXT, { appId: APP }), { base: "main" });
+  /** @type {any} */ let got;
+  try {
+    got = {
+      none: of(RULES_NONE),
+      anyApp: of(rulesRequiring(POLICY_CONTEXT, null)),
+      bypassed: of(PINNED.rules, { ruleset: rulesetWith([ORG_ADMIN]) }),
+      hidden: of(PINNED.rules, { ruleset: rulesetWith(undefined) }),
+      held: of(PINNED.rules, { ruleset: rulesetWith([]) }),
+      signedOut: await pr.enforcementNow({ nwo: NWO, base: "fix-1", auth: async () => ({ ok: false, why: "no App credentials" }), api: github().api }),
+    };
+  } catch (err) { got = { threw: String(err) }; }
+  assert.match(String(got.bypassed?.fix), /remove that bypass, or require merge-policy from reeve's App in a rule no one can bypass/, JSON.stringify(got));
+  assert.match(got.none.fix, /require merge-policy from reeve's App on main/);
+  assert.match(got.anyApp.fix, /bind main's requirement of merge-policy to reeve's App/);
+  assert.match(got.hidden.fix, /in a rule reeve's App can read whole/);
+  assert.equal(got.held.fix, null);
+  assert.match(got.signedOut.fix, /make reeve's App able to sign in/);
+  const r = refusedRun();
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stderr, /--enforce refused: reeve's App couldn't be signed in to read main's rules: .*\. To enforce, make reeve's App able to sign in/);
+  assert.doesNotMatch(r.stderr, /Require the merge-policy check from reeve's App on main/, "not a remedy for this refusal");
 });

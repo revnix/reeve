@@ -234,7 +234,9 @@ export function readState(db, { limit = 12, freshWindow = 900, now = Math.floor(
 
   // Each base's enforcement as last noted (#166): stale where it wasn't
   // measured again within two refreshes, the base renamed, say, or without a
-  // pull request to publish on, so it isn't shown as what stands.
+  // pull request to publish on, or where the daemon that measures it has
+  // stopped, so it isn't shown as what stands.
+  const daemon = daemonLiveness(db, now, freshWindow);
   /** @type {{ base: string, state: string, why: string, at: number, ageSeconds: number, stale: boolean }[]} */ let enforcement = [];
   try {
     enforcement = /** @type {any[]} */ (db.prepare(`SELECT e.at, e.payload FROM event e WHERE e.op = ?
@@ -242,12 +244,13 @@ export function readState(db, { limit = 12, freshWindow = 900, now = Math.floor(
       .flatMap((r) => {
         try {
           const p = JSON.parse(r.payload), at = Number(r.at);
-          return [{ base: String(p.base), state: String(p.state), why: String(p.why), at, ageSeconds: now - at, stale: now - at > 2 * ENFORCEMENT_REFRESH_S }];
+          return [{ base: String(p.base), state: String(p.state), why: String(p.why), at, ageSeconds: now - at,
+                    stale: now - at > 2 * ENFORCEMENT_REFRESH_S || daemon.alive !== true }];
         } catch { return []; }
       });
   } catch { /* same */ }
 
-  return { prs: [...prs.values()], runs, pending, enforcement, daemon: daemonLiveness(db, now, freshWindow) };
+  return { prs: [...prs.values()], runs, pending, enforcement, daemon };
 }
 
 /** The escalations band: what genuinely needs a person. */

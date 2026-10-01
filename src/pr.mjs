@@ -1058,8 +1058,9 @@ const SETTLES_ALONE = new Set(["required_deployments", "workflows", "code_scanni
  *                     else of protection could be
  *   pinned            each place that requires `context` from reeve's App by
  *                     its id, a ruleset or classic protection, with who can
- *                     bypass it: a list, empty for no one, or null where that
- *                     can't be read (#166). `ruleset` reads a ruleset by id.
+ *                     bypass it: a list of { key, name }, empty for no one, or
+ *                     null where that can't be read (#166). `ruleset` reads a
+ *                     ruleset by id.
  *
  * GitHub requires things in two places, and both are read: the rules that apply to
  * the branch (every ruleset, the organisation's included, every page), and classic
@@ -1088,7 +1089,7 @@ export function requirementsOn({ rules, branch, protection = null, ruleset = nul
   const settlesAlone = [];
   /** @type {Map<string, { ruleset?: number | string | null, protection?: true }>} */ const pins = new Map();
   let byRules = null, byProtection = null, threadResolution = false, strict = false, whole = true, mergeQueue = false;
-  /** @type {string[] | null} */ let admins = null;
+  /** @type {{ key: string, name: string }[] | null} */ let admins = null;
   // A required check is reeve's, another App's, or, bound to an App reeve can't
   // name, both: GitHub waits for whichever App it is.
   const required = (answers, c, bound, /** @type {{ ruleset?: number | string | null, protection?: true }} */ source) => {
@@ -1145,7 +1146,7 @@ export function requirementsOn({ rules, branch, protection = null, ruleset = nul
       if (p.required_status_checks?.strict) strict = true;
       // Off, administrators merge past every check classic protection requires.
       const held = p.enforce_admins?.enabled;
-      admins = held === true ? [] : held === false ? ["administrators"] : null;
+      admins = held === true ? [] : held === false ? [{ key: "administrators", name: "administrators" }] : null;
       if (p.required_signatures?.enabled) unevaluated.push("protection required_signatures");
       if (p.lock_branch?.enabled) unevaluated.push("protection lock_branch");
       if (p.restrictions) unevaluated.push("protection restrictions");
@@ -1170,9 +1171,12 @@ export function requirementsOn({ rules, branch, protection = null, ruleset = nul
     : { own, others: null, threadResolution: null, strict: null, unevaluated: null, settlesAlone: null, checks, mergeQueue: queue, pinned };
 }
 
-// A bypass actor as doctor names one (R-01), with the mode it may bypass in.
-const bypasser = (/** @type {any} */ b) =>
-  `${b?.actor_type}${b?.actor_id == null ? "" : `:${b.actor_id}`}${b?.bypass_mode ? ` (${b.bypass_mode})` : ""}`;
+// A bypass actor: who it is, as doctor names one (R-01), and that with the mode
+// it may bypass in, for a person to read.
+const bypasser = (/** @type {any} */ b) => {
+  const key = `${b?.actor_type}${b?.actor_id == null ? "" : `:${b.actor_id}`}`;
+  return { key, name: `${key}${b?.bypass_mode ? ` (${b.bypass_mode})` : ""}` };
+};
 
 const parsed = (r) => { try { return r?.ok ? JSON.parse(r.out || "{}") : undefined; } catch { return undefined; } };
 // Whether a branch has classic protection, as the branch reports it: false for
@@ -1186,34 +1190,56 @@ const classicProtection = (b) => (!b ? null : b.protected === false || b.protect
  * requires `context` from reeve's App, so nothing merges there that reeve
  * hasn't passed; `advisory` where none does: the base doesn't require it,
  * requires it of another App, or of any, whose result under the name could
- * meet it, or someone can bypass every rule that requires it of reeve's;
- * `unknown` where that can't be read. With why, for a person to read.
+ * meet it, or one actor can bypass every rule that requires it of reeve's;
+ * `unknown` where that can't be read or told. With why, for a person to read;
+ * what would make it enforced, `fix`; and whether a rule requires reeve's
+ * result there at all, `required`: where none does, it blocks nothing.
  * @param {ReturnType<typeof requirementsOn> | null} req
  * @param {{ base?: string | null, context?: string }} [o]
- * @returns {{ state: "enforced" | "advisory" | "unknown", why: string }}
+ * @returns {{ state: "enforced" | "advisory" | "unknown", why: string, fix: string | null, required: boolean | null }}
  */
 export function enforcementOf(req, { base = null, context = POLICY_CONTEXT } = {}) {
   const on = base ?? "the base";
-  const unknown = (/** @type {string} */ why) => ({ state: /** @type {const} */ ("unknown"), why });
-  const unread = unknown(`whether ${on} requires ${context} from reeve's App can't be read`);
+  const required = req?.own ?? null;
+  const unknown = (/** @type {string} */ why, /** @type {string} */ fix) => ({ state: /** @type {const} */ ("unknown"), why, fix, required });
+  const advisory = (/** @type {string} */ why, /** @type {string} */ fix) => ({ state: /** @type {const} */ ("advisory"), why, fix, required });
+  const unread = unknown(`whether ${on} requires ${context} from reeve's App can't be read`,
+    `let reeve's App read ${on}'s rules and branch protection, with Administration read`);
+  const anywhere = `require ${context} from reeve's App in a rule no one can bypass`;
   if (req == null || req.own == null) return unread;
-  if (req.own === false) return { state: "advisory", why: `${on} doesn't require ${context} from reeve's App, so what reeve publishes there blocks nothing` };
+  if (req.own === false)
+    return advisory(`${on} doesn't require ${context} from reeve's App, so what reeve publishes there blocks nothing`,
+                    `require ${context} from reeve's App on ${on}, in a rule no one can bypass`);
   // GitHub requires every rule that applies, so one that requires the check
   // from reeve's App, and that no one can bypass, holds every merge there to
   // reeve's result, whatever else applies or couldn't be read.
   const pinned = req.pinned ?? [];
   const where = (/** @type {{ protection?: boolean, ruleset?: unknown }} */ s) => (s.protection ? "branch protection" : `ruleset ${s.ruleset ?? "of no id"}`);
   const holds = pinned.find((s) => Array.isArray(s.bypass) && !s.bypass.length);
-  if (holds) return { state: "enforced", why: `${on} requires ${context} from reeve's App, in ${where(holds)}, which no one can bypass` };
+  if (holds) return { state: "enforced", why: `${on} requires ${context} from reeve's App, in ${where(holds)}, which no one can bypass`, fix: null, required };
   // Short of that, a rule whose bypass can't be read, or a reading that isn't
   // whole, can't say.
   const unsure = pinned.find((s) => !Array.isArray(s.bypass));
-  if (unsure) return unknown(`${on} requires ${context} from reeve's App in ${where(unsure)}, and who can bypass ${where(unsure)} can't be read`);
+  if (unsure)
+    return unknown(`${on} requires ${context} from reeve's App in ${where(unsure)}, and who can bypass ${where(unsure)} can't be read`,
+                   `require ${context} from reeve's App in a rule reeve's App can read whole, such as branch protection that includes administrators`);
   if (!Array.isArray(req.others)) return unread;
-  if (pinned.length)
-    return { state: "advisory", why: `${on} requires ${context} from reeve's App, but ${pinned.map((s) => `${(s.bypass ?? []).join(", ")} can bypass ${where(s)}`).join(", and ")}, so a merge there needn't wait for reeve's result` };
+  if (pinned.length) {
+    // To merge past reeve's result, one actor must be able to bypass every rule
+    // that requires it. Who's who across kinds of actor, a team's members or an
+    // organisation's admins, can't be told from the rules, so only one named in
+    // every list is one who can.
+    const lists = pinned.map((s) => /** @type {{ key: string, name: string }[]} */ (s.bypass));
+    const common = lists[0].filter((b) => lists.every((l) => l.some((x) => x.key === b.key)));
+    if (common.length)
+      return advisory(`${on} requires ${context} from reeve's App, but ${common.map((b) => b.name).join(", ")} can bypass ${pinned.map(where).join(" and ")}, so a merge there needn't wait for reeve's result`,
+                      `remove that bypass, or ${anywhere}`);
+    return unknown(`${on} requires ${context} from reeve's App in ${pinned.map(where).join(" and ")}, each of which someone can bypass (${pinned.map((s, k) => `${where(s)}: ${lists[k].map((b) => b.name).join(", ")}`).join("; ")}), and whether anyone can bypass every rule that requires it can't be told`,
+                   anywhere);
+  }
   // Required, then, only with no App bound: any App's result under the name meets it.
-  return { state: "advisory", why: `${on} requires ${context} from any App, so another's result under that name could meet it` };
+  return advisory(`${on} requires ${context} from any App, so another's result under that name could meet it`,
+                  `bind ${on}'s requirement of ${context} to reeve's App`);
 }
 
 /**
@@ -1224,8 +1250,9 @@ export function enforcementOf(req, { base = null, context = POLICY_CONTEXT } = {
  */
 export async function enforcementNow({ nwo, base, context = POLICY_CONTEXT, auth: authenticateAs = authenticate, api = apiAsInstallation }) {
   const auth = await authenticateAs(nwo);
-  if (!auth.ok) return { state: /** @type {const} */ ("unknown"), why: `reeve's App couldn't be signed in to read ${base}'s rules: ${auth.why}` };
-  return enforcementOf(requirementsOnBase({ nwo, base, context, gh: (args) => api(auth.token, args), appId: auth.appId ?? null }), { base, context });
+  if (!auth.ok) return { state: /** @type {const} */ ("unknown"), why: `reeve's App couldn't be signed in to read ${base}'s rules: ${auth.why}`,
+                         fix: "make reeve's App able to sign in (`reeve doctor` says why it can't)", required: null };
+  return enforcementOf(requirementsOnBase({ nwo, base, context, gh: (args) => api(auth.token, args), appId: auth.appId ?? null, reader: "app" }), { base, context });
 }
 
 /** Is `context` a required status check on a branch, from reeve's own App? requirementsOn's `own`. */
@@ -1240,11 +1267,16 @@ const REQUIRED_TTL_MS = 60_000;
 /** Drop every kept reading, so the next question reads the base afresh. The daemon calls this as each tick starts. */
 export function clearRequirements() { REQUIRED.clear(); REQUIRED_CHECKS.clear(); }
 
-/** requirementsOn for a base branch, read with `gh` and cached for a minute. */
-export function requirementsOnBase({ nwo, base, context, gh, appId = null, now = Date.now() }) {
+/**
+ * requirementsOn for a base branch, read with `gh` and cached for a minute.
+ * `reader` names the credential `gh` reads with, where it matters: a reading
+ * that couldn't say who can bypass a rule pinning reeve's check is kept for
+ * that reader only, so another, reeve's App, say, reads it afresh (#166).
+ */
+export function requirementsOnBase({ nwo, base, context, gh, appId = null, now = Date.now(), reader = null }) {
   const key = `${nwo}\u0000${base}\u0000${context}\u0000${appId ?? ""}`;
   const hit = REQUIRED.get(key);
-  if (hit && now - hit.at < REQUIRED_TTL_MS) return hit.value;
+  if (hit && now - hit.at < REQUIRED_TTL_MS && (hit.whole || hit.reader === reader)) return hit.value;
   const path = `repos/${nwo}/branches/${encodeURIComponent(base)}`;
   const branch = gh([path]);
   const value = requirementsOn({
@@ -1259,7 +1291,8 @@ export function requirementsOnBase({ nwo, base, context, gh, appId = null, now =
   // the reads it needed, say, is read again by the next caller, which may be
   // one that can: reeve's App reads what the ambient token couldn't.
   if (REQUIRED.size > 256) REQUIRED.clear();
-  if (value.own !== null && value.others !== null) REQUIRED.set(key, { at: now, value });
+  if (value.own !== null && value.others !== null)
+    REQUIRED.set(key, { at: now, value, reader, whole: value.pinned.every((s) => Array.isArray(s.bypass)) });
   return value;
 }
 
@@ -1336,7 +1369,7 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = PO
   const conclusion = shadow ? "neutral" : real;
   const title = `${shadow ? "[shadow] " : ""}${verdict.state}: ${verdict.summary}`;
   // Whether the base enforces it, read from its rules, with the result (#166).
-  const req = base ? requirementsOnBase({ nwo, base, context, gh: (args) => api(auth.token, args), appId: auth.appId ?? null }) : null;
+  const req = base ? requirementsOnBase({ nwo, base, context, gh: (args) => api(auth.token, args), appId: auth.appId ?? null, reader: "app" }) : null;
   const enforcement = base ? enforcementOf(req, { base, context }) : null;
   const enforced = !enforcement ? ""
     : shadow ? `Enforcing, it would be **${enforcement.state}**: ${enforcement.why}.\n\n`

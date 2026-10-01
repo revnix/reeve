@@ -1836,9 +1836,10 @@ async function tickOnce(ctx) {
     const c = ordersCommitment(db, nwo, /** @type {any} */ (orderKeys), storeIdentity(db), to);
     return "corrupt" in c ? null : c.orders;
   };
-  // Whether the store holds a record, for a publication to keep a record
-  // published that it doesn't, as no order may name it yet (#285).
-  const holdsRecord = (/** @type {string} */ digest) => Boolean(db.prepare(`SELECT 1 FROM decision WHERE digest = ?`).get(digest));
+  // Whether the store holds a record whole, as it was kept, for a publication
+  // to keep a record published that it doesn't, as no order may name it yet
+  // (#285): one changed in place, or moved to another pull request, isn't held.
+  const holdsRecord = (/** @type {string} */ digest) => holdsWhole(db)(digest);
   // The last result this tick published at a pull request's head with evidence,
   // under which name, and what it was published with.
   /** @type {{ pr: number, name: string, args: any } | null} */ let lastAtHead = null;
@@ -1865,8 +1866,9 @@ async function tickOnce(ctx) {
     let pub;
     try { pub = await (ctx.publish ?? publishVerdict)(again); }
     catch (err) { pub = { ok: false, why: err.message }; }
-    if (!pub.ok) {
-      log(logPath, `  #${pr}: the store's signed orders, as this tick extended them, couldn't be published — ${pub.why}; the next tick publishes them`);
+    // Kept behind evidence further on there, they aren't published either.
+    if (!pub.ok || pub.behind) {
+      log(logPath, `  #${pr}: the store's signed orders, as this tick extended them, couldn't be published — ${pub.ok ? `what was published there is kept, ${pub.behind}` : pub.why}; the next tick publishes them`);
       return false;
     }
     // Published as they now stand: only orders extended since go out again.

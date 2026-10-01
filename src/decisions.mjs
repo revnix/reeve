@@ -741,10 +741,14 @@ export function publishedChecked(db, which, { keys, repo, anchor: read = null, p
   // Every order the copy held up to each event a result published, committed as
   // that result committed the store's (#285): an order taken away, swapped in,
   // or cut short shows, whichever pull request's result carried it. One that
-  // doesn't hold is the replay's to report, and commits to nothing here.
+  // doesn't hold commits to nothing, and what was published can't be checked:
+  // a fault, as a check of one pull request doesn't read another's order.
   for (const c of [...commitments.values()].sort((a, b) => a.to - b.to)) {
     const mine = ordersCommitment(db, repo, keys, store, c.to);
-    if ("corrupt" in mine) continue;
+    if ("corrupt" in mine) {
+      faults.push(fault(0, "", `this copy's signed orders to its event ${c.to} can't be committed to, so what the merge policy published with #${c.pr}'s result at ${c.head.slice(0, 8)} can't be checked: ${mine.corrupt}`));
+      continue;
+    }
     if (mine.orders !== c.orders)
       faults.push(fault(0, "", `the merge policy published with #${c.pr}'s result at ${c.head.slice(0, 8)} the signed orders this store held to its event ${c.to}, ` +
                                "but this copy's orders to that event aren't those: an order was taken away, changed or swapped in, or the copy is from before"));

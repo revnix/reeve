@@ -910,3 +910,58 @@ test("where the results at a head can't be read, nothing is written there, as a 
     assert.deepEqual(calls.filter((a) => a.includes("POST") || a.includes("PATCH")), [], `shadow ${shadow}: nothing written`);
   }
 });
+
+// ── #285's fifth review ──────────────────────────────────────────────────────
+
+test("a merge queue's PASS isn't published where the orders published again at a head stayed behind what was there", async () => {
+  const dir = credentials();
+  const path = join(tempDir("reeve-pub-qbehind2-"), "s.db");
+  open(path).close();
+  /** @type {any[]} */ const published = [];
+  const seen = new Set();
+  const r = await run({ openPrs: () => [PR], evaluate: () => at(A), dbPath: path, ticks: 1, ...host(dir), evaluateQueue: judgedAtQueue, readQueue: queueOfOne,
+                        publish: async (args) => {
+                          published.push(args);
+                          // Published again with its orders, and kept behind evidence further on there.
+                          const key = `${args.evidence?.pr}@${args.verdict.head}`;
+                          const again = !args.queue && args.evidence && seen.has(key);
+                          seen.add(key);
+                          return { ok: true, id: 1, conclusion: "neutral", ...(again ? { behind: "at aaaaaaaa, its signed orders go to its event 3, where orders to event 9 were published, so what was published there is kept" } : {}) };
+                        } });
+  assert.ok(published.filter((p) => !p.queue && p.verdict.head === A).length >= 2, "control: the head was published again");
+  assert.deepEqual(published.filter((p) => p.queue && p.verdict.state === "PASS"), [], "no PASS went to the queue's commit");
+  assert.match(r.log, /queue commit cccccccccc \(#42\): could not publish PASS — the store's signed orders, extended with its records, couldn't be published/);
+});
+
+test("the daemon holds a record published only where the store holds it whole, not changed in place", async () => {
+  const dir = credentials();
+  const path = join(tempDir("reeve-pub-whole-"), "s.db");
+  open(path).close();
+  await run({ openPrs: () => [PR], evaluate: () => at(A), dbPath: path, ticks: 1, ...host(dir), publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }) });
+  let db = open(path);
+  const [first] = digestsOf(db);
+  // Changed in place: its row still there under its digest, naming another pull request.
+  db.prepare("UPDATE decision SET record = json_set(record, '$.subject.pr', 9) WHERE digest = ?").run(first);
+  db.close();
+  /** @type {(boolean | undefined)[]} */ const asked = [];
+  await run({ openPrs: () => [PR], evaluate: () => at(A, "RED"), dbPath: path, ticks: 1, ...host(dir),
+              publish: async (/** @type {any} */ args) => { if (args.holds) asked.push(args.holds(first)); return { ok: true, id: 1, conclusion: "neutral" }; } });
+  db = open(path);
+  const rows = db.prepare("SELECT count(*) AS n FROM decision WHERE digest = ?").get(first).n;
+  db.close();
+  assert.equal(rows, 1, "control: its row is still there");
+  assert.ok(asked.length > 0, "control: the publication asked");
+  assert.ok(asked.every((x) => x === false), JSON.stringify(asked));
+});
+
+test("a published commitment a copy's orders can't be committed to is a fault, though the check reads another pull request alone", async () => {
+  const dir = credentials();
+  const { path, published } = await ticksOfTwo([at(A), at(A, "RED")], host(dir));
+  const db = open(path);
+  // #7's order doesn't hold; #42 is the one checked.
+  db.prepare("UPDATE event SET payload = json_set(payload, '$.seq', 99999) WHERE op = 'decision.latest' AND subject = 'pr:7'").run();
+  const checked = publishedChecked(db, { pr: PR }, { keys: publishedKeys(dir), repo: REPO, anchor: null, published: githubOf(published) });
+  db.close();
+  assert.ok(checked.results > 0, "control: #42's results were checked");
+  assert.match(checked.faults.map((f) => f.why).join("\n"), /this copy's signed orders to its event \d+ can't be committed to, so what the merge policy published with #\d+'s result at [0-9a-f]{8} can't be checked: #7: /);
+});

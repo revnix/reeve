@@ -334,11 +334,11 @@ test("a reading whose bypass list couldn't be read is kept for its reader only, 
   const ask = (/** @type {any} */ gh, /** @type {any} */ o = {}) =>
     pr.enforcementOf(pr.requirementsOnBase({ nwo: NWO, base: "kept-1", context: POLICY_CONTEXT, gh, appId: APP, now: 1_000, ...o }), { base: o.base ?? "kept-1" });
   assert.equal(ask(read(rulesetWith(undefined))).state, "unknown", "first read with a credential that can't see who can bypass it");
-  assert.equal(ask(read(rulesetWith([])), { reader: "app" }).state, "enforced", "then by reeve's App, which can: read afresh, not the unknown kept");
-  // The same reader within the minute reads nothing again, whole or not.
+  // Kept for that reader for the minute, so it doesn't read the rules again for every pull request.
   const before = reads;
-  assert.equal(ask(read(rulesetWith(undefined)), { reader: "app" }).state, "enforced");
-  assert.equal(reads, before, "kept for the minute");
+  assert.equal(ask(read(rulesetWith(undefined))).state, "unknown");
+  assert.equal(reads, before, "kept for its reader");
+  assert.equal(ask(read(rulesetWith([])), { reader: "app" }).state, "enforced", "then by reeve's App, which can: read afresh, not the unknown kept");
   // Measuring and publishing, reeve's App reads afresh what another credential couldn't.
   const app = github(PINNED);
   assert.equal(ask(read(rulesetWith(undefined)), { base: "kept-2", now: Date.now() }).state, "unknown");

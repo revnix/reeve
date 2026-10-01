@@ -39,8 +39,9 @@ export const CASE_KINDS = Object.freeze([
  * @typedef {{ pr: number, mergedAt: number, head: string, mergeCommit: string | null }} Merged
  * @typedef {"right" | "false pass" | "false block"} Mark
  * @typedef {{ mark: Mark, by: string, at: number, note: string, to: number }} Audited
- * @typedef {{ id: string, where: "head" | "queue", pr: number, head: string, state: string, summary: string, why: string,
- *             first: number, last: number, seq: number, ticks: number, record: string | null, final: boolean, audited: Audited | null, again?: boolean }} Call
+ * @typedef {{ id: string, where: "head" | "queue", pr: number, head: string, state: string, summary: string, why: string, reasons: { why: string, ticks: number }[],
+ *             first: number, last: number, seq: number, ticks: number, record: string | null, final: boolean, audited: Audited | null, again?: boolean, gone?: boolean }} Call
+ * @typedef {(seq: number) => { id: string, record: string | null } | null} Judgment
  * @typedef {{ repo: string, by: string, at: number, seq?: number,
  *             calls: { id: string, where: string, pr: number, head: string, state: string, summary: string, record: string | null, mark: Mark, note: string, to: number }[] }} Audit
  * @typedef {{ right: boolean, note: string, to?: number }} Marked
@@ -63,6 +64,15 @@ export function callId(c) {
 
 /** How a call reads where a person audits it. @param {{ where: string, pr: number, head: string, state: string }} c */
 const callText = (c) => `#${c.pr} ${c.state} ${c.where === "queue" ? "on the queue's commit" : "at"} ${c.head.slice(0, 10)}`;
+/**
+ * A call's reason as a person reads it: its summary, and what it was judged
+ * for, each reason with how many ticks gave it where there was more than one.
+ * @param {Call} c
+ */
+function reasonOf(c) {
+  const why = c.reasons.length > 1 ? c.reasons.map((r) => `${r.why || "no reason given"} (${r.ticks} tick${r.ticks === 1 ? "" : "s"})`).join("; ") : c.why;
+  return c.summary ? `${c.summary}${why ? `: ${why}` : ""}` : why;
+}
 /** Up to ten of `list`, said, and how many more. @param {any[]} list @param {(c: any) => string} say */
 const some = (list, say) => list.slice(0, 10).map(say).join(", ") + (list.length > 10 ? `, and ${list.length - 10} more` : "");
 
@@ -184,40 +194,62 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
   // have let through.
   /** @type {Map<string, Call>} */
   const calls = new Map();
+  // Each judgment of the period, by its event: the call it's of, and its record.
+  /** @type {Map<number, { id: string, record: string | null }>} */
+  const judged = new Map();
   for (const [where, list] of /** @type {const} */ ([["head", decided], ["queue", queued]])) for (const e of list) {
     const call = { where, pr: e.pr, head: String(e.p.head ?? ""), state: String(e.p.state ?? ""), summary: String(e.p.summary ?? "") };
     const id = callId({ repo, ...call });
-    const c = calls.get(id) ?? { id, ...call, why: "", first: e.at, last: e.at, seq: e.seq, ticks: 0, record: null, final: false, audited: null, again: false };
+    const c = calls.get(id) ?? { id, ...call, why: "", reasons: [], first: e.at, last: e.at, seq: e.seq, ticks: 0, record: null, final: false, audited: null, again: false, gone: false };
     c.why = String(e.p.why ?? "");
+    // Every reason it was judged for, shown with the call (#314): a mark of it
+    // covers each, and an earlier one, judged on other evidence, isn't hidden by
+    // the latest.
+    const reason = c.reasons.find((r) => r.why === c.why);
+    if (reason) reason.ticks++;
+    else c.reasons.push({ why: c.why, ticks: 1 });
     c.last = e.at;
     c.seq = e.seq;
     c.ticks++;
     c.record = e.p.record ?? c.record;
     if (standing.has(e.seq)) c.final = true;
     calls.set(id, c);
+    judged.set(e.seq, { id, record: e.p.record ?? null });
   }
   const toAudit = [...calls.values()].sort((a, b) => a.pr - b.pr || a.first - b.first);
   // Each call's mark, as a person's latest audit of it gave it: an audit made
   // later counts over one before, so a mark corrected stands corrected: in the
   // order recorded, which a clock set back, or two in one second, doesn't
   // change; by time where that isn't known.
+  // A mark holds only while the store holds the judgment it saw, with the
+  // record it saw (#314): a store restored from a snapshot gives the event
+  // numbers after it out again, and a mark of one judgment would otherwise be
+  // taken for a mark of another made under its number.
   if (Array.isArray(audits)) for (const a of [...audits].sort((x, y) => (x.seq ?? 0) - (y.seq ?? 0) || x.at - y.at))
-    for (const m of a.calls) { const c = calls.get(m.id); if (c) c.audited = { mark: m.mark, by: a.by, at: a.at, note: m.note, to: m.to }; }
+    for (const m of a.calls) {
+      const c = calls.get(m.id);
+      if (!c) continue;
+      const saw = judged.get(m.to);
+      c.audited = { mark: m.mark, by: a.by, at: a.at, note: m.note, to: m.to };
+      c.gone = !(saw?.id === m.id && saw.record === (m.record ?? null));
+    }
   // A call judged again since it was marked right was judged on what that
   // audit didn't see, so it's for a person to mark again: judged after the
   // event its mark saw it judged to, by the store's order of events, which no
-  // clock set back, or two in one second, changes. One marked wrong stays a
-  // false call, however often it was judged again.
+  // clock set back, or two in one second, changes. So is one whose judgment
+  // marked is gone. One marked wrong stays a false call, however often it was
+  // judged again.
   for (const c of toAudit) c.again = Boolean(c.audited && c.seq > c.audited.to);
   const falseCalls = toAudit.filter((c) => c.audited && c.audited.mark !== "right");
-  const notYet = toAudit.filter((c) => !c.audited || c.again);
+  const notYet = toAudit.filter((c) => !c.audited || c.again || c.gone);
   const prs = new Set(toAudit.map((a) => a.pr)).size;
   /** @type {Omit<Condition, "name">} */
   const audit = !Array.isArray(audits) ? { met: false, detail: `the audits recorded can't be read, so they vouch for nothing: ${audits.why}` }
     : falseCalls.length ? { met: false, detail: `${falseCalls.length} false call(s): ${some(falseCalls, (c) => `${callText(c)} (${c.audited?.mark}, by ${c.audited?.by})`)}` }
     // None audited, or nothing to audit: no audit says there was no false call.
     : notYet.length === toAudit.length ? { met: null, detail: `${toAudit.length} call(s) on ${prs} pull request(s) to audit` }
-    : notYet.length ? { met: null, detail: `${toAudit.length - notYet.length} of ${toAudit.length} call(s) audited, none false; not yet: ${some(notYet, (c) => `${callText(c)}${c.again ? " (judged again since its audit)" : ""}`)}` }
+    : notYet.length ? { met: null, detail: `${toAudit.length - notYet.length} of ${toAudit.length} call(s) audited, none false; not yet: ${some(notYet, (c) => `${callText(c)}${
+        c.gone ? " (its audit saw a judgment this store doesn't hold)" : c.again ? " (judged again since its audit)" : ""}`)}` }
     : { met: true, detail: `all ${toAudit.length} call(s) audited right, by ${[...new Set(toAudit.map((c) => c.audited?.by))].join(", ")}` };
 
   const hours = running / 3600;
@@ -243,8 +275,13 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
   ];
   // Ready for a person's audit once every condition the records can show holds;
   // passed only once that audit is recorded, every call in it right.
+  /** @type {Judgment} */
+  const judgment = (seq) => judged.get(seq) ?? null;
+  // `judgment`, which call each event of the period judged, and on what record,
+  // for an audit to be taken of: a function, so a report written out as JSON
+  // leaves it out.
   return { since, now, running: { hours, ticks: ended.length, down }, merges, passedFinal: passedFinal.length, kinds, toAudit, seeded, conditions,
-           ready: conditions.every((c) => c.met !== false), passed: conditions.every((c) => c.met === true) };
+           ready: conditions.every((c) => c.met !== false), passed: conditions.every((c) => c.met === true), judgment };
 }
 
 /**
@@ -296,11 +333,13 @@ export function renderTrial(r, nwo) {
     out.push(`  #${m.pr} at ${m.head.slice(0, 10)}: ${m.missed ? `MISSED, ${m.missed}` : `${m.state}${m.queue ? ", through the queue" : ""}`}`);
   if (r.toAudit.length) {
     out.push("", "to audit (was each call right?):");
-    for (const a of r.toAudit)
+    for (const a of r.toAudit) {
+      const why = reasonOf(a);
       out.push(`  #${a.pr} ${a.state} ${a.where === "queue" ? "on the queue's commit" : "at"} ${a.head.slice(0, 10)}` +
-               `${a.summary ? ` (${a.summary}${a.why ? `: ${a.why}` : ""})` : a.why ? ` (${a.why})` : ""}, ${a.ticks} tick(s)${a.final ? ", standing when it merged" : ""}` +
+               `${why ? ` (${why})` : ""}, ${a.ticks} tick(s)${a.final ? ", standing when it merged" : ""}` +
                `${a.record ? `, record ${a.record.slice(0, 12)}` : ""}` +
-               `${a.audited ? `, audited: ${a.audited.mark}, by ${a.audited.by}${a.again ? ", judged again since" : ""}` : ""}`);
+               `${a.audited ? `, audited: ${a.audited.mark}, by ${a.audited.by}${a.gone ? ", of a judgment this store doesn't hold" : a.again ? ", judged again since" : ""}` : ""}`);
+    }
   }
   return out.join("\n");
 }
@@ -336,7 +375,7 @@ function cell(v) {
  */
 export function auditSheet(calls, nwo) {
   const rows = calls.map((c) => [c.id, c.pr, `https://github.com/${nwo}/pull/${c.pr}`, c.where, c.state,
-    c.summary ? `${c.summary}${c.why ? `: ${c.why}` : ""}` : c.why, c.final ? "yes" : "", c.ticks, when(c.first), c.seq,
+    reasonOf(c), c.final ? "yes" : "", c.ticks, when(c.first), c.seq,
     ...marked(c), c.audited?.note ?? ""]);
   // Marked as UTF-8, and lines ended as CSV ends them, for a spreadsheet to read it so.
   return "\uFEFF" + [SHEET_COLUMNS, ...rows].map((r) => r.map(cell).join(",")).join("\r\n") + "\r\n";
@@ -345,13 +384,15 @@ export function auditSheet(calls, nwo) {
 /**
  * A call's mark when the sheet is made: how it was marked before, and the mark
  * it carries. One judged again since it was marked right carries none, to be
- * marked again; what it was marked is in the first.
+ * marked again, nor one whose judgment marked this store doesn't hold; what it
+ * was marked is in the first.
  * @param {Call} c @returns {[string, string]}
  */
 function marked(c) {
   if (!c.audited) return ["", ""];
   const was = c.audited.mark === "right" ? "yes" : "no";
-  return c.again && c.audited.mark === "right" ? [`${was}, judged again since`, ""] : [was, was];
+  if (c.audited.mark !== "right") return [was, was];
+  return c.gone ? [`${was}, of a judgment this store doesn't hold`, ""] : c.again ? [`${was}, judged again since`, ""] : [was, was];
 }
 
 /** CSV's rows, cells split at `d`, a quoted cell taken whole. @param {string} text @param {string} d */
@@ -389,8 +430,10 @@ export function readSheet(text) {
   const body = String(text);
   // Trimmed, a cell loses a byte-order mark too.
   const norm = (/** @type {string} */ s) => s.trim().toLowerCase();
-  const d = [",", ";", "\t"].find((x) => { const h = (csvRows(body, x)[0] ?? []).map(norm); return h.includes("call") && h.includes(MARK_COLUMN) && h.includes(SEQ_COLUMN); });
-  if (!d) return { ok: false, why: `it isn't an audit sheet: its first row doesn't name the columns "call", "${SEQ_COLUMN}" and "${MARK_COLUMN}"` };
+  // Each column a mark is read with (#314): without "marked before", a mark the
+  // sheet carried would read as one given, and a stale copy undo a correction.
+  const d = [",", ";", "\t"].find((x) => { const h = (csvRows(body, x)[0] ?? []).map(norm); return ["call", SEQ_COLUMN, BEFORE_COLUMN, MARK_COLUMN].every((n) => h.includes(n)); });
+  if (!d) return { ok: false, why: `it isn't an audit sheet: its first row doesn't name the columns "call", "${SEQ_COLUMN}", "${BEFORE_COLUMN}" and "${MARK_COLUMN}"` };
   const [head, ...rows] = csvRows(body, d);
   const [idAt, markAt, noteAt, beforeAt, seqAt] = ["call", MARK_COLUMN, "note", BEFORE_COLUMN, SEQ_COLUMN].map((n) => head.map(norm).indexOf(n));
   /** @type {Map<string, Marked>} */ const marks = new Map();
@@ -402,7 +445,7 @@ export function readSheet(text) {
     // A mark the sheet carried from an audit, left as it was, is that audit's,
     // not this one's: recorded again, it would undo a correction recorded
     // since the sheet was made.
-    if (beforeAt >= 0 && MARKS.get(norm(r[beforeAt] ?? "")) === right) continue;
+    if (MARKS.get(norm(r[beforeAt] ?? "")) === right) continue;
     // Only as far as the call was judged when the sheet was made.
     const to = Number((r[seqAt] ?? "").trim());
     if (!Number.isSafeInteger(to) || to < 1) return { ok: false, why: `call ${id}'s "${SEQ_COLUMN}" isn't an event of the store: the sheet's columns were changed` };
@@ -419,12 +462,14 @@ export function readSheet(text) {
  * a false pass where it passed, or a false block where it didn't, with who
  * made it and when. A mark for a call the trial doesn't list, from a sheet made
  * for another repository or another start, isn't taken; nor an audit that
- * marks nothing, or names no one.
+ * marks nothing, or names no one. Each mark covers its call to the judgment
+ * the sheet showed it judged to, which must be one of its own in the report's
+ * `judgment` (#314), and keeps that judgment's record.
  * @param {Call[]} calls @param {Map<string, Marked>} marks
- * @param {{ repo: string, by: string, at: number }} o
+ * @param {{ repo: string, by: string, at: number, judgment: Judgment }} o
  * @returns {{ ok: true, audit: Audit } | { ok: false, why: string }}
  */
-export function auditOf(calls, marks, { repo, by, at }) {
+export function auditOf(calls, marks, { repo, by, at, judgment }) {
   const who = String(by ?? "").trim();
   if (!who) return { ok: false, why: "an audit names who made it: pass --by with their name" };
   const of = new Map(calls.map((c) => [c.id, c]));
@@ -435,8 +480,14 @@ export function auditOf(calls, marks, { repo, by, at }) {
   /** @type {Audit["calls"]} */ const audited = [];
   for (const c of calls) {
     const m = marks.get(c.id);
-    if (m) audited.push({ id: c.id, where: c.where, pr: c.pr, head: c.head, state: c.state, summary: c.summary, record: c.record,
-                          mark: m.right ? "right" : c.state === "PASS" ? "false pass" : "false block", note: m.note, to: m.to ?? c.seq });
+    if (!m) continue;
+    // A "judged to" changed on the sheet, past the call's last judgment say,
+    // would make the mark cover judgments the sheet didn't show.
+    const to = m.to ?? c.seq, saw = judgment(to);
+    if (saw?.id !== c.id)
+      return { ok: false, why: `call ${c.id}'s "${SEQ_COLUMN}", ${to}, isn't one of its judgments in this trial: the sheet's columns were changed, or it was made for another period` };
+    audited.push({ id: c.id, where: c.where, pr: c.pr, head: c.head, state: c.state, summary: c.summary, record: saw.record,
+                   mark: m.right ? "right" : c.state === "PASS" ? "false pass" : "false block", note: m.note, to });
   }
   return { ok: true, audit: { repo, by: who, at, calls: audited } };
 }
@@ -471,12 +522,81 @@ export function sheetThenRecord(sheetPath, text, record, { write = writeFileSync
     return r;
   } finally {
     try { unlinkSync(temp); } catch { /* gone */ }
-    if (placed && !kept) rmSync(sheetPath, { force: true });
+    // Taken away, and its folder synced again (#314): a power loss could
+    // otherwise bring the sheet back, to refuse a retry.
+    if (placed && !kept) {
+      rmSync(sheetPath, { force: true });
+      try { syncDir(dirname(sheetPath)); } catch { /* why the audit wasn't recorded is what's said */ }
+    }
   }
 }
 
 /** The name of the audit recorded `n`th. @param {number} n */
 const numbered = (n) => `${String(n).padStart(6, "0")}.json`;
+/** The name of the host's note of the audit recorded `n`th. @param {number} n */
+const noteName = (n) => `${String(n).padStart(6, "0")}.sha256`;
+/** The digest an audit's note holds: of its file's bytes. @param {string | Buffer} bytes */
+const digestOf = (bytes) => createHash("sha256").update(bytes).digest("hex");
+
+/**
+ * `dir`, and each folder above it to the one that holds the first folder
+ * `made` on the way to it, as `mkdirSync` answers: each holds a name made
+ * there, which only syncing it makes outlast a power loss.
+ * @param {string} dir @param {string | undefined} made
+ */
+function holding(dir, made) {
+  /** @type {string[]} */ const folders = [];
+  for (let f = dir; ; f = dirname(f)) { folders.push(f); if (!made || f === dirname(made) || f === dirname(f)) break; }
+  return folders;
+}
+
+/**
+ * The host's notes of the audits recorded (#314), kept in `notes` in its
+ * credentials folder, apart from the audits: each audit's number, and the
+ * digest of what was recorded under it. None where none were noted. Why where
+ * they can't be read, or one isn't a note reeve made: a note can't be told
+ * from one of an audit since lost.
+ * @param {string} notes
+ * @returns {{ ok: true, noted: Map<number, string> } | { ok: false, why: string }}
+ */
+function readNotes(notes) {
+  /** @type {Map<number, string>} */ const noted = new Map();
+  if (!existsSync(notes)) return { ok: true, noted };
+  try {
+    // Its own file, while it's written, starts with a dot.
+    for (const f of readdirSync(notes).filter((x) => !x.startsWith("."))) {
+      const n = Number(/^(\d+)\.sha256$/.exec(f)?.[1]);
+      if (!Number.isSafeInteger(n) || n < 1 || f !== noteName(n)) return { ok: false, why: `${f}, among the host's notes of the audits recorded, isn't one reeve noted` };
+      noted.set(n, readFileSync(join(notes, f), "utf8").trim());
+    }
+  } catch (err) {
+    return { ok: false, why: `the host's notes of the audits recorded, in ${notes}, can't be read: ${/** @type {NodeJS.ErrnoException} */ (err).code ?? /** @type {Error} */ (err).message}` };
+  }
+  return { ok: true, noted };
+}
+
+/**
+ * Notes on the host, in `notes`, that the audit recorded `n`th has `digest`:
+ * written whole to a file of its own and synced, linked into place, then its
+ * folder synced, and each made for it with the one that holds it. Why it
+ * couldn't be, or null.
+ * @param {string} notes @param {number} n @param {string} digest
+ * @param {{ link: typeof linkSync, fsync: typeof fsyncSync, syncDir: (dir: string) => void }} io
+ * @returns {string | null}
+ */
+function note(notes, n, digest, { link, fsync, syncDir }) {
+  try {
+    const made = mkdirSync(notes, { recursive: true, mode: 0o700 });
+    const temp = join(notes, `.${process.pid}.${randomBytes(4).toString("hex")}.part`);
+    try {
+      const fd = openSync(temp, "wx", 0o600);
+      try { writeFileSync(fd, digest + "\n"); fsync(fd); } finally { closeSync(fd); }
+      link(temp, join(notes, noteName(n)));
+    } finally { try { unlinkSync(temp); } catch { /* gone */ } }
+    for (const f of holding(notes, made)) syncDir(f);
+    return null;
+  } catch (err) { return `${notes}: ${/** @type {NodeJS.ErrnoException} */ (err).code ?? /** @type {Error} */ (err).message}`; }
+}
 
 /**
  * Keeps `audit` in `dir` as the next of the audits there, numbered in the
@@ -488,19 +608,28 @@ const numbered = (n) => `${String(n).padStart(6, "0")}.json`;
  * a power loss. Where, and, once it's in place, a folder that couldn't be
  * synced as `unsynced`: it's recorded, read by every report, and recording it
  * again would make two.
+ *
+ * With `notes`, the host's notes in its credentials folder (#314): numbered
+ * after the highest noted too, so one lost is never filled by another, and
+ * noted there once it's in place, with the digest of what was recorded. Notes
+ * that can't be read record nothing; one that can't be made is said as
+ * `unnoted`: the audit is recorded, but its loss couldn't be told.
  * @param {string} dir @param {Audit} audit
- * @param {{ link?: typeof linkSync, fsync?: typeof fsyncSync, syncDir?: (dir: string) => void }} [io]
- * @returns {{ path: string, unsynced: string | null }}
+ * @param {{ notes?: string | null, link?: typeof linkSync, fsync?: typeof fsyncSync, syncDir?: (dir: string) => void }} [io]
+ * @returns {{ path: string, unsynced: string | null, unnoted: string | null }}
  */
-export function recordAudit(dir, audit, { link = linkSync, fsync = fsyncSync, syncDir = syncFolder } = {}) {
+export function recordAudit(dir, audit, { notes = null, link = linkSync, fsync = fsyncSync, syncDir = syncFolder } = {}) {
+  const known = notes == null ? { ok: true, noted: new Map() } : readNotes(notes);
+  if ("why" in known) throw new Error(known.why);
   const made = mkdirSync(dir, { recursive: true, mode: 0o700 });
-  /** @type {string[]} */ const folders = [];
-  for (let f = dir; ; f = dirname(f)) { folders.push(f); if (!made || f === dirname(made) || f === dirname(f)) break; }
+  const folders = holding(dir, made);
   const temp = join(dir, `.${process.pid}.${randomBytes(4).toString("hex")}.part`);
+  const text = JSON.stringify(audit, null, 2) + "\n";
   try {
     const fd = openSync(temp, "wx", 0o600);
-    try { writeFileSync(fd, JSON.stringify(audit, null, 2) + "\n"); fsync(fd); } finally { closeSync(fd); }
-    for (let n = 1 + Math.max(0, ...readdirSync(dir).map((f) => Number(/^(\d+)\.json$/.exec(f)?.[1] ?? 0))); ; n++) {
+    try { writeFileSync(fd, text); fsync(fd); } finally { closeSync(fd); }
+    const highest = Math.max(0, ...readdirSync(dir).map((f) => Number(/^(\d+)\.json$/.exec(f)?.[1] ?? 0)), ...known.noted.keys());
+    for (let n = 1 + highest; ; n++) {
       const path = join(dir, numbered(n));
       try { link(temp, path); }
       catch (err) { if (/** @type {NodeJS.ErrnoException} */ (err).code === "EEXIST") continue; throw err; }
@@ -509,7 +638,7 @@ export function recordAudit(dir, audit, { link = linkSync, fsync = fsyncSync, sy
         try { syncDir(f); }
         catch (err) { unsynced ??= `${f}: ${/** @type {NodeJS.ErrnoException} */ (err).code ?? /** @type {Error} */ (err).message}`; }
       }
-      return { path, unsynced };
+      return { path, unsynced, unnoted: notes == null ? null : note(notes, n, digestOf(text), { link, fsync, syncDir }) };
     }
   } finally { try { unlinkSync(temp); } catch { /* gone */ } }
 }
@@ -526,20 +655,26 @@ function auditWhole(a) {
  * can't be read: a folder that can't be listed, a file that isn't one reeve
  * recorded, one that doesn't read whole or marks a call twice, or one of
  * another repository, vouches for nothing, and may have marked a call false.
- * @param {string} dir @param {string} repo
+ * With `notes`, the host's notes of them (#314): one noted and missing, the
+ * newest say, which would leave those before it numbered whole, or one that
+ * isn't what was noted under its number, vouches for nothing too.
+ * @param {string} dir @param {string} repo @param {{ notes?: string | null }} [o]
  * @returns {{ ok: true, audits: Audit[] } | { ok: false, why: string }}
  */
-export function readAudits(dir, repo) {
-  if (!existsSync(dir)) return { ok: true, audits: [] };
-  let names;
-  try { names = readdirSync(dir); }
+export function readAudits(dir, repo, { notes = null } = {}) {
+  const known = notes == null ? { ok: true, noted: new Map() } : readNotes(notes);
+  if ("why" in known) return { ok: false, why: known.why };
+  /** @type {string[]} */ let names = [];
+  try { if (existsSync(dir)) names = readdirSync(dir); }
   catch (err) { return { ok: false, why: `the audits recorded in ${dir} can't be listed: ${/** @type {NodeJS.ErrnoException} */ (err).code ?? /** @type {Error} */ (err).message}` }; }
   /** @type {Audit[]} */ const audits = [];
+  /** @type {Map<number, string>} */ const digests = new Map();
   for (const f of names.filter((x) => x.endsWith(".json")).sort()) {
     const seq = Number(/^(\d+)\.json$/.exec(f)?.[1]);
     if (!Number.isSafeInteger(seq) || seq < 1 || f !== numbered(seq)) return { ok: false, why: `${f}, among the audits recorded, isn't one reeve recorded` };
     let a;
-    try { a = JSON.parse(readFileSync(join(dir, f), "utf8")); } catch { return { ok: false, why: `the audit recorded in ${f} can't be read` }; }
+    try { const bytes = readFileSync(join(dir, f)); digests.set(seq, digestOf(bytes)); a = JSON.parse(bytes.toString("utf8")); }
+    catch { return { ok: false, why: `the audit recorded in ${f} can't be read` }; }
     if (!auditWhole(a)) return { ok: false, why: `the audit recorded in ${f} doesn't read whole` };
     const twice = a.calls.find((/** @type {any} */ c, /** @type {number} */ i) => a.calls.findIndex((/** @type {any} */ d) => d.id === c.id) !== i);
     if (twice) return { ok: false, why: `the audit recorded in ${f} marks call ${twice.id} twice` };
@@ -551,7 +686,80 @@ export function readAudits(dir, repo) {
   const gap = audits.findIndex((a, i) => a.seq !== i + 1);
   if (gap >= 0)
     return { ok: false, why: `the audits recorded go to ${numbered(/** @type {number} */ (audits.at(-1)?.seq))}, but ${numbered(gap + 1)} is missing, so what it marked can't be told` };
+  for (const [n, digest] of [...known.noted].sort((x, y) => x[0] - y[0])) {
+    if (!digests.has(n))
+      return { ok: false, why: `${numbered(n)}, noted on the host as recorded, is missing from ${dir}, so what it marked can't be told: a snapshot of the store that holds it puts it back, as reeve restore does` };
+    if (digests.get(n) !== digest) return { ok: false, why: `${numbered(n)} isn't the audit the host noted under that number, so what it marked can't be told` };
+  }
   return { ok: true, audits };
+}
+
+/**
+ * A copy of the audits kept in `dir`, each as it was recorded, for a snapshot
+ * of the store to carry beside it (#311): none where none were recorded. Why
+ * where they can't be read.
+ * @param {string} dir
+ * @returns {{ ok: true, audits: { name: string, text: string }[] } | { ok: false, why: string }}
+ */
+export function auditsCopy(dir) {
+  if (!existsSync(dir)) return { ok: true, audits: [] };
+  try {
+    return { ok: true, audits: readdirSync(dir).filter((f) => /^\d+\.json$/.test(f)).sort().map((name) => ({ name, text: readFileSync(join(dir, name), "utf8") })) };
+  } catch (err) { return { ok: false, why: `${dir}: ${/** @type {NodeJS.ErrnoException} */ (err).code ?? /** @type {Error} */ (err).message}` }; }
+}
+
+/**
+ * Puts back in `dir` each audit of `repo` that `copy`, a snapshot's copy of
+ * them as `auditsCopy` made it, holds and `dir` is missing, as it was recorded
+ * (#311). Where an audit there isn't the one the copy holds under its number,
+ * which of the two was recorded can't be told, and none is put back; nor from
+ * a copy that doesn't read as one, is another repository's, or misses one.
+ * Those recorded since the snapshot are left. Each is written whole to a file
+ * of its own and synced, then linked into place, and its folders synced.
+ * `where` is what the copy is beside, as a person reads it.
+ * @param {unknown} copy @param {string} where @param {string} dir @param {string} repo
+ * @param {{ fsync?: typeof fsyncSync, syncDir?: (dir: string) => void }} [io]
+ * @returns {{ ok: true, put: number, unsynced?: string } | { ok: false, why: string }}
+ */
+export function putBackAudits(copy, where, dir, repo, { fsync = fsyncSync, syncDir = syncFolder } = {}) {
+  const c = /** @type {any} */ (copy);
+  if (typeof c?.repo !== "string" || !Array.isArray(c.audits) || !c.audits.every((/** @type {any} */ a) => typeof a?.name === "string" && typeof a.text === "string"))
+    return { ok: false, why: `the copy of the audits beside ${where} can't be read` };
+  if (c.repo !== repo) return { ok: false, why: `the copy of the audits beside ${where} is of ${c.repo}, not ${repo}` };
+  /** @type {{ name: string, text: string }[]} */ const audits = c.audits;
+  const gap = audits.findIndex((a, i) => a.name !== numbered(i + 1));
+  if (gap >= 0) return { ok: false, why: `${numbered(gap + 1)} is missing from the copy of the audits beside ${where}` };
+  /** @type {{ name: string, text: string }[]} */ const missing = [];
+  for (const a of audits) {
+    let there = null;
+    try { there = readFileSync(join(dir, a.name), "utf8"); }
+    catch (err) {
+      const code = /** @type {NodeJS.ErrnoException} */ (err).code;
+      if (code !== "ENOENT") return { ok: false, why: `${a.name} in ${dir} can't be read: ${code ?? /** @type {Error} */ (err).message}` };
+    }
+    if (there === null) missing.push(a);
+    else if (there !== a.text) return { ok: false, why: `${a.name} in ${dir} isn't the audit the snapshot holds under that number, so which was recorded can't be told` };
+  }
+  if (!missing.length) return { ok: true, put: 0 };
+  /** @type {string | undefined} */ let made;
+  try {
+    made = mkdirSync(dir, { recursive: true, mode: 0o700 });
+    for (const a of missing) {
+      const temp = join(dir, `.${process.pid}.${randomBytes(4).toString("hex")}.part`);
+      try {
+        const fd = openSync(temp, "wx", 0o600);
+        try { writeFileSync(fd, a.text); fsync(fd); } finally { closeSync(fd); }
+        linkSync(temp, join(dir, a.name));
+      } finally { try { unlinkSync(temp); } catch { /* gone */ } }
+    }
+  } catch (err) {
+    return { ok: false, why: `the audits couldn't be put back in ${dir}: ${/** @type {NodeJS.ErrnoException} */ (err).code ?? /** @type {Error} */ (err).message}` };
+  }
+  for (const f of holding(dir, made)) {
+    try { syncDir(f); }
+    catch (err) { return { ok: true, put: missing.length, unsynced: `${f}: ${/** @type {NodeJS.ErrnoException} */ (err).code ?? /** @type {Error} */ (err).message}` }; }
+  }
+  return { ok: true, put: missing.length };
 }
 
 /** `gh`, as the person running this reads GitHub, bounded as every read is (#282). @param {string[]} args */

@@ -71,6 +71,8 @@ export const APPLIES = Object.freeze({
   "audit-sheet": Object.freeze(["trial"]),
   audited: Object.freeze(["trial"]),
   by: Object.freeze(["trial"]),
+  // When the trial's count ended (#314).
+  until: Object.freeze(["trial"]),
 
   // The decision records' own flags (#165): which pull request's, or which
   // record, to replay, and which commit `why` explains.

@@ -200,7 +200,8 @@ test("every call the daemon made is listed for a person's audit, merged or not, 
     [[5, "head", "a", "BLOCK", 2, false], [5, "head", "b", "PASS", 1, true], [5, "queue", "9", "PASS", 1, true], [6, "head", "c", "PASS", 1, false]]);
   assert.equal(r.conditions.find((c) => /no false call/.test(c.name))?.detail, "4 call(s) on 2 pull request(s) to audit");
   assert.equal(r.toAudit[0].why, "ci: checks not settled: RUNNING (2 check(s) still in flight)", "the latest reason");
-  assert.match(renderTrial(r, R), /#5 BLOCK at aaaaaaaaaa \(ci blocked: ci: checks not settled: RUNNING \(2 check\(s\) still in flight\)\), 2 tick\(s\)/);
+  // Each reason it was judged for, with its ticks (#314).
+  assert.match(renderTrial(r, R), /#5 BLOCK at aaaaaaaaaa \(ci blocked: ci: checks not settled: RUNNING \(3 check\(s\) still in flight\) \(1 tick\); ci: checks not settled: RUNNING \(2 check\(s\) still in flight\) \(1 tick\)\), 2 tick\(s\)/);
   assert.match(renderTrial(r, R), /#6 PASS at cccccccccc/);
 });
 

@@ -66,6 +66,10 @@ export const APPLIES = Object.freeze({
   // The trial's seeded known-bad cases, run for its report (#293).
   seeded: Object.freeze(["trial"]),
 
+  // When the shadow trial began, which enforcing needs to have passed (#166):
+  // read by `run`, and there only with --enforce.
+  "trial-since": Object.freeze(["run"]),
+
   // A person's audit of the trial's calls (#294): the sheet to mark them on,
   // the sheet marked, and who marked it.
   "audit-sheet": Object.freeze(["trial"]),

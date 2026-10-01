@@ -43,7 +43,8 @@ test("the shadow trial lets reeve enforce only once its report has passed, and s
 });
 
 /** A home whose App can't be signed in to, with acme/widget's store and profile, and `reeve run` there; `before` readies it. */
-function runEnforcing(/** @type {string[]} */ extra, /** @type {(home: string, db: string) => (() => void) | void} */ before = () => {}) {
+function runEnforcing(/** @type {string[]} */ extra, /** @type {(home: string, db: string) => (() => void) | void} */ before = () => {},
+                     /** @type {string[] | null} */ args = null) {
   const home = tempDir("reeve-trial-gate-home-");
   const db = statePathFor(home, "acme/widget");
   mkdirSync(dirname(db), { recursive: true });
@@ -56,7 +57,7 @@ function runEnforcing(/** @type {string[]} */ extra, /** @type {(home: string, d
     ci: { provider: "github-actions" }, merge: { method: "squash", enforcement: "attested" }, reviewers: [] })));
   const after = before(home, db);
   try {
-    return spawnSync(process.execPath, [REEVE, "run", "acme/widget", "--enforce", ...extra], { encoding: "utf8", cwd: home,
+    return spawnSync(process.execPath, [REEVE, "run", "acme/widget", ...(args ?? ["--enforce", ...extra])], { encoding: "utf8", cwd: home,
       env: { ...offlineEnv(), REEVE_HOME: home }, timeout: 120_000 });
   } finally { if (after) after(); }
 }
@@ -115,4 +116,31 @@ test("reeve run's help and the README say --enforce needs --trial-since", () => 
   const help = spawnSync(process.execPath, [REEVE, "help"], { encoding: "utf8", env: { ...offlineEnv(), REEVE_HOME: tempDir("reeve-help-") }, timeout: 60_000 });
   assert.match(help.stdout + help.stderr, /--enforce --trial-since <date>/);
   assert.match(readFileSync(fileURLToPath(new URL("../README.md", import.meta.url)), "utf8"), /--enforce --trial-since/);
+});
+
+test("--trial-since is taken only by reeve run --enforce, and refused anywhere it would be ignored", () => {
+  const home = tempDir("reeve-trial-since-home-");
+  const at = (/** @type {string[]} */ args) => spawnSync(process.execPath, [REEVE, ...args], { encoding: "utf8", cwd: home, env: { ...offlineEnv(), REEVE_HOME: home }, timeout: 60_000 });
+  const backup = at(["backup", "acme/widget", "--trial-since", "2026-09-30T09:14Z"]);
+  assert.notEqual(backup.status, 0, backup.stdout + backup.stderr);
+  assert.match(backup.stderr, /--trial-since is not implemented by `backup`/);
+  const shadow = runEnforcing([], () => {}, ["--trial-since", "2026-09-30T09:14Z"]);
+  assert.equal(shadow.status, 1, shadow.stdout + shadow.stderr);
+  assert.match(shadow.stderr, /--trial-since is read only with --enforce/);
+  assert.doesNotMatch(shadow.stdout + shadow.stderr, /daemon starting/);
+});
+
+test("the shadow trial's report runs to when the store's lock is held, so a call recorded before then is never left out", () => {
+  // A call the reeve that held the store recorded as it let go: dated a minute
+  // on, so a cutoff taken before the lock leaves it out, and one taken once it's
+  // held, as late as the store's newest record, doesn't.
+  const r = runEnforcing(["--trial-since", "2026-09-30T09:14Z"], (_home, db) => {
+    const s = open(db);
+    s.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
+      .run(Math.floor(Date.now() / 1000) + 60, "daemon", "pr.decided", "pr:7",
+           JSON.stringify({ head: "b".repeat(40), state: "BLOCK", summary: "", action: "ESCALATE", why: "", clauses: [] }));
+    s.close();
+  });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stderr, /no false call on audit: 1 call\(s\) on 1 pull request\(s\) to audit/, "the call is in the trial: " + r.stderr.slice(-800));
 });

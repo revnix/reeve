@@ -2554,6 +2554,10 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     // person's audit finding no false call. Both are measured, and every reason
     // to refuse is said at once, so a person sees all that's missing.
     /** @type {any} */ let enforcing = null;
+    if (opt("trial-since") != null && !flag("enforce")) {
+      console.error(`reeve ${cmd}: --trial-since is read only with --enforce, to check the shadow trial passed before enforcing; in shadow mode, leave it out`);
+      process.exit(1);
+    }
     if (flag("enforce")) {
       const trialSince = opt("trial-since");
       if (trialSince == null) {
@@ -2561,8 +2565,7 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
         process.exit(1);
       }
       const sinceAt = Math.floor(Date.parse(trialSince) / 1000);
-      const nowAt = Math.floor(Date.now() / 1000);
-      if (!Number.isFinite(sinceAt) || sinceAt > nowAt) {
+      if (!Number.isFinite(sinceAt) || sinceAt > Math.floor(Date.now() / 1000)) {
         console.error(`reeve ${cmd}: --trial-since takes the date the shadow trial began, as 2026-09-30T09:14Z, got ${JSON.stringify(trialSince)}`);
         process.exit(1);
       }
@@ -2572,7 +2575,7 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       const seeded = await (await import("../src/seeded.mjs")).runSeeded();
       // The store is read for the trial only once its lock is held and what a
       // killed restore left is put right, below: opening it can write it.
-      enforcing = { e, base, sinceAt, nowAt, trialSince, seeded };
+      enforcing = { e, base, sinceAt, trialSince, seeded };
     }
     // One reeve runs on a store at a time (#274), held until this one ends: a
     // second, on a store another is running on, would keep records whose signed
@@ -2593,13 +2596,18 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     // and it's settled: only this repository's, never another's named with
     // --db (#166). Then every reason to refuse, at once.
     if (enforcing) {
-      const { e, base, sinceAt, nowAt, trialSince, seeded } = enforcing;
+      const { e, base, sinceAt, trialSince, seeded } = enforcing;
       const { trialReport, trialGate, mergedSince, readAudits, storeIsOf } = await import("../src/trial.mjs");
       const kept = readAudits(auditDirFor(HOME, nwo), nwo, { notes: auditNotesFor(HOME, nwo) });
       const trialDb = open(dbPath);
       let report = null, bound;
       try {
         bound = storeIsOf(trialDb, nwo, { named: opt("db") != null });
+        // The trial runs to now, taken with the lock held, or to the store's
+        // newest record if that's later: so nothing the reeve that held the
+        // store recorded before it let go is left out of it.
+        const newest = Number(/** @type {any} */ (trialDb.prepare("SELECT MAX(at) AS at FROM event").get())?.at) || 0;
+        const nowAt = Math.max(Math.floor(Date.now() / 1000), newest);
         if (bound.ok)
           report = trialReport(trialDb, { repo: nwo, since: sinceAt, now: nowAt, merged: mergedSince(nwo, sinceAt, { until: nowAt }), seeded,
                                           audits: kept.ok ? kept.audits : { why: kept.why } });

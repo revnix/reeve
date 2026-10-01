@@ -154,6 +154,10 @@ test("the shadow trial counts toward enforcing only where every judgment it saw 
     .run(`d${at}`, 1, "a".repeat(40), JSON.stringify({ subject: { repo: "acme/widget", pr: 1, head: "a".repeat(40) }, code, policy: "p1", ...over }), at, at, at, at);
   judged(SINCE + 100); judged(SINCE + 200);
   assert.deepEqual(T.trialRanOn(db, { since: SINCE, until: SINCE + 1000, code, policy: "p1" }), { ok: true });
+  // Code that can't be told is no proof it's the same, though the policy is.
+  const unreadable = T.trialRanOn(db, { since: SINCE, until: SINCE + 1000, code: { commit: null }, policy: "p1" });
+  assert.equal(unreadable.ok, false, "untold code isn't this code");
+  assert.match(unreadable.why, /2 judgment\(s\) whose code or policy can't be told/);
   // Before the trial began: not the trial's.
   judged(SINCE - 100, { code: { ...code, commit: "o".repeat(40) } });
   assert.deepEqual(T.trialRanOn(db, { since: SINCE, until: SINCE + 1000, code, policy: "p1" }), { ok: true });
@@ -164,10 +168,6 @@ test("the shadow trial counts toward enforcing only where every judgment it saw 
   assert.equal(other.ok, false);
   assert.equal(other.after, SINCE + 400, "the trial would begin again after the last judgment made otherwise");
   assert.match(other.why, /2 judgment\(s\) made by other code or under another policy/);
-  // Code that can't be told is no proof it's the same.
-  const unreadable = T.trialRanOn(db, { since: SINCE, until: SINCE + 1000, code: { commit: null }, policy: "p1" });
-  assert.equal(unreadable.ok, false);
-  assert.match(unreadable.why, /can't be told/);
   db.close();
 });
 

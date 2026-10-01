@@ -21,7 +21,7 @@ import { validate, withDefaults } from "./profile/schema.mjs";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, linkSync, rmSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { resolveHome } from "./home.mjs";
-import { statePathFor, legacyStatePathFor, adoptLegacyStore, clearMoveLock } from "./paths.mjs";
+import { storeLookup, adoptStore, clearMoveLock } from "./paths.mjs";
 import { open } from "./db/ops.mjs";
 
 /**
@@ -297,11 +297,13 @@ export function renderPlan({ nwo, proposal, questions, notes, profile, unanswere
 
 /**
  * The repository's state database, as init sees it, without changing anything:
- * "exists", "legacy" (a store at the old path, to be moved into place) or
- * "missing".
+ * "exists", "legacy" (a store at the old path, to be moved into place),
+ * "missing", or "unusable" with why, where a store an earlier reeve kept may
+ * be another's (#310): init makes none in its place.
  */
 export function storeStatus(home, nwo) {
-  const path = statePathFor(home, nwo), legacy = legacyStatePathFor(home, nwo);
+  const { path, earlier: legacy, refused } = storeLookup(home, nwo);
+  if (refused) return { state: "unusable", path, why: refused };
   if (existsSync(path)) return { state: "exists", path };
   if (existsSync(legacy)) return { state: "legacy", path, legacy };
   return { state: "missing", path };
@@ -321,9 +323,10 @@ export function ensureStore(home, nwo, { openStore = open, log = () => {} } = {}
   // An existing store is left alone, apart from a move lock a killed mover left
   // beside it, which nothing else would look for.
   if (status.state === "exists") { clearMoveLock(status.path); return { changed: false, line: null }; }
+  if (status.state === "unusable") return { changed: false, failed: true, line: status.why };
   if (status.state === "legacy") {
     let said = null, used;
-    try { used = adoptLegacyStore(status.path, status.legacy, { log: (m) => { said = m; log(m); } }); }
+    try { used = adoptStore(home, nwo, { log: (m) => { said = m; log(m); } }); }
     catch (e) { return { changed: false, failed: true, line: e.message }; }
     return used === status.path
       ? { changed: true, line: `moved the state database to ${status.path}` }
@@ -387,6 +390,10 @@ export function init({ root = process.cwd(), answers = {}, write = false, home =
   if (!proposal) return { code: 1, output: `reeve init: ${notes.join("; ")}` };
 
   const nwo = proposal.identity.key;
+  // A store that can't be used is refused before anything is asked or
+  // planned: no answer, and no --write, puts it right (#310).
+  const found = storeStatus(home, nwo);
+  if (found.state === "unusable") return { code: 1, output: `reeve init: the state database can't be used: ${found.why}` };
   const { profile: detectedProfile, unanswered } = compose(proposal, questions, answers);
   const path = profilePath(nwo, detectedProfile.authority.profileLocation, home);
   const existingRaw = existsSync(path) ? readFileSync(path, "utf8") : null;

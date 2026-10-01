@@ -1372,25 +1372,34 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = PO
  *
  * The run's text shows on the watched repository's pull requests, so it names
  * the merge policy, never reeve.
+ *
+ * The evidence the run carries is kept in its withdrawal (#309), as an update
+ * and a supersession keep it: a record published before its order named it
+ * may have no other witness. Where the runs can't be listed, the run on record
+ * is read for it, and withdrawn without it where that can't be read either, as
+ * taking a PASS back comes first.
  */
 export async function withdrawVerdict({ nwo, head, name, id = null, why,
                                         auth: authenticateAs = authenticate, api = apiAsInstallation }) {
   const auth = await authenticateAs(nwo);
   if (!auth.ok) return { ok: false, why: auth.why };
-  const cancel = (run) => api(auth.token, ["-X", "PATCH", `repos/${nwo}/check-runs/${run}`, "-f", "status=completed", "-f", "conclusion=cancelled",
+  const carried = (/** @type {string | null | undefined} */ summary) => { const e = readEvidence(summary); return e && !("garbled" in e) ? evidenceText(e) : ""; };
+  const cancel = (/** @type {number} */ run, kept = "") => api(auth.token, ["-X", "PATCH", `repos/${nwo}/check-runs/${run}`, "-f", "status=completed", "-f", "conclusion=cancelled",
     "-f", `output[title]=${`Withdrawn: ${why}`.slice(0, 250)}`,
-    "-f", `output[summary]=The merge policy withdrew its result here: ${why}. A withdrawn result doesn't pass. It publishes a new one once it can check this pull request again.`]);
+    "-f", `output[summary]=The merge policy withdrew its result here: ${why}. A withdrawn result doesn't pass. It publishes a new one once it can check this pull request again.${kept}`]);
   const runs = existingRuns(auth.token, nwo, head, [name], api);
   if (!runs) {
     const unread = `the check runs at ${head.slice(0, 8)} couldn't be read`;
     if (id == null) return { ok: false, why: unread };
-    const res = cancel(id);
+    const one = api(auth.token, [`repos/${nwo}/check-runs/${id}`, "--jq", ".output.summary"]);
+    // A read that fails holds no text, and carries none.
+    const res = cancel(id, carried(one.out));
     return { ok: false, why: res.ok ? `${unread}, so a later run of reeve's there may still pass` : String(res.err ?? "").split("\n")[0] };
   }
   const run = runs.mine[name]?.id ?? null;
   // Nothing of reeve's stands there, so there is nothing to take back.
   if (run == null) return { ok: true, id: null };
-  const res = cancel(run);
+  const res = cancel(run, carried(runs.mine[name]?.summary));
   if (!res.ok) return { ok: false, why: String(res.err ?? "").split("\n")[0] };
   return { ok: true, id: run };
 }

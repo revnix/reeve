@@ -13,7 +13,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { netTimeoutMs, netFailure } from "./net-bound.mjs";
 import { syncFolder } from "./signing.mjs";
 import { TICK_STARTED, TICK_STOPPED } from "./status.mjs";
@@ -40,7 +40,7 @@ export const CASE_KINDS = Object.freeze([
  * @typedef {"right" | "false pass" | "false block"} Mark
  * @typedef {{ mark: Mark, by: string, at: number, note: string }} Audited
  * @typedef {{ id: string, where: "head" | "queue", pr: number, head: string, state: string, summary: string, why: string,
- *             first: number, last: number, ticks: number, record: string | null, final: boolean, audited: Audited | null }} Call
+ *             first: number, last: number, ticks: number, record: string | null, final: boolean, audited: Audited | null, again?: boolean }} Call
  * @typedef {{ repo: string, by: string, at: number, seq?: number,
  *             calls: { id: string, where: string, pr: number, head: string, state: string, summary: string, record: string | null, mark: Mark, note: string }[] }} Audit
  * @typedef {{ name: string, met: boolean | null, detail: string }} Condition
@@ -186,7 +186,7 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
   for (const [where, list] of /** @type {const} */ ([["head", decided], ["queue", queued]])) for (const e of list) {
     const call = { where, pr: e.pr, head: String(e.p.head ?? ""), state: String(e.p.state ?? ""), summary: String(e.p.summary ?? "") };
     const id = callId({ repo, ...call });
-    const c = calls.get(id) ?? { id, ...call, why: "", first: e.at, last: e.at, ticks: 0, record: null, final: false, audited: null };
+    const c = calls.get(id) ?? { id, ...call, why: "", first: e.at, last: e.at, ticks: 0, record: null, final: false, audited: null, again: false };
     c.why = String(e.p.why ?? "");
     c.last = e.at;
     c.ticks++;
@@ -201,15 +201,19 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
   // change; by time where that isn't known.
   if (Array.isArray(audits)) for (const a of [...audits].sort((x, y) => (x.seq ?? 0) - (y.seq ?? 0) || x.at - y.at))
     for (const m of a.calls) { const c = calls.get(m.id); if (c) c.audited = { mark: m.mark, by: a.by, at: a.at, note: m.note }; }
+  // A call judged again since it was marked right was judged on what that
+  // audit didn't see, so it's for a person to mark again. One marked wrong
+  // stays a false call, however often it was judged again.
+  for (const c of toAudit) c.again = Boolean(c.audited && c.last > c.audited.at);
   const falseCalls = toAudit.filter((c) => c.audited && c.audited.mark !== "right");
-  const notYet = toAudit.filter((c) => !c.audited);
+  const notYet = toAudit.filter((c) => !c.audited || c.again);
   const prs = new Set(toAudit.map((a) => a.pr)).size;
   /** @type {Omit<Condition, "name">} */
   const audit = !Array.isArray(audits) ? { met: false, detail: `the audits recorded can't be read, so they vouch for nothing: ${audits.why}` }
     : falseCalls.length ? { met: false, detail: `${falseCalls.length} false call(s): ${some(falseCalls, (c) => `${callText(c)} (${c.audited?.mark}, by ${c.audited?.by})`)}` }
     // None audited, or nothing to audit: no audit says there was no false call.
     : notYet.length === toAudit.length ? { met: null, detail: `${toAudit.length} call(s) on ${prs} pull request(s) to audit` }
-    : notYet.length ? { met: null, detail: `${toAudit.length - notYet.length} of ${toAudit.length} call(s) audited, none false; not yet: ${some(notYet, callText)}` }
+    : notYet.length ? { met: null, detail: `${toAudit.length - notYet.length} of ${toAudit.length} call(s) audited, none false; not yet: ${some(notYet, (c) => `${callText(c)}${c.again ? " (judged again since its audit)" : ""}`)}` }
     : { met: true, detail: `all ${toAudit.length} call(s) audited right, by ${[...new Set(toAudit.map((c) => c.audited?.by))].join(", ")}` };
 
   const hours = running / 3600;
@@ -292,7 +296,7 @@ export function renderTrial(r, nwo) {
       out.push(`  #${a.pr} ${a.state} ${a.where === "queue" ? "on the queue's commit" : "at"} ${a.head.slice(0, 10)}` +
                `${a.summary ? ` (${a.summary}${a.why ? `: ${a.why}` : ""})` : a.why ? ` (${a.why})` : ""}, ${a.ticks} tick(s)${a.final ? ", standing when it merged" : ""}` +
                `${a.record ? `, record ${a.record.slice(0, 12)}` : ""}` +
-               `${a.audited ? `, audited: ${a.audited.mark}, by ${a.audited.by}` : ""}`);
+               `${a.audited ? `, audited: ${a.audited.mark}, by ${a.audited.by}${a.again ? ", judged again since" : ""}` : ""}`);
   }
   return out.join("\n");
 }
@@ -301,7 +305,9 @@ export function renderTrial(r, nwo) {
 
 /** The sheet's column a person marks each call in. */
 export const MARK_COLUMN = "was reeve right? (yes/no)";
-const SHEET_COLUMNS = ["call", "pull request", "link", "where", "verdict", "reason", "standing when it merged", "ticks", "first seen", MARK_COLUMN, "note"];
+/** How a call was marked when the sheet was made: what a mark left as it was is, and not a mark given anew. */
+const BEFORE_COLUMN = "marked before";
+const SHEET_COLUMNS = ["call", "pull request", "link", "where", "verdict", "reason", "standing when it merged", "ticks", "first seen", BEFORE_COLUMN, MARK_COLUMN, "note"];
 /** What a person may write in that column, and what it says. Left empty, the call isn't audited. */
 const MARKS = new Map([["yes", true], ["right", true], ["no", false], ["wrong", false]]);
 
@@ -325,9 +331,21 @@ function cell(v) {
 export function auditSheet(calls, nwo) {
   const rows = calls.map((c) => [c.id, c.pr, `https://github.com/${nwo}/pull/${c.pr}`, c.where, c.state,
     c.summary ? `${c.summary}${c.why ? `: ${c.why}` : ""}` : c.why, c.final ? "yes" : "", c.ticks, when(c.first),
-    c.audited ? (c.audited.mark === "right" ? "yes" : "no") : "", c.audited?.note ?? ""]);
+    ...marked(c), c.audited?.note ?? ""]);
   // Marked as UTF-8, and lines ended as CSV ends them, for a spreadsheet to read it so.
   return "\uFEFF" + [SHEET_COLUMNS, ...rows].map((r) => r.map(cell).join(",")).join("\r\n") + "\r\n";
+}
+
+/**
+ * A call's mark when the sheet is made: how it was marked before, and the mark
+ * it carries. One judged again since it was marked right carries none, to be
+ * marked again; what it was marked is in the first.
+ * @param {Call} c @returns {[string, string]}
+ */
+function marked(c) {
+  if (!c.audited) return ["", ""];
+  const was = c.audited.mark === "right" ? "yes" : "no";
+  return c.again && c.audited.mark === "right" ? [`${was}, judged again since`, ""] : [was, was];
 }
 
 /** CSV's rows, cells split at `d`, a quoted cell taken whole. @param {string} text @param {string} d */
@@ -368,13 +386,17 @@ export function readSheet(text) {
   const d = [",", ";", "\t"].find((x) => { const h = (csvRows(body, x)[0] ?? []).map(norm); return h.includes("call") && h.includes(MARK_COLUMN); });
   if (!d) return { ok: false, why: `it isn't an audit sheet: its first row doesn't name the columns "call" and "${MARK_COLUMN}"` };
   const [head, ...rows] = csvRows(body, d);
-  const [idAt, markAt, noteAt] = ["call", MARK_COLUMN, "note"].map((n) => head.map(norm).indexOf(n));
+  const [idAt, markAt, noteAt, beforeAt] = ["call", MARK_COLUMN, "note", BEFORE_COLUMN].map((n) => head.map(norm).indexOf(n));
   /** @type {Map<string, { right: boolean, note: string }>} */ const marks = new Map();
   for (const r of rows) {
     const id = (r[idAt] ?? "").trim(), mark = norm(r[markAt] ?? ""), note = noteAt < 0 ? "" : (r[noteAt] ?? "").trim();
     if (!id || !mark) continue;
     const right = MARKS.get(mark);
     if (right === undefined) return { ok: false, why: `call ${id} is marked ${JSON.stringify(r[markAt].trim())}: mark each call yes or no, or leave it empty` };
+    // A mark the sheet carried from an audit, left as it was, is that audit's,
+    // not this one's: recorded again, it would undo a correction recorded
+    // since the sheet was made.
+    if (beforeAt >= 0 && MARKS.get(norm(r[beforeAt] ?? "")) === right) continue;
     const was = marks.get(id);
     if (was && was.right !== right) return { ok: false, why: `call ${id} is marked twice, yes and no` };
     marks.set(id, { right, note: was?.note || note });
@@ -400,7 +422,7 @@ export function auditOf(calls, marks, { repo, by, at }) {
   const stray = [...marks.keys()].filter((id) => !of.has(id));
   if (stray.length)
     return { ok: false, why: `the sheet marks ${stray.length} call(s) this trial doesn't list (${stray.slice(0, 3).join(", ")}): was it made for another repository, or with another --since?` };
-  if (!marks.size) return { ok: false, why: `the sheet marks no call: write yes or no in its "${MARK_COLUMN}" column` };
+  if (!marks.size) return { ok: false, why: `the sheet marks no call, but for marks it carried from audits recorded: write yes or no in its "${MARK_COLUMN}" column` };
   /** @type {Audit["calls"]} */ const audited = [];
   for (const c of calls) {
     const m = marks.get(c.id);
@@ -411,26 +433,41 @@ export function auditOf(calls, marks, { repo, by, at }) {
 }
 
 /**
- * Writes the sheet `text` to `sheetPath`, a file that mustn't be there yet,
- * whole and synced, and only then runs `record`, recording the audit the sheet
- * carries: so a sheet that can't be written records nothing, and a sheet whose
- * audit can't be recorded is taken away. A file already there is left as it
- * was, `EEXIST`; otherwise what failed says which step, as `stage`.
+ * Puts the sheet `text` at `sheetPath`, where nothing may be yet, and only then
+ * runs `record`, recording the audit the sheet carries. The sheet is written
+ * whole to a file of its own and synced, linked into place, which fails where
+ * anything is there, and its folder synced: nothing is at its name until it's
+ * whole, so a stop partway leaves no sheet to refuse a retry. A sheet that
+ * can't be put in place records nothing, and one whose audit can't be
+ * recorded is taken away. A file already there is left as it was, `EEXIST`;
+ * otherwise what failed says which step, as `stage`. Its own file is gone
+ * afterwards, whatever failed.
  * @template T @param {string} sheetPath @param {string} text @param {() => T} record
- * @param {{ write?: (fd: number, text: string) => void }} [io] @returns {T}
+ * @param {{ write?: (fd: number, text: string) => void, syncDir?: (dir: string) => void }} [io] @returns {T}
  */
-export function sheetThenRecord(sheetPath, text, record, { write = writeFileSync } = {}) {
-  const fd = openSync(sheetPath, "wx");
-  let kept = false;
+export function sheetThenRecord(sheetPath, text, record, { write = writeFileSync, syncDir = syncFolder } = {}) {
+  const temp = join(dirname(sheetPath), `.${basename(sheetPath)}.${process.pid}.${randomBytes(4).toString("hex")}.part`);
+  let placed = false, kept = false;
   try {
-    try { try { write(fd, text); fsyncSync(fd); } finally { closeSync(fd); } }
-    catch (err) { throw Object.assign(/** @type {Error} */ (err), { stage: "sheet" }); }
+    try {
+      const fd = openSync(temp, "wx", 0o600);
+      try { write(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
+    } catch (err) { throw Object.assign(/** @type {Error} */ (err), { stage: "sheet" }); }
+    linkSync(temp, sheetPath);
+    placed = true;
+    try { syncDir(dirname(sheetPath)); } catch (err) { throw Object.assign(/** @type {Error} */ (err), { stage: "sheet" }); }
     /** @type {T} */ let r;
     try { r = record(); } catch (err) { throw Object.assign(/** @type {Error} */ (err), { stage: "record" }); }
     kept = true;
     return r;
-  } finally { if (!kept) rmSync(sheetPath, { force: true }); }
+  } finally {
+    try { unlinkSync(temp); } catch { /* gone */ }
+    if (placed && !kept) rmSync(sheetPath, { force: true });
+  }
 }
+
+/** The name of the audit recorded `n`th. @param {number} n */
+const numbered = (n) => `${String(n).padStart(6, "0")}.json`;
 
 /**
  * Keeps `audit` in `dir` as the next of the audits there, numbered in the
@@ -455,7 +492,7 @@ export function recordAudit(dir, audit, { link = linkSync, fsync = fsyncSync, sy
     const fd = openSync(temp, "wx", 0o600);
     try { writeFileSync(fd, JSON.stringify(audit, null, 2) + "\n"); fsync(fd); } finally { closeSync(fd); }
     for (let n = 1 + Math.max(0, ...readdirSync(dir).map((f) => Number(/^(\d+)\.json$/.exec(f)?.[1] ?? 0))); ; n++) {
-      const path = join(dir, `${String(n).padStart(6, "0")}.json`);
+      const path = join(dir, numbered(n));
       try { link(temp, path); }
       catch (err) { if (/** @type {NodeJS.ErrnoException} */ (err).code === "EEXIST") continue; throw err; }
       /** @type {string | null} */ let unsynced = null;
@@ -491,7 +528,7 @@ export function readAudits(dir, repo) {
   /** @type {Audit[]} */ const audits = [];
   for (const f of names.filter((x) => x.endsWith(".json")).sort()) {
     const seq = Number(/^(\d+)\.json$/.exec(f)?.[1]);
-    if (!Number.isSafeInteger(seq) || seq < 1) return { ok: false, why: `${f}, among the audits recorded, isn't one reeve recorded` };
+    if (!Number.isSafeInteger(seq) || seq < 1 || f !== numbered(seq)) return { ok: false, why: `${f}, among the audits recorded, isn't one reeve recorded` };
     let a;
     try { a = JSON.parse(readFileSync(join(dir, f), "utf8")); } catch { return { ok: false, why: `the audit recorded in ${f} can't be read` }; }
     if (!auditWhole(a)) return { ok: false, why: `the audit recorded in ${f} doesn't read whole` };
@@ -500,6 +537,11 @@ export function readAudits(dir, repo) {
     if (a.repo !== repo) return { ok: false, why: `the audit recorded in ${f} is of ${a.repo}, not ${repo}` };
     audits.push({ ...a, seq });
   }
+  // Numbered from one with none missing: an audit taken away from among them
+  // may have corrected a mark one before it gave, which would stand again.
+  const gap = audits.findIndex((a, i) => a.seq !== i + 1);
+  if (gap >= 0)
+    return { ok: false, why: `the audits recorded go to ${numbered(/** @type {number} */ (audits.at(-1)?.seq))}, but ${numbered(gap + 1)} is missing, so what it marked can't be told` };
   return { ok: true, audits };
 }
 

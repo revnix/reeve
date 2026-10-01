@@ -3,7 +3,7 @@
 // of no false call read from what was recorded.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, fsyncSync, linkSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, fsyncSync, linkSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -63,6 +63,12 @@ const noFalseCall = (r) => r.conditions.find((c) => /no false call/.test(c.name)
 const fill = (sheet, marks) => sheet.split("\r\n").map((row) => {
   const m = marks[row.split(",")[0]];
   return m === undefined ? row : row.replace(/,,$/, `,${m[0]},${m[1] ?? ""}`);
+}).join("\r\n");
+
+/** The sheet with the mark of each call `marks` names set, whatever it carried. */
+const fill2 = (/** @type {string} */ sheet, /** @type {Record<string, string>} */ marks) => sheet.split("\r\n").map((row) => {
+  const m = marks[row.split(",")[0]];
+  return m === undefined ? row : row.replace(/,[^,]*,([^,]*)$/, `,${m},$1`);
 }).join("\r\n");
 
 // ── naming a call ────────────────────────────────────────────────────────────
@@ -182,21 +188,21 @@ test("an audit is kept with who made it and when, and read back as it was kept",
 
 test("an audit kept that doesn't read whole, or is another repository's, is a fault, not an audit", () => {
   const r = report([]);
-  const bad = (/** @type {string} */ text, name = "000099.json") => {
+  const bad = (/** @type {string} */ text, name = "000002.json") => {
     const dir = join(tempDir("reeve-audits-"), "audits");
     trial.recordAudit(dir, audit(r, () => true));
     writeFileSync(join(dir, name), text);
     return trial.readAudits(dir, R);
   };
-  assert.match(JSON.stringify(bad("{not json")), /000099\.json can't be read/);
+  assert.match(JSON.stringify(bad("{not json")), /000002\.json can't be read/);
   const whole = audit(r, () => true);
-  assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, by: "" }))), /000099\.json doesn't read whole/, "no one named");
-  assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, at: "today" }))), /000099\.json doesn't read whole/, "no time");
-  assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, calls: [{ ...whole.calls[0], mark: "maybe" }] }))), /000099\.json doesn't read whole/, "a mark that isn't one");
-  assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, repo: "x/y" }))), /000099\.json is of x\/y, not o\/r/);
+  assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, by: "" }))), /000002\.json doesn't read whole/, "no one named");
+  assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, at: "today" }))), /000002\.json doesn't read whole/, "no time");
+  assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, calls: [{ ...whole.calls[0], mark: "maybe" }] }))), /000002\.json doesn't read whole/, "a mark that isn't one");
+  assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, repo: "x/y" }))), /000002\.json is of x\/y, not o\/r/);
   // The same call marked twice, right then false: which counts can't be told.
   const twice = { ...whole, calls: [whole.calls[0], { ...whole.calls[0], mark: "false block" }] };
-  assert.match(JSON.stringify(bad(JSON.stringify(twice))), new RegExp(`000099\\.json marks call ${whole.calls[0].id} twice`));
+  assert.match(JSON.stringify(bad(JSON.stringify(twice))), new RegExp(`000002\\.json marks call ${whole.calls[0].id} twice`));
   assert.match(JSON.stringify(bad(JSON.stringify(whole), "z.json")), /z\.json, among the audits recorded, isn't one reeve recorded/, "a file reeve didn't number");
   assert.equal(bad(JSON.stringify(whole)).ok, true, "control: a whole one of this repository reads");
   // Where the folder can't be listed, a file in its place say.
@@ -212,7 +218,7 @@ test("the sheet lists every call with its reason and a link to its pull request,
   const sheet = trial.auditSheet(r.toAudit, R);
   assert.ok(sheet.startsWith("\uFEFF"), "marked as UTF-8, for a spreadsheet to read it so");
   const [head, ...rows] = sheet.replace(/^\uFEFF/, "").split("\r\n").filter(Boolean);
-  assert.deepEqual(head.split(","), ["call", "pull request", "link", "where", "verdict", "reason", "standing when it merged", "ticks", "first seen", MARK, "note"]);
+  assert.deepEqual(head.split(","), ["call", "pull request", "link", "where", "verdict", "reason", "standing when it merged", "ticks", "first seen", "marked before", MARK, "note"]);
   assert.equal(rows.length, 4, "a row for each call");
   assert.match(sheet, /,https:\/\/github\.com\/o\/r\/pull\/7,/);
   assert.match(sheet, /"ci blocked: failing: ""unit"", lint"/, "a reason with commas and quotes stays one cell");
@@ -494,4 +500,80 @@ test("a call is named for its repository too, so a sheet of a fork's calls isn't
   const [ours, theirs] = [of("o/r"), of("fork/r")];
   s.db.close();
   assert.notEqual(ours, theirs);
+});
+
+// ── #307's third review ──────────────────────────────────────────────────────
+
+test("audits numbered with one missing among them aren't read: what it marked can't be told", () => {
+  const dir = join(tempDir("reeve-audits-"), "audits");
+  const r = report([]);
+  for (let i = 0; i < 3; i++) trial.recordAudit(dir, audit(r, () => true));
+  assert.equal(/** @type {any} */ (trial.readAudits(dir, R)).audits.length, 3, "control: three, numbered one to three");
+  rmSync(join(dir, "000002.json"));
+  assert.match(JSON.stringify(trial.readAudits(dir, R)), /the audits recorded go to 000003\.json, but 000002\.json is missing, so what it marked can't be told/);
+  const first = join(tempDir("reeve-audits-"), "audits");
+  trial.recordAudit(first, audit(r, () => true));
+  trial.recordAudit(first, audit(r, () => true));
+  rmSync(join(first, "000001.json"));
+  assert.match(JSON.stringify(trial.readAudits(first, R)), /000001\.json is missing/);
+  // Numbered otherwise than reeve numbers them, one could stand in for another under the same number.
+  const odd = join(tempDir("reeve-audits-"), "audits");
+  trial.recordAudit(odd, audit(r, () => true));
+  writeFileSync(join(odd, "2.json"), readFileSync(join(odd, "000001.json")));
+  assert.match(JSON.stringify(trial.readAudits(odd, R)), /2\.json, among the audits recorded, isn't one reeve recorded/);
+});
+
+test("a call judged again since it was marked right is for a person to mark again, and one marked wrong stays a false call", () => {
+  const r = report([]);
+  const right = audit(r, () => true, { at: T0 + 20 * MIN });
+  // #6 judged again twenty minutes after the audit: the same call, on evidence the audit didn't see.
+  const again = (/** @type {any} */ s) => s.decided(T0 + 40 * MIN, 6, sha("c"), "PASS");
+  const after = report([right], again);
+  assert.equal(noFalseCall(after).met, null, noFalseCall(after).detail);
+  assert.match(noFalseCall(after).detail, /not yet: #6 PASS at cccccccccc \(judged again since its audit\)$/);
+  assert.equal(noFalseCall(report([right])).met, true, "control: not judged again, it's met");
+  const wrong = audit(r, (c) => c.pr !== 6, { at: T0 + 20 * MIN });
+  assert.equal(noFalseCall(report([wrong], again)).met, false, "a call found false stays false");
+  // The sheet leaves it to mark again, saying how it was marked.
+  const sheet = trial.auditSheet(after.toAudit, R);
+  const row = sheet.split("\r\n").find((x) => x.startsWith(callOf(after, 6, "c").id + ",")) ?? "";
+  assert.match(row, /,"?yes, judged again since"?,,$/);
+});
+
+test("a sheet records only the marks a person gave or changed, not those it carried from an audit, so a stale sheet doesn't undo a correction", () => {
+  const r0 = report([]);
+  const first = audit(r0, () => true, { at: T0 + 2 * HOUR });
+  // Two sheets made from the first audit, every call carried as right.
+  const r1 = report([first]);
+  const sheet = trial.auditSheet(r1.toAudit, R);
+  const [fiveB, six] = [callOf(r1, 5, "b"), callOf(r1, 6, "c")];
+  // One person corrects #6, and records it.
+  const theirs = /** @type {any} */ (trial.readSheet(fill2(sheet, { [six.id]: "no" })));
+  assert.deepEqual([...theirs.marks.keys()], [six.id], "only the mark changed is read");
+  const correction = /** @type {any} */ (trial.auditOf(r1.toAudit, theirs.marks, { repo: R, by: "X", at: T0 + 3 * HOUR })).audit;
+  // Another, from their own copy of the sheet, marks #5 at b wrong, #6 left as it was carried.
+  const mine = /** @type {any} */ (trial.readSheet(fill2(sheet, { [fiveB.id]: "no" })));
+  assert.deepEqual([...mine.marks.keys()], [fiveB.id]);
+  const later = /** @type {any} */ (trial.auditOf(r1.toAudit, mine.marks, { repo: R, by: "Y", at: T0 + 4 * HOUR })).audit;
+  const after = report([first, correction, later]);
+  assert.match(noFalseCall(after).detail, /#6 PASS at cccccccccc \(false pass, by X\)/, "the correction stands");
+  assert.match(noFalseCall(after).detail, /#5 PASS at bbbbbbbbbb \(false pass, by Y\)/);
+  // A sheet that changes nothing it carried marks nothing.
+  const none = /** @type {any} */ (trial.readSheet(sheet));
+  assert.equal(none.marks.size, 0);
+  assert.match(JSON.stringify(trial.auditOf(r1.toAudit, none.marks, { repo: R, by: "Z", at: T0 })), /marks no call/);
+});
+
+test("a sheet is put in place whole: nothing is at its name until it's written, synced and its folder synced, before its audit is recorded", () => {
+  const d = tempDir("reeve-audit-sheet-");
+  const at = join(d, "calls.csv");
+  /** @type {string[]} */ const done = [];
+  try {
+    trial.sheetThenRecord(at, "x", () => { done.push(`record ${existsSync(at)}`); }, {
+      write: (fd, text) => { done.push(`write ${existsSync(at)}`); writeFileSync(fd, text); },
+      syncDir: (dir) => { done.push(`folder ${dir === d} ${existsSync(at)}`); } });
+  } catch (err) { done.push(`threw ${/** @type {any} */ (err).code}`); }
+  assert.deepEqual(done, ["write false", "folder true true", "record true"]);
+  assert.equal(readFileSync(at, "utf8"), "x");
+  assert.deepEqual(readdirSync(d), ["calls.csv"], "its own file gone");
 });

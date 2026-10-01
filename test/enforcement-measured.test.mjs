@@ -208,7 +208,7 @@ test("enforcing is measured before the daemon starts, and refused unless the def
     authority: { permission: "admin", policy: "propose_only", profileLocation: "sidecar" },
     state: { mode: "in-repo" }, units: [{ id: "root", root: ".", language: "javascript", packageManager: "npm", commands: {} }],
     ci: { provider: "github-actions" }, merge: { method: "squash", enforcement: "attested" }, reviewers: [] })));
-  const r = spawnSync(process.execPath, [REEVE, "run", "acme/widget", "--enforce"], { encoding: "utf8", cwd: home, env: { ...offlineEnv(), REEVE_HOME: home }, timeout: 60_000 });
+  const r = spawnSync(process.execPath, [REEVE, "run", "acme/widget", "--enforce", "--trial-since", "2026-09-30T09:14Z"], { encoding: "utf8", cwd: home, env: { ...offlineEnv(), REEVE_HOME: home }, timeout: 60_000 });
   assert.equal(r.status, 1, r.stdout + r.stderr);
   assert.match(r.stderr, /reeve run: --enforce refused: reeve's App couldn't be signed in to read main's rules/);
   assert.doesNotMatch(r.stdout + r.stderr, /daemon starting/, "the daemon didn't start");
@@ -407,7 +407,7 @@ function refusedRun() {
     authority: { permission: "admin", policy: "propose_only", profileLocation: "sidecar" },
     state: { mode: "in-repo" }, units: [{ id: "root", root: ".", language: "javascript", packageManager: "npm", commands: {} }],
     ci: { provider: "github-actions" }, merge: { method: "squash", enforcement: "attested" }, reviewers: [] })));
-  return spawnSync(process.execPath, [REEVE, "run", "acme/widget", "--enforce"], { encoding: "utf8", cwd: home, env: { ...offlineEnv(), REEVE_HOME: home }, timeout: 60_000 });
+  return spawnSync(process.execPath, [REEVE, "run", "acme/widget", "--enforce", "--trial-since", "2026-09-30T09:14Z"], { encoding: "utf8", cwd: home, env: { ...offlineEnv(), REEVE_HOME: home }, timeout: 60_000 });
 }
 
 test("--enforce refused says what would fix it, for the reason it's refused", async () => {

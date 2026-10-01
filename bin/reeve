@@ -238,6 +238,7 @@ const FLAGS = {
   takeover:       { value: false, what: "take a lease whose holder is provably dead" },
   execute:        { value: false, what: "actually act, rather than observe" },
   enforce:        { value: false, what: "publish the merge policy as enforcing" },
+  "trial-since":  { value: true,  what: "when the shadow trial began, which --enforce needs to have passed" },
   events:         { value: false, what: "export the event log too" },
   published:      { value: false, what: "for replay, check the store against what the merge policy published on GitHub" },
   health:         { value: false, what: "report health only" },
@@ -2548,12 +2549,41 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     // reeve's check from reeve's App, in a rule no one can bypass, or what
     // reeve publishes may block nothing, and saying it enforces would be false.
     // Measured before anything is held, and refused with what would fix it.
+    // And only after a shadow trial that passed (#166): its report built as
+    // `reeve trial` builds it, from when it began, every condition met and a
+    // person's audit finding no false call. Both are measured, and every reason
+    // to refuse is said at once, so a person sees all that's missing.
     if (flag("enforce")) {
+      const trialSince = opt("trial-since");
+      if (trialSince == null) {
+        console.error(`reeve ${cmd}: --enforce needs --trial-since, the date the shadow trial began, as 2026-09-30T09:14Z: reeve enforces only after it has passed`);
+        process.exit(1);
+      }
+      const sinceAt = Math.floor(Date.parse(trialSince) / 1000);
+      const nowAt = Math.floor(Date.now() / 1000);
+      if (!Number.isFinite(sinceAt) || sinceAt > nowAt) {
+        console.error(`reeve ${cmd}: --trial-since takes the date the shadow trial began, as 2026-09-30T09:14Z, got ${JSON.stringify(trialSince)}`);
+        process.exit(1);
+      }
       const base = profile.identity?.defaultBranch ?? "main";
       const { enforcementNow } = await import("../src/pr.mjs");
       const e = await enforcementNow({ nwo, base });
-      if (e.state !== "enforced") {
-        console.error(`reeve ${cmd}: --enforce refused: ${e.why}. To enforce, ${e.fix ?? `make ${base} enforce what reeve publishes`}, then run this again; until then, run without --enforce, in shadow mode`);
+      const { trialReport, trialGate, mergedSince, readAudits } = await import("../src/trial.mjs");
+      const seeded = await (await import("../src/seeded.mjs")).runSeeded();
+      const kept = readAudits(auditDirFor(HOME, nwo), nwo, { notes: auditNotesFor(HOME, nwo) });
+      const trialDb = open(dbPath);
+      let report;
+      try {
+        report = trialReport(trialDb, { repo: nwo, since: sinceAt, now: nowAt, merged: mergedSince(nwo, sinceAt, { until: nowAt }), seeded,
+                                        audits: kept.ok ? kept.audits : { why: kept.why } });
+      } finally { trialDb.close(); }
+      const passed = trialGate(report, { since: sinceAt });
+      const refusals = [
+        ...(e.state === "enforced" ? [] : [`${e.why}. To enforce, ${e.fix ?? `make ${base} enforce what reeve publishes`}`]),
+        ...("why" in passed ? [`${passed.why}. To enforce, run the trial until it passes: reeve trial ${nwo} --since ${trialSince} --seeded says what's short`] : []),
+      ];
+      if (refusals.length) {
+        console.error(`reeve ${cmd}: --enforce refused: ${refusals.join(". And ")}. Then run this again; until then, run without --enforce, in shadow mode`);
         process.exit(1);
       }
     }

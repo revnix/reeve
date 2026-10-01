@@ -329,6 +329,21 @@ export function storeIsOf(db, nwo, { named }) {
 const when = (t) => new Date(t * 1000).toISOString().replace(/:\d\d\.\d+Z$/, "Z").replace("T", " ");
 
 /**
+ * Whether the shadow trial lets reeve enforce (#166): only once its report has
+ * passed, every condition met and a person's audit of its calls finding none
+ * false. Time alone doesn't pass it. With why not, naming each condition short,
+ * for `reeve run --enforce` to refuse with.
+ * @param {{ passed: boolean, conditions: { name: string, met: boolean | null, detail: string }[] }} report
+ * @param {{ since: number }} o
+ * @returns {{ ok: true } | { ok: false, why: string }}
+ */
+export function trialGate(report, { since }) {
+  if (report.passed) return { ok: true };
+  const short = report.conditions.filter((c) => c.met !== true).map((c) => `${c.name}: ${c.detail}`);
+  return { ok: false, why: `the shadow trial from ${when(since)} hasn't passed: ${short.join("; ")}` };
+}
+
+/**
  * The report, for a person to read.
  * @param {ReturnType<typeof trialReport>} r @param {string} nwo
  */

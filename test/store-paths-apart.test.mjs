@@ -9,7 +9,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { open } from "../src/db/ops.mjs";
 import * as paths from "../src/paths.mjs";
-import { everyStore } from "../src/backup.mjs";
+import { everyStore, snapshotAll } from "../src/backup.mjs";
 import { storeStatus, ensureStore } from "../src/init.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 import { offlineEnv } from "./fixtures/offline-github.mjs";
@@ -117,4 +117,18 @@ test("reeve init refuses such a store before planning anything, as --write could
   assert.equal(r.status, 1, r.stdout + r.stderr);
   assert.match(r.stdout + r.stderr, /reeve init: the state database can't be used: an earlier reeve kept a store at .*-github\.db/);
   assert.doesNotMatch(r.stdout + r.stderr, /reeve init --write {3}to apply/);
+});
+
+test("a store an earlier reeve kept where names a path made alike shared one isn't backed up as any repository's, and the backup that skips it fails", () => {
+  const home = tempDir("reeve-paths-home-");
+  storeAt(shared(home, "o", "-github"));
+  storeAt(paths.statePathFor(home, "o/r"));
+  /** @type {any} */ let all;
+  try { all = snapshotAll(home, join(home, "backups"), { at: 1000 }); } catch (err) { all = { threw: String(err) }; }
+  const shared_ = all.find?.((/** @type {any} */ r) => /-github/.test(r.why ?? "") || r.nwo === "o/-github");
+  assert.equal(shared_?.ok, false, JSON.stringify(all));
+  assert.equal(shared_?.escalate, "builder:backup:failed");
+  assert.match(String(shared_?.why), /-github\.db is a store an earlier reeve kept where names a path made alike shared one, so whose it is can't be told/);
+  assert.ok(all.find((/** @type {any} */ r) => r.nwo === "o/r")?.ok, "control: the others are backed up");
+  assert.equal(existsSync(join(home, "backups", "o--github")), false, "filed under no repository");
 });

@@ -17357,4 +17357,22 @@ export const STUBS = [
               find: "  if (found.state === \"unusable\") return { code: 1, output:",
               replace: "  if (false) return { code: 1, output:" }],
   },
+  {
+    name: "backup-ambiguous-store-named",
+    why: "take a store with a dot or a dash first, not coded, for the repository its path reads as. One that may be another's would be filed under it",
+    test: "test/store-paths-apart.test.mjs",
+    expectRed: "a store an earlier reeve kept where names a path made alike shared one isn't backed up as any repository's, and the backup that skips it fails",
+    edits: [{ file: "src/backup.mjs",
+              find: "      const ambiguous = /^[.-]/.test(o.name) || /^[.-]/.test(f);",
+              replace: "      const ambiguous = false;" }],
+  },
+  {
+    name: "backup-ambiguous-store-refused",
+    why: "back up a store whose owner can't be told as the repository its path reads as. Its snapshots would be filed where its owner's restore can't find them",
+    test: "test/store-paths-apart.test.mjs",
+    expectRed: "a store an earlier reeve kept where names a path made alike shared one isn't backed up as any repository's, and the backup that skips it fails",
+    edits: [{ file: "src/backup.mjs",
+              find: "    if (ambiguous) {\n      results.push({ nwo, ok: false, outcome: \"failed\", escalate: \"builder:backup:failed\", path: null,",
+              replace: "    if (false) {\n      results.push({ nwo, ok: false, outcome: \"failed\", escalate: \"builder:backup:failed\", path: null," }],
+  },
 ];

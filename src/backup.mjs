@@ -214,8 +214,12 @@ export function everyStore(home) {
     try { files = readdirSync(join(root, o.name)); } catch { continue; }
     for (const f of files) {
       if (!f.endsWith(".db")) continue;
-      // The repository it's of, as its path names it (#310).
-      out.push({ nwo: storeRepo(o.name, f), path: join(root, o.name, f), kind: "repo" });
+      // The repository it's of, as its path names it (#310). One whose owner or
+      // name has a dot or a dash first, not coded, is one an earlier reeve kept
+      // where names a path made alike shared one: whose it is can't be told
+      // from its path, and every command refuses it, so it's `ambiguous`.
+      const ambiguous = /^[.-]/.test(o.name) || /^[.-]/.test(f);
+      out.push({ nwo: storeRepo(o.name, f), path: join(root, o.name, f), kind: "repo", ...(ambiguous ? { ambiguous: true } : {}) });
     }
   }
   return out;
@@ -394,7 +398,14 @@ export function validateSnapshot(path, { expectVersion = null, kind = "repo", de
  */
 export function snapshotAll(home, root, { at = Math.floor(Date.now() / 1000), keep = 14, open: openDb = null } = {}) {
   const results = [];
-  for (const { nwo, path } of everyStore(home)) {
+  for (const { nwo, path, ambiguous } of everyStore(home)) {
+    // Not filed under a repository it may not be (#310): a backup that failed,
+    // escalated until it's moved to its repository's path.
+    if (ambiguous) {
+      results.push({ nwo, ok: false, outcome: "failed", escalate: "builder:backup:failed", path: null,
+                     why: `${path} is a store an earlier reeve kept where names a path made alike shared one, so whose it is can't be told: it isn't backed up until it's moved, by hand, to its repository's path` });
+      continue;
+    }
     let db = null;
     try {
       db = openDb ? openDb(path) : new DatabaseSync(path, { readOnly: true });

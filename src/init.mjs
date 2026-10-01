@@ -298,8 +298,8 @@ export function renderPlan({ nwo, proposal, questions, notes, profile, unanswere
 /**
  * The repository's state database, as init sees it, without changing anything:
  * "exists", "legacy" (a store at the old path, to be moved into place),
- * "missing", or "unusable" with why, where whose a store found is can't be
- * told, or is another's (#310): init makes none in its place.
+ * "missing", or "unusable" with why, where a store an earlier reeve kept may
+ * be another's (#310): init makes none in its place.
  */
 export function storeStatus(home, nwo) {
   const { path, earlier: legacy, refused } = storeLookup(home, nwo);
@@ -390,6 +390,10 @@ export function init({ root = process.cwd(), answers = {}, write = false, home =
   if (!proposal) return { code: 1, output: `reeve init: ${notes.join("; ")}` };
 
   const nwo = proposal.identity.key;
+  // A store that can't be used is refused before anything is asked or
+  // planned: no answer, and no --write, puts it right (#310).
+  const found = storeStatus(home, nwo);
+  if (found.state === "unusable") return { code: 1, output: `reeve init: the state database can't be used: ${found.why}` };
   const { profile: detectedProfile, unanswered } = compose(proposal, questions, answers);
   const path = profilePath(nwo, detectedProfile.authority.profileLocation, home);
   const existingRaw = existsSync(path) ? readFileSync(path, "utf8") : null;
@@ -415,8 +419,7 @@ export function init({ root = process.cwd(), answers = {}, write = false, home =
   if (!profileChanged && store.state === "exists") return { code: 0, output: output + "\n\nnothing to do", path };
   if (!write) {
     const plan = store.state === "missing" ? `\n\nthe state database will be created at ${store.path}`
-      : store.state === "legacy" ? `\n\nthe state database will be moved from ${store.legacy} to ${store.path}`
-      : store.state === "unusable" ? `\n\nthe state database can't be used: ${store.why}` : "";
+      : store.state === "legacy" ? `\n\nthe state database will be moved from ${store.legacy} to ${store.path}` : "";
     return { code: 2, output: output + plan + `\n\n-> reeve init --write   to apply`, path };
   }
 

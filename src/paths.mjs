@@ -11,10 +11,8 @@
 // system's stated primary requirement, so a key that cannot tell two of them apart
 // contradicts the whole point.
 
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
-import { storeLock } from "./db/ops.mjs";
 import { DatabaseSync } from "node:sqlite";
 
 /**
@@ -40,13 +38,15 @@ const exact = s => encodeURIComponent(String(s)).replace(/[.!~*'()]/g, c => `%${
 
 /**
  * A repository's owner or name as one segment of a store's or a dashboard's
- * path (#310): kept as it is where `safe` would keep it, letters, digits, `.`,
- * `_` and `-` with no dot first, and percent-coded as `exact` codes it where
- * not. One name for each: one kept holds no `%`, and one coded always does. So
- * `.github` and `-github`, which `safe` made alike, are kept apart, and a store
- * already at its path for any other name stays where it is.
+ * path (#310): kept as it is where it's letters, digits, `.`, `_` and `-`
+ * starting with a letter, a digit or `_`, as `safe` kept it, and otherwise
+ * percent-coded as `exact` codes it, a `-` first as `%2D`. One name for each:
+ * one kept holds no `%`, and one coded always does. So `.github` and
+ * `-github`, which `safe` both made `-github`, each have a path of their own,
+ * neither the one they shared, and every other name's store and dashboard stay
+ * where they were.
  */
-const named = s => (/^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(String(s)) ? String(s) : exact(s));
+const named = s => (/^[A-Za-z0-9_][A-Za-z0-9._-]*$/.test(String(s)) ? String(s) : exact(s).replace(/^-/, "%2D"));
 /** The name a path's segment was made from by `named`: one that holds no `%` is as it is. */
 const unnamed = s => { if (!s.includes("%")) return s; try { return decodeURIComponent(s); } catch { return s; } };
 
@@ -64,17 +64,10 @@ export function statePathFor(home, nwo) {
 
 /**
  * The repository a store at `state/<owner>/<file>` is of: its owner's folder
- * and its file named as `statePathFor` names them, the `.db` taken off. Given
- * its `path`, one an earlier reeve kept where names were made alike (#310), not
- * moved yet, is the repository whose decision records it holds, every one.
+ * and its file named as `statePathFor` names them, the `.db` taken off.
  */
-export function storeRepo(owner, file, path = null) {
-  const nwo = `${unnamed(owner)}/${unnamed(String(file).replace(/\.db$/, ""))}`;
-  if (path == null || !nwo.split("/")[1].startsWith("-")) return nwo;
-  const o = ownerOf(path, nwo);
-  if (o.is !== "others" || o.mixed || o.others.length !== 1) return nwo;
-  const [so, sr] = parts(o.others[0]);
-  return so === owner && `${sr}.db` === file ? o.others[0] : nwo;
+export function storeRepo(owner, file) {
+  return `${unnamed(owner)}/${unnamed(String(file).replace(/\.db$/, ""))}`;
 }
 
 /**
@@ -119,119 +112,35 @@ export function legacyStatePathFor(home, nwo) {
 const sharedStatePath = (home, nwo) => { const [owner, repo] = parts(nwo); return join(home, "state", owner, `${repo}.db`); };
 
 /**
- * Whose the store at `path` is, by the decision records it holds (#310):
- * `mine` where every one, and at least one, is of `nwo`; `none` where it holds
- * none; `unread` where it, or one of them, can't be read; otherwise `others`,
- * the other repositories they're of, `mixed` where some are of `nwo` too.
- * @param {string} path @param {string} nwo
- * @returns {{ is: "mine" | "none" | "unread" } | { is: "others", others: string[], mixed: boolean }}
- */
-function ownerOf(path, nwo) {
-  const repos = reposIn(path);
-  if (repos === null || repos.includes(null)) return { is: "unread" };
-  if (!repos.length) return { is: "none" };
-  const others = /** @type {string[]} */ (repos.filter(r => r !== nwo));
-  return others.length ? { is: "others", others, mixed: others.length < repos.length } : { is: "mine" };
-}
-
-/**
- * The repositories the decision records of the store at `path` are of, null
- * for one that can't be read, or null where the store can't be. Read without
- * leaving anything beside it: a store closed whole, with no log beside it, is
- * read as it is on disk, as a read-only reader of it would otherwise leave a
- * log and its index there; one with its log is read with it, as nothing new
- * is made.
- * @param {string} path @returns {(string | null)[] | null}
- */
-function reposIn(path) {
-  let db = null;
-  try {
-    db = existsSync(`${path}-wal`) ? new DatabaseSync(path, { readOnly: true }) : new DatabaseSync(`${pathToFileURL(path).href}?immutable=1`, { readOnly: true });
-    return db.prepare(`SELECT DISTINCT CASE WHEN json_valid(record) THEN json_extract(record, '$.subject.repo') END AS repo FROM decision`).all()
-      .map(r => (typeof r.repo === "string" ? r.repo : null));
-  } catch { return null; }
-  finally { try { db?.close(); } catch { /* never opened */ } }
-}
-
-/**
  * Where `nwo`'s store is, where an earlier reeve kept it, to be moved into
- * place, and why it can't be used, if it can't (#310). Before #310 an owner and
- * name were made safe for the path, and names that made alike, `.github` and
- * `-github`, shared a store there:
- * - one there is `.github`'s only where every decision record it holds, and at
- *   least one, is of `.github`; one only of others is theirs, and the store
- *   under the name alone, from before stores were kept by owner, is looked for
- *   as before; one whose owner can't be told, holding none, both, or one that
- *   can't be read, is refused rather than taken for none;
- * - one at `-github`'s path, which is its own, is refused where a record it
- *   holds is another's, or can't be read.
+ * place, and why it can't be used, if it can't (#310). A name kept as it is has
+ * the path it had, and a store an earlier reeve kept for it is there, or under
+ * the name alone, from before stores were kept by owner, as before. A name
+ * coded has a path of its own, where no earlier reeve kept one: a store found
+ * where one did, at the path `safe` made, which names a path made alike
+ * shared, or under the name alone, may be another's, and whose it is can't be
+ * told from it, so it's named, never taken.
  * @param {string} home @param {string} nwo
  * @returns {{ path: string, earlier: string, refused: string | null }}
  */
 export function storeLookup(home, nwo) {
-  const path = statePathFor(home, nwo), shared = sharedStatePath(home, nwo);
-  const legacy = legacyStatePathFor(home, nwo);
-  const [, repo] = String(nwo).split("/");
-  if (existsSync(path)) {
-    if (!String(repo ?? "").startsWith("-")) return { path, earlier: legacy, refused: null };
-    const o = ownerOf(path, nwo);
-    if (o.is === "unread") return { path, earlier: legacy, refused: `the store at ${path} holds a decision record that can't be read, so whether it's ${nwo}'s or one whose name a path made alike to it can't be told` };
-    if (o.is !== "others") return { path, earlier: legacy, refused: null };
-    return { path, earlier: legacy, refused: o.mixed
-      ? `the store at ${path} holds the decision records of ${nwo} and of ${o.others.join(", ")}, which an earlier reeve kept in one store: neither can use it until it's split by hand`
-      : `the store at ${path} holds decision records of ${o.others.join(", ")}, not ${nwo}: an earlier reeve kept the stores of names a path made alike in one place. Run reeve once for ${o.others[0]} to move its store to its own path, then run this again` };
-  }
-  if (shared === path || !existsSync(shared)) return { path, earlier: legacy, refused: null };
-  const o = ownerOf(shared, nwo);
-  if (o.is === "mine") return { path, earlier: shared, refused: null };
-  if (o.is === "others" && !o.mixed) return { path, earlier: legacy, refused: null };
-  return { path, earlier: legacy, refused: `an earlier reeve kept a store at ${shared}, where names a path made alike shared one, and ${
-    o.is === "none" ? "it holds no decision record" : o.is === "unread" ? "a decision record it holds can't be read" : `it holds the decision records of ${nwo} and of ${o.others.join(", ")}`
-  }, so whether it's ${nwo}'s can't be told: move it to ${path} by hand if it is` };
-}
-
-/** Where an earlier reeve kept the store for `nwo`, for it to be moved into place, as `storeLookup` finds it. */
-export function earlierStorePath(home, nwo) {
-  return storeLookup(home, nwo).earlier;
+  const path = statePathFor(home, nwo), shared = sharedStatePath(home, nwo), legacy = legacyStatePathFor(home, nwo);
+  if (shared === path || existsSync(path)) return { path, earlier: legacy, refused: null };
+  const found = [shared, legacy].find(p => existsSync(p));
+  if (!found) return { path, earlier: legacy, refused: null };
+  return { path, earlier: legacy, refused: `an earlier reeve kept a store at ${found}, where it kept the stores of names a path made alike, ${nwo} among them, ` +
+    `so it may be ${nwo}'s or another's. If it's ${nwo}'s, move it, with any -wal and -shm beside it, to ${path} while no reeve runs, then run this again` };
 }
 
 /**
  * The store for `nwo`, moved into place from where an earlier reeve kept it,
- * as `adoptLegacyStore` moves it, and the path to use (#310). Throws, with
- * `code` STORE_REFUSED, where `storeLookup` refuses it. Moved from where names
- * were made alike only while no reeve runs on it there, STORE_BUSY otherwise:
- * one would go on writing it under its old name while another started on it
- * under its new one. A dashboard of this repository left at that path's is
- * taken away, whenever it's found there.
+ * as `adoptLegacyStore` moves it, and the path to use. Throws, with `code`
+ * STORE_REFUSED, where `storeLookup` refuses it.
  */
 export function adoptStore(home, nwo, opts = {}) {
   const found = storeLookup(home, nwo);
   if (found.refused) throw storeError("STORE_REFUSED", found.refused);
-  let used;
-  if (found.earlier !== sharedStatePath(home, nwo)) used = adoptLegacyStore(found.path, found.earlier, opts);
-  else {
-    const lock = storeLock(found.earlier);
-    if ("why" in lock) throw storeError(lock.busy ? "STORE_BUSY" : "STORE_REFUSED", lock.busy
-      ? `a reeve is running on ${found.earlier}, ${nwo}'s store before #310: stop it before the store moves to ${found.path}`
-      : `the lock on ${found.earlier} couldn't be taken, so ${nwo}'s store isn't moved from there: ${lock.why}`);
-    try { used = adoptLegacyStore(found.path, found.earlier, opts); } finally { lock.release(); }
-  }
-  retireSharedDash(home, nwo);
-  return used;
-}
-
-/**
- * Takes away this repository's dashboard left where names were made alike, at
- * a path that's another's now (#310): one whose title names it. Where it can't
- * be, it's tried again the next time.
- * @param {string} home @param {string} nwo
- */
-function retireSharedDash(home, nwo) {
-  const [owner, repo] = parts(nwo);
-  const shared = join(home, "dash", owner, `${repo}.html`);
-  if (shared === dashPathFor(home, nwo)) return;
-  try { if (readFileSync(shared, "utf8").includes(`<title>${nwo} — fleet</title>`)) rmSync(shared, { force: true }); }
-  catch { /* not there, or taken away the next time */ }
+  return adoptLegacyStore(found.path, found.earlier, opts);
 }
 
 /** Likewise for the dashboard, which sat directly in the reeve home. */

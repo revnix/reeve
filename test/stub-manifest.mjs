@@ -12481,8 +12481,8 @@ export const STUBS = [
     test: "test/published-order.test.mjs",
     expectRed: "no evidence is published where no order can be told",
     edits: [{ file: "src/daemon.mjs",
-              find: "    if (\"corrupt\" in order || order.top < ",
-              replace: "    if (order.top < " }],
+              find: "    if (\"corrupt\" in all) return null;\n",
+              replace: "" }],
   },
   {
     name: "evidence-order-not-cut-short",
@@ -12490,8 +12490,8 @@ export const STUBS = [
     test: "test/published-order.test.mjs",
     expectRed: "no evidence is published where no order can be told",
     edits: [{ file: "src/daemon.mjs",
-              find: "      if (\"corrupt\" in order || order.top < (a.latest.get(pr) ?? 0)) return null;",
-              replace: "      if (\"corrupt\" in order) return null;" }],
+              find: "      if (order.top < (a.latest.get(pr) ?? 0)) return null;\n",
+              replace: "" }],
   },
   {
     name: "published-only-policy-app",

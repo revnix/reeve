@@ -1804,15 +1804,19 @@ async function tickOnce(ctx) {
     /** @type {Set<number>} */ const prs = new Set(a.latest.keys());
     for (const { subject } of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ? AND subject GLOB 'pr:[1-9]*' AND substr(subject, 4) NOT GLOB '*[^0-9]*' AND length(subject) <= 18`).all(LATEST_OP)))
       prs.add(Number(String(subject).slice(3)));
-    /** @type {Map<number, { top: number, digest: string | null, entries: Map<number, string> }>} */ const orders = new Map();
-    for (const pr of prs) {
-      const order = signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), store);
-      if ("corrupt" in order || order.top < (a.latest.get(pr) ?? 0)) return null;
-      if (order.top) orders.set(pr, order);
-    }
+    // The commitment checks every order the store holds, and one that doesn't
+    // hold publishes nothing: an edited order would be published as the host's.
     const to = lastEntrySeq(db);
     const all = ordersCommitment(db, nwo, /** @type {any} */ (orderKeys), store, to);
-    return "corrupt" in all ? null : { orders, store: { to, orders: all.orders } };
+    if ("corrupt" in all) return null;
+    /** @type {Map<number, { top: number, digest: string | null, entries: Map<number, string> }>} */ const orders = new Map();
+    for (const pr of prs) {
+      // It holds, as the commitment checked it; one the anchor names and the store doesn't hold has none.
+      const order = /** @type {Exclude<ReturnType<typeof signedOrder>, { corrupt: string }>} */ (signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), store));
+      if (order.top < (a.latest.get(pr) ?? 0)) return null;
+      if (order.top) orders.set(pr, order);
+    }
+    return { orders, store: { to, orders: all.orders } };
   };
   const orderAt = (/** @type {number} */ pr) => {
     if (!ordering) return undefined;

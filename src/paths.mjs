@@ -35,6 +35,23 @@ export function statePathFor(home, nwo) {
   return join(home, "state", owner, `${repo}.db`);
 }
 
+/**
+ * A name, every character but a letter, a digit, `-` and `_` written as its
+ * percent code: one name for each, which no two share and none walks out of the
+ * folder, as `.github` and `-github` would share `safe`'s.
+ */
+const exact = s => encodeURIComponent(String(s)).replace(/[.!~*'()]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+
+/**
+ * Where a person's audits of one repository's shadow trial are kept (#294),
+ * under its owner's and its own names exactly: an audit of another repository
+ * found there makes this one's unreadable.
+ */
+export function auditDirFor(home, nwo) {
+  const [owner, repo] = String(nwo).split("/");
+  return join(home, "audits", exact(owner ?? ""), exact(repo ?? ""));
+}
+
 /** The dashboard for one repository. */
 export function dashPathFor(home, nwo) {
   const [owner, repo] = parts(nwo);

@@ -110,6 +110,7 @@ export function renderHtml({ nwo, state, health, generatedAt = new Date() }) {
 
 <h1>${esc(nwo ?? "reeve")}</h1>
 <div class="sub">generated ${esc(generatedAt.toISOString().replace("T", " ").slice(0, 19))} UTC · regenerated each tick · never edit this file</div>
+${(state.enforcement ?? []).map((x) => `<div class="sub">enforcement: <b>${esc(x.state)}</b>: ${esc(x.why)}</div>`).join("\n") || `<div class="sub">enforcement: not measured yet</div>`}
 
 <div class="hero">
   <div class="n ${heroTone}">${pct == null ? "—" : pct + "%"}</div>

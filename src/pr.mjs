@@ -1145,6 +1145,42 @@ const parsed = (r) => { try { return r?.ok ? JSON.parse(r.out || "{}") : undefin
 // protect reports itself protected, with its classic protection disabled.
 const classicProtection = (b) => (!b ? null : b.protected === false || b.protection?.enabled === false ? false : true);
 
+/**
+ * Whether results reeve publishes on `base` are enforced (#166), from what
+ * `requirementsOn` read of its rules: `enforced` where the base requires
+ * `context` from reeve's App, so nothing merges there that reeve hasn't
+ * passed; `advisory` where it doesn't, requires it of another App, or of any,
+ * whose result under the name could meet it; `unknown` where that can't be
+ * read. With why, for a person to read.
+ * @param {ReturnType<typeof requirementsOn> | null} req
+ * @param {{ base?: string | null, context?: string }} [o]
+ * @returns {{ state: "enforced" | "advisory" | "unknown", why: string }}
+ */
+export function enforcementOf(req, { base = null, context = POLICY_CONTEXT } = {}) {
+  const on = base ?? "the base";
+  const unread = { state: /** @type {const} */ ("unknown"), why: `whether ${on} requires ${context} from reeve's App can't be read` };
+  if (req == null || req.own == null) return unread;
+  if (req.own === false) return { state: "advisory", why: `${on} doesn't require ${context} from reeve's App, so what reeve publishes there blocks nothing` };
+  // Required, and bound to reeve's App only where no requirement takes any App's
+  // result under the name; a reading that isn't whole can't say.
+  if (!Array.isArray(req.others)) return unread;
+  if (req.others.some((o) => o.context === context && o.besideOwn))
+    return { state: "advisory", why: `${on} requires ${context} from any App, so another's result under that name could meet it` };
+  return { state: "enforced", why: `${on} requires ${context} from reeve's App` };
+}
+
+/**
+ * Whether results reeve publishes on `base` are enforced now (#166), read from
+ * the base's rules with reeve's App, as publishing reads them: `enforcementOf`.
+ * Unknown where the App can't be signed in to read them.
+ * @param {{ nwo: string, base: string, context?: string, auth?: typeof authenticate, api?: typeof apiAsInstallation }} o
+ */
+export async function enforcementNow({ nwo, base, context = POLICY_CONTEXT, auth: authenticateAs = authenticate, api = apiAsInstallation }) {
+  const auth = await authenticateAs(nwo);
+  if (!auth.ok) return { state: /** @type {const} */ ("unknown"), why: `reeve's App couldn't be signed in to read ${base}'s rules: ${auth.why}` };
+  return enforcementOf(requirementsOnBase({ nwo, base, context, gh: (args) => api(auth.token, args), appId: auth.appId ?? null }), { base, context });
+}
+
 /** Is `context` a required status check on a branch, from reeve's own App? requirementsOn's `own`. */
 export const requiredOn = (read, context, options) => requirementsOn(read, context, options).own;
 
@@ -1250,9 +1286,15 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = PO
   const name = shadow ? shadowContextOf(context) : context;
   const conclusion = shadow ? "neutral" : real;
   const title = `${shadow ? "[shadow] " : ""}${verdict.state}: ${verdict.summary}`;
+  // Whether the base enforces it, read from its rules, with the result (#166).
+  const req = base ? requirementsOnBase({ nwo, base, context, gh: (args) => api(auth.token, args), appId: auth.appId ?? null }) : null;
+  const enforcement = base ? enforcementOf(req, { base, context }) : null;
+  const enforced = !enforcement ? ""
+    : shadow ? `Enforcing, it would be **${enforcement.state}**: ${enforcement.why}.\n\n`
+    : `**${enforcement.state === "enforced" ? "Enforced" : enforcement.state === "advisory" ? "Advisory" : "Enforcement unknown"}.** ${enforcement.why}.\n\n`;
   const body = shadow
-    ? `**Shadow mode.** This check reports what the merge policy *would* have decided. It does not block, and it is published as \`${name}\`, so it can never stand in for \`${context}\`.\n\nIf enforcing, this revision would be: **${real}**\n\n${renderVerdict(verdict)}`
-    : renderVerdict(verdict);
+    ? `**Shadow mode.** This check reports what the merge policy *would* have decided. It does not block, and it is published as \`${name}\`, so it can never stand in for \`${context}\`.\n\nIf enforcing, this revision would be: **${real}**\n\n${enforced}${renderVerdict(verdict)}`
+    : `${enforced}${renderVerdict(verdict)}`;
 
   // Update the run already at this head rather than adding another. One head on
   // nextly had accumulated 38 of these in an afternoon: the API's default
@@ -1322,12 +1364,11 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = PO
   // Enforcing, a failed write is the whole story. In shadow mode it isn't: a
   // rule requiring the enforcement name still needs saying, or one failed write
   // would leave it unseen.
-  if (!res.ok && !shadow) return { ok: false, why: res.err.split("\n")[0], behind };
+  if (!res.ok && !shadow) return { ok: false, why: res.err.split("\n")[0], behind, enforcement };
   const unwritten = res.ok ? null : `couldn't publish as ${name} (${res.err.split("\n")[0]})`;
 
   let held = null;
   if (shadow) {
-    const req = base ? requirementsOnBase({ nwo, base, context, gh: (args) => api(auth.token, args), appId: auth.appId ?? null }) : null;
     const required = req?.own ?? null;
     // Bound to reeve's App, only reeve's run can pass the requirement. With no
     // App bound, or the binding unread, anyone's result under the name can.
@@ -1353,8 +1394,8 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = PO
   const id = res.ok ? JSON.parse(res.out).id : null;
   if (unwritten || left)
     return { ok: false, why: [unwritten, left && (res.ok ? `published as ${name}, but ${left}` : left)].filter(Boolean).join("; "),
-             id, conclusion, name, wouldBe: real, shadow, updated: Boolean(existing), superseded, held, behind };
-  return { ok: true, id, conclusion, name, wouldBe: real, shadow, updated: Boolean(existing), superseded, held, behind };
+             id, conclusion, name, wouldBe: real, shadow, updated: Boolean(existing), superseded, held, behind, enforcement };
+  return { ok: true, id, conclusion, name, wouldBe: real, shadow, updated: Boolean(existing), superseded, held, behind, enforcement };
 }
 
 /**

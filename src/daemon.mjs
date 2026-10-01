@@ -33,7 +33,7 @@ import { claimProvider, releaseProvider, bindProviderLease, noteRateLimit, heart
 import { openHold } from "./build/holds.mjs";
 import { hubSession, NO_HUB } from "./build/hubsession.mjs";
 import { resolveRepoId } from "./build/repoid.mjs";
-import { readState, noteTick, noteTickStart, noteTickStopped, cleanMergeRate } from "./status.mjs";
+import { readState, noteTick, noteTickStart, noteTickStopped, cleanMergeRate, noteEnforcement } from "./status.mjs";
 import { buildAlert, notify, printable } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects, reap, canonical, durably } from "./db/ops.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
@@ -3184,6 +3184,17 @@ async function tickOnce(ctx) {
     if (pub.held) {
       log(logPath, `    shadow: ${pub.held}`);
       raise(`shadow mode: ${pub.held}`);
+    }
+    // Whether the base enforces what's published (#166): noted when it changes,
+    // for status and the dashboard to say, and, enforcing, raised while it
+    // isn't, as a result that blocks nothing is no gate.
+    if (pub.enforcement && e.baseRef) {
+      try { noteEnforcement(db, e.baseRef, pub.enforcement); }
+      catch (err) { log(logPath, `    could not note ${e.baseRef}'s enforcement: ${err.message}`); }
+      if (!shadow && pub.enforcement.state !== "enforced") {
+        log(logPath, `    enforcing, but ${pub.enforcement.why}`);
+        raise(`enforcing, but ${pub.enforcement.why}`);
+      }
     }
     // The store is behind what the merge policy already published of it (#274):
     // rolled back, or restored from before, perhaps onto a host without its

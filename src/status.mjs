@@ -168,6 +168,26 @@ function daemonLiveness(db, now, window) {
         why: `the daemon has not ticked for ${Math.floor(age / 60)} minute(s) — everything below is history, not status` };
 }
 
+/** The op the daemon writes a base's enforcement under (#166), when it changes. */
+export const ENFORCEMENT_OP = "policy.enforcement";
+
+/**
+ * Notes `base`'s enforcement (#166) in the store, where it isn't what was
+ * noted last for it, for status and the dashboard to read without asking
+ * GitHub. Whether it was written.
+ * @param {any} db @param {string} base @param {{ state: string, why: string }} enforcement
+ */
+export function noteEnforcement(db, base, enforcement) {
+  const subject = `base:${base}`;
+  const last = /** @type {any} */ (db.prepare(`SELECT payload FROM event WHERE op = ? AND subject = ? ORDER BY seq DESC LIMIT 1`).get(ENFORCEMENT_OP, subject));
+  let was = null;
+  try { was = last ? JSON.parse(last.payload) : null; } catch { /* written again below */ }
+  if (was?.state === enforcement.state && was?.why === enforcement.why) return false;
+  db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(unixepoch(),?,?,?,?)`)
+    .run("daemon", ENFORCEMENT_OP, subject, JSON.stringify({ base, state: enforcement.state, why: enforcement.why }));
+  return true;
+}
+
 export function readState(db, { limit = 12, freshWindow = 900, now = Math.floor(Date.now() / 1000) } = {}) {
   const prs = new Map();
   try {
@@ -208,7 +228,15 @@ export function readState(db, { limit = 12, freshWindow = 900, now = Math.floor(
     pending = db.prepare(`SELECT id, title FROM node WHERE kind='decision' AND status='open'`).all();
   } catch { /* same */ }
 
-  return { prs: [...prs.values()], runs, pending, daemon: daemonLiveness(db, now, freshWindow) };
+  // Each base's enforcement as last noted (#166).
+  /** @type {{ base: string, state: string, why: string, at: number }[]} */ let enforcement = [];
+  try {
+    enforcement = /** @type {any[]} */ (db.prepare(`SELECT e.at, e.payload FROM event e WHERE e.op = ?
+        AND e.seq = (SELECT MAX(seq) FROM event WHERE op = e.op AND subject = e.subject) ORDER BY e.subject`).all(ENFORCEMENT_OP))
+      .flatMap((r) => { try { const p = JSON.parse(r.payload); return [{ base: String(p.base), state: String(p.state), why: String(p.why), at: Number(r.at) }]; } catch { return []; } });
+  } catch { /* same */ }
+
+  return { prs: [...prs.values()], runs, pending, enforcement, daemon: daemonLiveness(db, now, freshWindow) };
 }
 
 /** The escalations band: what genuinely needs a person. */
@@ -271,6 +299,9 @@ export function render({ nwo, state, health, width = 78 }) {
     L.push(`│  clean-merge  not measurable${health?.clean?.why ? ` (${health.clean.why})` : ""}`);
   }
   if (health?.base) L.push(`│  base         ${health.base}`);
+  // Whether GitHub holds a merge to reeve's result, as last measured (#166).
+  if (!state.enforcement?.length) L.push("│  enforcement  not measured yet: the daemon measures it as it publishes");
+  for (const x of state.enforcement ?? []) L.push(`│  enforcement  ${x.state}: ${x.why}`);
   if (health?.reviewers?.length) {
     // Four states, never two. A rate-limited reviewer reports success, and an
     // uninstalled one reports nothing; both look like "found no problems".

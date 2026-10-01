@@ -3,12 +3,13 @@
 // of no false call read from what was recorded.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, fsyncSync, linkSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { open } from "../src/db/ops.mjs";
 import * as trial from "../src/trial.mjs";
+import { auditDirFor } from "../src/paths.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 import { offlineEnv } from "./fixtures/offline-github.mjs";
 
@@ -171,28 +172,37 @@ test("an audit is kept with who made it and when, and read back as it was kept",
   const path = trial.recordAudit(dir, first);
   trial.recordAudit(dir, second);
   assert.ok(existsSync(path), path);
-  assert.equal(readdirSync(dir).filter((f) => f.endsWith(".json")).length, 2, "each kept, the earlier one too");
+  assert.deepEqual(readdirSync(dir).sort(), ["000001.json", "000002.json"], "each kept, the earlier one too, numbered as recorded");
   const read = trial.readAudits(dir, R);
   assert.ok(read.ok, JSON.stringify(read));
-  assert.deepEqual(read.audits.map((a) => [a.by, a.at]).sort(), [["A. Person", T0 + 2 * HOUR], ["Another", T0 + 3 * HOUR]]);
-  assert.deepEqual(read.audits.find((a) => a.by === "A. Person"), first);
+  assert.deepEqual(read.audits.map((a) => [a.by, a.at, a.seq]), [["A. Person", T0 + 2 * HOUR, 1], ["Another", T0 + 3 * HOUR, 2]]);
+  const { seq: _seq, ...back } = /** @type {any} */ (read.audits[0]);
+  assert.deepEqual(back, first);
 });
 
 test("an audit kept that doesn't read whole, or is another repository's, is a fault, not an audit", () => {
   const r = report([]);
-  const bad = (/** @type {string} */ text) => {
+  const bad = (/** @type {string} */ text, name = "000099.json") => {
     const dir = join(tempDir("reeve-audits-"), "audits");
     trial.recordAudit(dir, audit(r, () => true));
-    writeFileSync(join(dir, "z.json"), text);
+    writeFileSync(join(dir, name), text);
     return trial.readAudits(dir, R);
   };
-  assert.match(JSON.stringify(bad("{not json")), /z\.json can't be read/);
+  assert.match(JSON.stringify(bad("{not json")), /000099\.json can't be read/);
   const whole = audit(r, () => true);
-  assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, by: "" }))), /z\.json doesn't read whole/, "no one named");
-  assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, at: "today" }))), /z\.json doesn't read whole/, "no time");
-  assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, calls: [{ ...whole.calls[0], mark: "maybe" }] }))), /z\.json doesn't read whole/, "a mark that isn't one");
-  assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, repo: "x/y" }))), /z\.json is of x\/y, not o\/r/);
+  assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, by: "" }))), /000099\.json doesn't read whole/, "no one named");
+  assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, at: "today" }))), /000099\.json doesn't read whole/, "no time");
+  assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, calls: [{ ...whole.calls[0], mark: "maybe" }] }))), /000099\.json doesn't read whole/, "a mark that isn't one");
+  assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, repo: "x/y" }))), /000099\.json is of x\/y, not o\/r/);
+  // The same call marked twice, right then false: which counts can't be told.
+  const twice = { ...whole, calls: [whole.calls[0], { ...whole.calls[0], mark: "false block" }] };
+  assert.match(JSON.stringify(bad(JSON.stringify(twice))), new RegExp(`000099\\.json marks call ${whole.calls[0].id} twice`));
+  assert.match(JSON.stringify(bad(JSON.stringify(whole), "z.json")), /z\.json, among the audits recorded, isn't one reeve recorded/, "a file reeve didn't number");
   assert.equal(bad(JSON.stringify(whole)).ok, true, "control: a whole one of this repository reads");
+  // Where the folder can't be listed, a file in its place say.
+  const notDir = join(tempDir("reeve-audits-"), "audits");
+  writeFileSync(notDir, "");
+  assert.match(JSON.stringify(trial.readAudits(notDir, R)), /the audits recorded in .* can't be listed: ENOTDIR/);
 });
 
 // ── the sheet ────────────────────────────────────────────────────────────────
@@ -310,6 +320,9 @@ test("reeve trial writes the audit sheet, records the one a person filled in und
   // Every call marked right.
   const ids = sheet.replace(/^\uFEFF/, "").split("\r\n").slice(1).filter(Boolean).map((x) => x.split(",")[0]);
   writeFileSync(sheetPath, fill(sheet, Object.fromEntries(ids.map((id) => [id, ["yes"]]))));
+  const named = run("trial", R, "--db", s.path, "--since", since, "--by", "The Founder");
+  assert.equal(named.status, 2, named.stderr);
+  assert.match(named.stderr, /without --audited nothing is recorded/, "a name with no sheet isn't taken for an audit");
   const nobody = run("trial", R, "--db", s.path, "--since", since, "--audited", sheetPath);
   assert.equal(nobody.status, 2, nobody.stderr);
   assert.match(nobody.stderr, /pass --by with their name/);
@@ -319,6 +332,16 @@ test("reeve trial writes the audit sheet, records the one a person filled in und
   assert.match(recorded.stdout, /met +no false call on audit: all 2 call\(s\) audited right, by The Founder/);
   const kept = readdirSync(join(home, "audits", "o", "r")).filter((f) => f.endsWith(".json"));
   assert.equal(kept.length, 1, `kept under the reeve home: ${kept}`);
+  // Recorded again, and the sheet named is the one being recorded: refused before anything is recorded.
+  const same = run("trial", R, "--db", s.path, "--since", since, "--audited", sheetPath, "--by", "The Founder", "--audit-sheet", sheetPath);
+  assert.equal(same.status, 2, same.stderr);
+  assert.match(same.stderr, /won't write over .*calls\.csv/);
+  assert.equal(readdirSync(join(home, "audits", "o", "r")).filter((f) => f.endsWith(".json")).length, 1, "and nothing more recorded");
+  // A new sheet beside it carries the marks just recorded.
+  const next = join(dir, "next.csv");
+  const both = run("trial", R, "--db", s.path, "--since", since, "--audited", sheetPath, "--by", "The Founder", "--audit-sheet", next);
+  assert.match(both.stderr, /audit recorded in .*000002\.json/);
+  assert.match(readFileSync(next, "utf8"), /,yes,/);
   const later = run("trial", R, "--db", s.path, "--since", since, "--json");
   assert.equal(JSON.parse(later.stdout).conditions.find((/** @type {any} */ c) => /no false call/.test(c.name)).met, true, "read back in each report");
   const unknown = run("trial", R, "--db", s.path, "--since", since, "--audited", join(dir, "absent.csv"), "--by", "The Founder");
@@ -328,4 +351,84 @@ test("reeve trial writes the audit sheet, records the one a person filled in und
     const elsewhere = run("replay", R, flag, "x");
     assert.equal(elsewhere.status, 2, `only the trial takes ${flag}: ${elsewhere.stderr}`);
   }
+});
+
+test("of two audits recorded in one second, the one recorded after counts, whatever order they're read in", () => {
+  const dir = join(tempDir("reeve-audits-"), "audits");
+  const r = report([]);
+  trial.recordAudit(dir, audit(r, () => true));
+  trial.recordAudit(dir, audit(r, (c) => c.pr !== 6));
+  const read = /** @type {any} */ (trial.readAudits(dir, R));
+  assert.deepEqual(read.audits.map((/** @type {any} */ a) => [a.at, a.seq]), [[T0 + 2 * HOUR, 1], [T0 + 2 * HOUR, 2]], "control: one second, recorded in turn");
+  assert.equal(noFalseCall(report([...read.audits].reverse())).met, false, "the later, marking #6 wrong, counts");
+  assert.equal(noFalseCall(report(read.audits)).met, false);
+});
+
+test("an audit is recorded under the next number, after another that took its number first", () => {
+  const dir = join(tempDir("reeve-audits-"), "audits");
+  const a = audit(report([]), () => true);
+  let raced = false;
+  let path;
+  try {
+    path = trial.recordAudit(dir, a, { link: (from, to) => {
+      if (!raced) { raced = true; writeFileSync(to, JSON.stringify(a)); }
+      return linkSync(from, to);
+    } });
+  } catch (err) { path = String(/** @type {any} */ (err).code); }
+  assert.ok(raced, "control: another took the first number");
+  assert.match(String(path), /000002\.json$/);
+  assert.deepEqual(JSON.parse(readFileSync(String(path), "utf8")), a);
+});
+
+test("an audit is synced before it's said to be recorded, its file before it's linked into place, and its folders after", () => {
+  const dir = join(tempDir("reeve-audits-"), "o", "audits");
+  /** @type {string[]} */ const done = [];
+  trial.recordAudit(dir, audit(report([]), () => true), {
+    fsync: (fd) => { done.push("file"); fsyncSync(fd); },
+    link: (from, to) => { done.push("link"); linkSync(from, to); },
+    syncDir: (d) => done.push(`folder ${d}`) });
+  assert.deepEqual(done, ["file", "link", `folder ${dir}`, `folder ${dirname(dir)}`, `folder ${dirname(dirname(dir))}`]);
+});
+
+test("an audit whose recording fails leaves no file of its own behind", () => {
+  const dir = join(tempDir("reeve-audits-"), "audits");
+  const failing = () => { throw Object.assign(new Error("EIO: i/o error"), { code: "EIO" }); };
+  assert.throws(() => trial.recordAudit(dir, audit(report([]), () => true), { link: failing }), /EIO/);
+  assert.deepEqual(readdirSync(dir), [], "nothing left behind");
+});
+
+test("audits of repositories whose names a path would make alike are kept apart, and none outside the audits", () => {
+  const home = "/h";
+  assert.notEqual(auditDirFor(home, "o/.github"), auditDirFor(home, "o/-github"));
+  assert.notEqual(auditDirFor(home, "o/a.b"), auditDirFor(home, "o/a-b"));
+  assert.equal(auditDirFor(home, "nextlyhq/nextly"), "/h/audits/nextlyhq/nextly", "an ordinary name is kept as it is");
+  assert.ok(auditDirFor(home, "o/..").startsWith("/h/audits/o/"), auditDirFor(home, "o/.."));
+  assert.notEqual(auditDirFor(home, "o/.."), "/h/audits/o/..");
+});
+
+test("an audit that can't be recorded is refused, and the sheet made for it is taken away", () => {
+  const start = Math.floor(Date.now() / 1000) - 3 * HOUR;
+  const since = new Date(start * 1000).toISOString();
+  const s = store();
+  ticking(s, start, 2);
+  s.decided(start + 5 * MIN, 7, sha("a"), "PASS");
+  s.record(R, 7, sha("a"));
+  s.db.close();
+  const { home, run } = reeveWith();
+  const dir = tempDir("reeve-audit-sheet-");
+  const sheetPath = join(dir, "calls.csv");
+  assert.equal(run("trial", R, "--db", s.path, "--since", since, "--audit-sheet", sheetPath).status, 1, "control: the sheet is written");
+  const sheet = readFileSync(sheetPath, "utf8");
+  const ids = sheet.replace(/^\uFEFF/, "").split("\r\n").slice(1).filter(Boolean).map((x) => x.split(",")[0]);
+  writeFileSync(sheetPath, fill(sheet, Object.fromEntries(ids.map((id) => [id, ["yes"]]))));
+  // Its folder can't be made: a file stands where it would be.
+  mkdirSync(join(home, "audits", "o"), { recursive: true });
+  writeFileSync(join(home, "audits", "o", "r"), "");
+  const next = join(dir, "next.csv");
+  const r = run("trial", R, "--db", s.path, "--since", since, "--audited", sheetPath, "--by", "The Founder", "--audit-sheet", next);
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /the audit couldn't be recorded in .*audits\/o\/r/);
+  assert.equal(existsSync(next), false, "no sheet for an audit that wasn't recorded");
+  const typed = run("trial", R, "--db", s.path, "--since", since, "--audited", sheetPath, "--by", "The Founder", "--json");
+  assert.equal(JSON.parse(typed.stdout).kind, "audit_unrecorded");
 });

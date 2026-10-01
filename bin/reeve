@@ -962,6 +962,9 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     // Refused in the typed form, so --json gets a document even then.
     if (!nwo) fail("usage", "reeve trial: no repo. Pass owner/repo.", { exit: EXITS.misuse });
     const auditedPath = opt("audited"), sheetPath = opt("audit-sheet");
+    // A name with no sheet to record would look like an audit made, and none is.
+    if (opt("by") != null && auditedPath == null)
+      fail("usage", "reeve trial: --by names who made the audit --audited records, and without --audited nothing is recorded", { exit: EXITS.misuse });
     const dbPath = opt("db") ?? stateFor(nwo);
     if (!existsSync(dbPath)) fail("store_absent", `reeve trial: ${missingStoreMessage(dbPath, { initCreatesIt: !opt("db"), nwo })}`);
     const since = opt("since");
@@ -996,21 +999,33 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       return trialReport(db, { repo: nwo, since: sinceAt, now, merged, seeded, audits: kept.ok ? kept.audits : { why: kept.why } });
     };
     let report = reportOf();
-    if (marks) {
-      // Taken of the calls as this report lists them, and only those.
-      const made = auditOf(report.toAudit, marks, { repo: nwo, by: opt("by"), at: now });
-      if (!made.ok) fail("usage", `reeve trial: ${auditedPath}: ${made.why}`, { exit: EXITS.misuse });
-      const path = recordAudit(auditDir, made.audit);
+    // Taken of the calls as this report lists them, and only those.
+    const made = marks ? auditOf(report.toAudit, marks, { repo: nwo, by: opt("by"), at: now }) : null;
+    if (made && !made.ok) fail("usage", `reeve trial: ${auditedPath}: ${made.why}`, { exit: EXITS.misuse });
+    // The sheet's file is made before an audit is recorded, so one that can't
+    // be records nothing. Never over a file already there: it may be a sheet a
+    // person is marking, or the one being recorded.
+    let sheetFd = null;
+    if (sheetPath != null) {
+      try { sheetFd = openSync(sheetPath, "wx"); }
+      catch (e) {
+        fail("usage", e.code === "EEXIST" ? `reeve trial: won't write over ${sheetPath}: name a new file for the sheet, or record the one marked with --audited`
+          : `reeve trial: the sheet couldn't be written to ${sheetPath}: ${e.code ?? e.message}`, { exit: EXITS.misuse });
+      }
+    }
+    if (made?.ok) {
+      let path;
+      try { path = recordAudit(auditDir, made.audit); }
+      catch (e) {
+        // Nothing recorded, so no sheet either.
+        if (sheetFd !== null) { closeSync(sheetFd); rmSync(sheetPath, { force: true }); }
+        fail("audit_unrecorded", `reeve trial: the audit couldn't be recorded in ${auditDir}: ${e.code ?? e.message}`);
+      }
       console.error(`audit recorded in ${path}: ${made.audit.calls.length} call(s) marked by ${made.audit.by}`);
       report = reportOf();
     }
-    if (sheetPath != null) {
-      // Never over a sheet already there: it may be one a person is marking.
-      try { writeFileSync(sheetPath, auditSheet(report.toAudit, nwo), { flag: "wx" }); }
-      catch (e) {
-        fail("usage", e.code === "EEXIST" ? `reeve trial: won't write over ${sheetPath}: name a new file for the sheet, or record the one marked with --audited`
-          : `reeve trial: the sheet couldn't be written to ${sheetPath}: ${e.code ?? e.message}`);
-      }
+    if (sheetFd !== null) {
+      try { writeFileSync(sheetFd, auditSheet(report.toAudit, nwo)); } finally { closeSync(sheetFd); }
       console.error(`audit sheet written to ${sheetPath}: ${report.toAudit.length} call(s), ${report.toAudit.filter((c) => c.audited).length} marked already`);
     }
     console.log(flag("json") ? JSON.stringify(report, null, 2) : renderTrial(report, nwo));

@@ -12,9 +12,10 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { netTimeoutMs, netFailure } from "./net-bound.mjs";
+import { syncFolder } from "./signing.mjs";
 import { TICK_STARTED, TICK_STOPPED } from "./status.mjs";
 
 /** A gap between ticks longer than this is downtime, as #158 says. */
@@ -40,7 +41,7 @@ export const CASE_KINDS = Object.freeze([
  * @typedef {{ mark: Mark, by: string, at: number, note: string }} Audited
  * @typedef {{ id: string, where: "head" | "queue", pr: number, head: string, state: string, summary: string, why: string,
  *             first: number, last: number, ticks: number, record: string | null, final: boolean, audited: Audited | null }} Call
- * @typedef {{ repo: string, by: string, at: number,
+ * @typedef {{ repo: string, by: string, at: number, seq?: number,
  *             calls: { id: string, where: string, pr: number, head: string, state: string, summary: string, record: string | null, mark: Mark, note: string }[] }} Audit
  * @typedef {{ name: string, met: boolean | null, detail: string }} Condition
  */
@@ -193,8 +194,9 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
   }
   const toAudit = [...calls.values()].sort((a, b) => a.pr - b.pr || a.first - b.first);
   // Each call's mark, as a person's latest audit of it gave it: an audit made
-  // later counts over one before, so a mark corrected stands corrected.
-  if (Array.isArray(audits)) for (const a of [...audits].sort((x, y) => x.at - y.at))
+  // later counts over one before, so a mark corrected stands corrected. Of two
+  // made in one second, the one recorded after.
+  if (Array.isArray(audits)) for (const a of [...audits].sort((x, y) => x.at - y.at || (x.seq ?? 0) - (y.seq ?? 0)))
     for (const m of a.calls) { const c = calls.get(m.id); if (c) c.audited = { mark: m.mark, by: a.by, at: a.at, note: m.note }; }
   const falseCalls = toAudit.filter((c) => c.audited && c.audited.mark !== "right");
   const notYet = toAudit.filter((c) => !c.audited);
@@ -406,38 +408,64 @@ export function auditOf(calls, marks, { repo, by, at }) {
 }
 
 /**
- * Keeps `audit` in `dir`, a file of its own beside the audits before it, none
- * written over, and written whole or not at all. Returns where.
+ * Keeps `audit` in `dir` as the next of the audits there, numbered in the
+ * order they were recorded, so of two made in one second the one recorded
+ * after counts. Written whole to a file of its own and synced, then linked into
+ * place, which fails where another took that number first, and the next is
+ * tried; its own file is gone afterwards, whatever failed. The folder is synced
+ * once it's linked, so an audit said to be recorded outlasts a power loss.
+ * Returns where it was kept.
  * @param {string} dir @param {Audit} audit
+ * @param {{ link?: typeof linkSync, fsync?: typeof fsyncSync, syncDir?: (dir: string) => void }} [io]
  */
-export function recordAudit(dir, audit) {
+export function recordAudit(dir, audit, { link = linkSync, fsync = fsyncSync, syncDir = syncFolder } = {}) {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const name = `${new Date(audit.at * 1000).toISOString().replace(/[-:.]/g, "")}-${randomBytes(4).toString("hex")}`;
-  const path = join(dir, `${name}.json`), part = join(dir, `.${name}.part`);
-  writeFileSync(part, JSON.stringify(audit, null, 2) + "\n", { flag: "wx", mode: 0o600 });
-  renameSync(part, path);
-  return path;
+  const temp = join(dir, `.${process.pid}.${randomBytes(4).toString("hex")}.part`);
+  try {
+    const fd = openSync(temp, "wx", 0o600);
+    try { writeFileSync(fd, JSON.stringify(audit, null, 2) + "\n"); fsync(fd); } finally { closeSync(fd); }
+    for (let n = 1 + Math.max(0, ...readdirSync(dir).map((f) => Number(/^(\d+)\.json$/.exec(f)?.[1] ?? 0))); ; n++) {
+      const path = join(dir, `${String(n).padStart(6, "0")}.json`);
+      try { link(temp, path); }
+      catch (err) { if (/** @type {NodeJS.ErrnoException} */ (err).code === "EEXIST") continue; throw err; }
+      // Its folder holds its name, and the two above hold theirs, made here perhaps.
+      for (const f of [dir, dirname(dir), dirname(dirname(dir))]) syncDir(f);
+      return path;
+    }
+  } finally { try { unlinkSync(temp); } catch { /* gone */ } }
+}
+
+/** Whether `a` reads whole as an audit kept. @param {any} a */
+function auditWhole(a) {
+  const marks = ["right", "false pass", "false block"];
+  return typeof a?.repo === "string" && typeof a.by === "string" && a.by.trim() !== "" && Number.isFinite(a.at) && Array.isArray(a.calls)
+    && a.calls.every((/** @type {any} */ c) => typeof c?.id === "string" && marks.includes(c.mark) && typeof c.note === "string");
 }
 
 /**
- * Every audit kept in `dir` for `repo`, or why they can't be read: one that
- * doesn't read whole, or is another repository's, vouches for nothing, and
- * may have marked a call false.
+ * Every audit kept in `dir` for `repo`, in the order recorded, or why they
+ * can't be read: a folder that can't be listed, a file that isn't one reeve
+ * recorded, one that doesn't read whole or marks a call twice, or one of
+ * another repository, vouches for nothing, and may have marked a call false.
  * @param {string} dir @param {string} repo
  * @returns {{ ok: true, audits: Audit[] } | { ok: false, why: string }}
  */
 export function readAudits(dir, repo) {
   if (!existsSync(dir)) return { ok: true, audits: [] };
+  let names;
+  try { names = readdirSync(dir); }
+  catch (err) { return { ok: false, why: `the audits recorded in ${dir} can't be listed: ${/** @type {NodeJS.ErrnoException} */ (err).code ?? /** @type {Error} */ (err).message}` }; }
   /** @type {Audit[]} */ const audits = [];
-  for (const f of readdirSync(dir).filter((x) => x.endsWith(".json")).sort()) {
+  for (const f of names.filter((x) => x.endsWith(".json")).sort()) {
+    const seq = Number(/^(\d+)\.json$/.exec(f)?.[1]);
+    if (!Number.isSafeInteger(seq) || seq < 1) return { ok: false, why: `${f}, among the audits recorded, isn't one reeve recorded` };
     let a;
     try { a = JSON.parse(readFileSync(join(dir, f), "utf8")); } catch { return { ok: false, why: `the audit recorded in ${f} can't be read` }; }
-    const marks = ["right", "false pass", "false block"];
-    if (typeof a?.repo !== "string" || typeof a.by !== "string" || !a.by.trim() || !Number.isFinite(a.at) || !Array.isArray(a.calls)
-        || a.calls.some((/** @type {any} */ c) => typeof c?.id !== "string" || !marks.includes(c.mark) || typeof c.note !== "string"))
-      return { ok: false, why: `the audit recorded in ${f} doesn't read whole` };
+    if (!auditWhole(a)) return { ok: false, why: `the audit recorded in ${f} doesn't read whole` };
+    const twice = a.calls.find((/** @type {any} */ c, /** @type {number} */ i) => a.calls.findIndex((/** @type {any} */ d) => d.id === c.id) !== i);
+    if (twice) return { ok: false, why: `the audit recorded in ${f} marks call ${twice.id} twice` };
     if (a.repo !== repo) return { ok: false, why: `the audit recorded in ${f} is of ${a.repo}, not ${repo}` };
-    audits.push(a);
+    audits.push({ ...a, seq });
   }
   return { ok: true, audits };
 }

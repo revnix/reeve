@@ -17,6 +17,7 @@ import { storeIdentity } from "../src/db/records.mjs";
 // Read off the module, so a test of a name it doesn't export fails, rather than every test.
 const { explainDecision, replayDecisions, publishedChecked } = decisions;
 import { evidenceText, readEvidence, readPublished } from "../src/published.mjs";
+import * as pr from "../src/pr.mjs";
 import { publishVerdict } from "../src/pr.mjs";
 import { computeVerdict } from "../src/verdict.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
@@ -964,4 +965,49 @@ test("a published commitment a copy's orders can't be committed to is a fault, t
   db.close();
   assert.ok(checked.results > 0, "control: #42's results were checked");
   assert.match(checked.faults.map((f) => f.why).join("\n"), /this copy's signed orders to its event \d+ can't be committed to, so what the merge policy published with #\d+'s result at [0-9a-f]{8} can't be checked: #7: /);
+});
+
+// ── #309: a withdrawal keeps the evidence ────────────────────────────────────
+
+/** A GitHub whose run 5 at A, the merge policy's, carries `evidence`; `listed` false where the runs can't be listed, `read` false where run 5 can't be read either. */
+const withdrawing = (/** @type {any} */ evidence, { listed = true, read = true } = {}) => {
+  /** @type {string[][]} */ const calls = [];
+  const summary = `BLOCK: ci\n${evidenceText(evidence)}`;
+  const api = (/** @type {string} */ _t, /** @type {string[]} */ args) => {
+    calls.push(args);
+    if (args.some((a) => /check-runs\?/.test(a)))
+      return listed ? { ok: true, out: JSON.stringify({ name: "merge-policy (shadow)", id: 5, conclusion: "neutral", app: "merge-policy", summary }) } : { ok: false, out: "", err: "HTTP 502" };
+    if (!args.includes("PATCH") && args.some((a) => /check-runs\/5$/.test(a))) return read ? { ok: true, out: summary } : { ok: false, out: "", err: "HTTP 502" };
+    return { ok: true, out: JSON.stringify({ id: 5 }) };
+  };
+  const written = () => String((calls.find((a) => a.includes("PATCH")) ?? []).find((x) => typeof x === "string" && x.startsWith("output[summary]=")) ?? "").slice("output[summary]=".length);
+  return { api, calls, written, summary };
+};
+const withdrawAt = (/** @type {any} */ gh, id = 5) => /** @type {any} */ (pr).withdrawVerdict({ nwo: REPO, head: A, name: "merge-policy (shadow)", id, why: "the merge policy stopped", auth: async () => ({ ok: true, token: "t" }), api: gh.api });
+
+test("a withdrawn result keeps the evidence it carried, and a copy is still held to it", async () => {
+  const evidence = ev(X, { n: 2, names: X }, st(9));
+  const gh = withdrawing(evidence);
+  const r = await withdrawAt(gh);
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.match(gh.written(), /^The merge policy withdrew its result here: the merge policy stopped/);
+  assert.deepEqual(readEvidence(gh.written()), evidence, "the evidence kept, whole");
+  // Read back as a copy's check reads what was published there.
+  const read = readPublished(REPO, PR, [A], { gh: githubAt(B, { [A]: [{ name: "merge-policy (shadow)", app: "merge-policy", summary: gh.written() }] }) });
+  assert.ok("evidence" in read && read.evidence.some((e) => e.record === X && e.head === A), JSON.stringify(read));
+});
+
+test("a withdrawal where the runs can't be listed keeps the evidence of the run on record, read for itself", async () => {
+  const evidence = ev(X, { n: 2, names: X }, st(9));
+  const gh = withdrawing(evidence, { listed: false });
+  const r = await withdrawAt(gh);
+  assert.equal(r.ok, false, "control: not done, as a later run there may still pass");
+  assert.deepEqual(readEvidence(gh.written()), evidence);
+});
+
+test("a withdrawal is made though the evidence of the run on record can't be read, as taking a PASS back comes first", async () => {
+  const gh = withdrawing(ev(X, { n: 2, names: X }, st(9)), { listed: false, read: false });
+  await withdrawAt(gh);
+  assert.ok(gh.calls.some((a) => a.includes("PATCH") && a.includes(`repos/${REPO}/check-runs/5`)), JSON.stringify(gh.calls));
+  assert.equal(readEvidence(gh.written()), null, "withdrawn without it");
 });

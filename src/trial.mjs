@@ -122,7 +122,9 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
   // No tick at all is no running, however short the time; one under way as
   // the report starts is a tick.
   if (!ended.length && !started.length && !marks[0].start) running = 0;
-  const wasDown = (/** @type {number} */ t) => down.some((d) => t > d.from && t < d.to);
+  // From the second a stretch begins (#306): a merge then wasn't judged. One in
+  // the second it ends is the next tick's to judge.
+  const wasDown = (/** @type {number} */ t) => down.some((d) => t >= d.from && t < d.to);
 
   const decided = events(db, "pr.decided", since, now);
   const queued = events(db, "queue.decided", since, now);

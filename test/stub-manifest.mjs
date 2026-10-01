@@ -15077,4 +15077,13 @@ export const STUBS = [
               find: "  \"audit-sheet\": Object.freeze([\"trial\"]),\n",
               replace: "" }],
   },
+  {
+    name: "trial-down-from-its-first-second",
+    why: "take a merge in the second downtime begins as made while the daemon ran. A PASS standing at its head would count it as covered",
+    test: "test/trial-running.test.mjs",
+    expectRed: "a merge in the first second of downtime was made while the daemon was down, and one in the second it ends is the next tick's",
+    edits: [{ file: "src/trial.mjs",
+              find: "down.some((d) => t >= d.from && t < d.to)",
+              replace: "down.some((d) => t > d.from && t < d.to)" }],
+  },
 ];

@@ -1650,8 +1650,9 @@ async function tickOnce(ctx) {
       if (!keys) return;
       try {
         const a = ctx.anchor.read(nwo) ?? noAnchor();
-        const id = storeIdentity(db);
-        if (!id || a.store !== id) return;
+        let id = storeIdentity(db);
+        // Another store's anchor holds nothing of this one's.
+        if (a.store && a.store !== id) return;
         const { baseline } = signingState(db, /** @type {any} */ (keys));
         const whole = holdsWhole(db);
         /** @type {Map<number, Set<string>>} */ const named = new Map();
@@ -1666,9 +1667,20 @@ async function tickOnce(ctx) {
           if (baseline?.has(d) || a.pinned.get(pr)?.has(d) || namedBy(pr).has(d) || !whole(d)) continue;
           unnamed.set(pr, [...(unnamed.get(pr) ?? []), d]);
         }
-        for (const [pr, ds] of unnamed)
-          if (!ctx.anchor.pin(nwo, id, pr, ds)) { log(logPath, `signing: #${pr}: records kept before records were pinned couldn't be pinned on the host's anchor; it's tried again next tick`); return; }
         const n = [...unnamed.values()].reduce((x, ds) => x + ds.length, 0);
+        // An anchor bound to no store yet, as a baseline over no record leaves
+        // it until the store's first order, is bound by the first record kept
+        // (#281): one kept before #299 wasn't, so it binds it here, as keeping
+        // one does.
+        if (n && !a.store) {
+          const bound = bindStore(a);
+          if (bound === null) { log(logPath, "signing: the host's anchor couldn't be bound to this store, so records kept before records were pinned aren't pinned yet; it's tried again next tick"); return; }
+          if (!bound) return;
+          id = storeIdentity(db);
+          if (!id || a.store !== id) return;
+        }
+        for (const [pr, ds] of unnamed)
+          if (!ctx.anchor.pin(nwo, /** @type {string} */ (id), pr, ds)) { log(logPath, `signing: #${pr}: records kept before records were pinned couldn't be pinned on the host's anchor; it's tried again next tick`); return; }
         if (n) log(logPath, `signing: pinned ${n} record(s) this store holds that no signed order or baseline names, kept before records were pinned`);
         ctx.unnamedPinned = true;
       } catch (err) { log(logPath, `signing: records kept before records were pinned couldn't be pinned on the host's anchor — ${err.message}; it's tried again next tick`); }
@@ -2694,6 +2706,9 @@ async function tickOnce(ctx) {
   }
 
 
+  // Before any record is kept, and whether or not the pull requests can be
+  // listed: records a reeve before #299 kept are pinned first (#304).
+  pinUnnamed();
   const prs = (ctx.openPrs ?? openPrs)(nwo, profile.watch?.maxOpenPrs ?? 20);
   if (prs === null) {
     // Could not ask is not none. Returning an empty list here would look exactly
@@ -2752,7 +2767,6 @@ async function tickOnce(ctx) {
         : prAnchor);
 
   const waiting = new Set();
-  pinUnnamed();
   for (const pr of prs) {
     if (halted(ctx.haltMarker)) {
       await takeBackAll("the merge policy is halted");

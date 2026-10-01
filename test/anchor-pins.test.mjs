@@ -1167,3 +1167,43 @@ test("a record a signed order or the store's baseline names, or one that doesn't
   await tick(kept.dbPath, null, host(kept.dir, { ...fileAnchor(kept.dir), reserve: () => false }));
   assert.equal(anchorRead(kept.dir)?.pinned?.get(PR)?.has(kept.red) ?? false, false, "a record changed in place isn't pinned");
 });
+
+test("a record kept before #299 is pinned though the tick can't list the pull requests", async () => {
+  const { dir, dbPath, red } = await keptUnpinned();
+  const r = await tick(dbPath, null, { ...host(dir, { ...fileAnchor(dir), reserve: () => false }), openPrs: () => null });
+  assert.match(r.log, /could not list PRs/, "control: the tick couldn't list them");
+  assert.ok(anchorRead(dir)?.pinned?.get(PR)?.has(red), "pinned all the same");
+});
+
+test("a record kept before #299 on a store whose anchor is bound to none yet binds it, and is pinned before a pull request is judged", async () => {
+  const dir = credentials();
+  const dbPath = store();
+  // A baseline over no record leaves the anchor bound to no store until the first order.
+  await tick(dbPath, null, host(dir));
+  assert.equal(anchorRead(dir)?.store ?? null, null, "control: bound to none");
+  // A reeve before #299 keeps the store's first record: it neither binds the anchor nor pins it, and orders nothing.
+  const real = fileAnchor(dir);
+  let id = null;
+  const before = { ...real, reserve: () => false, pin: () => true, pending: () => true,
+                   read: (/** @type {string} */ repo) => { const a = real.read(repo); return a && id ? { ...a, store: id } : a; },
+                   bind: (/** @type {string} */ _repo, /** @type {string} */ store) => { id = store; return true; } };
+  await tick(dbPath, at(A), host(dir, before));
+  let db = open(dbPath);
+  const [kept] = digestsOf(db);
+  const store_ = storeIdentity(db);
+  db.close();
+  assert.ok(kept, "control: a record was kept");
+  assert.equal(anchorRead(dir)?.store ?? null, null, "control: and the anchor still bound to none");
+  assert.equal(anchorRead(dir)?.pending ?? null, null, "control: nor its binding begun");
+  // Before the next tick judges a pull request, which could stop it before its end binds the anchor.
+  /** @type {boolean | null} */ let atJudging = null;
+  await tick(dbPath, at(A, "RED"), { ...host(dir, { ...fileAnchor(dir), reserve: () => false }),
+    evaluate: () => { atJudging ??= Boolean(anchorRead(dir)?.store && anchorRead(dir)?.pinned?.get(PR)?.has(kept)); return at(A, "RED"); } });
+  db = open(dbPath);
+  const identity = storeIdentity(db);
+  db.close();
+  assert.ok(identity && identity === (store_ ?? identity), "control: the store has its identity");
+  assert.equal(atJudging, true, "bound and pinned before a pull request was judged");
+  assert.equal(anchorRead(dir)?.store, identity, "bound to the store");
+  assert.ok(anchorRead(dir)?.pinned?.get(PR)?.has(kept), "and the record pinned");
+});

@@ -1469,6 +1469,10 @@ async function tickOnce(ctx) {
     try { return fn(true); } finally { lock.release(); }
   };
   /** @type {Map<string, any> | null | undefined} */ let orderKeys;
+  // The keys orders are checked with, read once a tick, wherever they're first
+  // asked for, and by every step of the tick from one read: a key changed since
+  // the last tick, this host's own replaced say, is read the next.
+  const keysNow = () => (orderKeys === undefined ? (orderKeys = ctx.keys?.() ?? null) : orderKeys);
   // The host's anchor bound to this store (#281), where it's no store's yet: in
   // the step that makes or finds its baseline, under the host's lock, and only
   // to a store that holds one, of this repository only, every order in it
@@ -1501,7 +1505,7 @@ async function tickOnce(ctx) {
     // be no store's for good.
     if (!had && db.prepare(`SELECT 1 FROM event WHERE op = ? LIMIT 1`).get(STORE_ID_OP)) return not("this store holds an identity that can't be read");
     const id = had ?? a.pending?.store ?? randomBytes(16).toString("hex");
-    if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
+    keysNow();
     if (orderKeys) for (const r of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ?`).all(LATEST_OP))) {
       const pr = Number(String(r.subject).slice(3));
       const order = signedOrder(db, nwo, pr, /** @type {any} */ (orderKeys), id);
@@ -1629,6 +1633,57 @@ async function tickOnce(ctx) {
         if (id && ctx.anchor.read(nwo)?.store === id && !ctx.anchor.unpin(nwo, id, pr, [digest]))
           log(logPath, `signing: #${pr}: a record whose commit failed couldn't be unpinned from the host's anchor`);
       } catch (err) { log(logPath, `signing: #${pr}: a record whose commit failed couldn't be unpinned from the host's anchor — ${err.message}`); }
+    });
+  };
+  // A record a reeve before #299 kept wasn't pinned, and one it stopped before
+  // ordering would show nowhere, taken away while no reeve ran: a record the
+  // store holds already counts as pinned or ordered, and isn't pinned again
+  // (#304). So, before any record is kept, each the store holds whole that no
+  // signed order or the store's baseline names, and the host's anchor doesn't
+  // pin, is pinned, where the anchor is this store's: looked for every tick, as
+  // one may be kept between them by a reeve before #299 on the store. Ordered
+  // at a tick's end, it's unpinned.
+  const pinUnnamed = () => {
+    if (!ordering || !begun.began) return;
+    withOrderLock((held) => {
+      if (!held) return;
+      const keys = keysNow();
+      if (!keys) return;
+      try {
+        const a = ctx.anchor.read(nwo) ?? noAnchor();
+        let id = storeIdentity(db);
+        // Another store's anchor holds nothing of this one's.
+        if (a.store && a.store !== id) return;
+        const { baseline } = signingState(db, /** @type {any} */ (keys));
+        const whole = holdsWhole(db);
+        /** @type {Map<number, Set<string>>} */ const named = new Map();
+        const namedBy = (/** @type {number} */ pr) => {
+          let n = named.get(pr);
+          if (!n) { const o = signedOrder(db, nwo, pr, /** @type {any} */ (keys), id); named.set(pr, (n = "digests" in o ? o.digests : new Set())); }
+          return n;
+        };
+        /** @type {Map<number, string[]>} */ const unnamed = new Map();
+        for (const r of /** @type {any[]} */ (db.prepare(`SELECT pr, digest FROM decision WHERE ${FILED}`).all())) {
+          const pr = Number(r.pr), d = String(r.digest);
+          if (baseline?.has(d) || a.pinned.get(pr)?.has(d) || namedBy(pr).has(d) || !whole(d)) continue;
+          unnamed.set(pr, [...(unnamed.get(pr) ?? []), d]);
+        }
+        const n = [...unnamed.values()].reduce((x, ds) => x + ds.length, 0);
+        // An anchor bound to no store yet, as a baseline over no record leaves
+        // it until the store's first order, is bound by the first record kept
+        // (#281): one kept before #299 wasn't, so it binds it here, as keeping
+        // one does.
+        if (n && !a.store) {
+          const bound = bindStore(a);
+          if (bound === null) { log(logPath, "signing: the host's anchor couldn't be bound to this store, so records kept before records were pinned aren't pinned yet; it's tried again next tick"); return; }
+          if (!bound) return;
+          id = storeIdentity(db);
+          if (!id || a.store !== id) return;
+        }
+        for (const [pr, ds] of unnamed)
+          if (!ctx.anchor.pin(nwo, /** @type {string} */ (id), pr, ds)) { log(logPath, `signing: #${pr}: records kept before records were pinned couldn't be pinned on the host's anchor; it's tried again next tick`); return; }
+        if (n) log(logPath, `signing: pinned ${n} record(s) this store holds that no signed order or baseline names, kept before records were pinned`);
+      } catch (err) { log(logPath, `signing: records kept before records were pinned couldn't be pinned on the host's anchor — ${err.message}; it's tried again next tick`); }
     });
   };
   /**
@@ -1833,7 +1888,7 @@ async function tickOnce(ctx) {
   };
   const orderAt = (/** @type {number} */ pr) => {
     if (!ordering) return undefined;
-    if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
+    keysNow();
     if (!orderKeys) return undefined;
     if (asPublished === undefined) asPublished = ordersAsPublished();
     if (!asPublished) return undefined;
@@ -1967,7 +2022,7 @@ async function tickOnce(ctx) {
     if (!ordering || !begun.began) return;
     withOrderLock((held) => {
       if (!held) return;
-      if (orderKeys === undefined) orderKeys = ctx.keys?.() ?? null;
+      keysNow();
       if (!orderKeys) return;
       (ctx.durably ?? durably)(db, () => {
         let id = null, a = null;
@@ -2657,6 +2712,10 @@ async function tickOnce(ctx) {
   // operator who believes nothing at all is moving will misread the hub. It also
   // withdraws every PASS it has standing, and each withdrawal logs a line of its
   // own before this one.
+  // Before any record is kept, halted or not, and whether or not the pull
+  // requests can be listed: records a reeve before #299 kept are pinned first
+  // (#304), as a halted reeve still finishes what it owes.
+  pinUnnamed();
   if (halted(ctx.haltMarker)) {
     await takeBackAll("the merge policy is halted");
     // Said now, as on the mid-tick HALT: a halted tick returns before the

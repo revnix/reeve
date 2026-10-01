@@ -722,13 +722,15 @@ test("a sheet taken away because its audit couldn't be recorded has its folder s
       { syncDir: (dir) => { done.push(`folder ${dir === d} ${existsSync(at)}`); } });
   } catch (err) { done.push(`threw ${/** @type {any} */ (err).stage}`); }
   assert.deepEqual(done, ["folder true true", "folder true false", "threw record"]);
-  // Its folder's sync failing then is no reason to hide why the audit wasn't recorded.
+  // Its folder's sync failing then is said with why the audit wasn't recorded, and hides nothing of it.
   /** @type {any} */ let got;
   try {
     trial.sheetThenRecord(join(d, "b.csv"), "x", () => { throw Object.assign(new Error("EIO: i/o error"), { code: "EIO" }); },
       { syncDir: () => { if (!existsSync(join(d, "b.csv"))) throw Object.assign(new Error("EROFS"), { code: "EROFS" }); } });
   } catch (err) { got = err; }
   assert.equal(got?.code, "EIO", String(got));
+  assert.equal(got?.stage, "record");
+  assert.match(String(got?.unsynced), new RegExp(`${d.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}: EROFS`));
   assert.equal(existsSync(join(d, "b.csv")), false);
 });
 
@@ -901,4 +903,50 @@ test("reeve trial notes each audit it records in the host's credentials folder, 
     const unnoted = run("trial", R, "--db", s.path, "--since", since, "--audited", sheetPath, "--by", "The Founder");
     assert.match(unnoted.stderr, /audit recorded in .*000001\.json: 1 call\(s\) marked by The Founder, but the host couldn't note it \(.*EACCES\), so its loss couldn't be told/);
   } finally { chmodSync(notesIn(home), 0o700); }
+});
+
+// ── #317's first review ──────────────────────────────────────────────────────
+
+test("an audit found without its note, as one whose recording stopped before it was noted, is noted when the next is recorded", () => {
+  const home = tempDir("reeve-audits-");
+  const dir = auditDirFor(home, R), notes = notesIn(home);
+  const r = report([]);
+  trial.recordAudit(dir, audit(r, () => true), { notes });
+  // The second recorded, its note never made: the recording stopped in between.
+  trial.recordAudit(dir, audit(r, (c) => (c.pr === 6 ? false : undefined)));
+  assert.deepEqual(notesAt(notes), ["000001.sha256"], "control: the second isn't noted");
+  trial.recordAudit(dir, audit(r, (c) => (c.pr === 5 ? true : undefined)), { notes });
+  assert.deepEqual(notesAt(notes), ["000001.sha256", "000002.sha256", "000003.sha256"]);
+  // Its loss can be told now.
+  rmSync(join(dir, "000002.json"));
+  assert.match(JSON.stringify(trial.readAudits(dir, R, { notes })), /000002\.json is missing|000002\.json, noted on the host as recorded, is missing/);
+  // One the host couldn't note then is said as unnoted.
+  const other = tempDir("reeve-audits-");
+  const [d2, n2] = [auditDirFor(other, R), notesIn(other)];
+  trial.recordAudit(d2, audit(r, () => true));
+  /** @type {any} */ let got;
+  try {
+    got = trial.recordAudit(d2, audit(r, () => true), { notes: n2, link: (from, to) => {
+      if (to.endsWith("000001.sha256")) throw Object.assign(new Error("EIO: i/o error"), { code: "EIO" });
+      return linkSync(from, to);
+    } });
+  } catch (err) { got = { threw: /** @type {any} */ (err).code }; }
+  assert.match(String(got.path), /000002\.json$/, JSON.stringify(got));
+  assert.match(String(got.unnoted), /EIO/);
+});
+
+test("a mark of a judgment after the report's period holds for it, so an audit recorded since doesn't unsettle a period already audited", () => {
+  const s = store();
+  ticking(s, T0, 2);
+  s.decided(T0 + MIN, 5, sha("b"), "PASS", { record: "3".repeat(64) });
+  s.decided(T0 + 2 * MIN, 6, sha("c"), "PASS", { record: "1".repeat(64) });
+  const period = () => trial.trialReport(s.db, { repo: R, since: T0, now: T0 + HOUR, merged: [] });
+  const first = audit(period(), () => true);
+  // After the period, #6 judged again, and an audit of a later period marks it right to there.
+  s.decided(T0 + HOUR + 10 * MIN, 6, sha("c"), "PASS", { record: "1".repeat(64) });
+  const later = audit(trial.trialReport(s.db, { repo: R, since: T0, now: T0 + 2 * HOUR, merged: [] }), (c) => (c.pr === 6 ? true : undefined));
+  const after = trial.trialReport(s.db, { repo: R, since: T0, now: T0 + HOUR, merged: [], audits: [{ ...first, seq: 1 }, { ...later, seq: 2 }] });
+  s.db.close();
+  assert.ok(/** @type {number} */ (later.calls[0]?.to) > callOf(after, 6, "c").seq, "control: the later mark covers a judgment after the period");
+  assert.equal(noFalseCall(after).met, true, noFalseCall(after).detail);
 });

@@ -1,5 +1,5 @@
 // A person's audits of the shadow trial kept with the store's backups (#311): each
-// snapshot of a repository's store takes a copy of its audits beside it, and a
+// snapshot of a repository's store carries its audits in its own file, and a
 // restore puts back those the audits folder is missing, as they were recorded.
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -7,10 +7,11 @@ import { chmodSync, existsSync, fsyncSync, mkdirSync, readdirSync, readFileSync,
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import { open } from "../src/db/ops.mjs";
 import * as backup from "../src/backup.mjs";
 import * as trial from "../src/trial.mjs";
-import { auditDirFor, statePathFor } from "../src/paths.mjs";
+import { auditDirFor, auditNotesFor, statePathFor } from "../src/paths.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 import { offlineEnv } from "./fixtures/offline-github.mjs";
 
@@ -35,142 +36,201 @@ function homeWith(n = 2) {
     const made = /** @type {any} */ (trial.auditOf(r.toAudit, new Map(r.toAudit.map((c) => [c.id, { right: i % 2 === 0, note: "" }])),
                                                    { repo: R, by: "A. Person", at: T0 + i, judgment: r.judgment }));
     assert.ok(made.ok, JSON.stringify(made));
-    trial.recordAudit(dir, made.audit);
+    trial.recordAudit(dir, made.audit, { notes: auditNotesFor(home, R) });
   }
-  return { home, db, dir, root: join(home, "backups") };
+  return { home, db, dir, notes: auditNotesFor(home, R), root: join(home, "backups") };
 }
 /** The audits in `dir`, by name, as their bytes read. */
 const audits = (/** @type {string} */ dir) =>
   Object.fromEntries((existsSync(dir) ? readdirSync(dir) : []).filter((f) => f.endsWith(".json")).sort().map((f) => [f, readFileSync(join(dir, f), "utf8")]));
-/** The copy of the audits beside the snapshot at `path`. */
-const copyOf = (/** @type {string} */ path) => path.replace(/\.db$/, ".audits.json");
+/** The audits the snapshot at `path` carries, by name, as their text reads; null where it carries none. */
+function carried(/** @type {string} */ path) {
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'trial_audit'").get()) return null;
+    return Object.fromEntries(db.prepare("SELECT name, text FROM trial_audit ORDER BY name").all().map((r) => [r.name, r.text]));
+  } finally { db.close(); }
+}
+/** A snapshot of `home`'s store of `R` at `at`, carrying its audits. */
+const snap = (/** @type {any} */ h, at = 1000, keep = 5) => backup.snapshot(h.db, h.root, R, at, { keep, audits: { dir: h.dir, notes: h.notes } });
 
-test("a snapshot of a repository's store takes a copy of its audits beside it, as recorded, and pruning takes the copy with its store", () => {
-  const { db, dir, root } = homeWith(2);
-  const was = audits(dir);
+test("a snapshot of a repository's store carries its audits in its own file, as recorded", () => {
+  const h = homeWith(2);
+  const was = audits(h.dir);
   assert.deepEqual(Object.keys(was), ["000001.json", "000002.json"], "control: two recorded");
-  const first = backup.snapshot(db, root, R, 1000, { keep: 2, audits: dir });
+  const first = snap(h);
+  h.db.close();
   assert.ok(first.ok, JSON.stringify(first));
-  assert.ok(existsSync(copyOf(String(first.path))), "a copy beside it");
-  assert.deepEqual(JSON.parse(readFileSync(copyOf(String(first.path)), "utf8")),
-                   { repo: R, audits: Object.entries(was).map(([name, text]) => ({ name, text })) });
-  // A copy another process published this second, its store's snapshot not yet beside it, is that one's.
-  writeFileSync(join(dirname(String(first.path)), "1001.audits.json"), "theirs");
-  // A copy left by a snapshot that stopped before its store was published, older than any kept,
-  // and one a process that's gone was writing.
-  writeFileSync(join(dirname(String(first.path)), "999.audits.json"), "{}");
-  writeFileSync(join(dirname(String(first.path)), ".999.999999.audits.tmp"), "{}");
-  const second = backup.snapshot(db, root, R, 1001, { keep: 2, audits: dir });
-  assert.equal(second.auditsWhy, null, JSON.stringify(second));
-  assert.equal(readFileSync(copyOf(String(second.path)), "utf8"), "theirs");
-  backup.snapshot(db, root, R, 1002, { keep: 2, audits: dir });
-  db.close();
-  assert.deepEqual(readdirSync(dirname(String(first.path))).sort(), ["1001.audits.json", "1001.db", "1002.audits.json", "1002.db"]);
+  assert.deepEqual(carried(String(first.path)), was, "each as its file reads, in the snapshot itself");
+  assert.deepEqual(readdirSync(dirname(String(first.path))), ["1000.db"], "and nothing beside it");
+  assert.equal(backup.validateSnapshot(String(first.path), { kind: "repo", deep: true }).ok, true, "a store that restores");
 });
 
-test("every store's snapshot takes its repository's audits, and one whose audits can't be read is a backup that failed, its store's snapshot kept", () => {
+test("a snapshot whose audits a report wouldn't read isn't taken, so it never pushes out one that holds them", () => {
+  const h = homeWith(2);
+  const kept = snap(h, 1000, 1);
+  assert.ok(kept.ok, JSON.stringify(kept));
+  const whole = readFileSync(join(h.dir, "000002.json"));
+  // One that doesn't read whole.
+  writeFileSync(join(h.dir, "000002.json"), "{not json");
+  const broken = snap(h, 1001, 1);
+  assert.equal(broken.ok, false, JSON.stringify(broken));
+  assert.match(String(broken.why), /its audits couldn't be put in it whole, so it wasn't taken: the audit recorded in 000002\.json can't be read/);
+  // The newest lost, as only the host's notes tell.
+  rmSync(join(h.dir, "000002.json"));
+  const lost = snap(h, 1002, 1);
+  assert.equal(lost.ok, false, JSON.stringify(lost));
+  assert.match(String(lost.why), /000002\.json, noted on the host as recorded, is missing/);
+  assert.deepEqual(readdirSync(dirname(String(kept.path))), ["1000.db"], "the one that holds them is kept, though only one is");
+  assert.deepEqual(Object.keys(carried(String(kept.path)) ?? {}), ["000001.json", "000002.json"]);
+  writeFileSync(join(h.dir, "000002.json"), whole);
+  assert.ok(snap(h, 1003, 1).ok, "control: put back, a snapshot is taken");
+  h.db.close();
+});
+
+test("every store's snapshot carries its repository's audits, and one whose audits can't be read is a backup that failed, escalated, older ones kept", () => {
   const { home, db, dir, root } = homeWith(1);
   db.close();
   const all = backup.snapshotAll(home, root, { at: 2000 });
   const ours = all.find((r) => r.nwo === R);
   assert.ok(ours?.ok, JSON.stringify(all));
-  assert.deepEqual(JSON.parse(readFileSync(copyOf(String(ours?.path)), "utf8")).audits.map((/** @type {any} */ a) => a.name), ["000001.json"]);
+  assert.deepEqual(Object.keys(carried(String(ours?.path)) ?? {}), ["000001.json"]);
   // The audits folder can't be read: a file stands where it would be.
   rmSync(dir, { recursive: true });
   writeFileSync(dir, "");
   const next = backup.snapshotAll(home, root, { at: 2001 }).find((r) => r.nwo === R);
   assert.equal(next?.ok, false, JSON.stringify(next));
   assert.equal(next?.escalate, "builder:backup:failed");
-  assert.match(String(next?.why), /the store's snapshot was taken, but its audits couldn't be copied beside it: .*ENOTDIR/);
-  assert.ok(existsSync(join(root, "o-r", "2001.db")), "the store's snapshot is kept");
-  assert.equal(existsSync(join(root, "o-r", "2001.audits.json")), false);
+  assert.match(String(next?.why), /its audits couldn't be put in it whole, so it wasn't taken: .*ENOTDIR/);
+  assert.deepEqual(readdirSync(join(root, "o-r")), ["2000.db"], "nothing taken, and the one before kept");
 });
 
 test("a restore puts back the audits a snapshot holds, as recorded, leaves those recorded since, and refuses where one there isn't the snapshot's", () => {
-  const { db, dir, root } = homeWith(2);
-  const snap = String(backup.snapshot(db, root, R, 1000, { keep: 5, audits: dir }).path);
-  db.close();
+  const h = homeWith(2);
+  const path = String(snap(h).path);
+  h.db.close();
+  const { dir } = h;
   const was = audits(dir);
   rmSync(dir, { recursive: true });
-  const put = backup.restoreAudits(snap, dir, R);
+  const put = backup.restoreAudits(path, dir, R);
   assert.deepEqual(put, { ok: true, put: 2 });
   assert.deepEqual(audits(dir), was, "byte for byte as recorded");
-  assert.deepEqual(trial.readAudits(dir, R), { ok: true, audits: Object.values(was).map((t, i) => ({ ...JSON.parse(t), seq: i + 1 })) });
-  assert.deepEqual(backup.restoreAudits(snap, dir, R), { ok: true, put: 0 }, "those there already are left");
+  assert.equal(trial.readAudits(dir, R, { notes: h.notes }).ok, true, "and as the host noted them");
+  assert.deepEqual(backup.restoreAudits(path, dir, R), { ok: true, put: 0 }, "those there already are left");
   // One recorded since the snapshot is left as it is.
   writeFileSync(join(dir, "000003.json"), was["000001.json"]);
   rmSync(join(dir, "000002.json"));
-  assert.deepEqual(backup.restoreAudits(snap, dir, R), { ok: true, put: 1 });
+  assert.deepEqual(backup.restoreAudits(path, dir, R), { ok: true, put: 1 });
   assert.deepEqual(Object.keys(audits(dir)), ["000001.json", "000002.json", "000003.json"]);
   // One there that isn't the snapshot's: refused, and nothing put back.
   rmSync(join(dir, "000002.json"));
   writeFileSync(join(dir, "000001.json"), was["000002.json"]);
-  const refused = backup.restoreAudits(snap, dir, R);
+  const refused = backup.restoreAudits(path, dir, R);
   assert.equal(refused.ok, false, JSON.stringify(refused));
   assert.match(String(/** @type {any} */ (refused).why), /000001\.json in .* isn't the audit the snapshot holds under that number/);
   assert.equal(existsSync(join(dir, "000002.json")), false, "nothing put back");
   // The folder can't be read: a file stands where it would be.
   rmSync(dir, { recursive: true });
   writeFileSync(dir, "");
-  assert.match(JSON.stringify(backup.restoreAudits(snap, dir, R)), /000001\.json in .* can't be read: ENOTDIR/);
+  assert.match(JSON.stringify(backup.restoreAudits(path, dir, R)), /000001\.json in .* can't be read: ENOTDIR/);
   // Nor written.
   rmSync(dir);
   mkdirSync(dir, { mode: 0o500 });
   /** @type {any} */ let got;
-  try { got = backup.restoreAudits(snap, dir, R); } catch (err) { got = { threw: String(err) }; } finally { chmodSync(dir, 0o700); }
+  try { got = backup.restoreAudits(path, dir, R); } catch (err) { got = { threw: String(err) }; } finally { chmodSync(dir, 0o700); }
   assert.match(JSON.stringify(got), /the audits couldn't be put back in .*: EACCES/);
 });
 
-test("audits put back are synced, each file before it's linked into place, and their folders after, to the one that held the first made", () => {
-  const { home, db, dir, root } = homeWith(2);
-  const snap = String(backup.snapshot(db, root, R, 1000, { keep: 5, audits: dir }).path);
-  db.close();
+test("a restore from a snapshot that wouldn't restore puts back none of the audits it carries", () => {
+  const h = homeWith(2);
+  const path = String(snap(h).path);
+  h.db.close();
+  // Its store broken, the audits it carries still there to read.
+  const t = new DatabaseSync(path);
+  t.exec("DROP TABLE event");
+  t.close();
+  assert.equal(backup.validateSnapshot(path, { kind: "repo" }).ok, false, "control: it wouldn't restore");
+  rmSync(h.dir, { recursive: true });
+  /** @type {any} */ let got;
+  try { got = backup.restoreAudits(path, h.dir, R); } catch (err) { got = { threw: String(err) }; }
+  assert.equal(got.ok, false, JSON.stringify(got));
+  assert.match(String(got.why), /the snapshot is not a usable store/);
+  assert.equal(existsSync(h.dir), false, "nothing put back");
+});
+
+test("a store restored from a snapshot doesn't keep the audits it carried", () => {
+  const h = homeWith(1);
+  const path = String(snap(h).path);
+  h.db.close();
+  const to = join(tempDir("reeve-audit-restore-"), "r.db");
+  const r = backup.restore(path, to, { isDaemonRunning: () => null });
+  assert.ok(r.ok, JSON.stringify(r));
+  assert.ok(carried(path), "control: the snapshot carries them");
+  assert.equal(carried(to), null, "the store doesn't");
+});
+
+test("audits put back are synced, each file before it's linked into place, and their folders after, those there already too", () => {
+  const h = homeWith(2);
+  const path = String(snap(h).path);
+  h.db.close();
+  const { home, dir } = h;
   rmSync(join(home, "audits"), { recursive: true });
-  /** @type {string[]} */ const done = [];
-  const copy = JSON.parse(readFileSync(copyOf(snap), "utf8"));
-  const put = trial.putBackAudits(copy, snap, dir, R, {
-    fsync: (fd) => { done.push(`file ${readdirSync(dir).filter((f) => f.endsWith(".json")).length}`); fsyncSync(fd); },
-    syncDir: (d) => { done.push(`folder ${d.slice(home.length)}`); } });
-  assert.deepEqual(put, { ok: true, put: 2 });
+  /** @type {string[]} */ let done = [];
+  const copy = { repo: R, audits: Object.entries(carried(path) ?? {}).map(([name, text]) => ({ name, text })) };
+  const io = {
+    fsync: (/** @type {number} */ fd) => { done.push(`file ${readdirSync(dir).filter((f) => f.endsWith(".json")).length}`); fsyncSync(fd); },
+    syncDir: (/** @type {string} */ d) => { done.push(`folder ${d.slice(home.length)}`); } };
+  assert.deepEqual(trial.putBackAudits(copy, path, dir, R, io), { ok: true, put: 2 });
   assert.deepEqual(done, ["file 0", "file 1", "folder /audits/o/r", "folder /audits/o", "folder /audits", "folder "]);
+  // Put back again, nothing missing: its folder is synced again, as a sync that failed before leaves it unsure.
+  done = [];
+  assert.deepEqual(trial.putBackAudits(copy, path, dir, R, io), { ok: true, put: 0 });
+  assert.deepEqual(done, ["folder /audits/o/r"]);
   // A folder that can't be synced: they're put back, and it says so.
   rmSync(dir, { recursive: true });
   /** @type {any} */ let unsynced;
-  try { unsynced = trial.putBackAudits(copy, snap, dir, R, { syncDir: () => { throw Object.assign(new Error("EIO: i/o error"), { code: "EIO" }); } }); }
+  try { unsynced = trial.putBackAudits(copy, path, dir, R, { syncDir: () => { throw Object.assign(new Error("EIO: i/o error"), { code: "EIO" }); } }); }
   catch (err) { unsynced = { threw: String(err) }; }
-  assert.equal(/** @type {any} */ (unsynced).put, 2);
-  assert.match(String(/** @type {any} */ (unsynced).unsynced), /EIO/);
+  assert.equal(unsynced.put, 2);
+  assert.match(String(unsynced.unsynced), /EIO/);
 });
 
 test("a snapshot taken before audits were kept with snapshots restores none, and leaves the audits as they are", () => {
-  const { db, dir, root } = homeWith(1);
-  const snap = String(backup.snapshot(db, root, R, 1000, { keep: 5 }).path);
-  db.close();
-  assert.equal(existsSync(copyOf(snap)), false, "control: no copy beside it");
-  const was = audits(dir);
-  assert.deepEqual(backup.restoreAudits(snap, dir, R), { ok: true, put: 0, none: true });
-  assert.deepEqual(audits(dir), was);
+  const h = homeWith(1);
+  const path = String(backup.snapshot(h.db, h.root, R, 1000, { keep: 5 }).path);
+  h.db.close();
+  assert.equal(carried(path), null, "control: it carries none");
+  const was = audits(h.dir);
+  /** @type {any} */ let got;
+  try { got = backup.restoreAudits(path, h.dir, R); } catch (err) { got = { threw: String(err) }; }
+  assert.deepEqual(got, { ok: true, put: 0, none: true });
+  assert.deepEqual(audits(h.dir), was);
+  // And its store restores as it did.
+  const to = join(tempDir("reeve-audit-restore-"), "r.db");
+  assert.deepEqual(backup.restore(path, to, { isDaemonRunning: () => null }), { ok: true, why: null });
 });
 
-test("a snapshot's copy of the audits that can't be read, is another repository's, or misses one, puts none of them back", () => {
-  const { db, dir, root } = homeWith(2);
-  const snap = String(backup.snapshot(db, root, R, 1000, { keep: 5, audits: dir }).path);
-  db.close();
-  const copy = JSON.parse(readFileSync(copyOf(snap), "utf8"));
-  rmSync(dir, { recursive: true });
-  const bad = (/** @type {string} */ text) => {
-    writeFileSync(copyOf(snap), text);
-    try { return backup.restoreAudits(snap, dir, R); } catch (err) { return { threw: String(err) }; }
-  };
-  assert.match(JSON.stringify(bad("{not json")), /the copy of the audits beside .* can't be read/);
-  assert.match(JSON.stringify(bad("[]")), /the copy of the audits beside .* can't be read/, "JSON, but not a copy");
-  assert.match(JSON.stringify(bad(JSON.stringify({ ...copy, repo: "x/y" }))), /the copy of the audits beside .* is of x\/y, not o\/r/);
-  assert.match(JSON.stringify(bad(JSON.stringify({ ...copy, audits: [copy.audits[1]] }))), /000001\.json is missing from the copy of the audits beside/);
-  assert.equal(existsSync(dir), false, "nothing put back");
-  assert.deepEqual(bad(JSON.stringify(copy)), { ok: true, put: 2 }, "control: the copy as it was taken puts them back");
+test("a copy of the audits that isn't one, is another repository's, or misses one, puts none of them back", () => {
+  const h = homeWith(2);
+  const path = String(snap(h).path);
+  h.db.close();
+  const copy = { repo: R, audits: Object.entries(carried(path) ?? {}).map(([name, text]) => ({ name, text })) };
+  rmSync(h.dir, { recursive: true });
+  const put = (/** @type {unknown} */ c) => { try { return trial.putBackAudits(c, path, h.dir, R); } catch (err) { return { threw: String(err) }; } };
+  assert.match(JSON.stringify(put([])), /the copy of the audits in .* can't be read/);
+  assert.match(JSON.stringify(put({ ...copy, repo: "x/y" })), /the copy of the audits in .* is of x\/y, not o\/r/);
+  assert.match(JSON.stringify(put({ ...copy, audits: [copy.audits[1]] })), /000001\.json is missing from the copy of the audits in/);
+  assert.equal(existsSync(h.dir), false, "nothing put back");
+  // A snapshot carrying another repository's.
+  const t = new DatabaseSync(path);
+  t.exec("UPDATE trial_audit SET repo = 'x/y'");
+  t.close();
+  assert.match(JSON.stringify(backup.restoreAudits(path, h.dir, R)), /is of x\/y, not o\/r/);
+  assert.equal(existsSync(h.dir), false, "nothing put back");
+  assert.deepEqual(put(copy), { ok: true, put: 2 }, "control: the copy as it was taken puts them back");
 });
 
-test("reeve backup takes a copy of the audits with the store, and reeve restore puts back those missing before the store, and says so", () => {
+test("reeve backup takes the audits with the store, and reeve restore puts back those missing before the store, and says so", () => {
   const { home, db, dir } = homeWith(2);
   db.close();
   const bin = tempDir("reeve-audit-gh-");
@@ -180,31 +240,31 @@ test("reeve backup takes a copy of the audits with the store, and reeve restore 
   const run = (/** @type {string[]} */ ...args) => spawnSync(process.execPath, [REEVE, ...args], { encoding: "utf8", env });
   const taken = run("backup", R);
   assert.equal(taken.status, 0, taken.stdout + taken.stderr);
-  const snap = String(/snapshot -> (\S+)/.exec(taken.stdout)?.[1]);
-  assert.ok(existsSync(copyOf(snap)), `a copy beside ${snap}`);
+  const path = String(/snapshot -> (\S+)/.exec(taken.stdout)?.[1]);
+  assert.deepEqual(Object.keys(carried(path) ?? {}), ["000001.json", "000002.json"], `the audits in ${path}`);
   const was = audits(dir);
   rmSync(dir, { recursive: true });
   // The store is there: it isn't replaced without --overwrite, but the audits it lost are put back.
-  const kept = run("restore", R, "--from", snap, "--force");
+  const kept = run("restore", R, "--from", path, "--force");
   assert.equal(kept.status, 1, kept.stdout + kept.stderr);
-  assert.match(kept.stdout, /put back 2 audit\(s\) of o\/r from .*\.audits\.json/);
+  assert.match(kept.stdout, /put back 2 audit\(s\) of o\/r from .*\.db/);
   assert.match(kept.stdout, /refused: .* exists; pass overwrite/);
   assert.deepEqual(audits(dir), was);
   // Restored to a store that's gone, with one audit there that isn't the snapshot's: nothing is restored.
   writeFileSync(join(dir, "000001.json"), was["000002.json"]);
   const fresh = join(tempDir("reeve-audit-restore-"), "r.db");
-  const refused = run("restore", R, "--from", snap, "--db", fresh, "--force");
+  const refused = run("restore", R, "--from", path, "--db", fresh, "--force");
   assert.equal(refused.status, 1);
   assert.match(refused.stdout, /refused: 000001\.json in .* isn't the audit the snapshot holds under that number/);
   assert.equal(existsSync(fresh), false, "and the store isn't restored either");
   writeFileSync(join(dir, "000001.json"), was["000001.json"]);
-  const done = run("restore", R, "--from", snap, "--db", fresh, "--force");
+  const done = run("restore", R, "--from", path, "--db", fresh, "--force");
   assert.equal(done.status, 0, done.stdout + done.stderr);
   assert.match(done.stdout, /restored .*\.db -> .*r\.db/);
-  // A backup whose audits can't be read takes the store's snapshot, and fails.
+  // A backup whose audits can't be read takes nothing, and fails.
   rmSync(dir, { recursive: true });
   writeFileSync(dir, "");
   const failed = run("backup", R);
   assert.equal(failed.status, 1, failed.stdout + failed.stderr);
-  assert.match(failed.stdout, /snapshot -> .*\nfailed: the audits of o\/r couldn't be copied beside it: .*ENOTDIR/);
+  assert.match(failed.stdout, /failed: its audits couldn't be put in it whole, so it wasn't taken: .*ENOTDIR/);
 });

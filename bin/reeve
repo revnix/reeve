@@ -11,7 +11,7 @@ import { hubAccess } from "../src/build/hubaccess.mjs";
 import { resolveRepoIdAt } from "../src/build/repoid.mjs";
 import { loadRegistry } from "../src/build/registryio.mjs";
 import { snapshot, restore, latestSnapshot, exportEvents,
-         snapshotAll, restoreHub, validateSnapshot, settleRestores, restoreAudits, auditsCopyPath } from "../src/backup.mjs";
+         snapshotAll, restoreHub, validateSnapshot, settleRestores, restoreAudits } from "../src/backup.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick, measuredContainment, withdrawStanding, tellStuck, runningCode } from "../src/daemon.mjs";
 import { replayDecisions, renderReplay, publishedChecked } from "../src/decisions.mjs";
@@ -660,11 +660,10 @@ switch (cmd) {
       console.log(r.ok ? `${r.count} event(s) -> ${r.path}` : `failed: ${r.why}`);
       process.exit(r.ok ? 0 : 1);
     }
-    // With a copy of the audits of its trial beside it (#311).
-    const r = snapshot(db, root, nwo, undefined, { audits: auditDirFor(HOME, nwo) });
+    // With the audits of its trial in it (#311).
+    const r = snapshot(db, root, nwo, undefined, { audits: { dir: auditDirFor(HOME, nwo), notes: auditNotesFor(HOME, nwo) } });
     console.log(r.ok ? `snapshot -> ${r.path}` : `failed: ${r.why}`);
-    if (r.ok && r.auditsWhy) console.log(`failed: the audits of ${nwo} couldn't be copied beside it: ${r.auditsWhy}`);
-    process.exit(r.ok && !r.auditsWhy ? 0 : 1);
+    process.exit(r.ok ? 0 : 1);
   }
 
   case "export-events": {
@@ -821,14 +820,14 @@ switch (cmd) {
     const from = opt("from") ?? latestSnapshot(opt("to") ?? join(HOME, "backups"), nwo);
     if (!from) { console.error(`reeve restore: no snapshot for ${nwo}`); process.exit(1); }
     const dbPath = opt("db") ?? stateFor(nwo);
-    // The audits of its trial the snapshot holds a copy of go back first, where
+    // The audits of its trial the snapshot carries go back first, where
     // they're missing, as they were recorded (#311): they're kept apart from
     // the store, and a store refused here, as one already there is, is no
-    // reason to leave them lost. An audit there that isn't the snapshot's
-    // restores nothing.
+    // reason to leave them lost. A snapshot that wouldn't restore, or an audit
+    // there that isn't the snapshot's, restores nothing.
     const put = restoreAudits(from, auditDirFor(HOME, nwo), nwo);
     if (!put.ok) { console.log(`refused: ${put.why}`); process.exit(1); }
-    if (put.put) console.log(`put back ${put.put} audit(s) of ${nwo} from ${auditsCopyPath(from)}` +
+    if (put.put) console.log(`put back ${put.put} audit(s) of ${nwo} from ${from}` +
                              (put.unsynced ? `, but a folder couldn't be synced (${put.unsynced}), so a power loss could undo it` : ""));
     const r = restore(from, dbPath, { overwrite: flag("overwrite"), force: flag("force") });
     console.log(r.ok ? `restored ${from} -> ${dbPath}` : `refused: ${r.why}`);
@@ -1040,7 +1039,8 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       if (sheetPath != null && e.code === "EEXIST" && e.stage === undefined)
         fail("usage", `reeve trial: won't write over ${sheetPath}: name a new file for the sheet, or record the one marked with --audited`, { exit: EXITS.misuse });
       if (sheetPath == null || e.stage === "record")
-        fail("audit_unrecorded", `reeve trial: the audit couldn't be recorded in ${auditDir}${sheetPath != null ? ", so no sheet was written" : ""}: ${e.code ?? e.message}`);
+        fail("audit_unrecorded", `reeve trial: the audit couldn't be recorded in ${auditDir}${sheetPath != null ? ", so no sheet was written" : ""}: ${e.code ?? e.message}` +
+             (e.unsynced ? `; the sheet was taken away, but its folder couldn't be synced (${e.unsynced}): if ${sheetPath} is there after a power loss, remove it before recording again` : ""));
       fail("usage", `reeve trial: the sheet couldn't be written to ${sheetPath}${audit ? ", so the audit wasn't recorded" : ""}: ${e.code ?? e.message}`, { exit: EXITS.misuse });
     }
     if (recorded && audit) {

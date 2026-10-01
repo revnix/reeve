@@ -20,14 +20,14 @@ import { execFileSync } from "node:child_process";
 // `linkSync` is the snapshot PUBLISH: it is atomic AND exclusive, where
 // `renameSync` is atomic but REPLACES an existing destination -- so two
 // same-second writers would both believe they won.
-import { mkdirSync, existsSync, copyFileSync, readdirSync, readFileSync, rmSync, writeFileSync, linkSync, renameSync, openSync, closeSync, statSync, fsyncSync,
+import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync, linkSync, renameSync, openSync, closeSync, statSync, fsyncSync,
          lstatSync, realpathSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join, dirname, basename } from "node:path";
 import { open as openStore, exportJsonl, storeLock } from "./db/ops.mjs";
 import { syncFolder, running } from "./signing.mjs";
 import { auditsCopy, putBackAudits } from "./trial.mjs";
-import { auditDirFor } from "./paths.mjs";
+import { auditDirFor, auditNotesFor } from "./paths.mjs";
 // Task 8's subset. `tablesAt` and `HUB_TABLES` are what a snapshot's table set
 // is validated against; Task 9 adds the locks, replay and hubEvent imports when
 // `restoreHub` needs them, and not before -- ESM resolves at instantiation, so
@@ -48,8 +48,8 @@ export { openStore as open };
 /** A repository name that is safe as one path segment. */
 const slug = nwo => String(nwo).replace(/[^A-Za-z0-9._-]/g, "-");
 
-/** Where a snapshot's copy of its repository's audits is kept: beside it, by its name (#311). */
-export const auditsCopyPath = snapshotPath => `${String(snapshotPath).replace(/\.db$/, "")}.audits.json`;
+/** The table a snapshot of a repository's store carries its audits in (#311), each as recorded, under its name. */
+export const AUDITS_TABLE = "trial_audit";
 
 /**
  * Write a consistent copy of the store.
@@ -57,11 +57,13 @@ export const auditsCopyPath = snapshotPath => `${String(snapshotPath).replace(/\
  * `VACUUM INTO` fails if the target exists, which is the behaviour we want: a
  * snapshot never silently overwrites another.
  *
- * With `audits`, the repository's audits folder, a copy of the audits of its
- * trial, as recorded, is put beside it before it's published (#311), so a
- * snapshot that carries them has its copy from the moment it's there. Audits
- * that can't be read leave the store's snapshot as it is, and say so as
- * `auditsWhy`.
+ * With `audits`, the repository's audits folder and the host's notes of them,
+ * the audits of its trial, as recorded, are put in the snapshot's own file
+ * before it's published (#311): one file, published whole, so it's never there
+ * without the audits it was taken with. Audits that can't be copied whole, as a
+ * report reads them, take no snapshot, and say why as `auditsWhy`: one taken
+ * without them would count among those kept, and in time push out every one
+ * that holds them. The snapshots there are kept as they are.
  */
 export function snapshot(db, root, nwo, at = Math.floor(Date.now() / 1000), { keep = 14, audits = null } = {}) {
   const dir = join(root, slug(nwo));
@@ -86,7 +88,7 @@ export function snapshot(db, root, nwo, at = Math.floor(Date.now() / 1000), { ke
   // safe direction, deleting a live writer's temp is not.
   try {
     for (const f of readdirSync(dir)) {
-      const m = /^\.(\d+)\.(\d+)(?:\.audits)?\.tmp$/.exec(f);
+      const m = /^\.(\d+)\.(\d+)\.tmp$/.exec(f);
       if (!m) continue;
       const owner = Number(m[2]);
       if (owner === process.pid) continue;              // ours, handled above
@@ -102,19 +104,12 @@ export function snapshot(db, root, nwo, at = Math.floor(Date.now() / 1000), { ke
     try { rmSync(temp, { force: true }); } catch {}
     return { ok: false, path: null, mine: false, why: `could not snapshot: ${e.message}` };
   }
-  // Published as the store's is, exclusively: one another process published
-  // this second is that snapshot's, of the same audits. A copy left by one
-  // that stops before its store is published is pruned.
-  let auditsWhy = null;
-  const copy = audits == null ? null : auditsCopy(audits);
-  if (copy && !copy.ok) auditsWhy = copy.why;
-  else if (copy) {
-    const copyTemp = join(dir, `.${at}.${process.pid}.audits.tmp`);
-    try {
-      writeFileSync(copyTemp, JSON.stringify({ repo: nwo, audits: copy.audits }), { mode: 0o600 });
-      try { linkSync(copyTemp, auditsCopyPath(path)); } catch (e) { if (e.code !== "EEXIST") throw e; }
-    } catch (e) { auditsWhy = `${auditsCopyPath(path)}: ${e.code ?? e.message}`; }
-    finally { try { rmSync(copyTemp, { force: true }); } catch {} }
+  if (audits) {
+    const auditsWhy = carryAudits(temp, nwo, audits);
+    if (auditsWhy) {
+      for (const s of ["", "-wal", "-shm", "-journal"]) { try { rmSync(temp + s, { force: true }); } catch {} }
+      return { ok: false, path: null, mine: false, why: `its audits couldn't be put in it whole, so it wasn't taken: ${auditsWhy}`, auditsWhy };
+    }
   }
   let mine;
   try {
@@ -138,7 +133,32 @@ export function snapshot(db, root, nwo, at = Math.floor(Date.now() / 1000), { ke
   // prune themselves afterwards (`snapshotAll` does). Moving it here would
   // change behaviour for the per-repo `backup` route, which is not this fix.
   prune(dir, keep);
-  return { ok: true, path, mine, why: mine ? null : "already taken this second", auditsWhy };
+  return { ok: true, path, mine, why: mine ? null : "already taken this second" };
+}
+
+/**
+ * Puts the audits of `nwo` kept in `audits.dir` in the store at `path`, a
+ * snapshot not yet published, each as it was recorded, in a transaction its
+ * commit syncs to disk. Only audits a report would read, by the host's notes
+ * too. Why they couldn't be, or null.
+ * @param {string} path @param {string} nwo @param {{ dir: string, notes?: string | null }} audits
+ * @returns {string | null}
+ */
+function carryAudits(path, nwo, audits) {
+  const copy = auditsCopy(audits.dir, nwo, { notes: audits.notes ?? null });
+  if ("why" in copy) return copy.why;
+  let t = null;
+  try {
+    t = new DatabaseSync(path);
+    t.exec("BEGIN");
+    t.exec(`DROP TABLE IF EXISTS ${AUDITS_TABLE}`);
+    t.exec(`CREATE TABLE ${AUDITS_TABLE} (name TEXT PRIMARY KEY, repo TEXT NOT NULL, text TEXT NOT NULL)`);
+    const put = t.prepare(`INSERT INTO ${AUDITS_TABLE} (name, repo, text) VALUES (?, ?, ?)`);
+    for (const a of copy.audits) put.run(a.name, nwo, a.text);
+    t.exec("COMMIT");
+    return null;
+  } catch (e) { return e.message; }
+  finally { try { t?.close(); } catch {} }
 }
 
 /**
@@ -165,14 +185,6 @@ function prune(dir, keep, { usable = () => true } = {}) {
       else rmSync(join(dir, f), { force: true });
     }
     for (const f of kept.slice(keep)) rmSync(join(dir, f), { force: true });
-    // A copy of the audits whose snapshot isn't beside it (#311), older than
-    // the newest kept: its snapshot was pruned, or it stopped between the two
-    // and was never published.
-    const newest = Number(kept[0]?.split(".")[0] ?? 0);
-    for (const f of readdirSync(dir)) {
-      const m = /^(\d+)\.audits\.json$/.exec(f);
-      if (m && Number(m[1]) < newest && !existsSync(join(dir, `${m[1]}.db`))) rmSync(join(dir, f), { force: true });
-    }
   } catch { /* pruning must never take the loop down */ }
 }
 
@@ -413,7 +425,7 @@ export function snapshotAll(home, root, { at = Math.floor(Date.now() / 1000), ke
       // `{ ok: true, path, mine: false, why: "already taken this second" }`
       // WITHOUT this block validating or deleting it -- `taken.mine` is false,
       // and only a snapshot this process wrote is one this process may judge.
-      const taken = snapshot(db, root, nwo, at, { keep: Infinity, audits: nwo === "hub" ? null : auditDirFor(home, nwo) });
+      const taken = snapshot(db, root, nwo, at, { keep: Infinity, audits: nwo === "hub" ? null : { dir: auditDirFor(home, nwo), notes: auditNotesFor(home, nwo) } });
       // The LOSER reports neither success nor failure, and this branch exists
       // because it previously fell through to `results.push({ nwo, ...taken })`
       // and reported `ok: true` for a file it never validated and does not own.
@@ -491,15 +503,10 @@ export function snapshotAll(home, root, { at = Math.floor(Date.now() / 1000), ke
             ? validateSnapshot(p, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION })
             : validateSnapshot(p, { kind: "repo" })).ok,
         });
-        // The store's snapshot stands, but the audits of its trial aren't
-        // backed up with it (#311): a backup that failed, said and escalated.
-        if (taken.auditsWhy) {
-          results.push({ nwo, ...taken, ok: false, outcome: "failed", escalate: "builder:backup:failed",
-                         why: `the store's snapshot was taken, but its audits couldn't be copied beside it: ${taken.auditsWhy}` });
-          continue;
-        }
       }
-      results.push({ nwo, outcome: taken.ok ? "taken" : "failed", ...taken });
+      // One whose audits couldn't be put in it wasn't taken (#311): a backup
+      // that failed, escalated until one is.
+      results.push({ nwo, outcome: taken.ok ? "taken" : "failed", ...taken, ...(taken.auditsWhy ? { escalate: "builder:backup:failed" } : {}) });
     } catch (e) {
       results.push({ nwo, ok: false, outcome: "failed", escalate: "builder:backup:failed",
                      why: `could not open ${path}: ${e.message}` });
@@ -584,18 +591,43 @@ export function latestSnapshot(root, nwo, { deep = false } = {}) {
 }
 
 /**
- * Puts back in `dir` the audits of `repo` that the snapshot at `snapshotPath`
- * holds a copy of beside it, and `dir` is missing, as they were recorded
- * (#311), as `putBackAudits` does. A snapshot taken before audits were kept
- * with snapshots holds none: `none`, and the audits are left as they are.
+ * Puts back in `dir` the audits of `repo` the snapshot at `snapshotPath`
+ * carries, that `dir` is missing, as they were recorded (#311), as
+ * `putBackAudits` does. Only from a snapshot that would restore: one that
+ * wouldn't is no recovery point for its audits either, and nothing is put
+ * back. A snapshot taken before audits were kept with snapshots carries none:
+ * `none`, and the audits are left as they are.
  * @param {string} snapshotPath @param {string} dir @param {string} repo @param {{ syncDir?: (dir: string) => void }} [io]
  */
 export function restoreAudits(snapshotPath, dir, repo, io = {}) {
-  const path = auditsCopyPath(snapshotPath);
-  if (!existsSync(path)) return { ok: true, put: 0, none: true };
-  let copy;
-  try { copy = JSON.parse(readFileSync(path, "utf8")); } catch { return { ok: false, why: `the copy of the audits beside ${snapshotPath} can't be read` }; }
-  return putBackAudits(copy, snapshotPath, dir, repo, io);
+  const valid = validateSnapshot(snapshotPath, { kind: "repo" });
+  if (!valid.ok) return { ok: false, why: `the snapshot is not a usable store: ${String(valid.why).replace(/^not a usable store: /, "")}` };
+  let rows = null, probe = null;
+  try {
+    probe = new DatabaseSync(snapshotPath, { readOnly: true });
+    if (probe.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(AUDITS_TABLE))
+      rows = probe.prepare(`SELECT name, repo, text FROM ${AUDITS_TABLE} ORDER BY name`).all();
+  } catch (e) { return { ok: false, why: `the audits ${snapshotPath} carries can't be read: ${e.message}` }; }
+  finally { try { probe?.close(); } catch {} }
+  if (!rows) return { ok: true, put: 0, none: true };
+  const other = rows.find(r => r.repo !== repo);
+  return putBackAudits({ repo: other ? String(other.repo) : repo, audits: rows.map(r => ({ name: r.name, text: r.text })) }, snapshotPath, dir, repo, io);
+}
+
+/**
+ * Takes the audits a snapshot carries out of `path`, a restore's copy of it:
+ * they go back to the audits folder, not into the store, where nothing reads
+ * them and the next snapshot would carry them again.
+ * @param {string} path
+ */
+function dropAudits(path) {
+  // Read and written, not read only: closed, a connection that writes takes
+  // the log and index it made beside a store kept in WAL mode with it.
+  const t = new DatabaseSync(path);
+  try {
+    if (!t.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(AUDITS_TABLE)) return;
+    t.exec(`DROP TABLE ${AUDITS_TABLE}`);
+  } finally { t.close(); }
 }
 
 export function restore(snapshotPath, dbPath, { overwrite = false, force = false, isDaemonRunning = daemonRunning, copy = copyFileSync,
@@ -665,6 +697,8 @@ export function restore(snapshotPath, dbPath, { overwrite = false, force = false
   let placed = false, synced = false;
   try {
     copy(snapshotPath, temp);
+    // Without the audits it carries (#311), which a restore puts back apart.
+    dropAudits(temp);
     const fd = openSync(temp, "r");
     try { fsyncSync(fd); } finally { closeSync(fd); }
     // The copy's name synced into its folder before the store's log is moved

@@ -12,7 +12,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { netTimeoutMs, netFailure } from "./net-bound.mjs";
 import { syncFolder } from "./signing.mjs";
@@ -48,14 +48,16 @@ export const CASE_KINDS = Object.freeze([
 
 /**
  * A call's name, for a person's audit to mark it by (#294): what makes it one
- * call, its place, pull request, commit, verdict and the clauses it blocked,
- * not the ticks that repeated it or its latest reason, which can count checks
- * still running. It starts with a letter, so a spreadsheet keeps it as text
- * rather than reading a number into it.
- * @param {{ where: string, pr: number, head: string, state: string, summary: string }} c
+ * call, its repository, place, pull request, commit, verdict and the clauses
+ * it blocked, not the ticks that repeated it or its latest reason, which can
+ * count checks still running. The repository as GitHub names it, case aside:
+ * a fork shares its upstream's commits and numbers, and a sheet of one's calls
+ * isn't the other's. It starts with a letter, so a spreadsheet keeps it as
+ * text rather than reading a number into it.
+ * @param {{ repo?: string, where: string, pr: number, head: string, state: string, summary: string }} c
  */
 export function callId(c) {
-  return "c" + createHash("sha256").update(JSON.stringify([c.where, c.pr, c.head, c.state, c.summary])).digest("hex").slice(0, 16);
+  return "c" + createHash("sha256").update(JSON.stringify([String(c.repo ?? "").toLowerCase(), c.where, c.pr, c.head, c.state, c.summary])).digest("hex").slice(0, 16);
 }
 
 /** How a call reads where a person audits it. @param {{ where: string, pr: number, head: string, state: string }} c */
@@ -183,7 +185,7 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
   const calls = new Map();
   for (const [where, list] of /** @type {const} */ ([["head", decided], ["queue", queued]])) for (const e of list) {
     const call = { where, pr: e.pr, head: String(e.p.head ?? ""), state: String(e.p.state ?? ""), summary: String(e.p.summary ?? "") };
-    const id = callId(call);
+    const id = callId({ repo, ...call });
     const c = calls.get(id) ?? { id, ...call, why: "", first: e.at, last: e.at, ticks: 0, record: null, final: false, audited: null };
     c.why = String(e.p.why ?? "");
     c.last = e.at;
@@ -194,9 +196,10 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
   }
   const toAudit = [...calls.values()].sort((a, b) => a.pr - b.pr || a.first - b.first);
   // Each call's mark, as a person's latest audit of it gave it: an audit made
-  // later counts over one before, so a mark corrected stands corrected. Of two
-  // made in one second, the one recorded after.
-  if (Array.isArray(audits)) for (const a of [...audits].sort((x, y) => x.at - y.at || (x.seq ?? 0) - (y.seq ?? 0)))
+  // later counts over one before, so a mark corrected stands corrected: in the
+  // order recorded, which a clock set back, or two in one second, doesn't
+  // change; by time where that isn't known.
+  if (Array.isArray(audits)) for (const a of [...audits].sort((x, y) => (x.seq ?? 0) - (y.seq ?? 0) || x.at - y.at))
     for (const m of a.calls) { const c = calls.get(m.id); if (c) c.audited = { mark: m.mark, by: a.by, at: a.at, note: m.note }; }
   const falseCalls = toAudit.filter((c) => c.audited && c.audited.mark !== "right");
   const notYet = toAudit.filter((c) => !c.audited);
@@ -408,18 +411,45 @@ export function auditOf(calls, marks, { repo, by, at }) {
 }
 
 /**
+ * Writes the sheet `text` to `sheetPath`, a file that mustn't be there yet,
+ * whole and synced, and only then runs `record`, recording the audit the sheet
+ * carries: so a sheet that can't be written records nothing, and a sheet whose
+ * audit can't be recorded is taken away. A file already there is left as it
+ * was, `EEXIST`; otherwise what failed says which step, as `stage`.
+ * @template T @param {string} sheetPath @param {string} text @param {() => T} record
+ * @param {{ write?: (fd: number, text: string) => void }} [io] @returns {T}
+ */
+export function sheetThenRecord(sheetPath, text, record, { write = writeFileSync } = {}) {
+  const fd = openSync(sheetPath, "wx");
+  let kept = false;
+  try {
+    try { try { write(fd, text); fsyncSync(fd); } finally { closeSync(fd); } }
+    catch (err) { throw Object.assign(/** @type {Error} */ (err), { stage: "sheet" }); }
+    /** @type {T} */ let r;
+    try { r = record(); } catch (err) { throw Object.assign(/** @type {Error} */ (err), { stage: "record" }); }
+    kept = true;
+    return r;
+  } finally { if (!kept) rmSync(sheetPath, { force: true }); }
+}
+
+/**
  * Keeps `audit` in `dir` as the next of the audits there, numbered in the
- * order they were recorded, so of two made in one second the one recorded
- * after counts. Written whole to a file of its own and synced, then linked into
- * place, which fails where another took that number first, and the next is
- * tried; its own file is gone afterwards, whatever failed. The folder is synced
- * once it's linked, so an audit said to be recorded outlasts a power loss.
- * Returns where it was kept.
+ * order they were recorded, so the one recorded after counts. Written whole to
+ * a file of its own and synced, then linked into place, which fails where
+ * another took that number first, and the next is tried; its own file is gone
+ * afterwards, whatever failed. Then its folder is synced, and each folder made
+ * for it with the one that holds it, so an audit said to be recorded outlasts
+ * a power loss. Where, and, once it's in place, a folder that couldn't be
+ * synced as `unsynced`: it's recorded, read by every report, and recording it
+ * again would make two.
  * @param {string} dir @param {Audit} audit
  * @param {{ link?: typeof linkSync, fsync?: typeof fsyncSync, syncDir?: (dir: string) => void }} [io]
+ * @returns {{ path: string, unsynced: string | null }}
  */
 export function recordAudit(dir, audit, { link = linkSync, fsync = fsyncSync, syncDir = syncFolder } = {}) {
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const made = mkdirSync(dir, { recursive: true, mode: 0o700 });
+  /** @type {string[]} */ const folders = [];
+  for (let f = dir; ; f = dirname(f)) { folders.push(f); if (!made || f === dirname(made) || f === dirname(f)) break; }
   const temp = join(dir, `.${process.pid}.${randomBytes(4).toString("hex")}.part`);
   try {
     const fd = openSync(temp, "wx", 0o600);
@@ -428,9 +458,12 @@ export function recordAudit(dir, audit, { link = linkSync, fsync = fsyncSync, sy
       const path = join(dir, `${String(n).padStart(6, "0")}.json`);
       try { link(temp, path); }
       catch (err) { if (/** @type {NodeJS.ErrnoException} */ (err).code === "EEXIST") continue; throw err; }
-      // Its folder holds its name, and the two above hold theirs, made here perhaps.
-      for (const f of [dir, dirname(dir), dirname(dirname(dir))]) syncDir(f);
-      return path;
+      /** @type {string | null} */ let unsynced = null;
+      for (const f of folders) {
+        try { syncDir(f); }
+        catch (err) { unsynced ??= `${f}: ${/** @type {NodeJS.ErrnoException} */ (err).code ?? /** @type {Error} */ (err).message}`; }
+      }
+      return { path, unsynced };
     }
   } finally { try { unlinkSync(temp); } catch { /* gone */ } }
 }

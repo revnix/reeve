@@ -169,7 +169,7 @@ test("an audit is kept with who made it and when, and read back as it was kept",
   const r = report([]);
   const first = audit(r, (c) => c.pr !== 6, { at: T0 + 2 * HOUR });
   const second = audit(r, () => true, { by: "Another", at: T0 + 3 * HOUR });
-  const path = trial.recordAudit(dir, first);
+  const { path } = trial.recordAudit(dir, first);
   trial.recordAudit(dir, second);
   assert.ok(existsSync(path), path);
   assert.deepEqual(readdirSync(dir).sort(), ["000001.json", "000002.json"], "each kept, the earlier one too, numbered as recorded");
@@ -370,24 +370,30 @@ test("an audit is recorded under the next number, after another that took its nu
   let raced = false;
   let path;
   try {
-    path = trial.recordAudit(dir, a, { link: (from, to) => {
+    ({ path } = trial.recordAudit(dir, a, { link: (from, to) => {
       if (!raced) { raced = true; writeFileSync(to, JSON.stringify(a)); }
       return linkSync(from, to);
-    } });
+    } }));
   } catch (err) { path = String(/** @type {any} */ (err).code); }
   assert.ok(raced, "control: another took the first number");
   assert.match(String(path), /000002\.json$/);
   assert.deepEqual(JSON.parse(readFileSync(String(path), "utf8")), a);
 });
 
-test("an audit is synced before it's said to be recorded, its file before it's linked into place, and its folders after", () => {
-  const dir = join(tempDir("reeve-audits-"), "o", "audits");
-  /** @type {string[]} */ const done = [];
-  trial.recordAudit(dir, audit(report([]), () => true), {
-    fsync: (fd) => { done.push("file"); fsyncSync(fd); },
-    link: (from, to) => { done.push("link"); linkSync(from, to); },
-    syncDir: (d) => done.push(`folder ${d}`) });
-  assert.deepEqual(done, ["file", "link", `folder ${dir}`, `folder ${dirname(dir)}`, `folder ${dirname(dirname(dir))}`]);
+test("an audit is synced before it's said to be recorded, its file before it's linked into place, and its folders after, to the one that held the first made", () => {
+  const home = tempDir("reeve-audits-");
+  const dir = join(home, "audits", "o", "r");
+  /** @type {string[]} */ let done = [];
+  const io = {
+    fsync: (/** @type {number} */ fd) => { done.push("file"); fsyncSync(fd); },
+    link: (/** @type {string} */ from, /** @type {string} */ to) => { done.push("link"); linkSync(from, to); },
+    syncDir: (/** @type {string} */ d) => { done.push(`folder ${d}`); } };
+  trial.recordAudit(dir, audit(report([]), () => true), io);
+  // The first audit made audits, o and r: the home holds the name of the first.
+  assert.deepEqual(done, ["file", "link", `folder ${dir}`, `folder ${join(home, "audits", "o")}`, `folder ${join(home, "audits")}`, `folder ${home}`]);
+  done = [];
+  trial.recordAudit(dir, audit(report([]), () => true), io);
+  assert.deepEqual(done, ["file", "link", `folder ${dir}`], "the next made no folder: its own holds its name");
 });
 
 test("an audit whose recording fails leaves no file of its own behind", () => {
@@ -431,4 +437,61 @@ test("an audit that can't be recorded is refused, and the sheet made for it is t
   assert.equal(existsSync(next), false, "no sheet for an audit that wasn't recorded");
   const typed = run("trial", R, "--db", s.path, "--since", since, "--audited", sheetPath, "--by", "The Founder", "--json");
   assert.equal(JSON.parse(typed.stdout).kind, "audit_unrecorded");
+});
+
+// ── #307's second review ─────────────────────────────────────────────────────
+
+test("an audit recorded after another counts over it, though the clock went back between them", () => {
+  const dir = join(tempDir("reeve-audits-"), "audits");
+  const r = report([]);
+  trial.recordAudit(dir, audit(r, () => true, { at: T0 + 3 * HOUR }));
+  // Recorded after, by a clock an hour behind.
+  trial.recordAudit(dir, audit(r, (c) => c.pr !== 6, { at: T0 + 2 * HOUR }));
+  const read = /** @type {any} */ (trial.readAudits(dir, R));
+  assert.equal(read.audits.length, 2, "control");
+  assert.equal(noFalseCall(report(read.audits)).met, false, "the later, marking #6 wrong, counts");
+});
+
+test("an audit in place whose folder can't then be synced is recorded, and says it may not outlast a power loss", () => {
+  const dir = join(tempDir("reeve-audits-"), "audits");
+  /** @type {any} */ let got;
+  try { got = trial.recordAudit(dir, audit(report([]), () => true), { syncDir: () => { throw Object.assign(new Error("EIO: i/o error"), { code: "EIO" }); } }); }
+  catch (err) { got = { threw: /** @type {any} */ (err).code }; }
+  assert.match(String(got.path), /000001\.json$/, JSON.stringify(got));
+  assert.match(String(got.unsynced), /EIO/);
+  assert.equal(/** @type {any} */ (trial.readAudits(dir, R)).audits.length, 1, "it's there, and read, so recording it again would make two");
+});
+
+test("a sheet is written whole before its audit is recorded: one that can't be written records nothing, and one whose audit can't be recorded is taken away", () => {
+  const d = tempDir("reeve-audit-sheet-");
+  let recorded = 0;
+  const fails = (/** @type {string} */ code) => () => { throw Object.assign(new Error(code), { code }); };
+  /** @type {any} */ let e1, e2, e3;
+  try { trial.sheetThenRecord(join(d, "a.csv"), "x", () => recorded++, { write: fails("ENOSPC") }); } catch (e) { e1 = e; }
+  assert.equal(e1?.stage, "sheet", String(e1));
+  assert.equal(recorded, 0, "nothing recorded");
+  assert.equal(existsSync(join(d, "a.csv")), false, "and no sheet left");
+  try { trial.sheetThenRecord(join(d, "b.csv"), "x", fails("EIO")); } catch (e) { e2 = e; }
+  assert.equal(e2?.stage, "record", String(e2));
+  assert.equal(existsSync(join(d, "b.csv")), false, "no sheet for an audit that wasn't recorded");
+  writeFileSync(join(d, "c.csv"), "mine");
+  try { trial.sheetThenRecord(join(d, "c.csv"), "x", () => recorded++); } catch (e) { e3 = e; }
+  assert.equal(e3?.code, "EEXIST", String(e3));
+  assert.equal(readFileSync(join(d, "c.csv"), "utf8"), "mine", "a file there is left as it was");
+  assert.equal(recorded, 0);
+  assert.equal(trial.sheetThenRecord(join(d, "d.csv"), "x", () => "kept"), "kept", "control");
+  assert.equal(readFileSync(join(d, "d.csv"), "utf8"), "x");
+});
+
+test("a call is named for its repository too, so a sheet of a fork's calls isn't taken for its upstream's", () => {
+  const one = { where: "head", pr: 5, head: sha("a"), state: "BLOCK", summary: "ci blocked" };
+  assert.notEqual(trial.callId({ ...one, repo: "o/r" }), trial.callId({ ...one, repo: "fork/r" }));
+  assert.equal(trial.callId({ ...one, repo: "o/r" }), trial.callId({ ...one, repo: "O/R" }), "as GitHub names it, case aside");
+  const s = store();
+  ticking(s, T0, 1);
+  s.decided(T0 + MIN, 5, sha("a"), "BLOCK", { summary: "ci blocked" });
+  const of = (/** @type {string} */ repo) => trial.trialReport(s.db, { repo, since: T0, now: T0 + HOUR, merged: [] }).toAudit[0].id;
+  const [ours, theirs] = [of("o/r"), of("fork/r")];
+  s.db.close();
+  assert.notEqual(ours, theirs);
 });

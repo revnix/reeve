@@ -195,6 +195,11 @@ test("an audit kept that doesn't read whole, or is another repository's, is a fa
     return trial.readAudits(dir, R);
   };
   assert.match(JSON.stringify(bad("{not json")), /000002\.json can't be read/);
+  // One that can't be read at all: a folder in its place.
+  const folder = join(tempDir("reeve-audits-"), "audits");
+  trial.recordAudit(folder, audit(r, () => true));
+  mkdirSync(join(folder, "000002.json"));
+  assert.match(JSON.stringify(trial.readAudits(folder, R)), /the audit recorded in 000002\.json can't be read/);
   const whole = audit(r, () => true);
   assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, by: "" }))), /000002\.json doesn't read whole/, "no one named");
   assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, at: "today" }))), /000002\.json doesn't read whole/, "no time");
@@ -955,4 +960,29 @@ test("a mark of a judgment after the report's period holds for it, so an audit r
   s.db.close();
   assert.ok(/** @type {number} */ (later.calls[0]?.to) > callOf(after, 6, "c").seq, "control: the later mark covers a judgment after the period");
   assert.equal(noFalseCall(after).met, true, noFalseCall(after).detail);
+});
+
+// ── #317's second review ─────────────────────────────────────────────────────
+
+test("the host's notes are synced again on every recording, to the credentials folder, so one whose folder's sync failed is made whole", () => {
+  const home = tempDir("reeve-audits-");
+  mkdirSync(join(home, "credentials"), { mode: 0o700 });
+  const dir = auditDirFor(home, R), notes = notesIn(home);
+  const r = report([]);
+  /** @type {any} */ let first;
+  try {
+    first = trial.recordAudit(dir, audit(r, () => true), { notes, syncDir: (d) => { if (d.startsWith(join(home, "credentials"))) throw Object.assign(new Error("EIO: i/o error"), { code: "EIO" }); } });
+  } catch (err) { first = { threw: String(err) }; }
+  assert.match(String(first.unnoted), /EIO/, JSON.stringify(first));
+  assert.deepEqual(notesAt(notes), ["000001.sha256"], "control: noted, its folder unsynced");
+  /** @type {string[]} */ const done = [];
+  trial.recordAudit(dir, audit(r, () => true), { notes, syncDir: (d) => { done.push(d.slice(home.length)); } });
+  assert.deepEqual(done.slice(0, 4), ["/credentials/audit-notes/o/r", "/credentials/audit-notes/o", "/credentials/audit-notes", "/credentials"], "before anything else");
+  // Synced again and failing still: recorded, and said.
+  /** @type {any} */ let again;
+  try {
+    again = trial.recordAudit(dir, audit(r, () => true), { notes, syncDir: (d) => { if (d === notes) throw Object.assign(new Error("EIO: i/o error"), { code: "EIO" }); } });
+  } catch (err) { again = { threw: String(err) }; }
+  assert.match(String(again.path), /000003\.json$/, JSON.stringify(again));
+  assert.match(String(again.unnoted), /EIO/);
 });

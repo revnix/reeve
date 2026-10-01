@@ -261,6 +261,9 @@ test("what merged is read from GitHub since the trial began, with its merge comm
     { number: 2, mergedAt: at(T0 + 60), headRefOid: sha("a"), mergeCommit: null },
     { number: 4, mergedAt: at(T0 + 80), headRefOid: sha("e"), mergeCommit: null }]) });
   assert.deepEqual(Array.isArray(upTo) && upTo.map((m) => m.pr), [2]);
+  // Bounded in the search too (#317), so merges after the period don't fill the one read.
+  assert.match(asked[1], new RegExp(`--search merged:${at(T0).replace(/\.\d+Z$/, "Z")}\\.\\.${at(T0 + 70).replace(/\.\d+Z$/, "Z")} `));
+  assert.match(asked[0], /--search merged:>=\S+ /, "control: unbounded, from the start");
   assert.match(JSON.stringify(mergedSince("o/r", T0, { run: () => ({ ok: false, out: "", err: "HTTP 502" }) })), /HTTP 502/);
   assert.match(JSON.stringify(mergedSince("o/r", T0, { run: () => ({ ok: true, out: "{not json" }) })), /doesn't read as a list/);
   assert.match(JSON.stringify(mergedSince("o/r", T0, { run: answer([{ number: 2, mergedAt: at(T0 + 60), headRefOid: "short", mergeCommit: null }]) })), /doesn't read whole/);

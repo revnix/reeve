@@ -63,7 +63,8 @@ export const AUDITS_TABLE = "trial_audit";
  * without the audits it was taken with. Audits that can't be copied whole, as a
  * report reads them, take no snapshot, and say why as `auditsWhy`: one taken
  * without them would count among those kept, and in time push out every one
- * that holds them. The snapshots there are kept as they are.
+ * that holds them. The snapshots there are kept as they are. They're read
+ * before the store is copied, so every judgment they cover is in the copy.
  */
 export function snapshot(db, root, nwo, at = Math.floor(Date.now() / 1000), { keep = 14, audits = null } = {}) {
   const dir = join(root, slug(nwo));
@@ -74,6 +75,9 @@ export function snapshot(db, root, nwo, at = Math.floor(Date.now() / 1000), { ke
   // `/^\d+\.db$/` filter, which is what makes the partial file unobservable.
   const temp = join(dir, `.${at}.${process.pid}.tmp`);
   try { rmSync(temp, { force: true }); } catch {}
+  const copy = audits ? auditsCopy(audits.dir, nwo, { notes: audits.notes ?? null }) : null;
+  if (copy && "why" in copy)
+    return { ok: false, path: null, mine: false, why: `its audits couldn't be put in it whole, so it wasn't taken: ${copy.why}`, auditsWhy: copy.why };
   // ABANDONED temporaries, from a process killed between `VACUUM INTO` and the
   // publish. Each is a full database copy, and nothing else will ever remove
   // one: `prune` and every candidate reader filter on `/^\d+\.db$/` precisely
@@ -104,8 +108,8 @@ export function snapshot(db, root, nwo, at = Math.floor(Date.now() / 1000), { ke
     try { rmSync(temp, { force: true }); } catch {}
     return { ok: false, path: null, mine: false, why: `could not snapshot: ${e.message}` };
   }
-  if (audits) {
-    const auditsWhy = carryAudits(temp, nwo, audits);
+  if (copy) {
+    const auditsWhy = carryAudits(temp, nwo, copy.audits);
     if (auditsWhy) {
       for (const s of ["", "-wal", "-shm", "-journal"]) { try { rmSync(temp + s, { force: true }); } catch {} }
       return { ok: false, path: null, mine: false, why: `its audits couldn't be put in it whole, so it wasn't taken: ${auditsWhy}`, auditsWhy };
@@ -137,16 +141,13 @@ export function snapshot(db, root, nwo, at = Math.floor(Date.now() / 1000), { ke
 }
 
 /**
- * Puts the audits of `nwo` kept in `audits.dir` in the store at `path`, a
- * snapshot not yet published, each as it was recorded, in a transaction its
- * commit syncs to disk. Only audits a report would read, by the host's notes
- * too. Why they couldn't be, or null.
- * @param {string} path @param {string} nwo @param {{ dir: string, notes?: string | null }} audits
+ * Puts `audits` of `nwo`, each as it was recorded, in the store at `path`, a
+ * snapshot not yet published, in a transaction its commit syncs to disk. Why
+ * they couldn't be, or null.
+ * @param {string} path @param {string} nwo @param {{ name: string, text: string }[]} audits
  * @returns {string | null}
  */
 function carryAudits(path, nwo, audits) {
-  const copy = auditsCopy(audits.dir, nwo, { notes: audits.notes ?? null });
-  if ("why" in copy) return copy.why;
   let t = null;
   try {
     t = new DatabaseSync(path);
@@ -154,7 +155,7 @@ function carryAudits(path, nwo, audits) {
     t.exec(`DROP TABLE IF EXISTS ${AUDITS_TABLE}`);
     t.exec(`CREATE TABLE ${AUDITS_TABLE} (name TEXT PRIMARY KEY, repo TEXT NOT NULL, text TEXT NOT NULL)`);
     const put = t.prepare(`INSERT INTO ${AUDITS_TABLE} (name, repo, text) VALUES (?, ?, ?)`);
-    for (const a of copy.audits) put.run(a.name, nwo, a.text);
+    for (const a of audits) put.run(a.name, nwo, a.text);
     t.exec("COMMIT");
     return null;
   } catch (e) { return e.message; }
@@ -596,8 +597,10 @@ export function latestSnapshot(root, nwo, { deep = false } = {}) {
  * `putBackAudits` does. Only from a snapshot that would restore: one that
  * wouldn't is no recovery point for its audits either, and nothing is put
  * back. A snapshot taken before audits were kept with snapshots carries none:
- * `none`, and the audits are left as they are.
- * @param {string} snapshotPath @param {string} dir @param {string} repo @param {{ syncDir?: (dir: string) => void }} [io]
+ * `none`, and the audits are left as they are. With the host's `notes`, each
+ * is checked against them, and noted where it isn't.
+ * @param {string} snapshotPath @param {string} dir @param {string} repo
+ * @param {{ notes?: string | null, syncDir?: (dir: string) => void }} [io]
  */
 export function restoreAudits(snapshotPath, dir, repo, io = {}) {
   const valid = validateSnapshot(snapshotPath, { kind: "repo" });

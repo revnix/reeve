@@ -637,7 +637,8 @@ function note(notes, n, digest, { link, fsync, syncDir }) {
  * With `notes`, the host's notes in its credentials folder (#314): numbered
  * after the highest noted too, so one lost is never filled by another, and
  * noted there once it's in place, with the digest of what was recorded; any
- * found there without its note is noted first. Notes that can't be read
+ * found there without its note is noted first, and the notes' folders are
+ * synced again, to the credentials folder. Notes that can't be read
  * record nothing; one that can't be made is said as `unnoted`: the audit is
  * recorded, but its loss couldn't be told.
  * @param {string} dir @param {Audit} audit
@@ -647,10 +648,16 @@ function note(notes, n, digest, { link, fsync, syncDir }) {
 export function recordAudit(dir, audit, { notes = null, link = linkSync, fsync = fsyncSync, syncDir = syncFolder } = {}) {
   const known = notes == null ? { ok: true, noted: new Map() } : readNotes(notes);
   if ("why" in known) throw new Error(known.why);
+  /** @type {string | null} */ let behind = null;
+  // The notes there synced again, each folder to the credentials folder: one
+  // whose sync failed when it was made is whole only once one succeeds.
+  if (notes != null && existsSync(notes))
+    for (const f of [notes, dirname(notes), dirname(dirname(notes)), dirname(dirname(dirname(notes)))]) {
+      try { syncDir(f); } catch (err) { behind ??= `${f}: ${/** @type {NodeJS.ErrnoException} */ (err).code ?? /** @type {Error} */ (err).message}`; }
+    }
   // An audit found without its note, one whose recording stopped before it was
   // noted, or one recorded before the host noted them, is noted now: its loss
   // can be told from here on.
-  /** @type {string | null} */ let behind = null;
   if (notes != null && existsSync(dir))
     for (const f of readdirSync(dir)) {
       const n = Number(/^(\d+)\.json$/.exec(f)?.[1]);
@@ -681,6 +688,22 @@ export function recordAudit(dir, audit, { notes = null, link = linkSync, fsync =
       return { path, unsynced, unnoted: notes == null ? null : note(notes, n, digestOf(text), { link, fsync, syncDir }) ?? behind };
     }
   } finally { try { unlinkSync(temp); } catch { /* gone */ } }
+}
+
+/**
+ * Why the text of the audit kept as `f` vouches for nothing to a report of
+ * `repo`, or null: it doesn't read, doesn't read whole, marks a call twice, or
+ * is another repository's.
+ * @param {string} text @param {string} f @param {string} repo
+ */
+function auditFault(text, f, repo) {
+  let a;
+  try { a = JSON.parse(text); } catch { return `the audit recorded in ${f} can't be read`; }
+  if (!auditWhole(a)) return `the audit recorded in ${f} doesn't read whole`;
+  const twice = a.calls.find((/** @type {any} */ c, /** @type {number} */ i) => a.calls.findIndex((/** @type {any} */ d) => d.id === c.id) !== i);
+  if (twice) return `the audit recorded in ${f} marks call ${twice.id} twice`;
+  if (a.repo !== repo) return `the audit recorded in ${f} is of ${a.repo}, not ${repo}`;
+  return null;
 }
 
 /** Whether `a` reads whole as an audit kept. @param {any} a */
@@ -724,14 +747,13 @@ function auditsKept(dir, repo, { notes = null } = {}) {
   for (const f of names.filter((x) => x.endsWith(".json")).sort()) {
     const seq = Number(/^(\d+)\.json$/.exec(f)?.[1]);
     if (!Number.isSafeInteger(seq) || seq < 1 || f !== numbered(seq)) return { ok: false, why: `${f}, among the audits recorded, isn't one reeve recorded` };
-    let a;
-    try { const bytes = readFileSync(join(dir, f)); digests.set(seq, digestOf(bytes)); texts.push(bytes.toString("utf8")); a = JSON.parse(bytes.toString("utf8")); }
+    let text;
+    try { const bytes = readFileSync(join(dir, f)); digests.set(seq, digestOf(bytes)); text = bytes.toString("utf8"); }
     catch { return { ok: false, why: `the audit recorded in ${f} can't be read` }; }
-    if (!auditWhole(a)) return { ok: false, why: `the audit recorded in ${f} doesn't read whole` };
-    const twice = a.calls.find((/** @type {any} */ c, /** @type {number} */ i) => a.calls.findIndex((/** @type {any} */ d) => d.id === c.id) !== i);
-    if (twice) return { ok: false, why: `the audit recorded in ${f} marks call ${twice.id} twice` };
-    if (a.repo !== repo) return { ok: false, why: `the audit recorded in ${f} is of ${a.repo}, not ${repo}` };
-    audits.push({ ...a, seq });
+    const fault = auditFault(text, f, repo);
+    if (fault) return { ok: false, why: fault };
+    texts.push(text);
+    audits.push({ ...JSON.parse(text), seq });
   }
   // Numbered from one with none missing: an audit taken away from among them
   // may have corrected a mark one before it gave, which would stand again.
@@ -767,12 +789,16 @@ export function auditsCopy(dir, repo, o = {}) {
  * a copy that doesn't read as one, is another repository's, or misses one.
  * Those recorded since the snapshot are left. Each is written whole to a file
  * of its own and synced, then linked into place, and its folders synced.
- * `where` is what the copy is beside, as a person reads it.
+ * Each must read as a report reads it: one that doesn't, changed in the
+ * snapshot since, puts none back. With the host's `notes`, each must be the
+ * one noted under its number, and any not noted is noted, as on a host that
+ * lost its notes with its audits; `unnoted` where one couldn't be. `where` is
+ * what the copy is in, as a person reads it.
  * @param {unknown} copy @param {string} where @param {string} dir @param {string} repo
- * @param {{ fsync?: typeof fsyncSync, syncDir?: (dir: string) => void }} [io]
- * @returns {{ ok: true, put: number, unsynced?: string } | { ok: false, why: string }}
+ * @param {{ notes?: string | null, fsync?: typeof fsyncSync, syncDir?: (dir: string) => void }} [io]
+ * @returns {{ ok: true, put: number, unsynced?: string, unnoted?: string } | { ok: false, why: string }}
  */
-export function putBackAudits(copy, where, dir, repo, { fsync = fsyncSync, syncDir = syncFolder } = {}) {
+export function putBackAudits(copy, where, dir, repo, { notes = null, fsync = fsyncSync, syncDir = syncFolder } = {}) {
   const c = /** @type {any} */ (copy);
   if (typeof c?.repo !== "string" || !Array.isArray(c.audits) || !c.audits.every((/** @type {any} */ a) => typeof a?.name === "string" && typeof a.text === "string"))
     return { ok: false, why: `the copy of the audits in ${where} can't be read` };
@@ -780,6 +806,14 @@ export function putBackAudits(copy, where, dir, repo, { fsync = fsyncSync, syncD
   /** @type {{ name: string, text: string }[]} */ const audits = c.audits;
   const gap = audits.findIndex((a, i) => a.name !== numbered(i + 1));
   if (gap >= 0) return { ok: false, why: `${numbered(gap + 1)} is missing from the copy of the audits in ${where}` };
+  for (const a of audits) {
+    const fault = auditFault(a.text, a.name, repo);
+    if (fault) return { ok: false, why: `in the copy of the audits in ${where}, ${fault}` };
+  }
+  const known = notes == null ? { ok: true, noted: new Map() } : readNotes(notes);
+  if ("why" in known) return { ok: false, why: `${known.why}, so none is put back` };
+  const unlike = audits.find((a, i) => known.noted.has(i + 1) && known.noted.get(i + 1) !== digestOf(a.text));
+  if (unlike) return { ok: false, why: `${unlike.name} in the copy of the audits in ${where} isn't the audit the host noted under that number, so which was recorded can't be told` };
   /** @type {{ name: string, text: string }[]} */ const missing = [];
   for (const a of audits) {
     let there = null;
@@ -808,11 +842,20 @@ export function putBackAudits(copy, where, dir, repo, { fsync = fsyncSync, syncD
   } catch (err) {
     return { ok: false, why: `the audits couldn't be put back in ${dir}: ${/** @type {NodeJS.ErrnoException} */ (err).code ?? /** @type {Error} */ (err).message}` };
   }
+  /** @type {{ ok: true, put: number, unsynced?: string, unnoted?: string }} */ const done = { ok: true, put: missing.length };
   for (const f of holding(dir, made)) {
     try { syncDir(f); }
-    catch (err) { return { ok: true, put: missing.length, unsynced: `${f}: ${/** @type {NodeJS.ErrnoException} */ (err).code ?? /** @type {Error} */ (err).message}` }; }
+    catch (err) { done.unsynced = `${f}: ${/** @type {NodeJS.ErrnoException} */ (err).code ?? /** @type {Error} */ (err).message}`; break; }
   }
-  return { ok: true, put: missing.length };
+  // Each noted on the host where it isn't, so the loss of one, the newest
+  // say, can be told again after a host lost its notes with its audits.
+  if (notes != null)
+    for (const [i, a] of audits.entries()) {
+      if (known.noted.has(i + 1)) continue;
+      const why = note(notes, i + 1, digestOf(a.text), { link: linkSync, fsync, syncDir });
+      if (why) { done.unnoted = why; break; }
+    }
+  return done;
 }
 
 /** `gh`, as the person running this reads GitHub, bounded as every read is (#282). @param {string[]} args */
@@ -834,8 +877,10 @@ function gh(args) {
  * @returns {Merged[] | { why: string }}
  */
 export function mergedSince(nwo, since, { run = gh, limit = 1000, until = null } = {}) {
-  const from = new Date(since * 1000).toISOString().replace(/\.\d+Z$/, "Z");
-  const r = run(["pr", "list", "--repo", nwo, "--state", "merged", "--search", `merged:>=${from}`,
+  const iso = (/** @type {number} */ t) => new Date(t * 1000).toISOString().replace(/\.\d+Z$/, "Z");
+  // Bounded at `until` in the search too, so merges after the period don't
+  // fill the one read the period's own merges must fit in.
+  const r = run(["pr", "list", "--repo", nwo, "--state", "merged", "--search", until == null ? `merged:>=${iso(since)}` : `merged:${iso(since)}..${iso(until)}`,
                  "--json", "number,mergedAt,headRefOid,mergeCommit", "--limit", String(limit)]);
   if (!r.ok) return { why: r.err || "gh failed" };
   let rows;

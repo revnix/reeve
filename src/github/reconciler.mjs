@@ -59,11 +59,39 @@ const gh = (path, jq, { paginate = false } = {}) => {
  * object, and carried unchanged through every read that follows.
  */
 export function pinHead(nwo, branch) {
-  const r = sh("git", ["ls-remote", `https://github.com/${nwo}.git`, `refs/heads/${branch}`]);
-  if (!r.ok || !r.out) return { ok: false, sha: null, why: r.err || `no ref refs/heads/${branch}` };
+  return pinRef(nwo, `refs/heads/${branch}`);
+}
+
+/**
+ * The commit `ref` names in `nwo`, read from the ref itself.
+ * @param {string} nwo @param {string} ref @param {typeof sh} [run]
+ */
+export function pinRef(nwo, ref, run = sh) {
+  const r = run("git", ["ls-remote", `https://github.com/${nwo}.git`, ref]);
+  if (!r.ok || !r.out) return { ok: false, sha: null, why: r.err || `no ref ${ref}` };
   const sha = r.out.split("\n")[0].split(/\s+/)[0];
   if (!/^[0-9a-f]{40}$/.test(sha)) return { ok: false, sha: null, why: `unparseable ref line: ${r.out.slice(0, 80)}` };
   return { ok: true, sha };
+}
+
+/**
+ * Whether a pull request's head, in `headRepo`, is a fork's (#320): its
+ * repository isn't the base's, GitHub's names case aside, or is gone.
+ * @param {string} nwo @param {string | null | undefined} headRepo
+ */
+export const isFork = (nwo, headRepo) => String(headRepo ?? "").toLowerCase() !== String(nwo).toLowerCase();
+
+/**
+ * A pull request's head, pinned as `pinHead` pins it (#320): its branch in the
+ * base repository, or, where its head is a fork's, whose branch the base
+ * repository doesn't hold, `refs/pull/<n>/head`, which GitHub keeps there for
+ * every pull request. Told against `base`, the base repository's name as
+ * GitHub gives it with the pull request, where it's known.
+ * @param {string} nwo @param {number | string} pr @param {string} headRef @param {string | null | undefined} headRepo
+ * @param {string} [base] @param {typeof sh} [run]
+ */
+export function pinPrHead(nwo, pr, headRef, headRepo, base = nwo, run = sh) {
+  return pinRef(nwo, isFork(base, headRepo) ? `refs/pull/${pr}/head` : `refs/heads/${headRef}`, run);
 }
 
 /**

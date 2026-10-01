@@ -335,7 +335,7 @@ test("each result the daemon publishes names the record it kept, and where the p
   const [green, red] = digestsOf(db);
   const keys = knownKeys({ local: dir }), id = storeIdentity(db);
   const [one, two] = db.prepare("SELECT seq FROM event WHERE op = 'decision.latest' ORDER BY seq").all().map((r) => r.seq);
-  const upTo = (/** @type {number} */ to) => ({ to, orders: /** @type {any} */ (decisions).ordersCommitment?.(db, REPO, keys, id, to)?.orders });
+  const upTo = (/** @type {number} */ to) => ({ to, orders: /** @type {any} */ (decisions).ordersCommitment?.(db, REPO, keys, id, to, true)?.orders, chained: true });
   const expected = [
     { pr: PR, record: green, order: null, store: upTo(0) },
     // Published again once the tick's orders are extended, to the entry naming it.
@@ -766,17 +766,18 @@ test("a result taken back before the tick's end isn't published again with its o
 
 test("each result the daemon publishes says what the store's orders commit to at an event, so a store gone further is told from one that forked", async () => {
   const dir = credentials();
-  /** @type {{ queue: boolean, orders: string, at: string | null | undefined }[]} */ const seen = [];
+  /** @type {{ queue: boolean, orders: string, chained: boolean | undefined, at: string | null | undefined }[]} */ const seen = [];
   // A queue's commit of one pull request too, which carries that one's evidence.
   await ticksOf(() => [PR], 2, { ...host(dir), evaluateQueue: judgedAtQueue,
     readQueue: () => ({ ok: true, queue: true, entries: [{ pr: PR, sha: Q, baseSha: QBASE, state: "AWAITING_CHECKS" }] }),
     publish: async (/** @type {any} */ args) => {
     // Asked while the tick runs, of the store as the publication found it.
-    if (args.evidence) seen.push({ queue: Boolean(args.queue), orders: args.evidence.store.orders, at: args.commitAt?.(args.evidence.store.to) });
+    if (args.evidence) seen.push({ queue: Boolean(args.queue), orders: args.evidence.store.orders, chained: args.evidence.store.chained, at: args.commitAt?.(args.evidence.store.to, args.evidence.store.chained) });
     return { ok: true, id: 1, conclusion: "neutral" };
   } });
   assert.ok(seen.some((x) => x.queue) && seen.some((x) => !x.queue), `control: results were published at a head and on the queue's commit: ${JSON.stringify(seen)}`);
   for (const x of seen) assert.equal(x.at, x.orders);
+  assert.ok(seen.every((x) => x.chained === true), "each over every entry of each order (#303)");
 });
 
 // ── #285's fourth review ─────────────────────────────────────────────────────
@@ -964,4 +965,58 @@ test("a published commitment a copy's orders can't be committed to is a fault, t
   db.close();
   assert.ok(checked.results > 0, "control: #42's results were checked");
   assert.match(checked.faults.map((f) => f.why).join("\n"), /this copy's signed orders to its event \d+ can't be committed to, so what the merge policy published with #\d+'s result at [0-9a-f]{8} can't be checked: #7: /);
+});
+
+// ── #303: the commitment over every entry ────────────────────────────────────
+
+test("evidence committing over every entry of each order reads back as written, and one over each top, as published before, still reads", () => {
+  const chained = { ...ev(X, { n: 2, names: Y }, st(9)), store: { ...st(9), chained: true } };
+  const text = evidenceText(chained);
+  assert.match(text, /- signed orders of this store, every entry chained, to its event 9: `e{64}`/);
+  assert.deepEqual(readEvidence(text), chained);
+  const tops = ev(X, { n: 2, names: Y }, st(9));
+  assert.match(evidenceText(tops), /- signed orders of this store, to its event 9: `e{64}`/);
+  assert.deepEqual(readEvidence(evidenceText(tops)), tops, "as published before #303, it reads as it was");
+});
+
+test("a copy whose entry before an order's top was swapped for one the host signed, its top as published, is caught by the commitment over every entry", async () => {
+  const dir = credentials();
+  const { path, published } = await ticks([at(A), at(A, "RED"), at(B), at(B, "RED")], host(dir));
+  const db = open(path);
+  const two = JSON.parse(db.prepare("SELECT payload FROM event WHERE op = 'decision.latest' AND subject = ? AND json_extract(payload, '$.n') = 2").get(`pr:${PR}`).payload);
+  const top = db.prepare("SELECT MAX(json_extract(payload, '$.n')) AS n FROM event WHERE op = 'decision.latest' AND subject = ?").get(`pr:${PR}`).n;
+  assert.ok(top >= 3, `control: entry 2 is beneath the top: ${top}`);
+  // Entry 2 signed again by this host, the same number and record, naming another besides: a copy's own.
+  const records = ["f".repeat(64)];
+  const s = fileSigner(dir)(latestStatement({ repo: two.repo, pr: PR, n: 2, digest: two.digest, records, store: two.store, seq: two.seq }));
+  db.prepare("UPDATE event SET payload = ? WHERE op = 'decision.latest' AND subject = ? AND json_extract(payload, '$.n') = 2").run(JSON.stringify({ ...two, records, envelope: s.envelope }), `pr:${PR}`);
+  const checked = publishedChecked(db, {}, { keys: publishedKeys(dir), repo: REPO, anchor: null, published: githubOf(published) });
+  db.close();
+  assert.ok(published.some((p) => p.evidence?.store.chained), "control: published over every entry");
+  assert.match(checked.faults.map((f) => f.why).join("\n"), /the signed orders this store held to its event \d+, but this copy's orders to that event aren't those/);
+});
+
+test("a commitment published over each order's top, as before #303, checks a copy as it did", async () => {
+  const h = await history();
+  const db = open(h.path);
+  // The same results, as a reeve before #303 published them.
+  const before = h.published.map((p) => p.evidence ? { ...p, evidence: { ...p.evidence, store: { to: p.evidence.store.to,
+    orders: /** @type {any} */ (decisions.ordersCommitment(db, REPO, h.keys, storeIdentity(db), p.evidence.store.to, false)).orders } } } : p);
+  const checked = publishedChecked(db, {}, { keys: h.keys, repo: REPO, anchor: null, published: githubOf(before) });
+  db.close();
+  assert.ok(before.some((p) => p.evidence && !("chained" in p.evidence.store)), "control: published over each top");
+  assert.deepEqual(checked.faults, [], JSON.stringify(checked.faults));
+});
+
+test("evidence over every entry goes forward over evidence over each top that its orders to that event commit to as published", async () => {
+  const tops = ev(X, { n: 3, names: X }, st(9));
+  const chained = { ...ev(Y, { n: 4, names: Y }, st(10, "f")), store: { ...st(10, "f"), chained: true } };
+  // The store's orders to event 9, committed over each top as the result published them, and over every entry.
+  const commitAt = (/** @type {number} */ to, /** @type {boolean} */ over) => (to !== 9 ? null : over === false ? "e".repeat(64) : "0".repeat(64));
+  assert.deepEqual(await publishOver(tops, chained, { commitAt }), { written: chained, behind: null });
+  const forked = await publishOver(tops, chained, { commitAt: (to, over) => (to === 9 && over === false ? "1".repeat(64) : "e".repeat(64)) });
+  assert.deepEqual(forked.written, tops, "control: one whose orders to it, over each top, aren't those published doesn't write over it");
+  // Without a store to ask, evidence of another kind at the same event can't be compared, and isn't held to it.
+  const same = { ...tops, store: { ...st(9, "f"), chained: true } };
+  assert.deepEqual(await publishOver(tops, same), { written: same, behind: null });
 });

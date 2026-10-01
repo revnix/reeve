@@ -1806,7 +1806,7 @@ async function tickOnce(ctx) {
   // extended, as none is extended before. The host's anchor, read with them,
   // says nothing of this store's orders where another store is bound to it, or
   // it can't be read.
-  /** @type {{ orders: Map<number, { top: number, digest: string | null, entries: Map<number, string> }>, store: { to: number, orders: string } } | null | undefined} */
+  /** @type {{ orders: Map<number, { top: number, digest: string | null, entries: Map<number, string> }>, store: { to: number, orders: string, chained: boolean } } | null | undefined} */
   let asPublished;
   const ordersAsPublished = () => {
     /** @type {import("./anchor.mjs").Anchor} */ let a;
@@ -1819,7 +1819,8 @@ async function tickOnce(ctx) {
     // The commitment checks every order the store holds, and one that doesn't
     // hold publishes nothing: an edited order would be published as the host's.
     const to = lastEntrySeq(db);
-    const all = ordersCommitment(db, nwo, /** @type {any} */ (orderKeys), store, to);
+    // Over every entry of each order (#303).
+    const all = ordersCommitment(db, nwo, /** @type {any} */ (orderKeys), store, to, true);
     if ("corrupt" in all) return null;
     /** @type {Map<number, { top: number, digest: string | null, entries: Map<number, string> }>} */ const orders = new Map();
     for (const pr of prs) {
@@ -1828,7 +1829,7 @@ async function tickOnce(ctx) {
       if (order.top < (a.latest.get(pr) ?? 0)) return null;
       if (order.top) orders.set(pr, order);
     }
-    return { orders, store: { to, orders: all.orders } };
+    return { orders, store: { to, orders: all.orders, chained: true } };
   };
   const orderAt = (/** @type {number} */ pr) => {
     if (!ordering) return undefined;
@@ -1844,8 +1845,8 @@ async function tickOnce(ctx) {
   // The store's commitment to its orders up to event `to`, for a publication to
   // tell a store whose orders to a published event aren't those from one gone
   // further (#285); null where they don't hold.
-  const commitAt = (/** @type {number} */ to) => {
-    const c = ordersCommitment(db, nwo, /** @type {any} */ (orderKeys), storeIdentity(db), to);
+  const commitAt = (/** @type {number} */ to, chained = false) => {
+    const c = ordersCommitment(db, nwo, /** @type {any} */ (orderKeys), storeIdentity(db), to, chained);
     return "corrupt" in c ? null : c.orders;
   };
   // Whether the store holds a record whole, as it was kept, for a publication

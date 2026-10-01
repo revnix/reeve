@@ -135,22 +135,26 @@ export const lastEntrySeq = (db) => Number(/** @type {any} */ (db.prepare(`SELEC
 /**
  * A commitment to every signed order the store held at its event `upTo`
  * (#285): sha256 over each pull request's number, top entry and that entry's
- * seal, in number order. Two stores commit alike only where they held the same
+ * seal, in number order; with `chained`, the chain over every entry of the
+ * order to its top in place of the top's seal (#303), so a copy holding
+ * another variant of an earlier entry, the host's key signed, beneath the same
+ * top commits otherwise too. What's published now is chained; a commitment
+ * published before is checked as it was made. Two stores commit alike only where they held the same
  * entries at the top of the same orders, so a copy with one pull request's
  * order taken away, another's swapped in, or its newest entries taken, doesn't
  * commit as the store did, whatever it counts. `corrupt` where an order doesn't
  * hold, or another is filed where no order finds it, and then it commits to
  * nothing.
- * @param {Db} db @param {string} repo @param {Keys} keys @param {string | null} store @param {number} upTo
+ * @param {Db} db @param {string} repo @param {Keys} keys @param {string | null} store @param {number} upTo @param {boolean} [chained]
  * @returns {{ orders: string } | { corrupt: string }}
  */
-export function ordersCommitment(db, repo, keys, store, upTo) {
+export function ordersCommitment(db, repo, keys, store, upTo, chained = false) {
   /** @type {[number, number, string][]} */ const tops = [];
   for (const { subject } of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ? AND seq <= ?`).all(LATEST_OP, upTo))) {
     const pr = Number(String(subject).slice(3));
     const order = signedOrder(db, repo, pr, keys, store, upTo);
     if ("corrupt" in order) return { corrupt: `#${pr}: ${order.corrupt}` };
-    if (order.top) tops.push([pr, order.top, /** @type {string} */ (order.seals.get(order.top))]);
+    if (order.top) tops.push([pr, order.top, /** @type {string} */ (chained ? orderChain(order.seals, order.top) : order.seals.get(order.top))]);
   }
   tops.sort((a, b) => a[0] - b[0]);
   return { orders: createHash("sha256").update(canonical(tops)).digest("hex") };
@@ -712,7 +716,7 @@ export function publishedChecked(db, which, { keys, repo, anchor: read = null, p
   let results = 0;
   /** @type {number[]} */ const unchecked = [];
   // Each commitment published, to the event it covers, and where it was first read.
-  /** @type {Map<string, { to: number, orders: string, head: string, pr: number }>} */ const commitments = new Map();
+  /** @type {Map<string, { to: number, orders: string, chained?: boolean, head: string, pr: number }>} */ const commitments = new Map();
   for (const pr of [...prs].sort((a, b) => a - b)) {
     const heads = /** @type {any[]} */ (headsOf.all(pr)).map((r) => String(r.head)).filter((h) => /^[0-9a-f]{40}$/.test(h));
     const got = published(pr, heads);
@@ -721,7 +725,7 @@ export function publishedChecked(db, which, { keys, repo, anchor: read = null, p
     if (!got.evidence.length && own.has(pr)) unchecked.push(pr);
     for (const e of got.evidence) {
       results++;
-      const key = `${e.store.to} ${e.store.orders}`;
+      const key = `${e.store.to} ${e.store.orders} ${Boolean(e.store.chained)}`;
       if (!commitments.has(key)) commitments.set(key, { ...e.store, head: e.head, pr });
       const at = e.head.slice(0, 8);
       const row = rowOf.get(e.record);
@@ -749,7 +753,7 @@ export function publishedChecked(db, which, { keys, repo, anchor: read = null, p
   // doesn't hold commits to nothing, and what was published can't be checked:
   // a fault, as a check of one pull request doesn't read another's order.
   for (const c of [...commitments.values()].sort((a, b) => a.to - b.to)) {
-    const mine = ordersCommitment(db, repo, keys, store, c.to);
+    const mine = ordersCommitment(db, repo, keys, store, c.to, Boolean(c.chained));
     if ("corrupt" in mine) {
       faults.push(fault(0, "", `this copy's signed orders to its event ${c.to} can't be committed to, so what the merge policy published with #${c.pr}'s result at ${c.head.slice(0, 8)} can't be checked: ${mine.corrupt}`));
       continue;

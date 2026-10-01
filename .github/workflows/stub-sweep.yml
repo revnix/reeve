@@ -4,9 +4,15 @@ name: Stub sweep
 # defects one at a time (test/stub-manifest.mjs) and requires the assertion each
 # entry names to go red.
 #
-# It takes about 35 minutes, so it runs nightly and on demand instead of on every
-# pull request (#151). CI Gate does not wait for it. A red nightly run is tracked
-# as an issue.
+# It runs nightly and on demand instead of on every pull request (#151). CI Gate
+# does not wait for it. A red nightly run is tracked as an issue.
+#
+# The whole manifest outgrew one job's time limit (cancelled at 120 minutes on
+# 2026-10-01, at about 1,900 entries), so it runs as shards in parallel, each the
+# n-th of the entries, and one last job combines their reports into the verdict
+# (#324). That job refuses unless every shard reported, at this commit, and every
+# entry was measured exactly once; it alone can see a test file with no entry,
+# which only a whole sweep can.
 
 on:
   schedule:
@@ -29,9 +35,15 @@ concurrency:
 
 jobs:
   sweep:
-    name: Stub sweep
+    name: Stub sweep, shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 90
+    strategy:
+      # Every shard runs to the end: one that fails says nothing of the others,
+      # and the combine step needs every report.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
@@ -72,9 +84,57 @@ jobs:
           STUB_SWEEP_NO_DIFF: "1"
           # Passed through the environment, never interpolated into the script.
           ENTRIES: ${{ inputs.entries }}
+          # This job's shard, of as many as the matrix has.
+          STUB_SWEEP_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+          STUB_SWEEP_RESULTS: ${{ runner.temp }}/stub-sweep-shard-${{ matrix.shard }}.json
         run: |
           set -euo pipefail
           # Word-splitting ENTRIES is deliberate: it is a list of entry names, and
           # the sweep refuses any name the manifest does not contain.
           # shellcheck disable=SC2086
           node scripts/stub-sweep.mjs $ENTRIES
+      # Kept whether or not this shard passed: the combine step judges them all.
+      # A shard stopped before its end writes no report, and the combine step
+      # says it never reported.
+      - name: Keep this shard's report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stub-sweep-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/stub-sweep-shard-${{ matrix.shard }}.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  combine:
+    name: Stub sweep
+    needs: sweep
+    # Whatever the shards did: a shard that failed or never reported is what
+    # this step exists to say.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: '24'
+      - name: Install
+        run: npm ci
+      # Outside the checkout, which the sweep requires clean.
+      - name: Fetch the shards' reports
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: stub-sweep-shard-*
+          path: ${{ runner.temp }}/shards
+          merge-multiple: true
+      - name: Judge the shards as one sweep
+        env:
+          TZ: UTC
+          STUB_SWEEP_NO_DIFF: "1"
+          SHARDS: ${{ runner.temp }}/shards
+        run: |
+          set -euo pipefail
+          # No report at all leaves the pattern unmatched, and the sweep says
+          # it needs the reports.
+          shopt -s nullglob
+          node scripts/stub-sweep.mjs --combine "$SHARDS"/*.json

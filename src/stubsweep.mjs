@@ -371,6 +371,66 @@ export function summarise(results) {
 }
 
 /**
+ * Which shard of a sweep to run (#324): "i/n", the i-th of n, counted from 1.
+ * Null where none is asked for. Anything else is an error, never read as some
+ * shard: a shard read wrongly runs entries no other shard does, or none.
+ */
+export function parseShard(spec) {
+  if (spec == null || spec === "") return null;
+  const m = /^([1-9]\d*)\/([1-9]\d*)$/.exec(String(spec));
+  if (!m || Number(m[1]) > Number(m[2]))
+    return { error: `STUB_SWEEP_SHARD must be i/n, with 1 <= i <= n: got ${JSON.stringify(spec)}` };
+  return { index: Number(m[1]), count: Number(m[2]) };
+}
+
+/** The entries shard `index` of `count` runs: every count-th, from the index-th. Shards 1 to count partition the list. */
+export function shardOf(entries, { index, count }) {
+  return entries.filter((_, k) => k % count === index - 1);
+}
+
+/**
+ * One sweep's results, from its shards' reports (#324). Each report says which
+ * shard it was, the commit it swept, the entries the sweep was asked for, and
+ * each result it got. They're refused unless they are shards 1 to n of one n,
+ * each once, at `head`, asked for the same entries, and every entry asked for
+ * was measured exactly once: a shard that stopped early, timed out or never
+ * reported would otherwise read as entries that passed. `whole` where every
+ * manifest entry was asked for, so the results can say what a whole run says.
+ */
+export function combineShards(manifest, reports, { head }) {
+  const refusals = [];
+  if (!reports.length) return { refusals: ["no shard reported"], results: [], whole: false };
+  const shards = reports.map(r => parseShard(r?.shard));
+  const count = shards.find(s => s && !("error" in s))?.count;
+  shards.forEach((s, k) => {
+    if (!s || "error" in s || s.count !== count) refusals.push(`a report isn't one of ${count ?? "any"} shards: ${JSON.stringify(reports[k]?.shard ?? null)}`);
+  });
+  for (let i = 1; i <= (count ?? 0); i++) {
+    const n = shards.filter(s => s && !("error" in s) && s.count === count && s.index === i).length;
+    if (n !== 1) refusals.push(n ? `shard ${i}/${count} reported ${n} times` : `shard ${i}/${count} never reported`);
+  }
+  for (const r of reports) if (r?.head !== head) refusals.push(`shard ${r?.shard} swept ${r?.head}, not ${head}`);
+  const wanted = Array.isArray(reports[0]?.wanted) ? reports[0].wanted : [];
+  if (reports.some(r => JSON.stringify(r?.wanted ?? []) !== JSON.stringify(wanted))) refusals.push("the shards were asked for different entries");
+  const expected = wanted.length ? manifest.filter(e => wanted.includes(e.name)) : manifest;
+  const seen = new Map();
+  for (const r of reports) for (const x of Array.isArray(r?.results) ? r.results : []) seen.set(x?.name, [...(seen.get(x?.name) ?? []), x]);
+  const listed = (names, what) => {
+    if (!names.length) return;
+    const shown = names.slice(0, 10).join(", ") + (names.length > 10 ? `, and ${names.length - 10} more` : "");
+    refusals.push(`${what(names.length)}: ${shown}`);
+  };
+  const entries = n => `${n} entr${n === 1 ? "y" : "ies"}`;
+  listed(expected.filter(e => !seen.has(e.name)).map(e => e.name), n => `${entries(n)} never measured`);
+  listed(expected.filter(e => (seen.get(e.name) ?? []).length > 1).map(e => e.name), n => `${entries(n)} measured more than once`);
+  const known = new Set(expected.map(e => e.name));
+  listed([...seen.keys()].filter(name => !known.has(name)).map(String),
+         n => `${n} result${n === 1 ? "" : "s"} for ${n === 1 ? "an entry" : "entries"} this sweep didn't ask for`);
+  const results = expected.filter(e => seen.get(e.name)?.length === 1).map(e => seen.get(e.name)[0]);
+  return { refusals, results, whole: expected.length === manifest.length };
+}
+
+/**
  * Porcelain `-z` into `{xy, path, line}`, which the human-readable form cannot give.
  *
  * A rename or copy carries its SOURCE as the NEXT NUL field rather than on the same

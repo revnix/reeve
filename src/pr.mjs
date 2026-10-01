@@ -1392,7 +1392,8 @@ export async function withdrawVerdict({ nwo, head, name, id = null, why,
     const unread = `the check runs at ${head.slice(0, 8)} couldn't be read`;
     if (id == null) return { ok: false, why: unread };
     const one = api(auth.token, [`repos/${nwo}/check-runs/${id}`, "--jq", ".output.summary"]);
-    const res = cancel(id, one.ok ? carried(one.out) : "");
+    // A read that fails holds no text, and carries none.
+    const res = cancel(id, carried(one.out));
     return { ok: false, why: res.ok ? `${unread}, so a later run of reeve's there may still pass` : String(res.err ?? "").split("\n")[0] };
   }
   const run = runs.mine[name]?.id ?? null;

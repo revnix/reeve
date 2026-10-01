@@ -1013,6 +1013,20 @@ test("a withdrawal is made though the evidence of the run on record can't be rea
   assert.equal(readEvidence(gh.written()), null, "withdrawn without it");
 });
 
+test("a withdrawal is made though the evidence the run carries doesn't read whole, and carries none", async () => {
+  const evidence = ev(X, { n: 2, names: X }, st(9));
+  const gh = withdrawing(evidence);
+  // The run's evidence block carries a line too many.
+  const garbled = `${gh.summary}\n- record of #${PR}: \`${Y}\``;
+  const api = (/** @type {string} */ t, /** @type {string[]} */ args) => (args.some((a) => /check-runs\?/.test(a))
+    ? { ok: true, out: JSON.stringify({ name: "merge-policy (shadow)", id: 5, conclusion: "neutral", app: "merge-policy", summary: garbled }) } : gh.api(t, args));
+  /** @type {any} */ let r;
+  try { r = await withdrawAt({ ...gh, api }); } catch (err) { r = { threw: String(err) }; }
+  assert.equal(r?.ok, true, JSON.stringify(r));
+  assert.ok(gh.calls.some((a) => a.includes("PATCH") && a.includes(`repos/${REPO}/check-runs/5`)), "withdrawn");
+  assert.equal(readEvidence(gh.written()), null, "without the block that doesn't read whole");
+});
+
 // ── #303: the commitment over every entry ────────────────────────────────────
 
 test("evidence committing over every entry of each order reads back as written, and one over each top, as published before, still reads", () => {

@@ -29,18 +29,46 @@ const parts = nwo => {
   return [safe(owner ?? "unknown"), safe(repo ?? "unknown")];
 };
 
-/** The state database for one repository. */
-export function statePathFor(home, nwo) {
-  const [owner, repo] = parts(nwo);
-  return join(home, "state", owner, `${repo}.db`);
-}
-
 /**
  * A name, every character but a letter, a digit, `-` and `_` written as its
  * percent code: one name for each, which no two share and none walks out of the
  * folder, as `.github` and `-github` would share `safe`'s.
  */
 const exact = s => encodeURIComponent(String(s)).replace(/[.!~*'()]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+
+/**
+ * A repository's owner or name as one segment of a store's or a dashboard's
+ * path (#310): kept as it is where it's letters, digits, `.`, `_` and `-`
+ * starting with a letter, a digit or `_`, as `safe` kept it, and otherwise
+ * percent-coded as `exact` codes it, a `-` first as `%2D`. One name for each:
+ * one kept holds no `%`, and one coded always does. So `.github` and
+ * `-github`, which `safe` both made `-github`, each have a path of their own,
+ * neither the one they shared, and every other name's store and dashboard stay
+ * where they were.
+ */
+const named = s => (/^[A-Za-z0-9_][A-Za-z0-9._-]*$/.test(String(s)) ? String(s) : exact(s).replace(/^-/, "%2D"));
+/** The name a path's segment was made from by `named`: one that holds no `%` is as it is. */
+const unnamed = s => { if (!s.includes("%")) return s; try { return decodeURIComponent(s); } catch { return s; } };
+
+/** The owner and name a store's or a dashboard's path is made of. */
+const segments = nwo => {
+  const [owner, repo] = String(nwo).split("/");
+  return [named(owner ?? "unknown"), named(repo ?? "unknown")];
+};
+
+/** The state database for one repository. */
+export function statePathFor(home, nwo) {
+  const [owner, repo] = segments(nwo);
+  return join(home, "state", owner, `${repo}.db`);
+}
+
+/**
+ * The repository a store at `state/<owner>/<file>` is of: its owner's folder
+ * and its file named as `statePathFor` names them, the `.db` taken off.
+ */
+export function storeRepo(owner, file) {
+  return `${unnamed(owner)}/${unnamed(String(file).replace(/\.db$/, ""))}`;
+}
 
 /**
  * Where a person's audits of one repository's shadow trial are kept (#294),
@@ -64,7 +92,7 @@ export function auditNotesFor(home, nwo) {
 
 /** The dashboard for one repository. */
 export function dashPathFor(home, nwo) {
-  const [owner, repo] = parts(nwo);
+  const [owner, repo] = segments(nwo);
   return join(home, "dash", owner, `${repo}.html`);
 }
 
@@ -78,6 +106,41 @@ export function dashPathFor(home, nwo) {
 export function legacyStatePathFor(home, nwo) {
   const [, repo] = parts(nwo);
   return join(home, "state", `${repo}.db`);
+}
+
+/** Where a store was kept before #310: owner and name made safe, `.github`'s and `-github`'s alike. */
+const sharedStatePath = (home, nwo) => { const [owner, repo] = parts(nwo); return join(home, "state", owner, `${repo}.db`); };
+
+/**
+ * Where `nwo`'s store is, where an earlier reeve kept it, to be moved into
+ * place, and why it can't be used, if it can't (#310). A name kept as it is has
+ * the path it had, and a store an earlier reeve kept for it is there, or under
+ * the name alone, from before stores were kept by owner, as before. A name
+ * coded has a path of its own, where no earlier reeve kept one: a store found
+ * where one did, at the path `safe` made, which names a path made alike
+ * shared, or under the name alone, may be another's, and whose it is can't be
+ * told from it, so it's named, never taken.
+ * @param {string} home @param {string} nwo
+ * @returns {{ path: string, earlier: string, refused: string | null }}
+ */
+export function storeLookup(home, nwo) {
+  const path = statePathFor(home, nwo), shared = sharedStatePath(home, nwo), legacy = legacyStatePathFor(home, nwo);
+  if (shared === path || existsSync(path)) return { path, earlier: legacy, refused: null };
+  const found = [shared, legacy].find(p => existsSync(p));
+  if (!found) return { path, earlier: legacy, refused: null };
+  return { path, earlier: legacy, refused: `an earlier reeve kept a store at ${found}, where it kept the stores of names a path made alike, ${nwo} among them, ` +
+    `so it may be ${nwo}'s or another's. If it's ${nwo}'s, move it, with any -wal and -shm beside it, to ${path} while no reeve runs, then run this again` };
+}
+
+/**
+ * The store for `nwo`, moved into place from where an earlier reeve kept it,
+ * as `adoptLegacyStore` moves it, and the path to use. Throws, with `code`
+ * STORE_REFUSED, where `storeLookup` refuses it.
+ */
+export function adoptStore(home, nwo, opts = {}) {
+  const found = storeLookup(home, nwo);
+  if (found.refused) throw storeError("STORE_REFUSED", found.refused);
+  return adoptLegacyStore(found.path, found.earlier, opts);
 }
 
 /** Likewise for the dashboard, which sat directly in the reeve home. */

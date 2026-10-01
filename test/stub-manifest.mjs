@@ -17559,7 +17559,7 @@ export const STUBS = [
     name: "restore-audits-refuses-anothers",
     why: "put back the audits of another repository's snapshot. They'd be kept as this one's",
     test: "test/backup-folders.test.mjs",
-    expectRed: "reeve restore refuses another repository's snapshot before it puts anything back",
+    expectRed: "a snapshot whose decision records are another repository's isn't restored, nor are its audits put back",
     edits: [{ file: "src/backup.mjs",
               find: "  // Nor from another repository's snapshot (#319): its audits aren't this one's.\n  const of = snapshotIsOf(snapshotPath, repo);\n  if (!of.ok) return { ok: false, why: of.why };\n",
               replace: "" }],

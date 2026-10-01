@@ -6,7 +6,7 @@
 // it might one day become.
 import { runDoctor, render, checkAppIdentity, hubFindings, renderHub } from "../src/doctor.mjs";
 import { open, storeLock } from "../src/db/ops.mjs";
-import { statePathFor, dashPathFor, legacyStatePathFor, legacyDashPathFor, hubPathFor, adoptLegacyStore, missingStoreMessage } from "../src/paths.mjs";
+import { statePathFor, dashPathFor, auditDirFor, legacyStatePathFor, legacyDashPathFor, hubPathFor, adoptLegacyStore, missingStoreMessage } from "../src/paths.mjs";
 import { hubAccess } from "../src/build/hubaccess.mjs";
 import { resolveRepoIdAt } from "../src/build/repoid.mjs";
 import { loadRegistry } from "../src/build/registryio.mjs";
@@ -244,6 +244,9 @@ const FLAGS = {
   write:          { value: false, what: "write the change rather than printing it" },
   "as-app":       { value: false, what: "act as the GitHub App rather than the user" },
   seeded:         { value: false, what: "run the trial's seeded known-bad cases too" },
+  "audit-sheet":  { value: true,  what: "write the trial's calls to a sheet, for a person to mark each one right or not" },
+  audited:        { value: true,  what: "record the audit a person marked on a sheet" },
+  by:             { value: true,  what: "who made the audit recorded" },
   test:           { value: false, what: "send a test alert through every configured channel" },
   help:           { value: false, what: "show this help" },
 };
@@ -949,12 +952,18 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
 
   // THE SHADOW TRIAL, against its conditions (#291): the store, and what
   // GitHub says merged, read as the person running this reads it. It changes
-  // nothing. 0 once every condition holds, 1 until then, as a false call is
-  // for a person's audit and is never taken as none.
+  // neither. 0 once every condition holds, 1 until then, as a false call is
+  // for a person's audit and is never taken as none. That audit (#294): the
+  // calls written to a sheet with --audit-sheet, for a person to mark each one
+  // right or not, and the sheet marked recorded with --audited, under the name
+  // --by gives, beside the audits before it, for every report to read.
   case "trial": {
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
     // Refused in the typed form, so --json gets a document even then.
     if (!nwo) fail("usage", "reeve trial: no repo. Pass owner/repo.", { exit: EXITS.misuse });
+    const auditedPath = opt("audited"), sheetPath = opt("audit-sheet");
+    if (auditedPath != null && !String(opt("by") ?? "").trim())
+      fail("usage", "reeve trial: --audited records a person's audit, and an audit names who made it: pass --by with their name", { exit: EXITS.misuse });
     const dbPath = opt("db") ?? stateFor(nwo);
     if (!existsSync(dbPath)) fail("store_absent", `reeve trial: ${missingStoreMessage(dbPath, { initCreatesIt: !opt("db"), nwo })}`);
     const since = opt("since");
@@ -963,7 +972,17 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       fail("usage", `reeve trial: --since takes the date the trial's count started from, as 2026-09-30T09:14Z${since == null ? "" : `, got ${JSON.stringify(since)}`}`);
     const now = Math.floor(Date.now() / 1000);
     if (sinceAt > now) fail("usage", `reeve trial: --since ${since} is after now, and a trial can't have begun after now`);
-    const { trialReport, renderTrial, mergedSince, storeIsOf } = await import("../src/trial.mjs");
+    const { trialReport, renderTrial, mergedSince, storeIsOf, auditSheet, readSheet, auditOf, recordAudit, readAudits } = await import("../src/trial.mjs");
+    // The sheet marked, read before anything runs.
+    let marks = null;
+    if (auditedPath != null) {
+      let text;
+      try { text = readFileSync(auditedPath, "utf8"); }
+      catch (e) { fail("usage", `reeve trial: the sheet ${auditedPath} can't be read: ${e.code ?? e.message}`, { exit: EXITS.misuse }); }
+      const sheet = readSheet(text);
+      if (!sheet.ok) fail("usage", `reeve trial: ${auditedPath}: ${sheet.why}`, { exit: EXITS.misuse });
+      marks = sheet.marks;
+    }
     // The seeded cases run only when asked: each is a judgement of its own, and
     // all of them take a while. Not run, the report says so.
     const seeded = flag("seeded") ? await (await import("../src/seeded.mjs")).runSeeded() : null;
@@ -972,7 +991,30 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     // this one, and forks share pull request numbers and heads.
     const bound = storeIsOf(db, nwo, { named: opt("db") != null });
     if (!bound.ok) fail("store_unusable", `reeve trial: ${bound.why}`);
-    const report = trialReport(db, { repo: nwo, since: sinceAt, now, merged: mergedSince(nwo, sinceAt, { until: now }), seeded });
+    const merged = mergedSince(nwo, sinceAt, { until: now });
+    const auditDir = auditDirFor(HOME, nwo);
+    const reportOf = () => {
+      const kept = readAudits(auditDir, nwo);
+      return trialReport(db, { repo: nwo, since: sinceAt, now, merged, seeded, audits: kept.ok ? kept.audits : { why: kept.why } });
+    };
+    let report = reportOf();
+    if (marks) {
+      // Taken of the calls as this report lists them, and only those.
+      const made = auditOf(report.toAudit, marks, { repo: nwo, by: opt("by"), at: now });
+      if (!made.ok) fail("usage", `reeve trial: ${auditedPath}: ${made.why}`, { exit: EXITS.misuse });
+      const path = recordAudit(auditDir, made.audit);
+      console.error(`audit recorded in ${path}: ${made.audit.calls.length} call(s) marked by ${made.audit.by}`);
+      report = reportOf();
+    }
+    if (sheetPath != null) {
+      // Never over a sheet already there: it may be one a person is marking.
+      try { writeFileSync(sheetPath, auditSheet(report.toAudit, nwo), { flag: "wx" }); }
+      catch (e) {
+        fail("usage", e.code === "EEXIST" ? `reeve trial: won't write over ${sheetPath}: name a new file for the sheet, or record the one marked with --audited`
+          : `reeve trial: the sheet couldn't be written to ${sheetPath}: ${e.code ?? e.message}`);
+      }
+      console.error(`audit sheet written to ${sheetPath}: ${report.toAudit.length} call(s), ${report.toAudit.filter((c) => c.audited).length} marked already`);
+    }
     console.log(flag("json") ? JSON.stringify(report, null, 2) : renderTrial(report, nwo));
     process.exit(report.passed ? 0 : 1);
   }
@@ -2620,7 +2662,9 @@ function usage() {
   replay [owner/repo]   recompute recorded verdicts with this code and compare them
                         (--pr <n>, --since <date>, --record <digest>;
                          0 all the same · 1 one differs or can't be replayed · 3 none)
-  trial [owner/repo]    the shadow trial against its conditions  (--since <date> it started, --json;
+  trial [owner/repo]    the shadow trial against its conditions  (--since <date> it started, --json,
+                         --seeded, --audit-sheet <file> to mark its calls on,
+                         --audited <file> --by <name> to record the sheet marked;
                          0 it has passed · 1 not yet)
   signing-key           the id and public half of the key decision records are signed with
                         (0 there is one · 3 none yet)

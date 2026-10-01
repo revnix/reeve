@@ -35,6 +35,12 @@ export function statePathFor(home, nwo) {
   return join(home, "state", owner, `${repo}.db`);
 }
 
+/** Where a person's audits of one repository's shadow trial are kept (#294). */
+export function auditDirFor(home, nwo) {
+  const [owner, repo] = parts(nwo);
+  return join(home, "audits", owner, repo);
+}
+
 /** The dashboard for one repository. */
 export function dashPathFor(home, nwo) {
   const [owner, repo] = parts(nwo);

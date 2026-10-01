@@ -522,13 +522,22 @@ mkdirSync(OFFLINE_GH_DIR);
 copyFileSync(fileURLToPath(new URL("../test/fixtures/offline-gh/gh", import.meta.url)), join(OFFLINE_GH_DIR, "gh"));
 process.on("exit", () => { try { rmSync(offlineDir, { recursive: true, force: true }); } catch { /* best effort: it holds no work */ } });
 let childRuns = 0;
+// This sweep's shard and report are its own, never a test's (#324): a test that
+// runs a sweep of its own, as the sweep's tests do, would otherwise run a shard
+// of it, and write its report over this one's.
+const unsharded = env => {
+  const e = { ...env };
+  delete e.STUB_SWEEP_SHARD;
+  delete e.STUB_SWEEP_RESULTS;
+  return e;
+};
 const childEnv = file => {
-  if (basename(file) === "escape.test.mjs") return { env: process.env, home: null, ghLog: null };
+  if (basename(file) === "escape.test.mjs") return { env: unsharded(process.env), home: null, ghLog: null };
   const n = ++childRuns;
   const home = join(offlineDir, `home-${n}`);
   mkdirSync(home);
   const ghLog = join(offlineDir, `gh-${n}.log`);
-  const env = { ...process.env, HOME: home, REEVE_TEST_GH_LOG: ghLog,
+  const env = { ...unsharded(process.env), HOME: home, REEVE_TEST_GH_LOG: ghLog,
                 PATH: `${OFFLINE_GH_DIR}${delimiter}${process.env.PATH ?? ""}` };
   delete env.REEVE_HOME;
   return { env, home, ghLog };

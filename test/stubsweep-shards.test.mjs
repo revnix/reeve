@@ -78,7 +78,7 @@ test("the shards' reports combine into one sweep's results, refused for a shard 
 // A throwaway repository with three entries, all caught, swept as shards.
 // The null guard first: `typeof null` is "object", so the object guard would answer for it.
 const SOURCE = `export function safe(v) {\n  if (v === null) throw new Error("null");\n  if (typeof v === "object") throw new Error("not a scalar");\n  if (v === undefined) throw new Error("no value");\n  return String(v);\n}\n`;
-function fixture() {
+function fixture(/** @type {string} */ extraTest = "") {
   const root = tempDir("reeve-sweep-shards-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "thing.mjs"), SOURCE);
@@ -86,7 +86,7 @@ function fixture() {
     `import test from "node:test";\nimport assert from "node:assert/strict";\nimport { safe } from "../src/thing.mjs";\n` +
     `test("an object is refused", () => { assert.throws(() => safe({}), /not a scalar/); });\n` +
     `test("no value is refused", () => { assert.throws(() => safe(undefined), /no value/); });\n` +
-    `test("null is refused", () => { assert.throws(() => safe(null), /null/); });\n`);
+    `test("null is refused", () => { assert.throws(() => safe(null), /null/); });\n` + extraTest);
   const guard = (/** @type {string} */ name, /** @type {string} */ red, /** @type {string} */ line) =>
     ({ name, why: `drop the ${name} guard`, test: "test/thing.test.mjs", expectRed: red, edits: [{ file: "src/thing.mjs", find: line, replace: "" }] });
   writeFileSync(join(root, "test", "stub-manifest.mjs"), `export const STUBS = ${JSON.stringify([
@@ -148,4 +148,15 @@ test("a shard asked for wrongly, or a combine given no report, is refused before
   const both = run(root, ["--combine", "x.json"], { STUB_SWEEP_SHARD: "1/2" });
   assert.equal(both.exit, 2, both.out.slice(-400));
   assert.match(both.out, /--combine judges every shard/);
+});
+
+test("a test the sweep runs gets none of the sweep's own shard or report settings", () => {
+  // A test that runs a sweep of its own, as the sweep's tests do, would otherwise run a shard of it, and write its report over this one's.
+  const { root, reports } = fixture(`test("the sweep's shard and report aren't the test's", () => {\n` +
+    `  assert.equal(process.env.STUB_SWEEP_SHARD, undefined);\n  assert.equal(process.env.STUB_SWEEP_RESULTS, undefined);\n});\n`);
+  const report = join(reports, "shard-1.json");
+  const r = run(root, [], { STUB_SWEEP_SHARD: "1/1", STUB_SWEEP_RESULTS: report });
+  assert.equal(r.exit, 0, r.out.slice(-600));
+  assert.match(r.out, /3\/3 stub\(s\) caught/);
+  assert.deepEqual(readOr(report)?.results?.map((/** @type {any} */ x) => x.verdict), ["CAUGHT", "CAUGHT", "CAUGHT"]);
 });

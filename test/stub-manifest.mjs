@@ -17663,4 +17663,13 @@ export const STUBS = [
               find: "if (combining && shard) die(2, \"stub-sweep: --combine judges every shard of a sweep, so it isn't one of them; unset STUB_SWEEP_SHARD\");\n",
               replace: "" }],
   },
+  {
+    name: "sweep-keeps-its-shard-from-tests",
+    why: "hand the tests it runs this sweep's shard and report. A test that runs a sweep of its own would run a shard of it, and write its report over this one's",
+    test: "test/stubsweep-shards.test.mjs",
+    expectRed: "a test the sweep runs gets none of the sweep's own shard or report settings",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: "  delete e.STUB_SWEEP_SHARD;\n  delete e.STUB_SWEEP_RESULTS;\n",
+              replace: "" }],
+  },
 ];

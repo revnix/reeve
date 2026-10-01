@@ -199,6 +199,7 @@ test("an audit kept that doesn't read whole, or is another repository's, is a fa
   assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, by: "" }))), /000002\.json doesn't read whole/, "no one named");
   assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, at: "today" }))), /000002\.json doesn't read whole/, "no time");
   assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, calls: [{ ...whole.calls[0], mark: "maybe" }] }))), /000002\.json doesn't read whole/, "a mark that isn't one");
+  assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, calls: [{ ...whole.calls[0], to: undefined }] }))), /000002\.json doesn't read whole/, "a mark that says no event it covers");
   assert.match(JSON.stringify(bad(JSON.stringify({ ...whole, repo: "x/y" }))), /000002\.json is of x\/y, not o\/r/);
   // The same call marked twice, right then false: which counts can't be told.
   const twice = { ...whole, calls: [whole.calls[0], { ...whole.calls[0], mark: "false block" }] };
@@ -218,7 +219,7 @@ test("the sheet lists every call with its reason and a link to its pull request,
   const sheet = trial.auditSheet(r.toAudit, R);
   assert.ok(sheet.startsWith("\uFEFF"), "marked as UTF-8, for a spreadsheet to read it so");
   const [head, ...rows] = sheet.replace(/^\uFEFF/, "").split("\r\n").filter(Boolean);
-  assert.deepEqual(head.split(","), ["call", "pull request", "link", "where", "verdict", "reason", "standing when it merged", "ticks", "first seen", "marked before", MARK, "note"]);
+  assert.deepEqual(head.split(","), ["call", "pull request", "link", "where", "verdict", "reason", "standing when it merged", "ticks", "first seen", "judged to", "marked before", MARK, "note"]);
   assert.equal(rows.length, 4, "a row for each call");
   assert.match(sheet, /,https:\/\/github\.com\/o\/r\/pull\/7,/);
   assert.match(sheet, /"ci blocked: failing: ""unit"", lint"/, "a reason with commas and quotes stays one cell");
@@ -226,15 +227,15 @@ test("the sheet lists every call with its reason and a link to its pull request,
   const filled = fill(sheet, { [five.id]: [" Yes"], [six.id]: ["no", "it merged with a failing check"], [seven.id]: ["RIGHT"] });
   const read = trial.readSheet(filled);
   assert.ok(read.ok, JSON.stringify(read));
-  assert.deepEqual([...read.marks].sort(), [[five.id, { right: true, note: "" }], [seven.id, { right: true, note: "" }],
-                                            [six.id, { right: false, note: "it merged with a failing check" }]].sort());
+  assert.deepEqual([...read.marks].sort(), [[five.id, { right: true, note: "", to: five.seq }], [seven.id, { right: true, note: "", to: seven.seq }],
+                                            [six.id, { right: false, note: "it merged with a failing check", to: six.seq }]].sort());
   // Saved again with a semicolon between cells, as some spreadsheets do, and with LF line ends.
-  const semi = `\uFEFFcall;pull request;${MARK};note\n${six.id};6;wrong;"a pass; it shouldn't be"\n${five.id};5;;\n`;
+  const semi = `\uFEFFcall;pull request;judged to;${MARK};note\n${six.id};6;${six.seq};wrong;"a pass; it shouldn't be"\n${five.id};5;${five.seq};;\n`;
   const back = trial.readSheet(semi);
   assert.ok(back.ok, JSON.stringify(back));
-  assert.deepEqual([...back.marks], [[six.id, { right: false, note: "a pass; it shouldn't be" }]], "a row with no mark is a call not audited");
+  assert.deepEqual([...back.marks], [[six.id, { right: false, note: "a pass; it shouldn't be", to: six.seq }]], "a row with no mark is a call not audited");
   // Tab-separated, as a sheet copied out of a spreadsheet is.
-  assert.deepEqual([...(/** @type {any} */ (trial.readSheet(`call\t${MARK}\tnote\n${seven.id}\tno\t\n`))).marks], [[seven.id, { right: false, note: "" }]]);
+  assert.deepEqual([...(/** @type {any} */ (trial.readSheet(`call\tjudged to\t${MARK}\tnote\n${seven.id}\t${seven.seq}\tno\t\n`))).marks], [[seven.id, { right: false, note: "", to: seven.seq }]]);
 });
 
 test("the sheet writes a reason that a spreadsheet would read as a formula as text", () => {
@@ -261,10 +262,13 @@ test("a mark that isn't yes or no, a call marked twice two ways, or a sheet that
   const maybe = trial.readSheet(fill(sheet, { [six.id]: ["maybe"] }));
   assert.equal(maybe.ok, false);
   assert.match(/** @type {any} */ (maybe).why, new RegExp(`${six.id}.*"maybe".*yes or no`));
-  const twice = trial.readSheet(`call,${MARK},note\r\n${six.id},yes,\r\n${six.id},no,\r\n`);
+  const twice = trial.readSheet(`call,judged to,${MARK},note\r\n${six.id},${six.seq},yes,\r\n${six.id},${six.seq},no,\r\n`);
   assert.equal(twice.ok, false);
   assert.match(JSON.stringify(twice), /marked twice/);
-  assert.equal(trial.readSheet(`call,${MARK},note\r\n${six.id},yes,\r\n${six.id},Yes,\r\n`).ok, true, "control: twice alike is one mark");
+  assert.equal(trial.readSheet(`call,judged to,${MARK},note\r\n${six.id},${six.seq},yes,\r\n${six.id},${six.seq},Yes,\r\n`).ok, true, "control: twice alike is one mark");
+  // Without the event each call was judged to, a mark can't say what it saw.
+  assert.match(JSON.stringify(trial.readSheet(`call,${MARK},note\r\n${six.id},yes,\r\n`)), /isn't an audit sheet/);
+  assert.match(String(/** @type {any} */ (trial.readSheet(`call,judged to,${MARK},note\r\n${six.id},soon,yes,\r\n`)).why), /"judged to" isn't an event of the store/);
   const none = trial.readSheet("a,b,c\r\n1,2,3\r\n");
   assert.equal(none.ok, false);
   assert.match(JSON.stringify(none), /isn't an audit sheet/);
@@ -576,4 +580,31 @@ test("a sheet is put in place whole: nothing is at its name until it's written, 
   assert.deepEqual(done, ["write false", "folder true true", "record true"]);
   assert.equal(readFileSync(at, "utf8"), "x");
   assert.deepEqual(readdirSync(d), ["calls.csv"], "its own file gone");
+});
+
+// ── #307's fourth review ─────────────────────────────────────────────────────
+
+test("a sheet's marks cover each call as judged to when it was made, so one judged again before the sheet is recorded is left to mark again", () => {
+  const r = report([]);
+  const sheet = trial.auditSheet(r.toAudit, R);
+  const six = callOf(r, 6, "c");
+  const again = (/** @type {any} */ s) => s.decided(T0 + 40 * MIN, 6, sha("c"), "PASS");
+  const now = report([], again);
+  assert.ok(callOf(now, 6, "c").seq > six.seq, "control: judged again since the sheet was made");
+  const read = /** @type {any} */ (trial.readSheet(fill(sheet, Object.fromEntries(r.toAudit.map((c) => [c.id, ["yes"]])))));
+  const made = /** @type {any} */ (trial.auditOf(now.toAudit, read.marks, { repo: R, by: "A. Person", at: T0 + 50 * MIN }));
+  assert.equal(made.audit.calls.find((/** @type {any} */ c) => c.id === six.id).to, six.seq, "its mark recorded as covering it to where the sheet saw it");
+  const after = report([made.audit], again);
+  assert.equal(noFalseCall(after).met, null, noFalseCall(after).detail);
+  assert.match(noFalseCall(after).detail, /not yet: #6 PASS at cccccccccc \(judged again since its audit\)$/);
+});
+
+test("a call judged again after its audit is so by the store's order of events, though its clock reads no later than the audit's", () => {
+  const r = report([]);
+  const right = audit(r, () => true, { at: T0 + 30 * MIN });
+  // Judged again after the audit, by a clock that reads ten minutes before it.
+  const after = report([right], (s) => s.decided(T0 + 20 * MIN, 6, sha("c"), "PASS"));
+  assert.equal(noFalseCall(after).met, null, noFalseCall(after).detail);
+  assert.match(noFalseCall(after).detail, /#6 PASS at cccccccccc \(judged again since its audit\)/);
+  assert.equal(noFalseCall(report([right])).met, true, "control: not judged again, it's met");
 });

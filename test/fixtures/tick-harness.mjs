@@ -89,7 +89,7 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
                     resolveRepoIdFn, project, keepDir = false, seams = null,
                     haltMarker, openPrs, containment, ticks = 1, dbPath, evaluate, treeOf, code, codeVersion,
                     readQueue, evaluateQueue, publish, withdraw, signer, anchor, keys, durably, prState, prIsFinished,
-                    afterTick } = {}) => {
+                    afterTick, shadow = true, enforcement } = {}) => {
   const dir = tempDir("reeve-prov-");
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
@@ -105,7 +105,7 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     // restart has to be read back from the store, and this is the only way to
     // watch it happen.
     nwo: "o/r", db: open(dbPath ?? join(dir, "s.db")), logPath: join(dir, "log.txt"),
-    execute: true, shadow: true, running: 0,
+    execute: true, shadow, running: 0,
     // OVERRIDABLE, and the default is a verdict with NO canary in it. The
     // daemon's containment verdict carries the canary's own result beside the
     // credential answer, and the two are different facts: a scenario about what
@@ -193,6 +193,8 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     // The merge queue (#163): what it holds, and how its commit is judged. Unset,
     // the queue is the offline read's, which holds nothing.
     ...(readQueue ? { readQueue } : {}),
+    // Enforcing, how each base's enforcement is measured (#166).
+    ...(enforcement ? { enforcement } : {}),
     ...(evaluateQueue ? { evaluateQueue } : {}),
     ...(withdraw ? { withdraw } : {}),
     // What signs each decision record (#165). Unset, the tick keeps its records

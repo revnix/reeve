@@ -962,8 +962,6 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     // Refused in the typed form, so --json gets a document even then.
     if (!nwo) fail("usage", "reeve trial: no repo. Pass owner/repo.", { exit: EXITS.misuse });
     const auditedPath = opt("audited"), sheetPath = opt("audit-sheet");
-    if (auditedPath != null && !String(opt("by") ?? "").trim())
-      fail("usage", "reeve trial: --audited records a person's audit, and an audit names who made it: pass --by with their name", { exit: EXITS.misuse });
     const dbPath = opt("db") ?? stateFor(nwo);
     if (!existsSync(dbPath)) fail("store_absent", `reeve trial: ${missingStoreMessage(dbPath, { initCreatesIt: !opt("db"), nwo })}`);
     const since = opt("since");

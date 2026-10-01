@@ -200,8 +200,8 @@ test("an audit kept that doesn't read whole, or is another repository's, is a fa
 test("the sheet lists every call with its reason and a link to its pull request, and reads back the marks given, as a spreadsheet saves it", () => {
   const r = report([], (s) => s.decided(T0 + 40 * MIN, 7, sha("d"), "BLOCK", { summary: "ci blocked", why: 'failing: "unit", lint' }));
   const sheet = trial.auditSheet(r.toAudit, R);
-  assert.ok(sheet.startsWith("﻿"), "marked as UTF-8, for a spreadsheet to read it so");
-  const [head, ...rows] = sheet.replace(/^﻿/, "").split("\r\n").filter(Boolean);
+  assert.ok(sheet.startsWith("\uFEFF"), "marked as UTF-8, for a spreadsheet to read it so");
+  const [head, ...rows] = sheet.replace(/^\uFEFF/, "").split("\r\n").filter(Boolean);
   assert.deepEqual(head.split(","), ["call", "pull request", "link", "where", "verdict", "reason", "standing when it merged", "ticks", "first seen", MARK, "note"]);
   assert.equal(rows.length, 4, "a row for each call");
   assert.match(sheet, /,https:\/\/github\.com\/o\/r\/pull\/7,/);
@@ -213,7 +213,7 @@ test("the sheet lists every call with its reason and a link to its pull request,
   assert.deepEqual([...read.marks].sort(), [[five.id, { right: true, note: "" }], [seven.id, { right: true, note: "" }],
                                             [six.id, { right: false, note: "it merged with a failing check" }]].sort());
   // Saved again with a semicolon between cells, as some spreadsheets do, and with LF line ends.
-  const semi = `﻿call;pull request;${MARK};note\n${six.id};6;wrong;"a pass; it shouldn't be"\n${five.id};5;;\n`;
+  const semi = `\uFEFFcall;pull request;${MARK};note\n${six.id};6;wrong;"a pass; it shouldn't be"\n${five.id};5;;\n`;
   const back = trial.readSheet(semi);
   assert.ok(back.ok, JSON.stringify(back));
   assert.deepEqual([...back.marks], [[six.id, { right: false, note: "a pass; it shouldn't be" }]], "a row with no mark is a call not audited");
@@ -308,7 +308,7 @@ test("reeve trial writes the audit sheet, records the one a person filled in und
   assert.match(again.stderr, /won't write over .*calls\.csv/);
   assert.equal(readFileSync(sheetPath, "utf8"), sheet, "and the sheet is as it was");
   // Every call marked right.
-  const ids = sheet.replace(/^﻿/, "").split("\r\n").slice(1).filter(Boolean).map((x) => x.split(",")[0]);
+  const ids = sheet.replace(/^\uFEFF/, "").split("\r\n").slice(1).filter(Boolean).map((x) => x.split(",")[0]);
   writeFileSync(sheetPath, fill(sheet, Object.fromEntries(ids.map((id) => [id, ["yes"]]))));
   const nobody = run("trial", R, "--db", s.path, "--since", since, "--audited", sheetPath);
   assert.equal(nobody.status, 2, nobody.stderr);
@@ -324,6 +324,8 @@ test("reeve trial writes the audit sheet, records the one a person filled in und
   const unknown = run("trial", R, "--db", s.path, "--since", since, "--audited", join(dir, "absent.csv"), "--by", "The Founder");
   assert.equal(unknown.status, 2);
   assert.match(unknown.stderr, /absent\.csv can't be read/);
-  const elsewhere = run("replay", R, "--by", "x");
-  assert.equal(elsewhere.status, 2, "only the trial takes an auditor's name: " + elsewhere.stderr);
+  for (const flag of ["--by", "--audited", "--audit-sheet"]) {
+    const elsewhere = run("replay", R, flag, "x");
+    assert.equal(elsewhere.status, 2, `only the trial takes ${flag}: ${elsewhere.stderr}`);
+  }
 });

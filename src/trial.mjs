@@ -200,8 +200,7 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
   /** @type {Omit<Condition, "name">} */
   const audit = !Array.isArray(audits) ? { met: false, detail: `the audits recorded can't be read, so they vouch for nothing: ${audits.why}` }
     : falseCalls.length ? { met: false, detail: `${falseCalls.length} false call(s): ${some(falseCalls, (c) => `${callText(c)} (${c.audited?.mark}, by ${c.audited?.by})`)}` }
-    // With nothing to audit, no audit says there was no false call.
-    : !toAudit.length ? { met: null, detail: "no call to audit yet" }
+    // None audited, or nothing to audit: no audit says there was no false call.
     : notYet.length === toAudit.length ? { met: null, detail: `${toAudit.length} call(s) on ${prs} pull request(s) to audit` }
     : notYet.length ? { met: null, detail: `${toAudit.length - notYet.length} of ${toAudit.length} call(s) audited, none false; not yet: ${some(notYet, callText)}` }
     : { met: true, detail: `all ${toAudit.length} call(s) audited right, by ${[...new Set(toAudit.map((c) => c.audited?.by))].join(", ")}` };
@@ -321,7 +320,7 @@ export function auditSheet(calls, nwo) {
     c.summary ? `${c.summary}${c.why ? `: ${c.why}` : ""}` : c.why, c.final ? "yes" : "", c.ticks, when(c.first),
     c.audited ? (c.audited.mark === "right" ? "yes" : "no") : "", c.audited?.note ?? ""]);
   // Marked as UTF-8, and lines ended as CSV ends them, for a spreadsheet to read it so.
-  return "﻿" + [SHEET_COLUMNS, ...rows].map((r) => r.map(cell).join(",")).join("\r\n") + "\r\n";
+  return "\uFEFF" + [SHEET_COLUMNS, ...rows].map((r) => r.map(cell).join(",")).join("\r\n") + "\r\n";
 }
 
 /** CSV's rows, cells split at `d`, a quoted cell taken whole. @param {string} text @param {string} d */
@@ -356,7 +355,8 @@ function csvRows(text, d) {
  * @returns {{ ok: true, marks: Map<string, { right: boolean, note: string }> } | { ok: false, why: string }}
  */
 export function readSheet(text) {
-  const body = String(text).replace(/^﻿/, "");
+  const body = String(text);
+  // Trimmed, a cell loses a byte-order mark too.
   const norm = (/** @type {string} */ s) => s.trim().toLowerCase();
   const d = [",", ";", "\t"].find((x) => { const h = (csvRows(body, x)[0] ?? []).map(norm); return h.includes("call") && h.includes(MARK_COLUMN); });
   if (!d) return { ok: false, why: `it isn't an audit sheet: its first row doesn't name the columns "call" and "${MARK_COLUMN}"` };
@@ -395,10 +395,10 @@ export function auditOf(calls, marks, { repo, by, at }) {
     return { ok: false, why: `the sheet marks ${stray.length} call(s) this trial doesn't list (${stray.slice(0, 3).join(", ")}): was it made for another repository, or with another --since?` };
   if (!marks.size) return { ok: false, why: `the sheet marks no call: write yes or no in its "${MARK_COLUMN}" column` };
   /** @type {Audit["calls"]} */ const audited = [];
-  for (const [id, m] of marks) {
-    const c = /** @type {Call} */ (of.get(id));
-    audited.push({ id, where: c.where, pr: c.pr, head: c.head, state: c.state, summary: c.summary, record: c.record,
-                   mark: m.right ? "right" : c.state === "PASS" ? "false pass" : "false block", note: m.note });
+  for (const c of calls) {
+    const m = marks.get(c.id);
+    if (m) audited.push({ id: c.id, where: c.where, pr: c.pr, head: c.head, state: c.state, summary: c.summary, record: c.record,
+                          mark: m.right ? "right" : c.state === "PASS" ? "false pass" : "false block", note: m.note });
   }
   return { ok: true, audit: { repo, by: who, at, calls: audited } };
 }

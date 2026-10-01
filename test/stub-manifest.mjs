@@ -4213,8 +4213,8 @@ export const STUBS = [
     test: "test/init-store.test.mjs",
     expectRed: "a command given a store it can't use refuses it with a reason, not a stack trace",
     edits: [{ file: "bin/reeve",
-              find: "  try { return adoptLegacyStore(statePathFor(HOME, nwo), legacyStatePathFor(HOME, nwo)); }\n  catch (e) { fail(\"store_unusable\", `reeve ${cmd}: ${e.message}`, { retryable: e.code === \"STORE_BUSY\" }); }\n",
-              replace: "  return adoptLegacyStore(statePathFor(HOME, nwo), legacyStatePathFor(HOME, nwo));\n" }],
+              find: "  try { return adoptLegacyStore(statePathFor(HOME, nwo), earlierStorePath(HOME, nwo)); }\n  catch (e) { fail(\"store_unusable\", `reeve ${cmd}: ${e.message}`, { retryable: e.code === \"STORE_BUSY\" }); }\n",
+              replace: "  return adoptLegacyStore(statePathFor(HOME, nwo), earlierStorePath(HOME, nwo));\n" }],
   },
   {
     name: "legacy-move-clears-a-killed-movers-lock",

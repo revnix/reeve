@@ -556,11 +556,15 @@ test("a sheet records only the marks a person gave or changed, not those it carr
   // One person corrects #6, and records it.
   const theirs = /** @type {any} */ (trial.readSheet(fill2(sheet, { [six.id]: "no" })));
   assert.deepEqual([...theirs.marks.keys()], [six.id], "only the mark changed is read");
-  const correction = /** @type {any} */ (trial.auditOf(r1.toAudit, theirs.marks, { repo: R, by: "X", at: T0 + 3 * HOUR, judgment: r1.judgment })).audit;
+  const fixed = /** @type {any} */ (trial.auditOf(r1.toAudit, theirs.marks, { repo: R, by: "X", at: T0 + 3 * HOUR, judgment: r1.judgment }));
+  assert.ok(fixed.ok, JSON.stringify(fixed));
+  const correction = fixed.audit;
   // Another, from their own copy of the sheet, marks #5 at b wrong, #6 left as it was carried.
   const mine = /** @type {any} */ (trial.readSheet(fill2(sheet, { [fiveB.id]: "no" })));
   assert.deepEqual([...mine.marks.keys()], [fiveB.id]);
-  const later = /** @type {any} */ (trial.auditOf(r1.toAudit, mine.marks, { repo: R, by: "Y", at: T0 + 4 * HOUR, judgment: r1.judgment })).audit;
+  const theirsLater = /** @type {any} */ (trial.auditOf(r1.toAudit, mine.marks, { repo: R, by: "Y", at: T0 + 4 * HOUR, judgment: r1.judgment }));
+  assert.ok(theirsLater.ok, JSON.stringify(theirsLater));
+  const later = theirsLater.audit;
   const after = report([first, correction, later]);
   assert.match(noFalseCall(after).detail, /#6 PASS at cccccccccc \(false pass, by X\)/, "the correction stands");
   assert.match(noFalseCall(after).detail, /#5 PASS at bbbbbbbbbb \(false pass, by Y\)/);
@@ -595,6 +599,7 @@ test("a sheet's marks cover each call as judged to when it was made, so one judg
   assert.ok(callOf(now, 6, "c").seq > six.seq, "control: judged again since the sheet was made");
   const read = /** @type {any} */ (trial.readSheet(fill(sheet, Object.fromEntries(r.toAudit.map((c) => [c.id, ["yes"]])))));
   const made = /** @type {any} */ (trial.auditOf(now.toAudit, read.marks, { repo: R, by: "A. Person", at: T0 + 50 * MIN, judgment: now.judgment }));
+  assert.ok(made.ok, JSON.stringify(made));
   assert.equal(made.audit.calls.find((/** @type {any} */ c) => c.id === six.id).to, six.seq, "its mark recorded as covering it to where the sheet saw it");
   const after = report([made.audit], again);
   assert.equal(noFalseCall(after).met, null, noFalseCall(after).detail);
@@ -613,6 +618,8 @@ test("a call judged again after its audit is so by the store's order of events, 
 
 // ── #314: edited sheets, a lost newest audit, calls judged on changing evidence ──
 
+/** The audits read, or what was thrown reading them: a stubbed reader that throws then fails an assertion rather than ending the file. */
+const readOr = (/** @type {Parameters<typeof trial.readAudits>} */ ...args) => { try { return trial.readAudits(...args); } catch (err) { return { ok: false, threw: String(err) }; } };
 /** Where the host notes the audits of `R` recorded in `home`: in its credentials folder, apart from the audits. */
 const notesIn = (/** @type {string} */ home) => join(home, "credentials", "audit-notes", "o", "r");
 /** The notes there, by name. */
@@ -657,6 +664,7 @@ test("a \"judged to\" that isn't one of its call's judgments is refused when the
   const sixMarked = /** @type {any} */ (trial.readSheet(`call,judged to,marked before,${MARK},note\r\n${first.id},${first.seq},,yes,\r\n`)).marks;
   const kept = /** @type {any} */ (trial.auditOf(now.toAudit, sixMarked, { repo: R, by: "A. Person", at: T0, judgment: now.judgment }));
   assert.equal(now.toAudit[0].record, "2".repeat(64), "control: its latest record is another");
+  assert.ok(kept.ok, JSON.stringify(kept));
   assert.equal(kept.audit.calls[0].record, "1".repeat(64));
 });
 
@@ -743,28 +751,26 @@ test("the host notes each audit recorded, apart from the audits, and where the n
   trial.recordAudit(dir, first, { notes });
   trial.recordAudit(dir, correction, { notes });
   assert.deepEqual(notesAt(notes), ["000001.sha256", "000002.sha256"], "each noted as it's recorded");
-  const read = /** @type {any} */ (trial.readAudits(dir, R, { notes }));
+  const read = /** @type {any} */ (readOr(dir, R, { notes }));
   assert.ok(read.ok, JSON.stringify(read));
   assert.equal(noFalseCall(report(read.audits)).met, false, "control: the correction marks #6 wrong");
   // The newest lost: those left are numbered from one with none missing, and #6 would read right again.
   const kept = readFileSync(join(dir, "000002.json"));
   rmSync(join(dir, "000002.json"));
   assert.equal(trial.readAudits(dir, R).ok, true, "control: without the host's notes, the loss can't be told");
-  assert.match(JSON.stringify(trial.readAudits(dir, R, { notes })), /000002\.json, noted on the host as recorded, is missing from .*, so what it marked can't be told/);
+  assert.match(JSON.stringify(readOr(dir, R, { notes })), /000002\.json, noted on the host as recorded, is missing from .*, so what it marked can't be told/);
   // One that isn't as recorded: the correction undone by hand.
   writeFileSync(join(dir, "000002.json"), JSON.stringify({ ...correction, calls: correction.calls.map((c) => ({ ...c, mark: "right" })) }, null, 2) + "\n");
-  assert.match(JSON.stringify(trial.readAudits(dir, R, { notes })), /000002\.json isn't the audit the host noted under that number/);
+  assert.match(JSON.stringify(readOr(dir, R, { notes })), /000002\.json isn't the audit the host noted under that number/);
   writeFileSync(join(dir, "000002.json"), kept);
-  assert.equal(trial.readAudits(dir, R, { notes }).ok, true, "control: put back as it was, it reads");
+  assert.equal(readOr(dir, R, { notes }).ok, true, "control: put back as it was, it reads");
   // A note the host didn't make, and notes that can't be listed.
   writeFileSync(join(notes, "x.sha256"), "");
-  assert.match(JSON.stringify(trial.readAudits(dir, R, { notes })), /x\.sha256, among the host's notes of the audits recorded, isn't one reeve noted/);
+  assert.match(JSON.stringify(readOr(dir, R, { notes })), /x\.sha256, among the host's notes of the audits recorded, isn't one reeve noted/);
   rmSync(join(notes, "x.sha256"));
   const notDir = join(tempDir("reeve-audits-"), "notes");
   writeFileSync(notDir, "");
-  /** @type {any} */ let unread;
-  try { unread = trial.readAudits(dir, R, { notes: notDir }); } catch (err) { unread = { threw: String(err) }; }
-  assert.match(JSON.stringify(unread), /the host's notes of the audits recorded, in .*, can't be read: ENOTDIR/);
+  assert.match(JSON.stringify(readOr(dir, R, { notes: notDir })), /the host's notes of the audits recorded, in .*, can't be read: ENOTDIR/);
 });
 
 test("a new audit is numbered after the highest the host noted, so a lost one is never filled by another", () => {
@@ -776,7 +782,7 @@ test("a new audit is numbered after the highest the host noted, so a lost one is
   rmSync(join(dir, "000002.json"));
   const { path } = trial.recordAudit(dir, audit(r, (c) => (c.pr === 5 ? true : undefined)), { notes });
   assert.match(path, /000003\.json$/);
-  assert.match(JSON.stringify(trial.readAudits(dir, R, { notes })), /000002\.json is missing, so what it marked can't be told/, "the one lost is still missing");
+  assert.match(JSON.stringify(readOr(dir, R, { notes })), /000002\.json is missing, so what it marked can't be told/, "the one lost is still missing");
   // Where the notes can't be read, which number is free can't be told: nothing is recorded.
   const blocked = join(tempDir("reeve-audits-"), "audits");
   const notDir = join(tempDir("reeve-audits-"), "notes");
@@ -797,7 +803,7 @@ test("an audit the host couldn't note is recorded, and says its loss couldn't be
   } catch (err) { got = { threw: /** @type {any} */ (err).code }; }
   assert.match(String(got.path), /000001\.json$/, JSON.stringify(got));
   assert.match(String(got.unnoted), /EIO/);
-  assert.equal(/** @type {any} */ (trial.readAudits(dir, R, { notes })).audits?.length, 1, "it's there, and read");
+  assert.equal(/** @type {any} */ (readOr(dir, R, { notes })).audits?.length, 1, "it's there, and read");
   assert.deepEqual(notesAt(notes).filter((f) => !f.startsWith(".")), [], "and not noted");
 });
 
@@ -919,7 +925,7 @@ test("an audit found without its note, as one whose recording stopped before it 
   assert.deepEqual(notesAt(notes), ["000001.sha256", "000002.sha256", "000003.sha256"]);
   // Its loss can be told now.
   rmSync(join(dir, "000002.json"));
-  assert.match(JSON.stringify(trial.readAudits(dir, R, { notes })), /000002\.json is missing|000002\.json, noted on the host as recorded, is missing/);
+  assert.match(JSON.stringify(readOr(dir, R, { notes })), /000002\.json is missing|000002\.json, noted on the host as recorded, is missing/);
   // One the host couldn't note then is said as unnoted.
   const other = tempDir("reeve-audits-");
   const [d2, n2] = [auditDirFor(other, R), notesIn(other)];

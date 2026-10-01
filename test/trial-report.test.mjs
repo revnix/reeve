@@ -200,7 +200,8 @@ test("every call the daemon made is listed for a person's audit, merged or not, 
     [[5, "head", "a", "BLOCK", 2, false], [5, "head", "b", "PASS", 1, true], [5, "queue", "9", "PASS", 1, true], [6, "head", "c", "PASS", 1, false]]);
   assert.equal(r.conditions.find((c) => /no false call/.test(c.name))?.detail, "4 call(s) on 2 pull request(s) to audit");
   assert.equal(r.toAudit[0].why, "ci: checks not settled: RUNNING (2 check(s) still in flight)", "the latest reason");
-  assert.match(renderTrial(r, R), /#5 BLOCK at aaaaaaaaaa \(ci blocked: ci: checks not settled: RUNNING \(2 check\(s\) still in flight\)\), 2 tick\(s\)/);
+  // Each reason it was judged for, with its ticks (#314).
+  assert.match(renderTrial(r, R), /#5 BLOCK at aaaaaaaaaa \(ci blocked: ci: checks not settled: RUNNING \(3 check\(s\) still in flight\) \(1 tick\); ci: checks not settled: RUNNING \(2 check\(s\) still in flight\) \(1 tick\)\), 2 tick\(s\)/);
   assert.match(renderTrial(r, R), /#6 PASS at cccccccccc/);
 });
 
@@ -260,6 +261,9 @@ test("what merged is read from GitHub since the trial began, with its merge comm
     { number: 2, mergedAt: at(T0 + 60), headRefOid: sha("a"), mergeCommit: null },
     { number: 4, mergedAt: at(T0 + 80), headRefOid: sha("e"), mergeCommit: null }]) });
   assert.deepEqual(Array.isArray(upTo) && upTo.map((m) => m.pr), [2]);
+  // Bounded in the search too (#317), so merges after the period don't fill the one read.
+  assert.match(asked[1], new RegExp(`--search merged:${at(T0).replace(/\.\d+Z$/, "Z")}\\.\\.${at(T0 + 70).replace(/\.\d+Z$/, "Z")} `));
+  assert.match(asked[0], /--search merged:>=\S+ /, "control: unbounded, from the start");
   assert.match(JSON.stringify(mergedSince("o/r", T0, { run: () => ({ ok: false, out: "", err: "HTTP 502" }) })), /HTTP 502/);
   assert.match(JSON.stringify(mergedSince("o/r", T0, { run: () => ({ ok: true, out: "{not json" }) })), /doesn't read as a list/);
   assert.match(JSON.stringify(mergedSince("o/r", T0, { run: answer([{ number: 2, mergedAt: at(T0 + 60), headRefOid: "short", mergeCommit: null }]) })), /doesn't read whole/);

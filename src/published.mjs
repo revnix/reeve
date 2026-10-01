@@ -14,9 +14,11 @@ import { netTimeoutMs, netFailure } from "./net-bound.mjs";
  * request's signed order as it stood, `null` where it had no entry yet; and a
  * commitment to every signed order the store held up to its event `to` (#285),
  * so a pull request whose orders are taken away from a copy, or swapped for
- * others, still shows, in what was published for any other.
+ * others, still shows, in what was published for any other: `chained`, over
+ * every entry of each order (#303), as published since; or over each order's
+ * top, as published before.
  * @typedef {{ pr: number, record: string, order: { n: number, names: string } | null,
- *             store: { to: number, orders: string } }} Evidence
+ *             store: { to: number, orders: string, chained?: boolean } }} Evidence
  */
 
 const HEX = /^[0-9a-f]{64}$/;
@@ -36,7 +38,7 @@ export function evidenceText(e) {
   return ["", HEADING, "",
     `- record of #${e.pr}: \`${e.record}\``,
     e.order ? `- signed order of #${e.pr}: entry ${e.order.n}, naming \`${e.order.names}\`` : `- signed order of #${e.pr}: no entry yet`,
-    `- signed orders of this store, to its event ${e.store.to}: \`${e.store.orders}\``,
+    `- signed orders of this store, ${e.store.chained ? "every entry chained, " : ""}to its event ${e.store.to}: \`${e.store.orders}\``,
   ].join("\n");
 }
 
@@ -56,10 +58,10 @@ export function readEvidence(text) {
   const block = lines.slice(at + 1).filter((l) => l.trim() !== "");
   const rec = /^- record of #([1-9]\d{0,14}): `([0-9a-f]{64})`$/.exec(block[0] ?? "");
   const ord = /^- signed order of #([1-9]\d{0,14}): (?:entry ([1-9]\d{0,14}), naming `([0-9a-f]{64})`|no entry yet)$/.exec(block[1] ?? "");
-  const all = /^- signed orders of this store, to its event (0|[1-9]\d{0,14}): `([0-9a-f]{64})`$/.exec(block[2] ?? "");
+  const all = /^- signed orders of this store, (every entry chained, )?to its event (0|[1-9]\d{0,14}): `([0-9a-f]{64})`$/.exec(block[2] ?? "");
   if (block.length !== 3 || !rec || !ord || !all || ord[1] !== rec[1]) return { garbled: true };
   return { pr: Number(rec[1]), record: rec[2], order: ord[2] ? { n: Number(ord[2]), names: ord[3] } : null,
-           store: { to: Number(all[1]), orders: all[2] } };
+           store: { to: Number(all[2]), orders: all[3], ...(all[1] ? { chained: true } : {}) } };
 }
 
 /**
@@ -76,7 +78,7 @@ export function readEvidence(text) {
  * since, where `holds` can say: no order or commitment may name it yet, and the
  * result published is all that witnesses it. Null where it doesn't fall short.
  * @param {Evidence} e @param {Evidence} prior @param {((n: number) => string | undefined) | null} [entryAt]
- * @param {((to: number) => string | null) | null} [commitAt] @param {((digest: string) => boolean) | null} [holds]
+ * @param {((to: number, chained: boolean) => string | null) | null} [commitAt] @param {((digest: string) => boolean) | null} [holds]
  */
 export function evidenceBehind(e, prior, entryAt = null, commitAt = null, holds = null) {
   const n = e.order?.n ?? 0, was = prior.order?.n ?? 0;
@@ -86,7 +88,10 @@ export function evidenceBehind(e, prior, entryAt = null, commitAt = null, holds 
     there !== undefined && there !== prior.order?.names
       ? `the store's entry ${was} of #${e.pr}'s signed order names ${String(there).slice(0, 12)}, where ${String(prior.order?.names).slice(0, 12)} was published` : null,
     e.store.to < prior.store.to ? `its signed orders go to its event ${e.store.to}, where orders to event ${prior.store.to} were published` : null,
-    e.store.to >= prior.store.to && (commitAt ? commitAt(prior.store.to) : e.store.to === prior.store.to ? e.store.orders : prior.store.orders) !== prior.store.orders
+    // As the prior committed, over each top or every entry (#303): without a
+    // store to ask, a commitment of another kind can't be compared.
+    e.store.to >= prior.store.to && (commitAt ? commitAt(prior.store.to, Boolean(prior.store.chained))
+      : e.store.to === prior.store.to && Boolean(e.store.chained) === Boolean(prior.store.chained) ? e.store.orders : prior.store.orders) !== prior.store.orders
       ? `its signed orders to event ${prior.store.to} aren't those published` : null,
     holds && prior.record !== e.record && !holds(prior.record)
       ? `the record published there, ${prior.record.slice(0, 12)}, isn't one this store holds` : null,

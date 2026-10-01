@@ -50,10 +50,11 @@ export const ANCHOR_DIR = "signing-anchors";
 /**
  * @typedef {{ n: number, digest: string, records: string[], seq: number | null }} Reserved
  * @typedef {{ began: boolean, latest: Map<number, number>, store: string | null,
- *             named: Map<number, string>, sealed: Map<number, string>, reserved: Map<number, Reserved>,
+ *             named: Map<number, string>, sealed: Map<number, string>, chained: Map<number, string>, reserved: Map<number, Reserved>,
  *             pinned: Map<number, Set<string>>, pending: { store: string, baseline: string, digests: string[] } | null }} Anchor
  *   `latest`: each pull request's highest entry noted; `named`: the record that
  *   entry names, where the anchor was told, and `sealed` the entry's seal;
+ *   `chained`: the chain over every entry of its order to that one (#303);
  *   `reserved`: an entry reserved and not yet noted, whole but for its
  *   repository and store, which are the anchor's; `pinned`: records kept and no
  *   entry names yet; `pending`: a binding begun and not yet made, with the
@@ -108,13 +109,15 @@ export function readAnchor(dir, repo) {
       || Object.entries(latest).some(([pr, n]) => !PR.test(pr) || !Number.isInteger(n) || n < 1)
       || !(a.store == null || (typeof a.store === "string" && STORE.test(a.store))))
     throw notOne();
-  // What #279 and #281 added, absent from an anchor written before them.
-  const named = byPr(a.named), sealed = byPr(a.sealed), reserved = byPr(a.reserved), pinned = byPr(a.pinned);
-  if (!named || !sealed || !reserved || !pinned) throw notOne();
+  // What #279, #281 and #303 added, absent from an anchor written before them.
+  const named = byPr(a.named), sealed = byPr(a.sealed), chained = byPr(a.chained), reserved = byPr(a.reserved), pinned = byPr(a.pinned);
+  if (!named || !sealed || !chained || !reserved || !pinned) throw notOne();
   // The record an entry names, only for an entry the anchor holds, and its seal
   // only with the record.
   if (named.some(([pr, d]) => !PR.test(pr) || !(pr in latest) || typeof d !== "string" || !DIGEST.test(d))) throw notOne();
   if (sealed.some(([pr, s]) => !PR.test(pr) || !(pr in (a.named ?? {})) || typeof s !== "string" || !DIGEST.test(s))) throw notOne();
+  // And the chain to it only with its seal.
+  if (chained.some(([pr, c]) => !PR.test(pr) || !(pr in (a.sealed ?? {})) || typeof c !== "string" || !DIGEST.test(c))) throw notOne();
   // Only the next entry is ever reserved, and only on an anchor bound to a
   // store, as an entry is that store's.
   if (reserved.some(([pr, r]) => !PR.test(pr) || typeof r?.digest !== "string" || !DIGEST.test(r.digest) || r.n !== (latest[pr] ?? 0) + 1
@@ -128,13 +131,14 @@ export function readAnchor(dir, repo) {
   return { began: a.began, latest: new Map(Object.entries(latest).map(([pr, n]) => [Number(pr), Number(n)])), store: a.store ?? null,
            named: new Map(named.map(([pr, d]) => [Number(pr), String(d)])),
            sealed: new Map(sealed.map(([pr, s]) => [Number(pr), String(s)])),
+           chained: new Map(chained.map(([pr, c]) => [Number(pr), String(c)])),
            reserved: new Map(reserved.map(([pr, r]) => [Number(pr), { n: Number(r.n), digest: String(r.digest), records: r.records.map(String), seq: r.seq === null ? null : Number(r.seq) }])),
            pinned: new Map(pinned.map(([pr, ds]) => [Number(pr), new Set(/** @type {string[]} */ (ds))])),
            pending: pending && { store: String(pending.store), baseline: String(pending.baseline), digests: pending.digests.map(String) } };
 }
 
 /** An anchor that holds nothing yet. @returns {Anchor} */
-export const noAnchor = () => ({ began: false, latest: new Map(), store: null, named: new Map(), sealed: new Map(), reserved: new Map(), pinned: new Map(), pending: null });
+export const noAnchor = () => ({ began: false, latest: new Map(), store: null, named: new Map(), sealed: new Map(), chained: new Map(), reserved: new Map(), pinned: new Map(), pending: null });
 
 /**
  * The seal of the entry reserved as `r` for pull request `pr`, on `repo`'s anchor
@@ -263,7 +267,7 @@ export function fileAnchor(dir, { write = (fd, buf, offset, length) => writeSync
         try {
           const fd = openSync(temp, "wx", 0o600);
           try {
-            writeAll(fd, canonical({ began: a.began, latest: written(a.latest), store: a.store, named: written(a.named), sealed: written(a.sealed),
+            writeAll(fd, canonical({ began: a.began, latest: written(a.latest), store: a.store, named: written(a.named), sealed: written(a.sealed), chained: written(a.chained),
                                      reserved: written(a.reserved), pinned: written(a.pinned, (ds) => [...ds].sort()), pending: a.pending }), write);
             fsyncSync(fd);
           } finally { closeSync(fd); }
@@ -384,15 +388,17 @@ export function fileAnchor(dir, { write = (fd, buf, offset, length) => writeSync
      * Only what the anchor reads back, a pull request's number and an entry's,
      * each a whole number from 1: written otherwise, it couldn't be read, and
      * would vouch for nothing again. With `digest`, the record the entry names
-     * as latest (#279), with `seal` the entry's seal, and with `names`, every
+     * as latest (#279), with `seal` the entry's seal, with `chain` the chain
+     * over every entry of the order to it (#303), and with `names`, every
      * record it names, which are pinned no longer. It clears the entry's
      * reservation.
-     * @param {string} repo @param {number} pr @param {number} n @param {string | null} [digest] @param {string[]} [names] @param {string | null} [seal]
+     * @param {string} repo @param {number} pr @param {number} n @param {string | null} [digest] @param {string[]} [names] @param {string | null} [seal] @param {string | null} [chain]
      */
-    note: (repo, pr, n, digest = null, names = [], seal = null) => update(repo, (a) => {
+    note: (repo, pr, n, digest = null, names = [], seal = null, chain = null) => update(repo, (a) => {
       if (!(Number.isSafeInteger(pr) && pr >= 1 && Number.isSafeInteger(n) && n >= 1)) throw new Error(`#${pr}, entry ${n}, isn't an entry of a pull request's order`);
       if (digest !== null && !DIGEST.test(String(digest))) throw new Error(`entry ${n} of #${pr}'s order names no record`);
       if (seal !== null && (!digest || !DIGEST.test(String(seal)))) throw new Error(`entry ${n} of #${pr}'s order has no seal`);
+      if (chain !== null && (!seal || !DIGEST.test(String(chain)))) throw new Error(`#${pr}'s order to entry ${n} has no chain`);
       const was = a.latest.get(pr) ?? 0;
       const r = a.reserved.get(pr);
       // A reserved number is noted only for the entry it was reserved for.
@@ -404,15 +410,19 @@ export function fileAnchor(dir, { write = (fd, buf, offset, length) => writeSync
         a.began = true;
         if (digest) a.named.set(pr, digest); else a.named.delete(pr);
         if (seal) a.sealed.set(pr, seal); else a.sealed.delete(pr);
+        if (chain) a.chained.set(pr, chain); else a.chained.delete(pr);
         changed = true;
       } else if (was === n && digest) {
-        // The same entry noted again: an anchor written before #279 learns its
-        // record and seal, and one that holds another is never written over.
-        const held = a.named.get(pr), heldSeal = a.sealed.get(pr);
+        // The same entry noted again: an anchor written before #279, or #303,
+        // learns its record, seal and chain, and one that holds another is
+        // never written over.
+        const held = a.named.get(pr), heldSeal = a.sealed.get(pr), heldChain = a.chained.get(pr);
         if (held && held !== digest) throw new Error(`entry ${n} of #${pr}'s order names another record on the host's anchor`);
         if (seal && heldSeal && heldSeal !== seal) throw new Error(`entry ${n} of #${pr}'s order is another entry on the host's anchor`);
+        if (chain && heldChain && heldChain !== chain) throw new Error(`#${pr}'s order to entry ${n} is another order on the host's anchor`);
         if (!held) { a.named.set(pr, digest); changed = true; }
         if (seal && !heldSeal) { a.sealed.set(pr, seal); changed = true; }
+        if (chain && !heldChain && (heldSeal ?? seal) === seal) { a.chained.set(pr, chain); changed = true; }
       }
       if (r && r.n <= (a.latest.get(pr) ?? 0)) { a.reserved.delete(pr); changed = true; }
       const pins = a.pinned.get(pr);

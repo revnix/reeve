@@ -122,6 +122,28 @@ export const entrySeal = (entry) =>
   createHash("sha256").update(canonical(latestStatement({ ...entry, repo: String(entry.repo).toLowerCase() }))).digest("hex");
 
 /**
+ * A chain over a pull request's order to entry `n` (#303): each entry's seal
+ * taken in turn with the chain before it, from the first, so it changes with
+ * any entry to `n`, not only the top. Entries name no entry before them, so a
+ * copy holding another variant of an earlier entry, signed by the host's key,
+ * would otherwise pass beneath a top the host noted. `seals` by entry number;
+ * null where one to `n` is missing.
+ * @param {Map<number, string>} seals @param {number} n @returns {string | null}
+ */
+export function orderChain(seals, n) {
+  let chain = "";
+  for (let i = 1; i <= n; i++) {
+    const seal = seals.get(i);
+    if (!seal) return null;
+    chain = chainStep(chain, seal);
+  }
+  return n >= 1 ? chain : null;
+}
+
+/** The chain once an entry with `seal` follows one at `chain`, "" before the first. @param {string} chain @param {string} seal */
+export const chainStep = (chain, seal) => createHash("sha256").update(canonical([chain, seal])).digest("hex");
+
+/**
  * The signing key in `dir`, the credentials folder. With `create`, one is made
  * when there's none, readable only by its owner. It's written whole to a file of
  * its own first, then linked into place, which fails if a key is already there:

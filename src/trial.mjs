@@ -7,10 +7,15 @@
 // call on audit. This reads the store and what GitHub says merged, and changes
 // nothing. What only a person can judge, a false call, is listed for them,
 // every call the daemon made and not only those a merge met, never passed on
-// silence.
+// silence. Their audit is kept apart from the store, each one with who made it
+// and when (#294), and read back by every report.
 
 import { execFileSync } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
+import { closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { netTimeoutMs, netFailure } from "./net-bound.mjs";
+import { syncFolder } from "./signing.mjs";
 import { TICK_STARTED, TICK_STOPPED } from "./status.mjs";
 
 /** A gap between ticks longer than this is downtime, as #158 says. */
@@ -32,10 +37,34 @@ export const CASE_KINDS = Object.freeze([
 
 /**
  * @typedef {{ pr: number, mergedAt: number, head: string, mergeCommit: string | null }} Merged
- * @typedef {{ where: "head" | "queue", pr: number, head: string, state: string, summary: string, why: string,
- *             first: number, last: number, ticks: number, record: string | null, final: boolean }} Call
+ * @typedef {"right" | "false pass" | "false block"} Mark
+ * @typedef {{ mark: Mark, by: string, at: number, note: string, to: number }} Audited
+ * @typedef {{ id: string, where: "head" | "queue", pr: number, head: string, state: string, summary: string, why: string,
+ *             first: number, last: number, seq: number, ticks: number, record: string | null, final: boolean, audited: Audited | null, again?: boolean }} Call
+ * @typedef {{ repo: string, by: string, at: number, seq?: number,
+ *             calls: { id: string, where: string, pr: number, head: string, state: string, summary: string, record: string | null, mark: Mark, note: string, to: number }[] }} Audit
+ * @typedef {{ right: boolean, note: string, to?: number }} Marked
  * @typedef {{ name: string, met: boolean | null, detail: string }} Condition
  */
+
+/**
+ * A call's name, for a person's audit to mark it by (#294): what makes it one
+ * call, its repository, place, pull request, commit, verdict and the clauses
+ * it blocked, not the ticks that repeated it or its latest reason, which can
+ * count checks still running. The repository as GitHub names it, case aside:
+ * a fork shares its upstream's commits and numbers, and a sheet of one's calls
+ * isn't the other's. It starts with a letter, so a spreadsheet keeps it as
+ * text rather than reading a number into it.
+ * @param {{ repo?: string, where: string, pr: number, head: string, state: string, summary: string }} c
+ */
+export function callId(c) {
+  return "c" + createHash("sha256").update(JSON.stringify([String(c.repo ?? "").toLowerCase(), c.where, c.pr, c.head, c.state, c.summary])).digest("hex").slice(0, 16);
+}
+
+/** How a call reads where a person audits it. @param {{ where: string, pr: number, head: string, state: string }} c */
+const callText = (c) => `#${c.pr} ${c.state} ${c.where === "queue" ? "on the queue's commit" : "at"} ${c.head.slice(0, 10)}`;
+/** Up to ten of `list`, said, and how many more. @param {any[]} list @param {(c: any) => string} say */
+const some = (list, say) => list.slice(0, 10).map(say).join(", ") + (list.length > 10 ? `, and ${list.length - 10} more` : "");
 
 /** @param {any} db @param {string} op @param {number} since @param {number} now */
 const events = (db, op, since, now) => /** @type {any[]} */ (db.prepare(
@@ -49,12 +78,13 @@ const events = (db, op, since, now) => /** @type {any[]} */ (db.prepare(
  * where it couldn't be read, and then whether every merge was covered can't be
  * said. `seeded` is how the seeded known-bad cases came out (src/seeded.mjs),
  * or null where they weren't run. Not run, none seeded, or one not as it must
- * be, and that condition isn't met.
+ * be, and that condition isn't met. `audits` is every audit of the calls a
+ * person recorded (#294), or `{ why }` where they couldn't be read.
  * @param {any} db
  * @param {{ repo: string, since: number, now: number, merged: Merged[] | { why: string },
- *           seeded?: import("./seeded.mjs").Result[] | null }} o
+ *           seeded?: import("./seeded.mjs").Result[] | null, audits?: Audit[] | { why: string } }} o
  */
-export function trialReport(db, { repo, since, now, merged, seeded = null }) {
+export function trialReport(db, { repo, since, now, merged, seeded = null, audits = [] }) {
   // Running time, from the ticks, recorded as each starts and as it ends
   // (#297). The time inside a tick, from its start to its end, or to now for one
   // still running, is running while the tick has taken no more than
@@ -96,7 +126,9 @@ export function trialReport(db, { repo, since, now, merged, seeded = null }) {
   // No tick at all is no running, however short the time; one under way as
   // the report starts is a tick.
   if (!ended.length && !started.length && !marks[0].start) running = 0;
-  const wasDown = (/** @type {number} */ t) => down.some((d) => t > d.from && t < d.to);
+  // From the second a stretch begins (#306): a merge then wasn't judged. One in
+  // the second it ends is the next tick's to judge.
+  const wasDown = (/** @type {number} */ t) => down.some((d) => t >= d.from && t < d.to);
 
   const decided = events(db, "pr.decided", since, now);
   const queued = events(db, "queue.decided", since, now);
@@ -154,16 +186,39 @@ export function trialReport(db, { repo, since, now, merged, seeded = null }) {
   const calls = new Map();
   for (const [where, list] of /** @type {const} */ ([["head", decided], ["queue", queued]])) for (const e of list) {
     const call = { where, pr: e.pr, head: String(e.p.head ?? ""), state: String(e.p.state ?? ""), summary: String(e.p.summary ?? "") };
-    const key = JSON.stringify(Object.values(call));
-    const c = calls.get(key) ?? { ...call, why: "", first: e.at, last: e.at, ticks: 0, record: null, final: false };
+    const id = callId({ repo, ...call });
+    const c = calls.get(id) ?? { id, ...call, why: "", first: e.at, last: e.at, seq: e.seq, ticks: 0, record: null, final: false, audited: null, again: false };
     c.why = String(e.p.why ?? "");
     c.last = e.at;
+    c.seq = e.seq;
     c.ticks++;
     c.record = e.p.record ?? c.record;
     if (standing.has(e.seq)) c.final = true;
-    calls.set(key, c);
+    calls.set(id, c);
   }
   const toAudit = [...calls.values()].sort((a, b) => a.pr - b.pr || a.first - b.first);
+  // Each call's mark, as a person's latest audit of it gave it: an audit made
+  // later counts over one before, so a mark corrected stands corrected: in the
+  // order recorded, which a clock set back, or two in one second, doesn't
+  // change; by time where that isn't known.
+  if (Array.isArray(audits)) for (const a of [...audits].sort((x, y) => (x.seq ?? 0) - (y.seq ?? 0) || x.at - y.at))
+    for (const m of a.calls) { const c = calls.get(m.id); if (c) c.audited = { mark: m.mark, by: a.by, at: a.at, note: m.note, to: m.to }; }
+  // A call judged again since it was marked right was judged on what that
+  // audit didn't see, so it's for a person to mark again: judged after the
+  // event its mark saw it judged to, by the store's order of events, which no
+  // clock set back, or two in one second, changes. One marked wrong stays a
+  // false call, however often it was judged again.
+  for (const c of toAudit) c.again = Boolean(c.audited && c.seq > c.audited.to);
+  const falseCalls = toAudit.filter((c) => c.audited && c.audited.mark !== "right");
+  const notYet = toAudit.filter((c) => !c.audited || c.again);
+  const prs = new Set(toAudit.map((a) => a.pr)).size;
+  /** @type {Omit<Condition, "name">} */
+  const audit = !Array.isArray(audits) ? { met: false, detail: `the audits recorded can't be read, so they vouch for nothing: ${audits.why}` }
+    : falseCalls.length ? { met: false, detail: `${falseCalls.length} false call(s): ${some(falseCalls, (c) => `${callText(c)} (${c.audited?.mark}, by ${c.audited?.by})`)}` }
+    // None audited, or nothing to audit: no audit says there was no false call.
+    : notYet.length === toAudit.length ? { met: null, detail: `${toAudit.length} call(s) on ${prs} pull request(s) to audit` }
+    : notYet.length ? { met: null, detail: `${toAudit.length - notYet.length} of ${toAudit.length} call(s) audited, none false; not yet: ${some(notYet, (c) => `${callText(c)}${c.again ? " (judged again since its audit)" : ""}`)}` }
+    : { met: true, detail: `all ${toAudit.length} call(s) audited right, by ${[...new Set(toAudit.map((c) => c.audited?.by))].join(", ")}` };
 
   const hours = running / 3600;
   const missed = merges.filter((m) => m.missed);
@@ -183,11 +238,11 @@ export function trialReport(db, { repo, since, now, merged, seeded = null }) {
       detail: seeded == null ? "not run: pass --seeded to run them"
         : !seeded.length ? "none seeded yet"
         : `${seeded.filter((s) => s.ok).length} of ${seeded.length}${seeded.some((s) => !s.ok) ? `; not as they must: ${seeded.filter((s) => !s.ok).map((s) => `${s.name} (${s.detail})`).join("; ")}` : ""}` },
-    // Only a person's audit says this, so it's never met here.
-    { name: "no false call on audit", met: null, detail: `${toAudit.length} call(s) on ${new Set(toAudit.map((a) => a.pr)).size} pull request(s) to audit` },
+    // Only a person's audit says this: met once it marks every call right.
+    { name: "no false call on audit", ...audit },
   ];
   // Ready for a person's audit once every condition the records can show holds;
-  // passed only once that audit is recorded, which nothing here does.
+  // passed only once that audit is recorded, every call in it right.
   return { since, now, running: { hours, ticks: ended.length, down }, merges, passedFinal: passedFinal.length, kinds, toAudit, seeded, conditions,
            ready: conditions.every((c) => c.met !== false), passed: conditions.every((c) => c.met === true) };
 }
@@ -244,9 +299,259 @@ export function renderTrial(r, nwo) {
     for (const a of r.toAudit)
       out.push(`  #${a.pr} ${a.state} ${a.where === "queue" ? "on the queue's commit" : "at"} ${a.head.slice(0, 10)}` +
                `${a.summary ? ` (${a.summary}${a.why ? `: ${a.why}` : ""})` : a.why ? ` (${a.why})` : ""}, ${a.ticks} tick(s)${a.final ? ", standing when it merged" : ""}` +
-               `${a.record ? `, record ${a.record.slice(0, 12)}` : ""}`);
+               `${a.record ? `, record ${a.record.slice(0, 12)}` : ""}` +
+               `${a.audited ? `, audited: ${a.audited.mark}, by ${a.audited.by}${a.again ? ", judged again since" : ""}` : ""}`);
   }
   return out.join("\n");
+}
+
+// ── a person's audit of the calls (#294) ────────────────────────────────────
+
+/** The sheet's column a person marks each call in. */
+export const MARK_COLUMN = "was reeve right? (yes/no)";
+/** How a call was marked when the sheet was made: what a mark left as it was is, and not a mark given anew. */
+const BEFORE_COLUMN = "marked before";
+/** The store's event a call was last judged at when the sheet was made: its mark covers it to there, and no further. */
+const SEQ_COLUMN = "judged to";
+const SHEET_COLUMNS = ["call", "pull request", "link", "where", "verdict", "reason", "standing when it merged", "ticks", "first seen", SEQ_COLUMN, BEFORE_COLUMN, MARK_COLUMN, "note"];
+/** What a person may write in that column, and what it says. Left empty, the call isn't audited. */
+const MARKS = new Map([["yes", true], ["right", true], ["no", false], ["wrong", false]]);
+
+/**
+ * One cell of the sheet. A cell starting as a formula does is written with a
+ * quote mark first, so a spreadsheet shows it as text: a reason can carry a
+ * check's name, and anyone opening a pull request can name a check.
+ * @param {unknown} v
+ */
+function cell(v) {
+  const s = /^[=+\-@\t\r]/.test(String(v ?? "")) ? `'${v}` : String(v ?? "");
+  return /[",;\t\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+/**
+ * The sheet a person audits the calls on, as CSV a spreadsheet opens: a row for
+ * each call with its reason and a link to its pull request, and a column to
+ * mark it right or not, filled in where an audit already marked it.
+ * @param {Call[]} calls @param {string} nwo
+ */
+export function auditSheet(calls, nwo) {
+  const rows = calls.map((c) => [c.id, c.pr, `https://github.com/${nwo}/pull/${c.pr}`, c.where, c.state,
+    c.summary ? `${c.summary}${c.why ? `: ${c.why}` : ""}` : c.why, c.final ? "yes" : "", c.ticks, when(c.first), c.seq,
+    ...marked(c), c.audited?.note ?? ""]);
+  // Marked as UTF-8, and lines ended as CSV ends them, for a spreadsheet to read it so.
+  return "\uFEFF" + [SHEET_COLUMNS, ...rows].map((r) => r.map(cell).join(",")).join("\r\n") + "\r\n";
+}
+
+/**
+ * A call's mark when the sheet is made: how it was marked before, and the mark
+ * it carries. One judged again since it was marked right carries none, to be
+ * marked again; what it was marked is in the first.
+ * @param {Call} c @returns {[string, string]}
+ */
+function marked(c) {
+  if (!c.audited) return ["", ""];
+  const was = c.audited.mark === "right" ? "yes" : "no";
+  return c.again && c.audited.mark === "right" ? [`${was}, judged again since`, ""] : [was, was];
+}
+
+/** CSV's rows, cells split at `d`, a quoted cell taken whole. @param {string} text @param {string} d */
+function csvRows(text, d) {
+  /** @type {string[][]} */ const rows = [];
+  /** @type {string[]} */ let row = [];
+  let at = "", quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quoted) {
+      if (ch === '"' && text[i + 1] === '"') { at += '"'; i++; }
+      else if (ch === '"') quoted = false;
+      else at += ch;
+    } else if (ch === '"' && at === "") quoted = true;
+    else if (ch === d) { row.push(at); at = ""; }
+    else if (ch === "\n" || ch === "\r") {
+      if (ch === "\r" && text[i + 1] === "\n") i++;
+      row.push(at); rows.push(row); row = []; at = "";
+    } else at += ch;
+  }
+  if (at !== "" || row.length) { row.push(at); rows.push(row); }
+  return rows;
+}
+
+/**
+ * The marks a filled sheet gives, by call, however a spreadsheet saved it:
+ * comma, semicolon or tab between cells, with or without a byte-order mark,
+ * either line ending. A row with no mark is a call not audited. A mark that
+ * isn't yes or no is refused, naming its call, rather than read as either; so
+ * is a call marked twice two ways.
+ * @param {string} text
+ * @returns {{ ok: true, marks: Map<string, Marked> } | { ok: false, why: string }}
+ */
+export function readSheet(text) {
+  const body = String(text);
+  // Trimmed, a cell loses a byte-order mark too.
+  const norm = (/** @type {string} */ s) => s.trim().toLowerCase();
+  const d = [",", ";", "\t"].find((x) => { const h = (csvRows(body, x)[0] ?? []).map(norm); return h.includes("call") && h.includes(MARK_COLUMN) && h.includes(SEQ_COLUMN); });
+  if (!d) return { ok: false, why: `it isn't an audit sheet: its first row doesn't name the columns "call", "${SEQ_COLUMN}" and "${MARK_COLUMN}"` };
+  const [head, ...rows] = csvRows(body, d);
+  const [idAt, markAt, noteAt, beforeAt, seqAt] = ["call", MARK_COLUMN, "note", BEFORE_COLUMN, SEQ_COLUMN].map((n) => head.map(norm).indexOf(n));
+  /** @type {Map<string, Marked>} */ const marks = new Map();
+  for (const r of rows) {
+    const id = (r[idAt] ?? "").trim(), mark = norm(r[markAt] ?? ""), note = noteAt < 0 ? "" : (r[noteAt] ?? "").trim();
+    if (!id || !mark) continue;
+    const right = MARKS.get(mark);
+    if (right === undefined) return { ok: false, why: `call ${id} is marked ${JSON.stringify(r[markAt].trim())}: mark each call yes or no, or leave it empty` };
+    // A mark the sheet carried from an audit, left as it was, is that audit's,
+    // not this one's: recorded again, it would undo a correction recorded
+    // since the sheet was made.
+    if (beforeAt >= 0 && MARKS.get(norm(r[beforeAt] ?? "")) === right) continue;
+    // Only as far as the call was judged when the sheet was made.
+    const to = Number((r[seqAt] ?? "").trim());
+    if (!Number.isSafeInteger(to) || to < 1) return { ok: false, why: `call ${id}'s "${SEQ_COLUMN}" isn't an event of the store: the sheet's columns were changed` };
+    const was = marks.get(id);
+    if (was && was.right !== right) return { ok: false, why: `call ${id} is marked twice, yes and no` };
+    marks.set(id, { right, note: was?.note || note, to: Math.min(was?.to ?? to, to) });
+  }
+  return { ok: true, marks };
+}
+
+/**
+ * An audit of `calls`, the trial's as reported, from the marks a person gave:
+ * each call as the report lists it, whatever else the sheet says, marked right,
+ * a false pass where it passed, or a false block where it didn't, with who
+ * made it and when. A mark for a call the trial doesn't list, from a sheet made
+ * for another repository or another start, isn't taken; nor an audit that
+ * marks nothing, or names no one.
+ * @param {Call[]} calls @param {Map<string, Marked>} marks
+ * @param {{ repo: string, by: string, at: number }} o
+ * @returns {{ ok: true, audit: Audit } | { ok: false, why: string }}
+ */
+export function auditOf(calls, marks, { repo, by, at }) {
+  const who = String(by ?? "").trim();
+  if (!who) return { ok: false, why: "an audit names who made it: pass --by with their name" };
+  const of = new Map(calls.map((c) => [c.id, c]));
+  const stray = [...marks.keys()].filter((id) => !of.has(id));
+  if (stray.length)
+    return { ok: false, why: `the sheet marks ${stray.length} call(s) this trial doesn't list (${stray.slice(0, 3).join(", ")}): was it made for another repository, or with another --since?` };
+  if (!marks.size) return { ok: false, why: `the sheet marks no call, but for marks it carried from audits recorded: write yes or no in its "${MARK_COLUMN}" column` };
+  /** @type {Audit["calls"]} */ const audited = [];
+  for (const c of calls) {
+    const m = marks.get(c.id);
+    if (m) audited.push({ id: c.id, where: c.where, pr: c.pr, head: c.head, state: c.state, summary: c.summary, record: c.record,
+                          mark: m.right ? "right" : c.state === "PASS" ? "false pass" : "false block", note: m.note, to: m.to ?? c.seq });
+  }
+  return { ok: true, audit: { repo, by: who, at, calls: audited } };
+}
+
+/**
+ * Puts the sheet `text` at `sheetPath`, where nothing may be yet, and only then
+ * runs `record`, recording the audit the sheet carries. The sheet is written
+ * whole to a file of its own and synced, linked into place, which fails where
+ * anything is there, and its folder synced: nothing is at its name until it's
+ * whole, so a stop partway leaves no sheet to refuse a retry. A sheet that
+ * can't be put in place records nothing, and one whose audit can't be
+ * recorded is taken away. A file already there is left as it was, `EEXIST`;
+ * otherwise what failed says which step, as `stage`. Its own file is gone
+ * afterwards, whatever failed.
+ * @template T @param {string} sheetPath @param {string} text @param {() => T} record
+ * @param {{ write?: (fd: number, text: string) => void, syncDir?: (dir: string) => void }} [io] @returns {T}
+ */
+export function sheetThenRecord(sheetPath, text, record, { write = writeFileSync, syncDir = syncFolder } = {}) {
+  const temp = join(dirname(sheetPath), `.${basename(sheetPath)}.${process.pid}.${randomBytes(4).toString("hex")}.part`);
+  let placed = false, kept = false;
+  try {
+    try {
+      const fd = openSync(temp, "wx", 0o600);
+      try { write(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
+    } catch (err) { throw Object.assign(/** @type {Error} */ (err), { stage: "sheet" }); }
+    linkSync(temp, sheetPath);
+    placed = true;
+    try { syncDir(dirname(sheetPath)); } catch (err) { throw Object.assign(/** @type {Error} */ (err), { stage: "sheet" }); }
+    /** @type {T} */ let r;
+    try { r = record(); } catch (err) { throw Object.assign(/** @type {Error} */ (err), { stage: "record" }); }
+    kept = true;
+    return r;
+  } finally {
+    try { unlinkSync(temp); } catch { /* gone */ }
+    if (placed && !kept) rmSync(sheetPath, { force: true });
+  }
+}
+
+/** The name of the audit recorded `n`th. @param {number} n */
+const numbered = (n) => `${String(n).padStart(6, "0")}.json`;
+
+/**
+ * Keeps `audit` in `dir` as the next of the audits there, numbered in the
+ * order they were recorded, so the one recorded after counts. Written whole to
+ * a file of its own and synced, then linked into place, which fails where
+ * another took that number first, and the next is tried; its own file is gone
+ * afterwards, whatever failed. Then its folder is synced, and each folder made
+ * for it with the one that holds it, so an audit said to be recorded outlasts
+ * a power loss. Where, and, once it's in place, a folder that couldn't be
+ * synced as `unsynced`: it's recorded, read by every report, and recording it
+ * again would make two.
+ * @param {string} dir @param {Audit} audit
+ * @param {{ link?: typeof linkSync, fsync?: typeof fsyncSync, syncDir?: (dir: string) => void }} [io]
+ * @returns {{ path: string, unsynced: string | null }}
+ */
+export function recordAudit(dir, audit, { link = linkSync, fsync = fsyncSync, syncDir = syncFolder } = {}) {
+  const made = mkdirSync(dir, { recursive: true, mode: 0o700 });
+  /** @type {string[]} */ const folders = [];
+  for (let f = dir; ; f = dirname(f)) { folders.push(f); if (!made || f === dirname(made) || f === dirname(f)) break; }
+  const temp = join(dir, `.${process.pid}.${randomBytes(4).toString("hex")}.part`);
+  try {
+    const fd = openSync(temp, "wx", 0o600);
+    try { writeFileSync(fd, JSON.stringify(audit, null, 2) + "\n"); fsync(fd); } finally { closeSync(fd); }
+    for (let n = 1 + Math.max(0, ...readdirSync(dir).map((f) => Number(/^(\d+)\.json$/.exec(f)?.[1] ?? 0))); ; n++) {
+      const path = join(dir, numbered(n));
+      try { link(temp, path); }
+      catch (err) { if (/** @type {NodeJS.ErrnoException} */ (err).code === "EEXIST") continue; throw err; }
+      /** @type {string | null} */ let unsynced = null;
+      for (const f of folders) {
+        try { syncDir(f); }
+        catch (err) { unsynced ??= `${f}: ${/** @type {NodeJS.ErrnoException} */ (err).code ?? /** @type {Error} */ (err).message}`; }
+      }
+      return { path, unsynced };
+    }
+  } finally { try { unlinkSync(temp); } catch { /* gone */ } }
+}
+
+/** Whether `a` reads whole as an audit kept. @param {any} a */
+function auditWhole(a) {
+  const marks = ["right", "false pass", "false block"];
+  return typeof a?.repo === "string" && typeof a.by === "string" && a.by.trim() !== "" && Number.isFinite(a.at) && Array.isArray(a.calls)
+    && a.calls.every((/** @type {any} */ c) => typeof c?.id === "string" && marks.includes(c.mark) && typeof c.note === "string" && Number.isSafeInteger(c.to) && c.to >= 1);
+}
+
+/**
+ * Every audit kept in `dir` for `repo`, in the order recorded, or why they
+ * can't be read: a folder that can't be listed, a file that isn't one reeve
+ * recorded, one that doesn't read whole or marks a call twice, or one of
+ * another repository, vouches for nothing, and may have marked a call false.
+ * @param {string} dir @param {string} repo
+ * @returns {{ ok: true, audits: Audit[] } | { ok: false, why: string }}
+ */
+export function readAudits(dir, repo) {
+  if (!existsSync(dir)) return { ok: true, audits: [] };
+  let names;
+  try { names = readdirSync(dir); }
+  catch (err) { return { ok: false, why: `the audits recorded in ${dir} can't be listed: ${/** @type {NodeJS.ErrnoException} */ (err).code ?? /** @type {Error} */ (err).message}` }; }
+  /** @type {Audit[]} */ const audits = [];
+  for (const f of names.filter((x) => x.endsWith(".json")).sort()) {
+    const seq = Number(/^(\d+)\.json$/.exec(f)?.[1]);
+    if (!Number.isSafeInteger(seq) || seq < 1 || f !== numbered(seq)) return { ok: false, why: `${f}, among the audits recorded, isn't one reeve recorded` };
+    let a;
+    try { a = JSON.parse(readFileSync(join(dir, f), "utf8")); } catch { return { ok: false, why: `the audit recorded in ${f} can't be read` }; }
+    if (!auditWhole(a)) return { ok: false, why: `the audit recorded in ${f} doesn't read whole` };
+    const twice = a.calls.find((/** @type {any} */ c, /** @type {number} */ i) => a.calls.findIndex((/** @type {any} */ d) => d.id === c.id) !== i);
+    if (twice) return { ok: false, why: `the audit recorded in ${f} marks call ${twice.id} twice` };
+    if (a.repo !== repo) return { ok: false, why: `the audit recorded in ${f} is of ${a.repo}, not ${repo}` };
+    audits.push({ ...a, seq });
+  }
+  // Numbered from one with none missing: an audit taken away from among them
+  // may have corrected a mark one before it gave, which would stand again.
+  const gap = audits.findIndex((a, i) => a.seq !== i + 1);
+  if (gap >= 0)
+    return { ok: false, why: `the audits recorded go to ${numbered(/** @type {number} */ (audits.at(-1)?.seq))}, but ${numbered(gap + 1)} is missing, so what it marked can't be told` };
+  return { ok: true, audits };
 }
 
 /** `gh`, as the person running this reads GitHub, bounded as every read is (#282). @param {string[]} args */

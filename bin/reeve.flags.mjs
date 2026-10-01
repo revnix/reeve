@@ -66,6 +66,12 @@ export const APPLIES = Object.freeze({
   // The trial's seeded known-bad cases, run for its report (#293).
   seeded: Object.freeze(["trial"]),
 
+  // A person's audit of the trial's calls (#294): the sheet to mark them on,
+  // the sheet marked, and who marked it.
+  "audit-sheet": Object.freeze(["trial"]),
+  audited: Object.freeze(["trial"]),
+  by: Object.freeze(["trial"]),
+
   // The decision records' own flags (#165): which pull request's, or which
   // record, to replay, and which commit `why` explains.
   pr: Object.freeze(["replay"]),
@@ -193,4 +199,5 @@ export const ERROR_KINDS = Object.freeze([
   "hub_incompatible",
   "store_absent",
   "store_unusable",
+  "audit_unrecorded",
 ]);

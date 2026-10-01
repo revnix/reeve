@@ -3,7 +3,7 @@
 // store and one dashboard, each writing into the other's.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -98,4 +98,71 @@ test("reeve finds the store an earlier reeve kept for a repository whose name a 
   const r = spawnSync(process.execPath, [REEVE, "replay", "o/.github"], { encoding: "utf8", env: { ...offlineEnv(), PATH: `${bin}:${offlineEnv().PATH}`, REEVE_HOME: home } });
   assert.match(r.stderr, new RegExp(`moved ${was.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} -> .*%2Egithub\\.db`), r.stdout + r.stderr);
   assert.ok(existsSync(paths.statePathFor(home, "o/.github")));
+});
+
+// ── #318's first review ──────────────────────────────────────────────────────
+
+/** reeve, run with `home` as its home and a gh that answers nothing. */
+function reeveIn(/** @type {string} */ home) {
+  const bin = tempDir("reeve-paths-gh-");
+  writeFileSync(join(bin, "gh"), "#!/bin/sh\necho \"not a read this test answers: $*\" >&2\nexit 1\n");
+  chmodSync(join(bin, "gh"), 0o755);
+  return (/** @type {string[]} */ ...args) => spawnSync(process.execPath, [REEVE, ...args], { encoding: "utf8", env: { ...offlineEnv(), PATH: `${bin}:${offlineEnv().PATH}`, REEVE_HOME: home } });
+}
+
+test("a store at a repository's own path holding another's records, kept there while names a path made alike shared one, is refused for it", () => {
+  const home = tempDir("reeve-paths-home-");
+  // `o/.github`'s store, kept at the path `o/-github`'s is now.
+  storeAt(shared(home, "o", "-github"), ["o/.github"]);
+  const r = reeveIn(home)("replay", "o/-github");
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stderr, /reeve replay: the store at .*-github\.db holds decision records of o\/\.github, not o\/-github/);
+  // Its own, the command runs on it.
+  const own = tempDir("reeve-paths-home-");
+  storeAt(shared(own, "o", "-github"), ["o/-github"]);
+  assert.doesNotMatch(reeveIn(own)("replay", "o/-github").stderr, /holds decision records of/, "control: its own store");
+});
+
+test("a store moved from where names were made alike takes the dashboard written beside it there", () => {
+  const home = tempDir("reeve-paths-home-");
+  storeAt(shared(home, "o", "-github"), ["o/.github"]);
+  const dash = join(home, "dash", "o", "-github.html");
+  mkdirSync(dirname(dash), { recursive: true });
+  writeFileSync(dash, "o/.github's dashboard");
+  reeveIn(home)("replay", "o/.github");
+  assert.ok(existsSync(paths.statePathFor(home, "o/.github")), "control: moved");
+  assert.equal(existsSync(dash), false, "its dashboard gone from the other's path");
+  // A store moved from the older layout leaves every dashboard as it is.
+  const older = tempDir("reeve-paths-home-");
+  storeAt(join(older, "state", "r.db"), ["o/r"]);
+  const theirs = join(older, "dash", "o", "r.html");
+  mkdirSync(dirname(theirs), { recursive: true });
+  writeFileSync(theirs, "x");
+  reeveIn(older)("replay", "o/r");
+  assert.ok(existsSync(paths.statePathFor(older, "o/r")), "control: moved from the older layout");
+  assert.ok(existsSync(theirs));
+});
+
+test("looking for a store an earlier reeve kept leaves nothing beside it", () => {
+  const home = tempDir("reeve-paths-");
+  const was = storeAt(shared(home, "o", "-github"), ["o/.github"]);
+  assert.deepEqual(readdirSync(dirname(was)), ["-github.db"], "control: closed whole, nothing beside it");
+  assert.equal(paths.earlierStorePath(home, "o/.github"), was);
+  assert.equal(paths.otherStoreAt(home, "o/-github"), "o/.github");
+  assert.deepEqual(readdirSync(dirname(was)), ["-github.db"]);
+});
+
+test("a store an earlier reeve kept, its records still in its log beside it, is read with its log", () => {
+  const home = tempDir("reeve-paths-");
+  const path = shared(home, "o", "-github");
+  mkdirSync(dirname(path), { recursive: true });
+  // Held open, as a reeve running on it holds it: what it commits stays in its log.
+  const db = open(path);
+  try {
+    db.exec("PRAGMA wal_autocheckpoint = 0");
+    db.prepare("INSERT INTO decision(digest,pr,head,record,first_at,last_at,first_seq,last_seq) VALUES(?,?,?,?,?,?,?,?)")
+      .run("o/.github#1", 1, sha("a"), JSON.stringify({ subject: { repo: "o/.github", pr: 1, head: sha("a") } }), 1, 1, 1, 1);
+    assert.ok(existsSync(`${path}-wal`), "control: its log is beside it");
+    assert.equal(paths.earlierStorePath(home, "o/.github"), path);
+  } finally { db.close(); }
 });

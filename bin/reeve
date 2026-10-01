@@ -6,7 +6,7 @@
 // it might one day become.
 import { runDoctor, render, checkAppIdentity, hubFindings, renderHub } from "../src/doctor.mjs";
 import { open, storeLock } from "../src/db/ops.mjs";
-import { statePathFor, dashPathFor, auditDirFor, earlierStorePath, legacyDashPathFor, hubPathFor, adoptLegacyStore, missingStoreMessage } from "../src/paths.mjs";
+import { statePathFor, dashPathFor, auditDirFor, adoptStore, otherStoreAt, legacyDashPathFor, hubPathFor, adoptLegacyStore, missingStoreMessage } from "../src/paths.mjs";
 import { hubAccess } from "../src/build/hubaccess.mjs";
 import { resolveRepoIdAt } from "../src/build/repoid.mjs";
 import { loadRegistry } from "../src/build/registryio.mjs";
@@ -503,8 +503,15 @@ const stateFor = nwo => {
   // A store another process is still moving, or one a failed move left split
   // between two paths, can't be used at either. Every command refuses it the
   // same way, and says why, rather than dying on a stack trace.
-  try { return adoptLegacyStore(statePathFor(HOME, nwo), earlierStorePath(HOME, nwo)); }
+  /** @type {string} */ let path;
+  try { path = adoptStore(HOME, nwo); }
   catch (e) { fail("store_unusable", `reeve ${cmd}: ${e.message}`, { retryable: e.code === "STORE_BUSY" }); }
+  // Another repository's store, kept at this one's path while names a path
+  // made alike shared one (#310), is never this one's.
+  const other = otherStoreAt(HOME, nwo);
+  if (other) fail("store_unusable", `reeve ${cmd}: the store at ${path} holds decision records of ${other}, not ${nwo}: an earlier reeve kept the stores ` +
+                                    `of names a path made alike in one place. Run reeve once for ${other} to move its store to its own path, then run this again`);
+  return path;
 };
 
 function detectNwo() {

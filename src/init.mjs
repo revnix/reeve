@@ -21,7 +21,7 @@ import { validate, withDefaults } from "./profile/schema.mjs";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, linkSync, rmSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { resolveHome } from "./home.mjs";
-import { statePathFor, earlierStorePath, adoptLegacyStore, clearMoveLock } from "./paths.mjs";
+import { statePathFor, earlierStorePath, adoptStore, clearMoveLock } from "./paths.mjs";
 import { open } from "./db/ops.mjs";
 
 /**
@@ -323,7 +323,7 @@ export function ensureStore(home, nwo, { openStore = open, log = () => {} } = {}
   if (status.state === "exists") { clearMoveLock(status.path); return { changed: false, line: null }; }
   if (status.state === "legacy") {
     let said = null, used;
-    try { used = adoptLegacyStore(status.path, status.legacy, { log: (m) => { said = m; log(m); } }); }
+    try { used = adoptStore(home, nwo, { log: (m) => { said = m; log(m); } }); }
     catch (e) { return { changed: false, failed: true, line: e.message }; }
     return used === status.path
       ? { changed: true, line: `moved the state database to ${status.path}` }

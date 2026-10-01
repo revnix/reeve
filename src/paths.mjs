@@ -13,6 +13,7 @@
 
 import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 
 /**
@@ -113,13 +114,55 @@ export function earlierStorePath(home, nwo) {
 
 /** Whether the store at `path` holds decision records, and only of `nwo`. One that can't be read can't be told. */
 function holdsOnly(path, nwo) {
+  const repos = reposIn(path);
+  return repos !== null && repos.length > 0 && repos.every(r => r === nwo);
+}
+
+/**
+ * The repositories the decision records of the store at `path` are of, or
+ * null where it can't be read. Read without leaving anything beside it: a
+ * store closed whole, with no log beside it, is read as it is on disk, as a
+ * read-only reader of it would otherwise leave a log and its index there; one
+ * with its log is read with it, as nothing new is made.
+ * @param {string} path @returns {(string | null)[] | null}
+ */
+function reposIn(path) {
   let db = null;
   try {
-    db = new DatabaseSync(path, { readOnly: true });
-    const repos = db.prepare(`SELECT DISTINCT CASE WHEN json_valid(record) THEN json_extract(record, '$.subject.repo') END AS repo FROM decision`).all();
-    return repos.length > 0 && repos.every(r => r.repo === nwo);
-  } catch { return false; }
+    db = existsSync(`${path}-wal`) ? new DatabaseSync(path, { readOnly: true }) : new DatabaseSync(`${pathToFileURL(path).href}?immutable=1`, { readOnly: true });
+    return db.prepare(`SELECT DISTINCT CASE WHEN json_valid(record) THEN json_extract(record, '$.subject.repo') END AS repo FROM decision`).all()
+      .map(r => (typeof r.repo === "string" ? r.repo : null));
+  } catch { return null; }
   finally { try { db?.close(); } catch { /* never opened */ } }
+}
+
+/**
+ * Another repository whose decision records the store at `nwo`'s path holds,
+ * or null (#310). Only a name `safe` made another's alike to, one that starts
+ * with `-`, as `.github` was made `-github`, can find another's store at its
+ * own path: one an earlier reeve kept there for the other, not moved yet. It's
+ * never this one's.
+ */
+export function otherStoreAt(home, nwo) {
+  const [, repo] = String(nwo).split("/");
+  const path = statePathFor(home, nwo);
+  if (!String(repo ?? "").startsWith("-") || !existsSync(path)) return null;
+  return (reposIn(path) ?? []).find(r => r !== nwo) ?? null;
+}
+
+/**
+ * The store for `nwo`, moved into place from where an earlier reeve kept it,
+ * as `adoptLegacyStore` moves it, and the path to use (#310). Moved from where
+ * names were made alike, the dashboard written beside it there goes too: it's
+ * this repository's, and its path is another's now.
+ */
+export function adoptStore(home, nwo, opts = {}) {
+  const next = statePathFor(home, nwo), earlier = earlierStorePath(home, nwo);
+  const used = adoptLegacyStore(next, earlier, opts);
+  const [owner, repo] = parts(nwo);
+  if (used === next && earlier === join(home, "state", owner, `${repo}.db`) && !existsSync(earlier))
+    rmSync(join(home, "dash", owner, `${repo}.html`), { force: true });
+  return used;
 }
 
 /** Likewise for the dashboard, which sat directly in the reeve home. */

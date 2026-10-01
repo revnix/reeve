@@ -17606,8 +17606,8 @@ export const STUBS = [
     test: "test/enforcement-measured.test.mjs",
     expectRed: "enforcing is measured before the daemon starts, and refused unless the default branch enforces what reeve publishes",
     edits: [{ file: "bin/reeve",
-              find: "      if (e.state !== \"enforced\") {\n        console.error(`reeve ${cmd}: --enforce refused:",
-              replace: "      if (false) {\n        console.error(`reeve ${cmd}: --enforce refused:" }],
+              find: "        ...(e.state === \"enforced\" ? [] : [",
+              replace: "        ...(true ? [] : [" }],
   },
   {
     name: "enforcement-signed-out-unknown",
@@ -18119,8 +18119,8 @@ export const STUBS = [
     test: "test/enforcement-measured.test.mjs",
     expectRed: "--enforce refused says what would fix it, for the reason it's refused",
     edits: [{ file: "bin/reeve",
-              find: "To enforce, ${e.fix ?? `make ${base} enforce what reeve publishes`}, then",
-              replace: "Require the merge-policy check from reeve's App on ${base}, then" }],
+              find: "[`${e.why}. To enforce, ${e.fix ?? `make ${base} enforce what reeve publishes`}`]",
+              replace: "[`${e.why}. Require the merge-policy check from reeve's App on ${base}`]" }],
   },
   {
     name: "requirements-kept-per-reader",

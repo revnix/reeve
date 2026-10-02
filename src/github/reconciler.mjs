@@ -12,9 +12,9 @@
 //     workflow that has not scheduled its jobs yet looks identical to one that
 //     has none.
 
-import { execFileSync } from "node:child_process";
 import { netTimeoutMs, netFailure } from "../net-bound.mjs";
 
+import { runCommand } from "./calls.mjs";
 /** Conclusions that do NOT block. Everything else does, including the ones a naive
  *  `conclusion === "failure"` branch would fall straight through. */
 const PASSING = new Set(["success", "skipped", "neutral"]);
@@ -45,7 +45,7 @@ const UNINFORMATIVE = new Set(["cancelled", "stale"]);
 function sh(cmd, args) {
   // A paged read of a busy head runs past the default 1 MiB, and a read cut
   // short there must not be taken for the whole list.
-  try { return { ok: true, out: execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024, timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim() }; }
+  try { return { ok: true, out: String(runCommand(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024, timeout: netTimeoutMs(), killSignal: "SIGKILL" })).trim() }; }
   catch (e) { return { ok: false, out: "", err: netFailure(e) }; }
 }
 const gh = (path, jq, { paginate = false } = {}) => {

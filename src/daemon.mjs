@@ -1414,8 +1414,22 @@ export async function tick(ctx) {
   let r;
   try { r = await tickOnce(ctx); }
   catch (err) { noteTickStopped(ctx.db); throw err; }
+  // On every way a tick ends: one that failed or halted spent its requests too.
+  finally { logGitHubCalls(ctx); }
   if (r?.halted || r?.unreadable) noteTickStopped(ctx.db);
   return r;
+}
+
+/**
+ * The GitHub requests a tick made, in all and per pull request it listed
+ * (#168), logged as it ends, however it ends: measured, before they're cut.
+ */
+function logGitHubCalls(ctx) {
+  const made = takeCalls();
+  if (!ctx.logPath) return;
+  const who = Object.entries(made.byWho).sort(([a], [b]) => a.localeCompare(b)).map(([w, n]) => `${w} ${n}`).join(", ");
+  const perPr = ctx.tickPrs == null ? "" : `, ${(ctx.tickPrs ? made.requests / ctx.tickPrs : 0).toFixed(1)} per pull request`;
+  log(resolve(ctx.logPath), `github: ${made.requests} request(s) in ${made.calls} call(s) this tick${perPr}${who ? ` (${who})` : ""}`);
 }
 
 async function tickOnce(ctx) {
@@ -1429,8 +1443,10 @@ async function tickOnce(ctx) {
   // Recorded as it starts, and again as it ends: the time between is running,
   // however long the tick takes (#297).
   noteTickStart(db);
-  // The GitHub calls counted from here are this tick's (#168).
+  // The GitHub requests counted from here are this tick's (#168), and for as
+  // many pull requests as it lists.
   takeCalls();
+  ctx.tickPrs = null;
   // Enforcing, a base where no rule requires reeve's check gets its results in
   // shadow (#166): enforcing there would say it gates what it can't. Where a
   // rule requires it, its results go out enforcing, though someone can bypass
@@ -2774,6 +2790,7 @@ async function tickOnce(ctx) {
   // it is always the SAME 20 -- so the remainder would never be looked at once,
   // silently, forever.
   const CAP = profile.watch?.maxOpenPrs ?? 20;
+  ctx.tickPrs = prs.length;
   log(logPath, `tick: ${nwo} — ${prs.length} open PR(s)` +
       (prs.length >= CAP ? ` — AT THE ${CAP} CAP: any beyond this are not being watched at all` : ""));
 
@@ -4878,15 +4895,6 @@ async function tickOnce(ctx) {
   if (ctx.reviewIngest !== false) {
     try { (ctx.deriveSupply ?? deriveSupply)(db, nwo, profile, { at: now() }); }
     catch (err) { log(logPath, `supply derive failed — ${err.message}`); }
-  }
-
-  // The GitHub calls this tick made, in all and per pull request it read
-  // (#168): measured, before they're cut.
-  {
-    const made = takeCalls();
-    const who = Object.entries(made.byWho).sort(([a], [b]) => a.localeCompare(b)).map(([w, n]) => `${w} ${n}`).join(", ");
-    log(logPath, `github: ${made.total} call(s) this tick, ${(prs.length ? made.total / prs.length : 0).toFixed(1)} per pull request` +
-                 (who ? ` (${who})` : ""));
   }
 
   noteTick(db);

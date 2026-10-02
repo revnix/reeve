@@ -35,7 +35,7 @@ reeve has no notification channel, so escalations reach a log only
 <ts> NEEDS YOU: reeve has no notification channel, so escalations reach a log only
 <ts> did NOT push: no notify channel configured
 <ts> shadow: 0 consecutive day(s) agreeing over 0 comparison(s)
-<ts> github: 0 call(s) this tick, 0.0 per pull request
+<ts> github: 0 request(s) in 0 call(s) this tick, 0.0 per pull request
 
 == 4 RESULT
 {"halted":false,"unreadable":null,"decisions":["FIX_CI"]}

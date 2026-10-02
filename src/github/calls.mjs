@@ -2,19 +2,23 @@
 /**
  * Every call reeve makes to GitHub, counted (#168).
  *
- * Each place that runs `gh` runs it here, so the calls a tick makes, and the
- * calls for each pull request it reads, can be measured before they're cut. A
- * call is counted under the identity it reads as, reeve's App or the login on
- * the machine, and its kind: the command, or the endpoint with its owner, name,
- * numbers and commits taken out, so `repos/o/r/pulls/7` and `repos/o/r/pulls/8`
- * are one kind.
+ * Each place that runs `gh` runs it here, so the requests a tick makes of
+ * GitHub, and those for each pull request it reads, can be measured before
+ * they're cut. Requests, not runs of gh: a paged read makes one for each page,
+ * which gh says on stderr when GH_DEBUG is set, one `* Request to` line each,
+ * with no header or body. Each is counted under the identity it reads as,
+ * reeve's App or the login on the machine, and its kind: the command, or the
+ * endpoint with its owner, name, numbers and commits taken out, so
+ * `repos/o/r/pulls/7` and `repos/o/r/pulls/8` are one kind.
  */
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 
 /** @typedef {"app" | "ambient"} Who */
 
-/** @type {Map<string, number>} */ const counted = new Map();
-/** @type {typeof execFileSync} */ let runner = execFileSync;
+/** @type {Map<string, { calls: number, requests: number }>} */ const counted = new Map();
+/** @type {typeof spawnSync} */ let runner = spawnSync;
+/** The lines gh writes on stderr for each request it makes, with GH_DEBUG set. */
+const REQUEST_LINE = /^\* Request (at|to|took) /;
 
 /** An endpoint with what varies taken out. @param {string} path */
 const shape = (path) => path.split("?")[0]
@@ -36,42 +40,61 @@ export function kindOf(args) {
 
 /**
  * Runs `gh` with `args`, as execFileSync runs it, its output read as text, and
- * counts the call under `who`, whether or not it succeeds: a call refused still
- * spent a request.
+ * counts each request it made of GitHub under `who`, whether or not it
+ * succeeds: a request refused still spent one. Failing, it throws as
+ * execFileSync throws, with what gh said on stderr but the lines saying its
+ * requests.
  * @param {string[]} args @param {import("node:child_process").ExecFileSyncOptions} [options]
  * @param {{ who?: Who }} [o]
  * @returns {string}
  */
 export function gh(args, options = {}, { who = "ambient" } = {}) {
+  const r = runner("gh", args, { ...options, encoding: "utf8", env: { ...(options.env ?? process.env), GH_DEBUG: "1" } });
+  const stderr = String(r.stderr ?? "");
   const key = `${who}\u0000${kindOf(args)}`;
-  counted.set(key, (counted.get(key) ?? 0) + 1);
-  return String(runner("gh", args, { ...options, encoding: "utf8" }));
+  const was = counted.get(key) ?? { calls: 0, requests: 0 };
+  counted.set(key, { calls: was.calls + 1, requests: was.requests + (stderr.match(/^\* Request to /gm) ?? []).length });
+  const said = stderr.split("\n").filter((line) => !REQUEST_LINE.test(line)).join("\n");
+  const failed = { status: r.status, signal: r.signal, stdout: r.stdout, stderr: said };
+  if (r.error) throw Object.assign(r.error, failed);
+  if (r.status !== 0) throw Object.assign(new Error(`Command failed: gh ${args.join(" ")}\n${said}`), failed);
+  return String(r.stdout ?? "");
 }
 
 /**
- * The calls counted since they were last taken, and counting begins afresh:
- * how many in all, under each identity, and of each kind.
- * @returns {{ total: number, byWho: Record<string, number>, byKind: Record<string, number> }}
+ * `cmd` with `args`, run as execFileSync runs it, and counted here where it's
+ * `gh`: for the helpers that run either.
+ * @param {string} cmd @param {string[]} args @param {import("node:child_process").ExecFileSyncOptions} [options]
+ */
+export function runCommand(cmd, args, options = {}) {
+  return cmd === "gh" ? gh(args, options) : execFileSync(cmd, args, options);
+}
+
+/**
+ * The requests counted since they were last taken, and counting begins afresh:
+ * how many in all, in how many runs of gh, under each identity, and of each kind.
+ * @returns {{ requests: number, calls: number, byWho: Record<string, number>, byKind: Record<string, number> }}
  */
 export function takeCalls() {
   /** @type {Record<string, number>} */ const byWho = {};
   /** @type {Record<string, number>} */ const byKind = {};
-  let total = 0;
+  let requests = 0, calls = 0;
   for (const [key, n] of counted) {
     const [who, kind] = key.split("\u0000");
-    byWho[who] = (byWho[who] ?? 0) + n;
-    byKind[kind] = (byKind[kind] ?? 0) + n;
-    total += n;
+    byWho[who] = (byWho[who] ?? 0) + n.requests;
+    byKind[kind] = (byKind[kind] ?? 0) + n.requests;
+    requests += n.requests;
+    calls += n.calls;
   }
   counted.clear();
-  return { total, byWho, byKind };
+  return { requests, calls, byWho, byKind };
 }
 
 /**
- * Runs `gh` with `run` in its place until the next call of this, for a test:
- * the suite fails a file that runs `gh`, so what reaches it is checked here.
- * The one in place before, to put back.
- * @param {typeof execFileSync} run
+ * Runs `gh` with `run`, as spawnSync runs it, in its place until the next call
+ * of this, for a test: the suite fails a file that runs `gh`, so what reaches
+ * it is checked here. The one in place before, to put back.
+ * @param {typeof spawnSync} run
  */
 export function runGhWith(run) {
   const was = runner;

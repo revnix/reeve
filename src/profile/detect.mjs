@@ -4,14 +4,14 @@
 // `question` with the evidence that made it ambiguous, because a wrong default
 // here is a gate judging the wrong thing. `reeve init` shows these before writing.
 
-import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, matchesGlob } from "node:path";
 import { runnerShells, scriptOutcome, scriptShells, listed } from "./shellscript.mjs";
 
+import { runCommand } from "../github/calls.mjs";
 function sh(cmd, args, cwd) {
   try {
-    return { ok: true, out: execFileSync(cmd, args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() };
+    return { ok: true, out: String(runCommand(cmd, args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })).trim() };
   } catch (e) { return { ok: false, out: "", err: String(e.stderr || e.message).trim() }; }
 }
 const ghJson = (path, jq, cwd) => {

@@ -39,7 +39,8 @@ function visible(body) {
   let fence = "";
   for (const l of text.split(/\r?\n/)) {
     const m = /^ {0,3}(`{3,}|~{3,})/.exec(l);
-    if (fence) { if (m && m[1][0] === fence[0] && m[1].length >= fence.length) fence = ""; continue; }
+    // Closed only by a fence alone on its line: one with an info string is inside.
+    if (fence) { if (m && m[1][0] === fence[0] && m[1].length >= fence.length && /^ {0,3}(`{3,}|~{3,})\s*$/.test(l)) fence = ""; continue; }
     if (m) { fence = m[1]; continue; }
     shown.push(l);
   }
@@ -50,7 +51,7 @@ function visible(body) {
 function section(body, title) {
   const lines = visible(body);
   // A heading is indented three spaces at most: four in, it's code.
-  const heading = new RegExp(`^ {0,3}#{1,6}\\s+${title}\\s*$`, "i");
+  const heading = new RegExp(`^ {0,3}#{1,6}\\s+${title}(?:\\s+#+)?\\s*$`, "i");
   const at = lines.findIndex((l) => heading.test(l.trimEnd()));
   if (at < 0) return [];
   const rest = lines.slice(at + 1);
@@ -59,17 +60,35 @@ function section(body, title) {
 }
 
 /**
+ * The markers of a list's top-level items among `lines`, as Markdown nests
+ * them: "-", "+", "*" or an item's number. An item indented as far as the
+ * text of the top-level item before it is part of that one, as a line of its
+ * "Verified by" is; a list indented four spaces or more is code.
+ * @param {string[]} lines @returns {string[]}
+ */
+function topItems(lines) {
+  /** @type {string[]} */ const markers = [];
+  let text = -1;
+  for (const l of lines) {
+    const m = /^( *)([-*+]|\d+[.)])( +)\S/.exec(l);
+    if (!m) continue;
+    const indent = m[1].length;
+    if (text < 0 ? indent > 3 : indent >= text) continue;
+    markers.push(m[2]);
+    // Where its text begins: past the marker and its spaces, or one space on
+    // where five or more begin code within it.
+    text = indent + m[2].length + (m[3].length > 4 ? 1 : m[3].length);
+  }
+  return markers;
+}
+
+/**
  * How many acceptance criteria a task's body names: the top-level items of its
- * "Acceptance criteria" section. Markdown takes a list indented up to three
- * spaces as top-level, so its first item says where that is; an item indented
- * two more is under one, as a line of its "Verified by" is part of it.
+ * "Acceptance criteria" section.
  * @param {unknown} body
  */
 export function criteriaOf(body) {
-  const items = section(body, "Acceptance criteria").map((l) => /^( *)(?:[-*+]|\d+[.)])\s+\S/.exec(l)).filter((m) => m !== null);
-  const top = items.length ? /** @type {RegExpExecArray} */ (items[0])[1].length : 0;
-  if (top > 3) return 0;
-  return items.filter((m) => /** @type {RegExpExecArray} */ (m)[1].length < top + 2).length;
+  return topItems(section(body, "Acceptance criteria")).length;
 }
 
 /**
@@ -79,10 +98,8 @@ export function criteriaOf(body) {
  */
 export function evidenceOf(body) {
   /** @type {Set<number>} */ const given = new Set();
-  for (const l of section(body, "Acceptance evidence")) {
-    const m = /^ {0,3}(\d+)[.)]\s+\S/.exec(l);
-    if (m) given.add(Number(m[1]));
-  }
+  // Its top-level numbered entries: one nested under another is part of it.
+  for (const marker of topItems(section(body, "Acceptance evidence"))) if (/^\d/.test(marker)) given.add(Number.parseInt(marker, 10));
   return given;
 }
 
@@ -132,6 +149,7 @@ function tasksOf({ nwo, pr, tasksRepo, gh }) {
   const found = gh(["--paginate", `search/issues?q=${encodeURIComponent(`repo:${tasksRepo} is:issue "${named}" in:comments`)}&per_page=100`, "--jq", ".incomplete_results, .items[].number"]);
   if (!found.ok) return unread("the task it delivers couldn't be looked for", found.err);
   const lines = found.out.split("\n").filter(Boolean);
+  if (!lines.some((l) => l === "false" || l === "true")) return unread("the task it delivers couldn't be looked for", "the search didn't read as GitHub's");
   if (lines.includes("true")) return unread("the task it delivers couldn't be looked for", "the search came back incomplete");
   const numbers = lines.filter((l) => l !== "false").map(Number);
   if (numbers.some((n) => !Number.isSafeInteger(n) || n < 1)) return unread("the task it delivers couldn't be looked for", "the search didn't read as GitHub's");

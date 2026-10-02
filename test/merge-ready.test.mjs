@@ -94,6 +94,15 @@ test("a task's criteria are the items of its Acceptance criteria section, and th
   assert.deepEqual([...a.evidenceOf("<!--\n## Acceptance evidence\n\n1. placeholder\n-->\n")], [], "a hidden heading");
   assert.deepEqual([...a.evidenceOf("Example:\n\n    ## Acceptance evidence\n\n1. not evidence\n")], [], "a heading indented four is code");
   assert.deepEqual([...a.evidenceOf("   ## Acceptance evidence\n\n1. evidence\n")], [1], "one indented three is a heading");
+  // An entry nested under another is part of it, not evidence of its own; one indented less is a sibling.
+  assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n1. evidence for one\n   2. a detail of it\n")].sort(), [1], "nested under 1");
+  assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n1. one\n  2. two\n")].sort(), [1, 2], "indented less than 1's text: a sibling");
+  assert.equal(a.criteriaOf("### Acceptance criteria\n\n1. one\n  2. two\n     1. a detail of two\n"), 2, "numbered criteria, one nested");
+  // A fence closes only on a line of the fence alone: one with an info string is inside the block.
+  assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n```md\n```js\n1. in code still\n```\n")], [], "a fence with an info string doesn't close one");
+  // A heading may close with hashes.
+  assert.deepEqual([...a.evidenceOf("## Acceptance evidence ##\n\n1. evidence\n")], [1], "closing hashes");
+  assert.equal(a.criteriaOf("### Acceptance criteria ###\n\n- one\n"), 1);
   assert.equal(a.criteriaOf("### Acceptance criteria\n\n    - in a code block, not a list\n"), 0, "four spaces in is code");
   assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n  1. a test\n   2. another\n")].sort(), [1, 2]);
 });
@@ -111,7 +120,7 @@ test("the task a pull request delivers is the one whose latest checkpoint names 
   const a = await acceptance();
   const ok = (/** @type {string} */ out) => ({ ok: true, out });
   const gh = github({
-    "search/issues": ok("12\n13"),
+    "search/issues": ok("false\n12\n13"),
     // Its checkpoint, then a comment that quotes the marker in passing: not a checkpoint.
     "repos/acme/tasks/issues/12/comments": ok([checkpoint("acme/app#7"), "a note quoting one, as an example:\n<!-- checkpoint v1 -->\npr:         acme/app#9\n"].map((c) => JSON.stringify(c)).join("\n")),
     // #13 named it once, and names another pull request now.
@@ -122,7 +131,7 @@ test("the task a pull request delivers is the one whose latest checkpoint names 
   assert.deepEqual(got, { readable: true, tasks: [12], criteria: 3, missing: [3] });
   // Two delivered, one naming no criteria: none can be evidenced for it.
   const blank = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "## Acceptance evidence\n\n1. a\n2. b\n3. c\n", tasksRepo: "acme/tasks", cache: new Map(), gh: github({
-    "search/issues": ok("12\n14"),
+    "search/issues": ok("false\n12\n14"),
     "repos/acme/tasks/issues/12/comments": ok(JSON.stringify(checkpoint("acme/app#7"))),
     "repos/acme/tasks/issues/14/comments": ok(JSON.stringify(checkpoint("acme/app#7"))),
     "repos/acme/tasks/issues/12": ok(JSON.stringify(TASK)),
@@ -130,8 +139,11 @@ test("the task a pull request delivers is the one whose latest checkpoint names 
   }) });
   assert.deepEqual(blank, { readable: true, tasks: [12, 14], criteria: 0, missing: [] }, "a task naming no criteria");
   // None names it: no task delivered.
-  const none = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", gh: github({ "search/issues": ok("") }), cache: new Map() });
+  const none = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", gh: github({ "search/issues": ok("false") }), cache: new Map() });
   assert.deepEqual(none, { readable: true, tasks: [], criteria: 0, missing: [] });
+  // An answer with no word on whether the search was whole is no answer.
+  const silent = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache: new Map(), gh: github({ "search/issues": ok("") }) });
+  assert.equal(silent.readable, false, "an empty answer");
   // A search GitHub says came back incomplete is no search.
   // Its task readable all the same: only the search's word stands between it and "found".
   const partial = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache: new Map(), gh: github({
@@ -145,7 +157,7 @@ test("the task a pull request delivers is the one whose latest checkpoint names 
   assert.deepEqual(later, { readable: true, tasks: [12], criteria: 3, missing: [] }, "the latest checkpoint naming a pull request");
   // A checkpoint naming the repository in other letters' case names the same pull request.
   const cased = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "## Acceptance evidence\n\n1. a\n2. b\n3. c\n", tasksRepo: "acme/tasks", cache: new Map(), gh: github({
-    "search/issues": ok("12"), "repos/acme/tasks/issues/12/comments": ok(JSON.stringify(checkpoint("Acme/App#7"))), "repos/acme/tasks/issues/12": ok(JSON.stringify(TASK)) }) });
+    "search/issues": ok("false\n12"), "repos/acme/tasks/issues/12/comments": ok(JSON.stringify(checkpoint("Acme/App#7"))), "repos/acme/tasks/issues/12": ok(JSON.stringify(TASK)) }) });
   assert.deepEqual(cased, { readable: true, tasks: [12], criteria: 3, missing: [] }, "Acme/App#7 is acme/app#7");
   // Issues only: a pull request in the tasks' repository is no task.
   /** @type {string[]} */ let asked = [];
@@ -153,7 +165,7 @@ test("the task a pull request delivers is the one whose latest checkpoint names 
   assert.match(decodeURIComponent(asked.find((x) => x.startsWith("search/")) ?? ""), /\bis:issue\b/);
   // The search read whole: the task on its second page is found.
   const paged = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache: new Map(), gh: (/** @type {string[]} */ args) => {
-    if (args.some((x) => x.startsWith("search/"))) return ok(args.includes("--paginate") ? [...Array.from({ length: 100 }, (_, i) => 200 + i), 12].join("\n") : Array.from({ length: 100 }, (_, i) => 200 + i).join("\n"));
+    if (args.some((x) => x.startsWith("search/"))) return ok(args.includes("--paginate") ? ["false", ...Array.from({ length: 100 }, (_, i) => 200 + i), "false", 12].join("\n") : ["false", ...Array.from({ length: 100 }, (_, i) => 200 + i)].join("\n"));
     const path = args.find((x) => x.startsWith("repos/")) ?? "";
     if (/issues\/12\/comments/.test(path)) return ok(JSON.stringify(checkpoint("acme/app#7")));
     if (/issues\/12$/.test(path)) return ok(JSON.stringify(TASK));
@@ -167,7 +179,7 @@ test("the task a pull request delivers is the one whose latest checkpoint names 
   // Said where a public pull request shows it: never the private repository, nor a task's number.
   assert.doesNotMatch(String(unread.why), /acme\/tasks/);
   const unreadTask = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache: new Map(), gh: github({
-    "search/issues": ok("12"), "repos/acme/tasks/issues/12/comments": { ok: false, out: "", err: "HTTP 502 for repos/acme/tasks/issues/12" } }) });
+    "search/issues": ok("false\n12"), "repos/acme/tasks/issues/12/comments": { ok: false, out: "", err: "HTTP 502 for repos/acme/tasks/issues/12" } }) });
   assert.equal(unreadTask.readable, false);
   assert.doesNotMatch(String(unreadTask.why), /acme\/tasks|#12\b/);
 });
@@ -176,14 +188,14 @@ test("the task is asked for again on a new head, and otherwise at most hourly", 
   const a = await acceptance();
   let searches = 0;
   const gh = (/** @type {string[]} */ args) => {
-    if (args.some((x) => x.startsWith("search/"))) { searches++; return { ok: true, out: "" }; }
+    if (args.some((x) => x.startsWith("search/"))) { searches++; return { ok: true, out: "false" }; }
     return { ok: false, out: "", err: "unexpected" };
   };
   const cache = new Map();
   /** The search as it answers now: a task found, or none. */
   let found = true;
   const finding = (/** @type {string[]} */ args) => {
-    if (args.some((x) => x.startsWith("search/"))) { searches++; return { ok: true, out: found ? "12" : "" }; }
+    if (args.some((x) => x.startsWith("search/"))) { searches++; return { ok: true, out: found ? "false\n12" : "false" }; }
     const path = args.find((x) => x.startsWith("repos/")) ?? "";
     if (/comments/.test(path)) return { ok: true, out: JSON.stringify(checkpoint("acme/app#7")) };
     return { ok: true, out: JSON.stringify(TASK) };
@@ -229,7 +241,7 @@ test("evaluatePr asks for acceptance evidence only where the profile names where
   const bin = tempDir("reeve-merge-ready-bin-");
   const path = process.env.PATH;
   /** gh as GitHub answers it here: the pull request's body, no task found, and everything else empty. */
-  writeFileSync(join(bin, "gh"), `#!/bin/sh\nfor a in "$@"; do case "$a" in repos/*|search/*|graphql) p="$a";; esac; done\ncase "$p" in\n  repos/acme/app/pulls/7) echo '"## Acceptance evidence"';;\n  search/*) ;;\n  graphql) echo '{"data":{"repository":{"pullRequest":{"mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","reviewDecision":null,"reviews":{"totalCount":0},"reviewThreads":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}';;\n  *) ;;\nesac\n`, { mode: 0o755 });
+  writeFileSync(join(bin, "gh"), `#!/bin/sh\nfor a in "$@"; do case "$a" in repos/*|search/*|graphql) p="$a";; esac; done\ncase "$p" in\n  repos/acme/app/pulls/7) echo '"## Acceptance evidence"';;\n  search/*) echo false;;\n  graphql) echo '{"data":{"repository":{"pullRequest":{"mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","reviewDecision":null,"reviews":{"totalCount":0},"reviewThreads":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}';;\n  *) ;;\nesac\n`, { mode: 0o755 });
   writeFileSync(join(bin, "git"), `#!/bin/sh\n[ "$1" = ls-remote ] && printf '%s\\trefs/heads/main\\n' ${"b".repeat(40)}\nexit 0\n`, { mode: 0o755 });
   const anchor = { ok: true, headRef: "f", baseRef: "main", state: "OPEN", title: "t", updatedAt: "2026-10-02T00:00:00Z", head: HEAD, pin: { ok: true, sha: HEAD }, authorLogin: "someone" };
   const db = open(join(tempDir("reeve-merge-ready-db-"), "s.db"));
@@ -268,7 +280,7 @@ test("an answer from GitHub that doesn't read as one is unread, never an empty d
   const ok = (/** @type {string} */ out) => ({ ok: true, out });
   const cache = new Map();
   const garbled = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache, gh: github({
-    "search/issues": ok("12"), "repos/acme/tasks/issues/12/comments": ok(JSON.stringify(checkpoint("acme/app#7"))), "repos/acme/tasks/issues/12": ok("") }) });
+    "search/issues": ok("false\n12"), "repos/acme/tasks/issues/12/comments": ok(JSON.stringify(checkpoint("acme/app#7"))), "repos/acme/tasks/issues/12": ok("") }) });
   assert.equal(garbled.readable, false, "a task body that doesn't read");
   assert.equal(cache.size, 0, "and nothing kept for it");
 });

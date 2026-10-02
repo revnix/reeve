@@ -424,18 +424,25 @@ export function trialForEnforcing(db, { nwo, store, named, since, now, trialSinc
  * --enforce` started on, from `since` to `until`, with what GitHub said merged
  * and the seeded cases as they ran then, and the audits as they read now. An
  * audit recorded since may mark a call false, or a judgment in it be found
- * another code's. `{ ok }`, or why not.
+ * another code's. The audits are read again once it's checked, and it's
+ * checked again with them where one was recorded meanwhile: three times at
+ * most, and audits that keep changing leave it unchecked. `{ ok }`, or why not.
  * @param {any} db
  * @param {{ nwo: string, since: number, until: number, merged: any, seeded: any, code: any, policy: string | null, audits: () => any }} o
  * @returns {{ ok: true } | { ok: false, why: string }}
  */
 export function trialHolds(db, { nwo, since, until, merged, seeded, code, policy, audits }) {
-  const read = audits();
-  const passed = trialGate(trialReport(db, { repo: nwo, since, now: until, merged, seeded, audits: read.ok ? read.audits : { why: read.why } }), { since });
-  if ("why" in passed) return { ok: false, why: passed.why };
   const ranOn = trialRanOn(db, { since, until, code, policy });
-  if ("why" in ranOn) return { ok: false, why: ranOn.why };
-  return { ok: true };
+  let read = audits();
+  for (let check = 0; check < 3; check++) {
+    const passed = trialGate(trialReport(db, { repo: nwo, since, now: until, merged, seeded, audits: read.ok ? read.audits : { why: read.why } }), { since });
+    const again = audits();
+    if (JSON.stringify(again) !== JSON.stringify(read)) { read = again; continue; }
+    if ("why" in passed) return { ok: false, why: passed.why };
+    if ("why" in ranOn) return { ok: false, why: ranOn.why };
+    return { ok: true };
+  }
+  return { ok: false, why: "audits were recorded while the shadow trial was checked, each time it was, so it couldn't be checked" };
 }
 
 /**

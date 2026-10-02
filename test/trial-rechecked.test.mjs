@@ -107,6 +107,41 @@ test("enforcing, a tick whose trial no longer passes publishes in shadow from th
   assert.deepEqual(asked, [1, 2], "checked while enforcing, and not again once in shadow");
 });
 
+test("an audit recorded while the trial is checked again is read too, and audits that keep changing leave it unchecked", () => {
+  const { db, window, audit } = passedTrial();
+  const right = audit(() => true);
+  const wrong = audit((c) => c.pr !== 21, T0 + 90 * HOUR);
+  // The false call recorded between the first read and the check's end.
+  let reads = 0;
+  const midway = T.trialHolds(db, { ...window, audits: () => ({ ok: true, audits: ++reads === 1 ? [right] : [right, wrong] }) });
+  assert.equal(midway.ok, false, "read again, the false call counts");
+  assert.ok(reads >= 2, "control: read again");
+  // An audit recorded on every read.
+  let n = 0;
+  const moving = T.trialHolds(db, { ...window, audits: () => ({ ok: true, audits: [right, ...Array.from({ length: ++n }, () => right)] }) });
+  assert.equal(moving.ok, false);
+  assert.match(moving.why, /audits were recorded while the shadow trial was checked, each time it was, so it couldn't be checked/);
+  db.close();
+});
+
+test("enforcing, the passes published before the trial stopped passing are withdrawn as it's found, before anything else is published", async () => {
+  /** @type {string[]} */ const order = [];
+  let tick = 0;
+  // A pull request judged PASS, every clause passing and its checks green.
+  const pass = { ...EVAL, verdict: { state: "PASS", summary: "ready", clauses: EVAL.verdict.clauses.map((/** @type {any} */ c) => ({ ...c, state: "PASS" })) },
+                 checks: { verdict: "GREEN", caused: [], failing: [] } };
+  await run({ ticks: 2, shadow: false, openPrs: () => { tick++; return [42]; }, evaluate: () => ({ ...pass }),
+    enforcement: async () => ({ state: "enforced", why: "", fix: null, required: true }),
+    trialHolds: () => (tick + 1 === 2 ? { ok: false, why: "an audit since marks #21's call false" } : { ok: true }),
+    publish: async (/** @type {any} */ a) => { order.push(`publish ${tick} ${a.shadow ? "shadow" : "enforcing"} ${a.verdict?.state}`); return { ok: true, id: 7, conclusion: "success", name: a.shadow ? "merge-policy (shadow)" : "merge-policy" }; },
+    withdraw: async (/** @type {any} */ a) => { order.push(`withdraw ${tick} ${a.why}`); return { ok: true }; } });
+  assert.ok(order.some((o) => /^publish 1 enforcing PASS/.test(o)), `control: a PASS enforcing first: ${JSON.stringify(order)}`);
+  const second = order.findIndex((o) => /^publish 2 /.test(o));
+  const taken = order.findIndex((o) => /^withdraw \d+ .*shadow trial no longer passes/.test(o));
+  assert.ok(taken >= 0, `withdrawn: ${JSON.stringify(order)}`);
+  assert.ok(second < 0 || taken < second, `before the tick publishes: ${JSON.stringify(order)}`);
+});
+
 test("a trial that can't be checked again is taken as no longer passing", async () => {
   /** @type {boolean[]} */ const shadows = [];
   const r = await run({ ticks: 1, shadow: false, openPrs: () => [42], evaluate: () => ({ ...EVAL }),

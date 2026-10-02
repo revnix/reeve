@@ -1453,7 +1453,14 @@ async function tickOnce(ctx, ran) {
   if (ctx.shadow === false && ctx.trialHolds) {
     let t;
     try { t = ctx.trialHolds(); } catch (err) { t = { ok: false, why: `it couldn't be checked: ${err.message}` }; }
-    if (!t.ok) { ctx.trialLost = t.why; ctx.shadow = true; }
+    if (!t.ok) {
+      ctx.trialLost = t.why;
+      ctx.shadow = true;
+      // What it published enforcing stands no longer: taken back now, before
+      // anything else, rather than as each pull request is published again
+      // through the tick, when one could merge on it meanwhile.
+      tellStuck(ctx, await withdrawStanding(ctx, "the shadow trial no longer passes, so reeve went back to shadow"));
+    }
   }
   // Which tick this is, for what counts only in a row.
   const tickNo = ctx.tickNo = (ctx.tickNo ?? 0) + 1;

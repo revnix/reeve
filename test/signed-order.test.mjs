@@ -818,6 +818,17 @@ test("an order that ran ahead of the host's anchor is noted there by a later tic
   assert.equal("top" in order && order.top, 2, "control: the order ran ahead of it");
   await run({ openPrs: () => [], evaluate: () => at(A), dbPath, prState: () => "CLOSED", prIsFinished: () => true, ...host(dir) });
   assert.equal(readAnchor(dir, REPO)?.latest.get(PR), 2);
+  // An anchor put back to a copy from before the entry, as a host restored from
+  // a backup: nothing reserved or pinned is left to say the order ran ahead.
+  const backDir = credentials();
+  const back = await ticks([at(A)], host(backDir));
+  const before = readFileSync(anchorPath(backDir, REPO));
+  await run({ evaluate: () => at(A, "RED"), dbPath: back, ...host(backDir) });
+  writeFileSync(anchorPath(backDir, REPO), before);
+  const put = readAnchor(backDir, REPO);
+  assert.deepEqual([put?.latest.get(PR), put?.reserved.size, put?.pinned.size], [1, 0, 0], "control: put back behind the order, nothing reserved or pinned");
+  await run({ openPrs: () => [], evaluate: () => at(A), dbPath: back, prState: () => "CLOSED", prIsFinished: () => true, ...host(backDir) });
+  assert.equal(readAnchor(backDir, REPO)?.latest.get(PR), 2, "an anchor put back");
 });
 
 test("the first entry of a pull request's order names every record kept for it before, so none can be taken away unseen", async () => {
@@ -1162,6 +1173,22 @@ test("an entry that doesn't check never counts as naming a record, so the order 
   db.close();
   const r = await closedTick(dbPath, host(dir));
   assert.match(r.log, /#42: its signed order doesn't hold, so it isn't extended/);
+  // Records kept before the store began signing, which its baseline names and
+  // nothing pins, on a host's anchor bound to the store and holding nothing of
+  // the pull request: only the entry, taken as it says, would name them.
+  const bareDir = credentials();
+  const bare = await ticks([at(A), at(B, "RED")], {});
+  await closedTick(bare, unordered(bareDir));
+  const a = readAnchor(bareDir, REPO);
+  db = open(bare);
+  assert.deepEqual([db.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n, a?.store, a?.latest.size, a?.pinned.size, a?.reserved.size],
+                   [1, identityOf(db), 0, 0, 0], "control: a baseline, and an anchor bound to the store, holding nothing of #42");
+  const both = digestsOf(db);
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
+    .run(3, "daemon", "decision.latest", `pr:${PR}`, JSON.stringify({ repo: REPO, n: "x", digest: both[1], records: both, store: null, envelope: "{}" }));
+  db.close();
+  const r2 = await closedTick(bare, host(bareDir));
+  assert.match(r2.log, /#42: its signed order doesn't hold, so it isn't extended/, "records its baseline names, its anchor holding nothing of them");
 });
 
 test("a record this reeve kept, taken away before an entry named it, is named all the same, so replay reports it gone", async () => {
@@ -1198,9 +1225,14 @@ test("an order that doesn't check is said not to hold, though its pull request's
   db.prepare("DELETE FROM decision WHERE pr = ?").run(PR);
   db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
     .run(3, "daemon", "decision.latest", `pr:${PR}`, JSON.stringify({ repo: REPO, n: "x", digest: "f".repeat(64), records: [], store: null, envelope: "{}" }));
+  // And one of a pull request the host's anchor holds nothing of: nothing but
+  // its order not holding makes it work.
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
+    .run(4, "daemon", "decision.latest", "pr:77", JSON.stringify({ repo: REPO, n: "x", digest: "f".repeat(64), records: [], store: null, envelope: "{}" }));
   db.close();
   const r = await closedTick(dbPath, host(dir));
   assert.match(r.log, /#42: its signed order doesn't hold, so it isn't extended/);
+  assert.match(r.log, /#77: its signed order doesn't hold, so it isn't extended/);
 });
 
 // ── from #278's ninth review ─────────────────────────────────────────────────

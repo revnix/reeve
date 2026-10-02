@@ -19352,7 +19352,7 @@ export const STUBS = [
     test: "test/merge-ready.test.mjs",
     expectRed: "the task a pull request delivers is the one whose latest checkpoint names it, found from the private side",
     edits: [{ file: "src/acceptance.mjs",
-              find: "    if (checkpointNames(bodies) !== named) continue;\n",
+              find: "    if (checkpointNames(bodies)?.toLowerCase() !== named.toLowerCase()) continue;\n",
               replace: "" }],
   },
   {

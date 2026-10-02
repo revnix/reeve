@@ -1446,6 +1446,15 @@ function logGitHubCalls(ctx, { outside = false } = {}) {
 /** @param {any} ctx @param {{ code: any, policy: string }} ran */
 async function tickOnce(ctx, ran) {
   const { code } = ran;
+  // Enforcing, the shadow trial is checked again each tick (#331), before
+  // anything is published: one that no longer passes, an audit since marking a
+  // call false say, or that can't be checked, turns this reeve to shadow for
+  // good. Only `reeve run --enforce`, on a trial that passes, enforces again.
+  if (ctx.shadow === false && ctx.trialHolds) {
+    let t;
+    try { t = ctx.trialHolds(); } catch (err) { t = { ok: false, why: `it couldn't be checked: ${err.message}` }; }
+    if (!t.ok) { ctx.trialLost = t.why; ctx.shadow = true; }
+  }
   // Which tick this is, for what counts only in a row.
   const tickNo = ctx.tickNo = (ctx.tickNo ?? 0) + 1;
   const { nwo, profile, db, execute = false, shadow = true } = ctx;
@@ -2161,6 +2170,8 @@ async function tickOnce(ctx, ran) {
    * so that putting it in the key requires deliberately going around this.
    */
   const raise = (cause, n = 1) => escalations.set(cause, (escalations.get(cause) ?? 0) + n);
+  // Standing until this reeve is started again (#331).
+  if (ctx.trialLost) raise(`reeve went back to shadow: the shadow trial no longer passes — ${ctx.trialLost}. Run reeve run --enforce again once it passes`);
 
   // Carrying out queued effects does not depend on being able to LIST pull
   // requests, and the two use different credentials -- `openPrs` uses the ambient

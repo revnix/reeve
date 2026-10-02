@@ -40,6 +40,9 @@ export const ESCALATIONS = {
   NEEDS_PERSON: "a clause only a person can settle",
   FINDINGS_UNMOVED: "a findings repair changed nothing and would run again on the same findings",
   BODY_UNREADABLE: "a reviewer wrote a review body reeve cannot read",
+  // A criterion of the task delivered with no evidence (#167): the author's to
+  // give, in the pull request's description, not a repair a worker can make.
+  ACCEPTANCE_MISSING: "a criterion of the task it delivers has no acceptance evidence",
 };
 
 const clause = (v, id) => v.clauses.find(c => c.id === id);
@@ -194,6 +197,12 @@ export function nextAction(e, p, h = {}) {
   const bodyReadable = clause(v, "bodyReadable");
   if (bodyReadable?.state === "BLOCK")
     return act(ACTIONS.ESCALATE, ESCALATIONS.BODY_UNREADABLE, { detail: bodyReadable.detail });
+
+  // A definite state too (#167): the clause names each criterion without
+  // evidence, and only whoever wrote the pull request can give it.
+  const acceptance = clause(v, "acceptance");
+  if (acceptance?.state === "BLOCK")
+    return act(ACTIONS.ESCALATE, ESCALATIONS.ACCEPTANCE_MISSING, { detail: acceptance.detail });
 
   // 4. Anything still in flight: wait. But an UNKNOWN that never resolves is a
   //    stall, so it escalates once it has outlived a reasonable settling window.

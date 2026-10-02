@@ -3315,6 +3315,10 @@ async function tickOnce(ctx, ran) {
                      ? fixAttemptNote(db, nwo, pr, ffp)
                  : null;
       raise(note ? `#${pr}: needs a human — ${note}` : `#${pr}: ${decision.why}`);
+      // Which criteria lack evidence (#167), in the log: the alert is one
+      // cause however they change, so it stands rather than being raised anew
+      // as evidence is added. The pull request's check names them too.
+      if (decision.why === ESCALATIONS.ACCEPTANCE_MISSING && decision.detail) log(logPath, `  #${pr}: ${decision.detail}`);
     }
   }
 

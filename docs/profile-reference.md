@@ -5,7 +5,7 @@ GENERATED from `src/profile/schema.mjs`. Do not edit by hand: run
 `test/profile-validate.test.mjs` fails while it is stale, and
 `node scripts/profile-reference.mjs --check` reports staleness without writing.
 
-77 keys. 36 carry a description.
+78 keys. 37 carry a description.
 
 `requirement` is what an operator must AUTHOR, not the validator's raw flag:
 the loader applies defaults before validating, so a `defaulted` key may be
@@ -42,6 +42,7 @@ else to put it, which is the point.
 | `ci.requiredChecks` | optional | a list of a non-empty string |
 | `ci.queueOnlyChecks` | optional | a list of a non-empty string |
 | `ci.reviewerStatusContexts` | optional | a list of a non-empty string |
+| `tasks.repo` | optional | a repository, owner/name |
 | `merge.method` | required | one of squash, merge, rebase |
 | `merge.deleteBranch` | optional | true or false |
 | `merge.enforcement` | required | one of enforced, attested |
@@ -154,6 +155,12 @@ Required checks that run only in the merge queue, as a repository's independent 
 **optional**
 
 Commit-status contexts published by REVIEWERS. Excluded from check classification entirely: a rate-limited CodeRabbit reports state=success with the truth in the description, so a reviewer's status read as CI is a fail-open by construction. These rows still reach the review pipeline, which can say "refused"; classification only knows how to say "passing".
+
+### `tasks.repo`
+
+**optional**
+
+Where the tasks pull requests deliver live (#167): the repository whose issues they are, owner/name. Named, each pull request a task's latest checkpoint names must give acceptance evidence for its criteria.
 
 ### `merge.method`
 

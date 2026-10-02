@@ -64,6 +64,8 @@ const describe = (fn, text, extra = {}) => Object.assign(fn, { describe: text, .
 
 const isStr = describe(v => (typeof v === "string" && v.length ? null : "must be a non-empty string"),
                        "a non-empty string");
+const isNwo = describe(v => (typeof v === "string" && /^[\w.-]+\/[\w.-]+$/.test(v) ? null : "must be owner/name"),
+                       "a repository, owner/name");
 const isBool = describe(v => (typeof v === "boolean" ? null : "must be a boolean"),
                         "true or false");
 const isInt = describe(v => (Number.isInteger(v) ? null : "must be an integer"),
@@ -296,6 +298,11 @@ export const FIELDS = {
   // "refused"; classification only knows how to say "passing".
   "ci.reviewerStatusContexts": [false, isArr(isStr)],
 
+  // Where the tasks pull requests deliver live (#167): the repository whose
+  // issues they are, owner/name. Named, each pull request a task's latest
+  // checkpoint names must give acceptance evidence for its criteria.
+  "tasks.repo":             [false, isNwo],
+
   "merge.method":           [true,  oneOf(MERGE_METHOD)],  // MEASURED from parent counts, not settings
   "merge.deleteBranch":     [false, isBool],
   "merge.enforcement":      [true,  oneOf(ENFORCEMENT)],
@@ -497,7 +504,7 @@ export function validate(profile) {
   // properties, validate, and serialize to nothing.
   for (const c of ["builder", "builder.budget", "builder.capabilities", "builder.cancel",
                    "builder.founder", "builder.lease", "builder.network",
-                   "builder.network.research", "builder.provider", "worker"]) {
+                   "builder.network.research", "builder.provider", "worker", "tasks"]) {
     const v = get(profile, c);
     if (v !== undefined && v !== null && (typeof v !== "object" || Array.isArray(v))) errors.push(`${c} must be an object`);
   }
@@ -522,6 +529,10 @@ export function validate(profile) {
     errors.push("project.kind 'client' forbids authority.profileLocation 'committed': no agent artifacts in a client repo");
   if (vis === "public" && loc === "committed")
     warnings.push("a committed profile in a public repo is visible to everyone; sidecar is the safer default");
+  // Where tasks live is private (#167): a committed profile in a public
+  // repository would publish it.
+  if (vis === "public" && loc === "committed" && get(profile, "tasks.repo") != null)
+    errors.push("tasks.repo names where private tasks live, and a profile committed to a public repository would publish it: keep it in a sidecar profile");
 
   const perm = get(profile, "authority.permission");
   const pol = get(profile, "authority.policy");

@@ -78,6 +78,8 @@ export const UNKNOWN_KINDS = Object.freeze(["waiting", "retry", "missing", "pers
 
 export const CLAUSE_IDS = Object.freeze(
   ["ci", "base", "review", "rounds", "threads", "findings", "mergeable", "cleared", "hold",
+   // CONDITIONAL too: only where the profile names where tasks live (#167).
+   "acceptance",
    // Two facts about review BODIES, and they are separate because their answers
    // are. `bodyFindings` is work — a worker can fix one and a later round can
    // supersede it. `bodyReadable` is reeve reporting that it cannot parse a
@@ -297,6 +299,22 @@ export function computeVerdict(i) {
   //     to UNKNOWN: a guardian built before the hub existed has no opinion about
   //     holds, and an UNKNOWN clause would drag every verdict it renders to
   //     UNKNOWN for a question it was never asked.
+  // Acceptance evidence (#167), only where the profile names where tasks live:
+  // each criterion of the task a pull request delivers evidenced in its
+  // description. None asked of one that delivers no task, and a task whose
+  // criteria can't be read is no evidence of none.
+  if (i.acceptance) {
+    const a = i.acceptance;
+    const many = (a.tasks?.length ?? 0) > 1;
+    const list = (/** @type {number[]} */ ns) => (ns.length > 1 ? `${ns.slice(0, -1).join(", ")} and ${ns.at(-1)}` : String(ns[0]));
+    if (a.readable === false) add("acceptance", UNKNOWN, a.why ?? "the task it delivers couldn't be read", "retry", "look for the task it delivers again");
+    else if (!a.tasks?.length) add("acceptance", PASS, "delivers no task, so no acceptance evidence is asked for");
+    else if (!a.criteria) add("acceptance", UNKNOWN, `the task${many ? "s" : ""} it delivers name${many ? "" : "s"} no acceptance criteria, so none can be evidenced`, "person", "a person writes the task's acceptance criteria");
+    else if (a.missing?.length)
+      add("acceptance", BLOCK, `no acceptance evidence for criteri${a.missing.length > 1 ? "a" : "on"} ${list(a.missing)} of the ${a.criteria} the task${many ? "s" : ""} delivered name${many ? "" : "s"}`);
+    else add("acceptance", PASS, `acceptance evidence for each of the ${a.criteria} criteria the task${many ? "s" : ""} delivered name${many ? "" : "s"}`);
+  }
+
   if (i.hold) {
     if (i.hold.readable === false) add("hold", UNKNOWN, `builder hold not readable: ${i.hold.why}`, "person", "a person makes the builder's holds readable");
     else if (i.hold.held) add("hold", BLOCK, i.hold.detail ? `${i.hold.reason}: ${i.hold.detail}` : String(i.hold.reason));

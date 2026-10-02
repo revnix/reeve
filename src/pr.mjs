@@ -7,6 +7,7 @@
 // publishes `neutral`, which GitHub renders but never blocks on, so a week of
 // them says exactly what the gate WOULD have refused.
 
+import { acceptanceOf, pullBody } from "./acceptance.mjs";
 import { pinHead, pinPrHead, isFork, readChecks, classify, settle, inheritedOrCaused, readTimeline, lastForcePush, suitesComplete } from "./github/reconciler.mjs";
 import { loadSettlement, saveSettlement } from "./db/ops.mjs";
 import { rootCause } from "./ci-rootcause.mjs";
@@ -926,6 +927,15 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
                    hardCap: profile.rounds?.hardCap ?? 10,
                    unspilledCritical: facts.unspilledCritical };
 
+  // Acceptance evidence (#167), only where the profile names where tasks live:
+  // the description read for it, and the task it delivers found from the
+  // private side.
+  let acceptance = null;
+  if (profile.tasks?.repo) {
+    const desc = pullBody(nwo, pr);
+    acceptance = "why" in desc ? { readable: false, why: desc.why } : acceptanceOf({ nwo, pr, head: pin.sha, html: desc.html, tasksRepo: profile.tasks.repo });
+  }
+
   let ledgerBlockers = null, ledgerBlockerIds = null;
   if (db) {
     try {
@@ -955,6 +965,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     reviewers, rounds, threads, cleared: facts.cleared,
     bodyFindings: facts.bodyFindings, unreadableBodies: facts.unreadableBodies,
     ledgerBlockers,
+    ...(acceptance ? { acceptance } : {}),
     mergeState: threads.mergeState, profile,
     mergeParts: readMergeParts(nwo, baseRef, threads, { rows: mergeRows(read), head: pin.sha }),
     // Passed through, never read here. `pr_hold` is a HUB row and this function

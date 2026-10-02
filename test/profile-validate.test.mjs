@@ -401,7 +401,8 @@ expectRefusal("budgets that are not an object", withBudget([]), /builder\.budget
   // earlier edit updated the comparison and missed the string inside the
   // template literal -- two places holding one fact, and the one a reader sees
   // was the wrong one. The label is derived from the constant now.
-  const PINNED_DOCUMENTED = 36;
+  // 37 with `tasks.repo`, where the tasks pull requests deliver live (#167).
+  const PINNED_DOCUMENTED = 37;
   const pinned = documented === PINNED_DOCUMENTED;
   console.log(`${pinned ? "PASS" : "FAIL"}  control: ${PINNED_DOCUMENTED} of the declared keys carry a description`);
   if (!pinned) {

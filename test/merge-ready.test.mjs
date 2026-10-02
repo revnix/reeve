@@ -131,7 +131,9 @@ test("the task a pull request delivers is the one whose latest checkpoint names 
   const none = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", gh: github({ "search/issues": ok("") }), cache: new Map() });
   assert.deepEqual(none, { readable: true, tasks: [], criteria: 0, missing: [] });
   // A search GitHub says came back incomplete is no search.
-  const partial = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache: new Map(), gh: github({ "search/issues": ok("true\n12") }) });
+  // Its task readable all the same: only the search's word stands between it and "found".
+  const partial = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache: new Map(), gh: github({
+    "search/issues": ok("true\n12"), "repos/acme/tasks/issues/12/comments": ok(JSON.stringify(checkpoint("acme/app#7"))), "repos/acme/tasks/issues/12": ok(JSON.stringify(TASK)) }) });
   assert.equal(partial.readable, false, "an incomplete search");
   // A checkpoint after, naming no pull request, doesn't take the task off it.
   const later = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "## Acceptance evidence\n\n1. a\n2. b\n3. c\n", tasksRepo: "acme/tasks", cache: new Map(), gh: github({

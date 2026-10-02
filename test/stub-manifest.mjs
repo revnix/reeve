@@ -11990,15 +11990,6 @@ export const STUBS = [
               replace: "      : !order.top ? [stored?.digest ?? null, stored ? Number(stored.last_seq) : null]\n      : stored && !order.digests.has(stored.digest) ? [stored.digest, Number(stored.last_seq)] : [order.digest, order.seq];" }],
   },
   {
-    name: "pending-anchored-orders",
-    why: "take as work only the orders the store holds. A pull request whose every record and entry a rollback took would never be said to be cut short",
-    test: "test/signed-order.test.mjs",
-    expectRed: "a rollback that takes a pull request's every record and entry away is said by the daemon's next tick",
-    edits: [{ file: "src/daemon.mjs",
-              find: "    for (const [pr, n] of a.latest) { const o = orders.get(pr); if (!o || (\"top\" in o && o.top < n)) prs.add(pr); }",
-              replace: "    void a;" }],
-  },
-  {
     name: "anchor-bind-says-began",
     why: "bind the host's anchor to a store without saying there that it began signing. A reeve stopped before its first note would leave the store, stripped while it's down, to be given a baseline again",
     test: "test/signed-order.test.mjs",

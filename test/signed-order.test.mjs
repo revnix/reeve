@@ -1419,6 +1419,21 @@ test("an entry filed under another name while a reeve runs is caught by its next
                           s.close();
                         } });
   assert.match(r.log, /#42: its signed order doesn't hold, so it isn't extended — an entry of a signed order in this store is filed under "pr:042"/);
+  // Over records its baseline names, which nothing pins again once the order
+  // doesn't hold: only the order checked again says so.
+  const baseDir = credentials();
+  const base = await ticks([at(A), at(B, "RED")], {});
+  /** @type {any} */ let before = null;
+  const r2 = await run({ ticks: 3, dbPath: base, ...host(baseDir), openPrs: () => [], evaluate: () => at(A), prState: () => "CLOSED", prIsFinished: () => true,
+                         afterTick: async (i) => {
+                           if (i !== 1) return;
+                           const s = open(base);
+                           s.prepare("UPDATE event SET subject = 'pr:042' WHERE op = 'decision.latest'").run();
+                           s.close();
+                           before = readAnchor(baseDir, REPO);
+                         } });
+  assert.deepEqual([[...(before?.latest ?? [])], before?.pinned.size], [[[PR, 1]], 0], "control: ordered and noted, nothing pinned");
+  assert.match(r2.log, /#42: its signed order doesn't hold, so it isn't extended — an entry of a signed order in this store is filed under "pr:042"/, "over records its baseline names");
 });
 
 test("one reeve runs on a store at a time: its lock is held by one, a link to the store included", () => {
@@ -1879,7 +1894,14 @@ test("a record filed under no pull request's number is never ordered or noted, s
   let db = open(dbPath);
   saveDecision(db, { at: 1, seq: 1000, pr: 0, head: B, ...recordOf(REPO, 0, B) });
   db.close();
-  const r = await closedTick(dbPath, host(dir));
+  // The pull requests the host's anchor is asked to reserve an entry of, or note
+  // one: it refuses one under no number too, so it's asked of none.
+  const real = fileAnchor(dir);
+  /** @type {unknown[]} */ const asked = [];
+  const anchor = { ...real, reserve: (/** @type {any[]} */ ...a) => { asked.push(a[2]); return real.reserve(...a); },
+                   note: (/** @type {any[]} */ ...a) => { asked.push(a[1]); return real.note(...a); } };
+  const r = await closedTick(dbPath, { ...host(dir), anchor });
+  assert.deepEqual(asked.filter((pr) => pr !== PR), [], "the anchor asked of no other number");
   db = open(dbPath);
   const unfiled = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest' AND subject NOT GLOB 'pr:[1-9]*'").get().n;
   db.close();

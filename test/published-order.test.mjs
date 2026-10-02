@@ -1142,6 +1142,43 @@ test("a copy is checked against every open pull request, and every one GitHub up
 /** The newest tick at which the store said every record it held was ordered and published, in seconds. */
 const witnessedOf = (/** @type {any} */ db) => db.prepare("SELECT MAX(json_extract(payload, '$.witnessed')) AS at FROM event WHERE op = 'daemon.tick' AND json_valid(payload)").get().at;
 
+test("the pull requests are read again until the lists hold still, and lists that keep moving are no list", () => {
+  const since = Date.parse(/** @type {any} */ (PULLS.find((p) => p.pr === 120)).updated) / 1000;
+  const all = PULLS.map((p) => String(p.pr));
+  // The open list: its first read misses #77, as one closing at a page's edge would shift it; then it holds still.
+  let opened = 0;
+  const openRace = (/** @type {string[]} */ args) => {
+    if (!args.some((a) => /state=open/.test(a))) return pullsOf(PULLS, [], [])(args);
+    return { ok: true, out: (++opened === 1 ? all.filter((n) => n !== "77") : all).join("\n") };
+  };
+  const open = listPullRequests("o/r", { gh: openRace, since });
+  assert.ok(Array.isArray(open) && open.includes(77), `the open list read again: ${JSON.stringify(open).slice(0, 200)}`);
+  let shifting = 0;
+  const openMoving = (/** @type {string[]} */ args) => (args.some((a) => /state=open/.test(a)) ? { ok: true, out: String(++shifting) } : pullsOf(PULLS, [], [])(args));
+  assert.match(JSON.stringify(listPullRequests("o/r", { gh: openMoving, since })), /the open pull requests of o\/r kept changing while they were read/);
+  // The updated list: #140, on its second page, updated while the first was read: that page then repeats the first's last, and lacks it.
+  let passes = 0;
+  const moved = PULLS.slice(99).filter((p) => p.pr !== 140);
+  const updatedRace = (/** @type {string[]} */ args) => {
+    const path = args.find((a) => a.startsWith("repos/")) ?? "";
+    if (/state=open/.test(path)) return { ok: true, out: "" };
+    const page = Number(/[?&]page=(\d+)/.exec(path)?.[1] ?? 1);
+    if (page === 1) passes++;
+    const rows = passes === 1 && page === 2 ? moved.slice(0, 100) : PULLS.slice((page - 1) * 100, page * 100);
+    return { ok: true, out: rows.map((r) => `${r.pr} ${r.updated}`).join("\n") };
+  };
+  const updated = listPullRequests("o/r", { gh: updatedRace, since });
+  assert.ok(Array.isArray(updated) && updated.includes(140), `the updated list read again: ${JSON.stringify(updated).slice(0, 200)}`);
+  assert.equal(passes, 2, "read again once it moved");
+  const alwaysMoving = (/** @type {string[]} */ args) => {
+    const path = args.find((a) => a.startsWith("repos/")) ?? "";
+    if (/state=open/.test(path)) return { ok: true, out: "" };
+    const page = Number(/[?&]page=(\d+)/.exec(path)?.[1] ?? 1);
+    return { ok: true, out: (page === 2 ? moved.slice(0, 100) : PULLS.slice(0, 100)).map((r) => `${r.pr} ${r.updated}`).join("\n") };
+  };
+  assert.match(JSON.stringify(listPullRequests("o/r", { gh: alwaysMoving, since })), /the pull requests of o\/r kept moving while they were read/);
+});
+
 test("a copy is checked against what GitHub updated since its newest tick that ordered and published every record, less an hour, and one with none says so", async () => {
   const h = await history();
   const db = open(h.path);

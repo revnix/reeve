@@ -106,6 +106,9 @@ function ghApi(args) {
   catch (e) { return { ok: false, out: "", err: netFailure(e) }; }
 }
 
+/** How many times a list of pull requests is read to get one that holds still while it's read (#334). */
+const LIST_READS = 3;
+
 /**
  * The pull requests of `nwo` GitHub lists (#285), read from GitHub, not from
  * any copy of the store, so one a copy no longer names is found all the same:
@@ -124,18 +127,39 @@ export function listPullRequests(nwo, { gh = ghApi, limit = 100, since = null } 
   const number = (/** @type {string} */ s) => { const n = Number(s); return Number.isSafeInteger(n) && n >= 1 ? n : null; };
   /** @type {Set<number>} */ const prs = new Set();
   // The open ones first: one that closes while the updated list is read is
-  // updated after the page that would have had it.
-  const open = gh(["--paginate", `repos/${nwo}/pulls?state=open&per_page=100`, "--jq", ".[].number"]);
-  if (!open.ok) return unread(open.err);
-  for (const s of open.out.split("\n").filter(Boolean)) { const n = number(s); if (n === null) return unlike; prs.add(n); }
-  for (let page = 1; ; page++) {
-    const got = gh([`repos/${nwo}/pulls?state=all&sort=updated&direction=desc&per_page=${per}&page=${page}`, "--jq", '.[] | "\\(.number) \\(.updated_at)"']);
-    if (!got.ok) return unread(got.err);
-    const rows = got.out.split("\n").filter(Boolean).map((l) => { const [n, at] = l.split(" "); return { n: number(n), at: Date.parse(at) / 1000 }; });
-    if (rows.some((r) => r.n === null || !Number.isFinite(r.at))) return unlike;
-    // The first page whole: it's the `limit` most recently updated.
-    for (const r of rows) if (page === 1 || (since !== null && r.at >= since)) prs.add(/** @type {number} */ (r.n));
-    if (since === null || rows.length < per || /** @type {any} */ (rows.at(-1)).at < since) break;
+  // updated after the page that would have had it. Read until two reads agree
+  // (#334): one closing while the pages are read shifts the rest, and one at a
+  // page's edge would be missed.
+  /** @type {string | null} */ let was = null, now = null;
+  for (let read = 0; read < LIST_READS && (now === null || now !== was); read++) {
+    const open = gh(["--paginate", `repos/${nwo}/pulls?state=open&per_page=100`, "--jq", ".[].number"]);
+    if (!open.ok) return unread(open.err);
+    was = now;
+    now = open.out.split("\n").filter(Boolean).sort().join("\n");
+  }
+  if (now !== was) return { why: `the open pull requests of ${nwo} kept changing while they were read` };
+  for (const s of String(now).split("\n").filter(Boolean)) { const n = number(s); if (n === null) return unlike; prs.add(n); }
+  // Then the most recently updated, page by page. One seen on an earlier page
+  // again means the list moved while it was read, one updated meanwhile taken
+  // to a page already read, so it's read again from the first (#334).
+  scan: for (let pass = 1; ; pass++) {
+    /** @type {Set<number>} */ const seen = new Set();
+    /** @type {number[]} */ const found = [];
+    for (let page = 1; ; page++) {
+      const got = gh([`repos/${nwo}/pulls?state=all&sort=updated&direction=desc&per_page=${per}&page=${page}`, "--jq", '.[] | "\\(.number) \\(.updated_at)"']);
+      if (!got.ok) return unread(got.err);
+      const rows = got.out.split("\n").filter(Boolean).map((l) => { const [n, at] = l.split(" "); return { n: number(n), at: Date.parse(at) / 1000 }; });
+      if (rows.some((r) => r.n === null || !Number.isFinite(r.at))) return unlike;
+      if (rows.some((r) => seen.has(/** @type {number} */ (r.n)))) {
+        if (pass < LIST_READS) continue scan;
+        return { why: `the pull requests of ${nwo} kept moving while they were read` };
+      }
+      // The first page whole: it's the `limit` most recently updated.
+      for (const r of rows) { seen.add(/** @type {number} */ (r.n)); if (page === 1 || (since !== null && r.at >= since)) found.push(/** @type {number} */ (r.n)); }
+      if (since === null || rows.length < per || /** @type {any} */ (rows.at(-1)).at < since) break;
+    }
+    for (const n of found) prs.add(n);
+    break;
   }
   return [...prs];
 }

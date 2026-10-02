@@ -1958,6 +1958,12 @@ async function tickOnce(ctx, ran) {
   // The last result this tick published at a pull request's head with evidence,
   // under which name, and what it was published with.
   /** @type {{ pr: number, name: string, args: any } | null} */ let lastAtHead = null;
+  // How far the signed orders this tick published reach: the newest entry a
+  // commitment it published covers (#308). None, where the store holds none.
+  let coveredTo = 0;
+  const covered = (/** @type {any} */ evidence) => { const to = Number(evidence?.store?.to); if (Number.isFinite(to)) coveredTo = Math.max(coveredTo, to); };
+  // When this tick found every record ordered and every entry published, if it did (#308).
+  /** @type {number | null} */ let witnessedAt = null;
   // What this tick published went out before its orders were extended, at its
   // end, so their newest entries, a merge queue's among them, would be
   // witnessed nowhere until the next tick published, or never, were nothing
@@ -1970,7 +1976,7 @@ async function tickOnce(ctx, ran) {
   const republishOrders = async () => {
     if (!lastAtHead || !ordering) return true;
     const { pr, name, args } = lastAtHead;
-    if (lastEntrySeq(db) <= args.evidence.store.to) return true;
+    if (lastEntrySeq(db) <= args.evidence.store.to) { covered(args.evidence); return true; }
     let st = null;
     try { st = standingAt(db, pr).find((x) => x.name === name && x.head === args.verdict.head); } catch { return false; }
     if (st?.op !== "pr.published" || st.state !== args.verdict.state) return false;
@@ -1988,6 +1994,7 @@ async function tickOnce(ctx, ran) {
     }
     // Published as they now stand: only orders extended since go out again.
     lastAtHead = { pr, name, args: again };
+    covered(again.evidence);
     return true;
   };
   // The host's anchor moved to entry `top` of `pr`'s order, with the record it
@@ -2123,6 +2130,16 @@ async function tickOnce(ctx, ran) {
         }
       });
     });
+  };
+  // Whether every record the store holds is ordered, as the host's anchor
+  // reads now (#308): no order has work left. Not where that can't be read. A
+  // store keeping no orders holds its every record unordered; one whose anchor
+  // is another store's publishes none of its orders, so none is covered.
+  const ordersSettled = () => {
+    try {
+      keysNow();
+      return !pendingOrders(ctx.anchor.read(nwo) ?? noAnchor(), storeIdentity(db)).length;
+    } catch { return false; }
   };
   // What each base requires is read afresh every tick. Kept across ticks, a rule
   // added between them went unseen for as long as the reading was kept.
@@ -3487,6 +3504,10 @@ async function tickOnce(ctx, ran) {
   // published as extended.
   orderPending();
   await republishOrders();
+  // Where every record the store holds is ordered, and every entry is in a
+  // commitment published, the tick says when (#308): a record published and
+  // lost from a copy since was published after, on a pull request open then.
+  if (ordersSettled() && lastEntrySeq(db) <= coveredTo) witnessedAt = now();
   // And one that arrived during the last publication there.
   if (await haltedNow()) return haltStop("HALTED after the merge queue was checked");
 
@@ -4906,7 +4927,7 @@ async function tickOnce(ctx, ran) {
     catch (err) { log(logPath, `supply derive failed — ${err.message}`); }
   }
 
-  noteTick(db, now(), ran);
+  noteTick(db, now(), witnessedAt === null ? ran : { ...ran, witnessed: witnessedAt });
 
   return { decisions, escalations, halted: false };
 }

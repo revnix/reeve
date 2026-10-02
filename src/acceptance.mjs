@@ -41,12 +41,16 @@ function section(body, title) {
 
 /**
  * How many acceptance criteria a task's body names: the top-level items of its
- * "Acceptance criteria" section. A line indented under one, its "Verified by",
- * is part of it.
+ * "Acceptance criteria" section. Markdown takes a list indented up to three
+ * spaces as top-level, so its first item says where that is; an item indented
+ * two more is under one, as a line of its "Verified by" is part of it.
  * @param {unknown} body
  */
 export function criteriaOf(body) {
-  return section(body, "Acceptance criteria").filter((l) => /^(?:[-*]|\d+[.)])\s+\S/.test(l)).length;
+  const items = section(body, "Acceptance criteria").map((l) => /^( *)(?:[-*]|\d+[.)])\s+\S/.exec(l)).filter((m) => m !== null);
+  const top = items.length ? /** @type {RegExpExecArray} */ (items[0])[1].length : 0;
+  if (top > 3) return 0;
+  return items.filter((m) => /** @type {RegExpExecArray} */ (m)[1].length < top + 2).length;
 }
 
 /**
@@ -57,7 +61,7 @@ export function criteriaOf(body) {
 export function evidenceOf(body) {
   /** @type {Set<number>} */ const given = new Set();
   for (const l of section(body, "Acceptance evidence")) {
-    const m = /^(\d+)[.)]\s+\S/.exec(l);
+    const m = /^ {0,3}(\d+)[.)]\s+\S/.exec(l);
     if (m) given.add(Number(m[1]));
   }
   return given;
@@ -70,9 +74,15 @@ export function missingEvidence(count, given) {
 
 /** The pull request the latest checkpoint among `comments` names, as it writes it, or null. @param {string[]} comments */
 function checkpointNames(comments) {
-  const last = comments.filter((c) => c.includes(CHECKPOINT)).at(-1);
+  const last = comments.filter((c) => c.startsWith(CHECKPOINT)).at(-1);
   const m = last ? /^pr:\s*(\S+)\s*$/m.exec(last) : null;
   return m ? m[1] : null;
+}
+
+/** The one JSON string `out` is, or null where it isn't one. @param {string} out */
+function one(out) {
+  const all = out.trim() ? strings(out) : null;
+  return all && all.length === 1 ? all[0] : null;
 }
 
 /** `out`, one JSON string to a line, read; null where a line isn't one. @param {string} out */
@@ -87,24 +97,28 @@ function strings(out) {
  * names none. Found by a search, and each checked by reading its checkpoints,
  * as the search matches one naming the pull request once and another since.
  * @param {{ nwo: string, pr: number, tasksRepo: string, gh: Gh }} o
- * @returns {{ ok: true, tasks: number[], criteria: number } | { ok: false, why: string }}
+ * @returns {{ ok: true, tasks: number[], criteria: number } | { ok: false, why: string, detail: string }}
  */
 function tasksOf({ nwo, pr, tasksRepo, gh }) {
   const named = `${nwo}#${pr}`;
-  const found = gh([`search/issues?q=${encodeURIComponent(`repo:${tasksRepo} "${named}" in:comments`)}&per_page=50`, "--jq", ".items[].number"]);
-  if (!found.ok) return { ok: false, why: `the task it delivers couldn't be looked for in ${tasksRepo}: ${found.err}` };
+  // Said on a pull request that may be public, so never naming the private
+  // repository or a task in it; what went wrong is kept with the input, which
+  // stays in the store.
+  const unread = (/** @type {string} */ why, /** @type {string | undefined} */ detail) => ({ ok: /** @type {const} */ (false), why, detail: detail ?? "" });
+  const found = gh(["--paginate", `search/issues?q=${encodeURIComponent(`repo:${tasksRepo} "${named}" in:comments`)}&per_page=100`, "--jq", ".items[].number"]);
+  if (!found.ok) return unread("the task it delivers couldn't be looked for", found.err);
   const numbers = found.out.split("\n").filter(Boolean).map(Number);
-  if (numbers.some((n) => !Number.isSafeInteger(n) || n < 1)) return { ok: false, why: `${tasksRepo}'s search didn't read as GitHub's` };
+  if (numbers.some((n) => !Number.isSafeInteger(n) || n < 1)) return unread("the task it delivers couldn't be looked for", "the search didn't read as GitHub's");
   /** @type {number[]} */ const tasks = [];
   let criteria = 0, blank = false;
   for (const n of [...new Set(numbers)].sort((a, b) => a - b)) {
     const comments = gh(["--paginate", `repos/${tasksRepo}/issues/${n}/comments?per_page=100`, "--jq", ".[].body | @json"]);
     const bodies = comments.ok ? strings(comments.out) : null;
-    if (!bodies) return { ok: false, why: `${tasksRepo}#${n}'s checkpoints couldn't be read: ${comments.err ?? "they don't read as GitHub's"}` };
+    if (!bodies) return unread("the checkpoints of the task it may deliver couldn't be read", comments.err ?? "they don't read as GitHub's");
     if (checkpointNames(bodies) !== named) continue;
     const issue = gh([`repos/${tasksRepo}/issues/${n}`, "--jq", ".body // \"\" | @json"]);
-    const body = issue.ok ? strings(issue.out)?.[0] ?? "" : null;
-    if (body === null) return { ok: false, why: `${tasksRepo}#${n} couldn't be read: ${issue.err ?? "it doesn't read as GitHub's"}` };
+    const body = issue.ok ? one(issue.out) : null;
+    if (body === null) return unread("the task it delivers couldn't be read", issue.err ?? "it doesn't read as GitHub's");
     const c = criteriaOf(body);
     if (!c) blank = true;
     tasks.push(n);
@@ -121,7 +135,7 @@ function tasksOf({ nwo, pr, tasksRepo, gh }) {
  * The tasks found are kept per pull request, and looked for again on a new
  * head, or an hour on.
  * @param {{ nwo: string, pr: number, head: string, body: unknown, tasksRepo: string, gh?: Gh, cache?: Map<string, Kept>, now?: number }} o
- * @returns {{ readable: true, tasks: number[], criteria: number, missing: number[] } | { readable: false, why: string }}
+ * @returns {{ readable: true, tasks: number[], criteria: number, missing: number[] } | { readable: false, why: string, detail: string }}
  */
 export function acceptanceOf({ nwo, pr, head, body, tasksRepo, gh = ghApi, cache = KEPT, now = Math.floor(Date.now() / 1000) }) {
   const key = `${nwo}#${pr}`;
@@ -129,7 +143,7 @@ export function acceptanceOf({ nwo, pr, head, body, tasksRepo, gh = ghApi, cache
   if (!kept || kept.head !== head || now - kept.at > TASK_KEPT_SECONDS) {
     const t = tasksOf({ nwo, pr, tasksRepo, gh });
     // Kept only once read: one that couldn't be is looked for again next time.
-    if ("why" in t) return { readable: false, why: t.why };
+    if ("why" in t) return { readable: false, why: t.why, detail: t.detail };
     kept = { head, at: now, tasks: t.tasks, criteria: t.criteria };
     cache.set(key, kept);
   }
@@ -145,6 +159,6 @@ export function acceptanceOf({ nwo, pr, head, body, tasksRepo, gh = ghApi, cache
  */
 export function pullBody(nwo, pr, { gh = ghApi } = {}) {
   const got = gh([`repos/${nwo}/pulls/${pr}`, "--jq", ".body // \"\" | @json"]);
-  const body = got.ok ? strings(got.out)?.[0] ?? "" : null;
+  const body = got.ok ? one(got.out) : null;
   return body === null ? { ok: false, why: `its description couldn't be read: ${got.err ?? "it doesn't read as GitHub's"}` } : { ok: true, body };
 }

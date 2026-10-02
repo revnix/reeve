@@ -83,6 +83,11 @@ test("a task's criteria are the items of its Acceptance criteria section, and th
   assert.deepEqual([...a.evidenceOf(pr)].sort(), [1, 3], "an entry with nothing in it is no evidence");
   assert.deepEqual([...a.evidenceOf("no section")], []);
   assert.deepEqual(a.missingEvidence(3, a.evidenceOf(pr)), [2]);
+  // A list indented one to three spaces is top-level all the same; an item indented under one isn't.
+  assert.equal(a.criteriaOf("### Acceptance criteria\n\n  - one\n    - a detail of it\n  - two\n"), 2);
+  assert.equal(a.criteriaOf("### Acceptance criteria\n\n - one\n - two\n - three\n"), 3);
+  assert.equal(a.criteriaOf("### Acceptance criteria\n\n    - in a code block, not a list\n"), 0, "four spaces in is code");
+  assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n  1. a test\n   2. another\n")].sort(), [1, 2]);
 });
 
 /** GitHub as `gh api` answers: a search, an issue's comments and body, by the path asked. */
@@ -99,7 +104,8 @@ test("the task a pull request delivers is the one whose latest checkpoint names 
   const ok = (/** @type {string} */ out) => ({ ok: true, out });
   const gh = github({
     "search/issues": ok("12\n13"),
-    "repos/acme/tasks/issues/12/comments": ok(JSON.stringify(checkpoint("acme/app#7"))),
+    // Its checkpoint, then a comment that quotes the marker in passing: not a checkpoint.
+    "repos/acme/tasks/issues/12/comments": ok([checkpoint("acme/app#7"), "a note quoting <!-- checkpoint v1 --> in passing"].map((c) => JSON.stringify(c)).join("\n")),
     // #13 named it once, and names another pull request now.
     "repos/acme/tasks/issues/13/comments": ok([checkpoint("acme/app#7"), checkpoint("acme/app#9")].map((c) => JSON.stringify(c)).join("\n")),
     "repos/acme/tasks/issues/12": ok(JSON.stringify(TASK)),
@@ -118,10 +124,25 @@ test("the task a pull request delivers is the one whose latest checkpoint names 
   // None names it: no task delivered.
   const none = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", gh: github({ "search/issues": ok("") }), cache: new Map() });
   assert.deepEqual(none, { readable: true, tasks: [], criteria: 0, missing: [] });
+  // The search read whole: the task on its second page is found.
+  const paged = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache: new Map(), gh: (/** @type {string[]} */ args) => {
+    if (args.some((x) => x.startsWith("search/"))) return ok(args.includes("--paginate") ? [...Array.from({ length: 100 }, (_, i) => 200 + i), 12].join("\n") : Array.from({ length: 100 }, (_, i) => 200 + i).join("\n"));
+    const path = args.find((x) => x.startsWith("repos/")) ?? "";
+    if (/issues\/12\/comments/.test(path)) return ok(JSON.stringify(checkpoint("acme/app#7")));
+    if (/issues\/12$/.test(path)) return ok(JSON.stringify(TASK));
+    if (/comments/.test(path)) return ok("");
+    return { ok: false, out: "", err: "unexpected" };
+  } });
+  assert.deepEqual(paged.readable && paged.tasks, [12], "every page of the search");
   // The search can't be read: unknown, never "no task".
   const unread = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", gh: github({ "search/issues": { ok: false, out: "", err: "HTTP 502" } }), cache: new Map() });
   assert.equal(unread.readable, false);
-  assert.match(String(unread.why), /HTTP 502/);
+  // Said where a public pull request shows it: never the private repository, nor a task's number.
+  assert.doesNotMatch(String(unread.why), /acme\/tasks/);
+  const unreadTask = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache: new Map(), gh: github({
+    "search/issues": ok("12"), "repos/acme/tasks/issues/12/comments": { ok: false, out: "", err: "HTTP 502 for repos/acme/tasks/issues/12" } }) });
+  assert.equal(unreadTask.readable, false);
+  assert.doesNotMatch(String(unreadTask.why), /acme\/tasks|#12\b/);
 });
 
 test("the task is asked for again on a new head, and otherwise at most hourly", async () => {
@@ -182,4 +203,18 @@ test("the watcher takes a criterion without evidence to whoever wrote the pull r
   assert.equal(d.why, ESCALATIONS.ACCEPTANCE_MISSING);
   assert.match(String(d.detail), /criterion 2 of the 3/);
   assert.notEqual(d.gap, true);
+});
+
+test("an answer from GitHub that doesn't read as one is unread, never an empty description or a task with no criteria", async () => {
+  const a = await acceptance();
+  for (const out of ["", "not json", "{}"]) {
+    assert.equal(a.pullBody("acme/app", 7, { gh: () => ({ ok: true, out }) }).ok, false, JSON.stringify(out));
+  }
+  assert.deepEqual(a.pullBody("acme/app", 7, { gh: () => ({ ok: true, out: JSON.stringify("") }) }), { ok: true, body: "" }, "an empty description, as GitHub says it");
+  const ok = (/** @type {string} */ out) => ({ ok: true, out });
+  const cache = new Map();
+  const garbled = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache, gh: github({
+    "search/issues": ok("12"), "repos/acme/tasks/issues/12/comments": ok(JSON.stringify(checkpoint("acme/app#7"))), "repos/acme/tasks/issues/12": ok("") }) });
+  assert.equal(garbled.readable, false, "a task body that doesn't read");
+  assert.equal(cache.size, 0, "and nothing kept for it");
 });

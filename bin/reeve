@@ -1090,7 +1090,7 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       if (flag("published")) {
         checked = publishedChecked(db, which, { keys: signingKeys(), repo: nwo, anchor: anchorFor(nwo),
                                                 published: (n, heads) => readPublished(nwo, n, heads),
-                                                listed: () => listPullRequests(nwo) });
+                                                listed: (since) => listPullRequests(nwo, { since }) });
         results.push(...checked.faults);
       }
     } catch (e) {

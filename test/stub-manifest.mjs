@@ -15851,7 +15851,7 @@ export const STUBS = [
     test: "test/published-order.test.mjs",
     expectRed: "each result the daemon publishes names the record it kept, and where the pull request's signed order stood",
     edits: [{ file: "src/daemon.mjs",
-              find: "    if (lastEntrySeq(db) <= args.evidence.store.to) { covered(args.evidence); return true; }\n",
+              find: "    if (lastEntrySeq(db) <= args.evidence.store.to) { if (!lastAtHead.behind) covered(args.evidence); return true; }\n",
               replace: "" }],
   },
   {
@@ -19103,7 +19103,7 @@ export const STUBS = [
     test: "test/published-order.test.mjs",
     expectRed: "a tick says it ordered and published every record only where it did: not where an entry couldn't be reserved, nor where the orders couldn't be published again",
     edits: [{ file: "src/daemon.mjs",
-              find: "{ covered(args.evidence); return true; }",
+              find: "{ if (!lastAtHead.behind) covered(args.evidence); return true; }",
               replace: "{ return true; }" }],
   },
   {
@@ -19183,5 +19183,14 @@ export const STUBS = [
     edits: [{ file: "src/published.mjs",
               find: "        return { why: `the pull requests of ${nwo} kept moving while they were read` };",
               replace: "        break scan;" }],
+  },
+  {
+    name: "covered-not-behind",
+    why: "count a publication GitHub kept back as covering the orders. A quiet tick would witness evidence GitHub never kept",
+    test: "test/published-order.test.mjs",
+    expectRed: "a tick says it ordered and published every record only where it did: not where an entry couldn't be reserved, nor where the orders couldn't be published again",
+    edits: [{ file: "src/daemon.mjs",
+              find: "{ if (!lastAtHead.behind) covered(args.evidence); return true; }",
+              replace: "{ covered(args.evidence); return true; }" }],
   },
 ];

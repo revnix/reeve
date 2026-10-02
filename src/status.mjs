@@ -120,11 +120,14 @@ export const TICK_STARTED = "daemon.tick.started";
  * A tick's start, recorded as it begins (#297). A tick is recorded as it ends
  * too, and between the two the daemon is running, however long the tick takes:
  * the shadow trial took one longer than its gap for the daemon being down.
+ * `ran`, on each of a tick's records, is the code and policy it ran (#166): the
+ * time a trial ran vouches only for those.
+ * @param {any} db @param {number} [at] @param {{ code?: any, policy?: string | null } | null} [ran]
  */
-export function noteTickStart(db, at = Math.floor(Date.now() / 1000)) {
+export function noteTickStart(db, at = Math.floor(Date.now() / 1000), ran = null) {
   try {
     db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
-      .run(at, "daemon", TICK_STARTED, null, "{}");
+      .run(at, "daemon", TICK_STARTED, null, JSON.stringify(ran ?? {}));
   } catch { /* a store that cannot record must not stop the loop */ }
 }
 
@@ -136,17 +139,17 @@ export const TICK_STOPPED = "daemon.tick.stopped";
  * recorded, and without this, a report made before the next tick would take it
  * for a tick still running.
  */
-export function noteTickStopped(db, at = Math.floor(Date.now() / 1000)) {
+export function noteTickStopped(db, at = Math.floor(Date.now() / 1000), ran = null) {
   try {
     db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
-      .run(at, "daemon", TICK_STOPPED, null, "{}");
+      .run(at, "daemon", TICK_STOPPED, null, JSON.stringify(ran ?? {}));
   } catch { /* a store that cannot record must not stop the loop */ }
 }
 
-export function noteTick(db, at = Math.floor(Date.now() / 1000)) {
+export function noteTick(db, at = Math.floor(Date.now() / 1000), ran = null) {
   try {
     db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
-      .run(at, "daemon", "daemon.tick", null, "{}");
+      .run(at, "daemon", "daemon.tick", null, JSON.stringify(ran ?? {}));
   } catch { /* a store that cannot record must not stop the loop */ }
 }
 

@@ -16,6 +16,8 @@ import { basename, dirname, join } from "node:path";
 import { netTimeoutMs, netFailure } from "./net-bound.mjs";
 import { syncFolder } from "./signing.mjs";
 import { TICK_STARTED, TICK_STOPPED } from "./status.mjs";
+import { sameCode } from "./decisions.mjs";
+import { decisionOf } from "./db/records.mjs";
 
 import { gh as runGh } from "./github/calls.mjs";
 /** A gap between ticks longer than this is downtime, as #158 says. */
@@ -327,6 +329,95 @@ export function storeIsOf(db, nwo, { named }) {
 
 /** A time as the report shows it. @param {number} t */
 const when = (t) => new Date(t * 1000).toISOString().replace(/:\d\d\.\d+Z$/, "Z").replace("T", " ");
+
+/**
+ * Whether the shadow trial lets reeve enforce (#166): only once its report has
+ * passed, every condition met and a person's audit of its calls finding none
+ * false. Time alone doesn't pass it. With why not, naming each condition short,
+ * for `reeve run --enforce` to refuse with.
+ * @param {{ passed: boolean, conditions: { name: string, met: boolean | null, detail: string }[] }} report
+ * @param {{ since: number }} o
+ * @returns {{ ok: true } | { ok: false, why: string }}
+ */
+export function trialGate(report, { since }) {
+  if (report.passed) return { ok: true };
+  const short = report.conditions.filter((c) => c.met !== true).map((c) => `${c.name}: ${c.detail}`);
+  return { ok: false, why: `the shadow trial from ${when(since)} hasn't passed: ${short.join("; ")}` };
+}
+
+/**
+ * Whether every judgment the shadow trial saw, and every tick it ran, from
+ * `since` to `until`, was made by `code` under `policy`, the code and policy
+ * about to enforce (#166): a trial vouches only for what it watched, so a deploy
+ * or a policy changed since begins it again. A judgment is told by the record
+ * it was judged from, whole and kept as its own; one without such a record, or
+ * a tick that doesn't say, is no proof it's the same. `{ ok }`, or why not, with
+ * when the last made otherwise was: the trial would begin again after it.
+ * @param {any} db @param {{ since: number, until: number, code: any, policy: string | null }} o
+ * @returns {{ ok: true } | { ok: false, why: string, after: number }}
+ */
+export function trialRanOn(db, { since, until, code, policy }) {
+  const count = { judgment: { other: 0, untold: 0 }, tick: { other: 0, untold: 0 } };
+  let after = 0;
+  /** One judgment or tick, at `at`, said to be made by `by` under `under`. @param {"judgment" | "tick"} what @param {number} at @param {any} by @param {any} under */
+  const tell = (what, at, by, under) => {
+    const same = by ? sameCode(by, code) : null;
+    if (same === true && policy != null && under === policy) return;
+    if (same === null || policy == null || under == null) count[what].untold++; else count[what].other++;
+    after = Math.max(after, at);
+  };
+  // Each judgment, by its record: the one its event names, kept as that pull
+  // request's at that event, and whole.
+  const rowOf = db.prepare("SELECT * FROM decision WHERE digest = ?");
+  for (const e of [...events(db, "pr.decided", since, until), ...events(db, "queue.decided", since, until)]) {
+    const row = typeof e.p.record === "string" ? /** @type {any} */ (rowOf.get(e.p.record)) : null;
+    const own = row && Number(row.pr) === e.pr && Number(row.first_seq) <= e.seq && e.seq <= Number(row.last_seq);
+    const d = own ? decisionOf(row) : null;
+    const record = d && !d.corrupt ? d.record : null;
+    tell("judgment", e.at, record?.code, record?.policy);
+  }
+  // Each tick, its start, end or stop: the time the trial ran is counted from them.
+  for (const op of [TICK_STARTED, "daemon.tick", TICK_STOPPED])
+    for (const e of events(db, op, since, until)) tell("tick", e.at, e.p.code, e.p.policy);
+  const { judgment: j, tick: t } = count;
+  if (!j.other && !j.untold && !t.other && !t.untold) return { ok: true };
+  const said = [j.other ? `${j.other} judgment(s) made by other code or under another policy than this reeve would enforce with` : "",
+                t.other ? `${t.other} tick(s) run by other code or under another policy than this reeve would enforce with` : "",
+                j.untold ? `${j.untold} judgment(s) whose code or policy can't be told` : "",
+                t.untold ? `${t.untold} tick(s) whose code or policy can't be told` : ""].filter(Boolean).join(", and ");
+  return { ok: false, after, why: `the shadow trial from ${when(since)} saw ${said}` };
+}
+
+/**
+ * Whether `reeve run --enforce` may enforce on the shadow trial in the store
+ * `db`, read with its lock held (#166): the reasons it may not, each with what
+ * would fix it. The store must be `nwo`'s; hold no record dated after `now`, the
+ * trial's end, as then the clock has gone back and the trial can't be read
+ * across it; and its trial must have passed, by the code and under the policy
+ * about to enforce. `audits` reads the audits recorded: once for the report,
+ * and again once all of it's read, as one recorded meanwhile may say a call the
+ * report took as right was false.
+ * @param {any} db
+ * @param {{ nwo: string, store: string, named: boolean, since: number, now: number, trialSince: string,
+ *           merged: any, seeded: any, code: any, policy: string | null, audits: () => any }} o
+ * @returns {{ ok: boolean, reasons: string[] }}
+ */
+export function trialForEnforcing(db, { nwo, store, named, since, now, trialSince, merged, seeded, code, policy, audits }) {
+  const bound = storeIsOf(db, nwo, { named });
+  if ("why" in bound) return { ok: false, reasons: [`${store} isn't ${nwo}'s to read its shadow trial from: ${bound.why}`] };
+  const newest = Number(/** @type {any} */ (db.prepare("SELECT MAX(at) AS at FROM event").get())?.at) || 0;
+  if (newest > now)
+    return { ok: false, reasons: [`${store} holds a record dated ${when(newest)}, after now: the clock has gone back since it was written, and a shadow trial can't be read across that. To enforce, run this again once the clock has passed it`] };
+  const reasons = [];
+  const first = audits();
+  const passed = trialGate(trialReport(db, { repo: nwo, since, now, merged, seeded, audits: first.ok ? first.audits : { why: first.why } }), { since });
+  if ("why" in passed) reasons.push(`${passed.why}. To enforce, run the trial until it passes: reeve trial ${nwo} --since ${trialSince} --seeded says what's short`);
+  const ranOn = trialRanOn(db, { since, until: now, code, policy });
+  if ("why" in ranOn) reasons.push(`${ranOn.why}. To enforce, run the trial again on this code and policy, from after ${when(ranOn.after)}`);
+  if (JSON.stringify(audits()) !== JSON.stringify(first))
+    reasons.push("an audit was recorded while the shadow trial was read, so what it says may not be what was read. To enforce, run this again");
+  return { ok: !reasons.length, reasons };
+}
 
 /**
  * The report, for a person to read.

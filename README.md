@@ -108,7 +108,9 @@ reeve dash                  write the one-page view
 reeve run [owner/repo]      the daemon
       --tick                  one pass and exit, in shadow mode only
       --execute               dispatch workers        (default: report only)
-      --enforce               publish real conclusions (default: shadow/neutral)
+      --enforce --trial-since <date>
+                              publish real conclusions, once the shadow trial begun
+                              then has passed (default: shadow/neutral)
 ```
 
 ## Running it unattended
@@ -198,8 +200,12 @@ clone, so it may hold work left in a different one entirely.
 
 `--execute` dispatches workers. `--enforce` publishes real conclusions instead of
 neutral ones. Both are opt-in, and the sequence is deliberate: observe, then fix
-under supervision, then enforce. The shadow period exits on **seven days of data
-with zero false blocks**, not on a date.
+under supervision, then enforce. The shadow period ends when the shadow trial's
+report passes (`reeve trial`), every condition met and a person's audit finding
+no false call, not on a date. So `--enforce` needs `--trial-since <date>`, when
+the trial began: `reeve run --enforce --trial-since <date>` refuses until that
+trial has passed, and while the default branch doesn't enforce what reeve
+publishes.
 
 ## Working on reeve
 

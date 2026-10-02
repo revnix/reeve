@@ -472,7 +472,7 @@ function shownRecord(db, pr, d, { head, sig, notIt, order }) {
  * git couldn't read its commit, or whether it differed from it, or by how much.
  * @param {any} a @param {any} b
  */
-const sameCode = (a, b) => {
+export const sameCode = (a, b) => {
   const readable = v => Boolean(v?.commit) && Boolean(v?.tree) && typeof v.dirty === "boolean" && (!v.dirty || Boolean(v.diff));
   if (!readable(a) || !readable(b)) return null;
   return a.commit === b.commit && a.tree === b.tree && a.dirty === b.dirty && a.diff === b.diff;

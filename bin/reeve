@@ -239,6 +239,7 @@ const FLAGS = {
   takeover:       { value: false, what: "take a lease whose holder is provably dead" },
   execute:        { value: false, what: "actually act, rather than observe" },
   enforce:        { value: false, what: "publish the merge policy as enforcing" },
+  "trial-since":  { value: true,  what: "when the shadow trial began, which --enforce needs to have passed" },
   events:         { value: false, what: "export the event log too" },
   published:      { value: false, what: "for replay, check the store against what the merge policy published on GitHub" },
   health:         { value: false, what: "report health only" },
@@ -2549,14 +2550,33 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     // reeve's check from reeve's App, in a rule no one can bypass, or what
     // reeve publishes may block nothing, and saying it enforces would be false.
     // Measured before anything is held, and refused with what would fix it.
+    // And only after a shadow trial that passed (#166): its report built as
+    // `reeve trial` builds it, from when it began, every condition met and a
+    // person's audit finding no false call. Both are measured, and every reason
+    // to refuse is said at once, so a person sees all that's missing.
+    /** @type {any} */ let enforcing = null;
+    if (opt("trial-since") != null && !flag("enforce")) {
+      console.error(`reeve ${cmd}: --trial-since is read only with --enforce, to check the shadow trial passed before enforcing; in shadow mode, leave it out`);
+      process.exit(1);
+    }
     if (flag("enforce")) {
+      const trialSince = opt("trial-since");
+      if (trialSince == null) {
+        console.error(`reeve ${cmd}: --enforce needs --trial-since, the date the shadow trial began, as 2026-09-30T09:14Z: reeve enforces only after it has passed`);
+        process.exit(1);
+      }
+      const sinceAt = Math.floor(Date.parse(trialSince) / 1000);
+      if (!Number.isFinite(sinceAt) || sinceAt > Math.floor(Date.now() / 1000)) {
+        console.error(`reeve ${cmd}: --trial-since takes the date the shadow trial began, as 2026-09-30T09:14Z, got ${JSON.stringify(trialSince)}`);
+        process.exit(1);
+      }
       const base = profile.identity?.defaultBranch ?? "main";
       const { enforcementNow } = await import("../src/pr.mjs");
       const e = await enforcementNow({ nwo, base });
-      if (e.state !== "enforced") {
-        console.error(`reeve ${cmd}: --enforce refused: ${e.why}. To enforce, ${e.fix ?? `make ${base} enforce what reeve publishes`}, then run this again; until then, run without --enforce, in shadow mode`);
-        process.exit(1);
-      }
+      const seeded = await (await import("../src/seeded.mjs")).runSeeded();
+      // The store is read for the trial only once its lock is held and what a
+      // killed restore left is put right, below: opening it can write it.
+      enforcing = { e, base, sinceAt, trialSince, seeded };
     }
     // One reeve runs on a store at a time (#274), held until this one ends: a
     // second, on a store another is running on, would keep records whose signed
@@ -2573,6 +2593,35 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
     // doesn't run, as the store would run without what it committed there.
     const settled = settleRestores(dbPath);
     if (!settled.ok) { console.error(`reeve ${cmd}: ${settled.why}`); process.exit(1); }
+    // Enforcing, the shadow trial's report from the store, now its lock is held
+    // and it's settled: only this repository's, never another's named with
+    // --db (#166). Then every reason to refuse, at once.
+    if (enforcing) {
+      const { e, base, sinceAt, trialSince, seeded } = enforcing;
+      const { trialForEnforcing, mergedSince, readAudits } = await import("../src/trial.mjs");
+      const { runningCode } = await import("../src/daemon.mjs");
+      const { policyHashFor } = await import("../src/decisions.mjs");
+      // The trial ends now, taken with the lock held. What GitHub says merged is
+      // read first, so the audits are read for the report and again with only
+      // the reading between.
+      const nowAt = Math.floor(Date.now() / 1000);
+      const merged = mergedSince(nwo, sinceAt, { until: nowAt });
+      const trialDb = open(dbPath);
+      let trial;
+      try {
+        trial = trialForEnforcing(trialDb, { nwo, store: dbPath, named: opt("db") != null, since: sinceAt, now: nowAt, trialSince, merged, seeded,
+                                             code: runningCode(), policy: policyHashFor(profile, nwo),
+                                             audits: () => readAudits(auditDirFor(HOME, nwo), nwo, { notes: auditNotesFor(HOME, nwo) }) });
+      } finally { trialDb.close(); }
+      const refusals = [
+        ...(e.state === "enforced" ? [] : [`${e.why}. To enforce, ${e.fix ?? `make ${base} enforce what reeve publishes`}`]),
+        ...trial.reasons,
+      ];
+      if (refusals.length) {
+        console.error(`reeve ${cmd}: --enforce refused: ${refusals.join(". And ")}. Then run this again; until then, run without --enforce, in shadow mode`);
+        process.exit(1);
+      }
+    }
     // Resolved before the context so the REASON survives. A project that is
     // simply not registered is `{ project: null, why: null }` -- an ordinary
     // state. A registry that could not be parsed is a fault that says so.
@@ -2781,7 +2830,9 @@ function usage() {
   run [owner/repo]      the daemon: watch, publish, decide, on a loop
       --tick                one pass and exit, in shadow mode only
       --execute             dispatch workers (default: report only)
-      --enforce             publish real conclusions (default: shadow/neutral)
+      --enforce --trial-since <date>
+                            publish real conclusions, once the shadow trial begun
+                            then has passed (default: shadow/neutral)
       --interval <seconds>  default 90
       --halt <path>         marker file that stops everything (default ~/.reeve/HALT)
   withdraw [owner/repo] withdraw every PASS reeve left standing there; systemd runs it

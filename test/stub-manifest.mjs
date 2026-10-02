@@ -18959,8 +18959,8 @@ export const STUBS = [
     test: "test/merge-ready.test.mjs",
     expectRed: "the task a pull request delivers is the one whose latest checkpoint names it, found from the private side",
     edits: [{ file: "src/acceptance.mjs",
-              find: "  if (!found.ok) return { ok: false, why:",
-              replace: "  if (!found.ok) return { ok: true, tasks: [], criteria: 0, why:" }],
+              find: "  if (!found.ok) return { ok: false, why: `the task it delivers couldn't be looked for in ${tasksRepo}: ${found.err}` };",
+              replace: "  if (!found.ok) return { ok: true, tasks: [], criteria: 0 };" }],
   },
   {
     name: "task-blank-counts",
@@ -19014,7 +19014,10 @@ export const STUBS = [
     expectRed: "evaluatePr asks for acceptance evidence only where the profile names where tasks live",
     edits: [{ file: "src/pr.mjs",
               find: "  if (profile.tasks?.repo) {\n    const desc = pullBody(nwo, pr);",
-              replace: "  if (true) {\n    const desc = pullBody(nwo, pr);" }],
+              replace: "  if (true) {\n    const desc = pullBody(nwo, pr);" },
+             { file: "src/pr.mjs",
+              find: "tasksRepo: profile.tasks.repo });",
+              replace: "tasksRepo: profile.tasks?.repo ?? \"none/none\" });" }],
   },
   {
     name: "evaluate-hands-acceptance",

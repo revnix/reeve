@@ -19028,4 +19028,13 @@ export const STUBS = [
               find: "    ...(acceptance ? { acceptance } : {}),\n",
               replace: "" }],
   },
+  {
+    name: "watcher-acceptance-escalates",
+    why: "leave a criterion without evidence to the watcher's fall-through. Every such pull request would be reported as a gap in reeve, every tick",
+    test: "test/merge-ready.test.mjs",
+    expectRed: "the watcher takes a criterion without evidence to whoever wrote the pull request, naming it, rather than as a gap",
+    edits: [{ file: "src/watcher.mjs",
+              find: "  const acceptance = clause(v, \"acceptance\");\n  if (acceptance?.state === \"BLOCK\")\n    return act(ACTIONS.ESCALATE, ESCALATIONS.ACCEPTANCE_MISSING, { detail: acceptance.detail });\n",
+              replace: "" }],
+  },
 ];

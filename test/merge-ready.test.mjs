@@ -170,3 +170,16 @@ test("evaluatePr asks for acceptance evidence only where the profile names where
     assert.ok(withTasks.verdict.clauses.some((c) => c.id === "acceptance"));
   } finally { process.env.PATH = path; db.close(); }
 });
+
+test("the watcher takes a criterion without evidence to whoever wrote the pull request, naming it, rather than as a gap", async () => {
+  const { nextAction, ACTIONS, ESCALATIONS } = await import("../src/watcher.mjs");
+  const input = ready();
+  input.acceptance = { ...input.acceptance, missing: [2] };
+  const e = { state: "open", pr: 7, head: HEAD, verdict: computeVerdict(input), checks: { verdict: "GREEN", caused: [], inherited: [], failing: [] },
+              rounds: input.rounds, reviewers: [], threads: { readable: true, total: 2, unresolved: 0, seen: 2 }, settled: { settled: true } };
+  const d = nextAction(e, { authority: { policy: "propose_and_merge" }, watch: {}, reviewers: [] }, { fixAttempts: new Map() });
+  assert.equal(d.action, ACTIONS.ESCALATE, JSON.stringify(d));
+  assert.equal(d.why, ESCALATIONS.ACCEPTANCE_MISSING);
+  assert.match(String(d.detail), /criterion 2 of the 3/);
+  assert.notEqual(d.gap, true);
+});

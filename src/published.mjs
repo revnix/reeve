@@ -123,17 +123,20 @@ export function listPullRequests(nwo, { gh = ghApi, limit = 100, since = null } 
   const unlike = { why: `the pull requests of ${nwo} don't read as GitHub's` };
   const number = (/** @type {string} */ s) => { const n = Number(s); return Number.isSafeInteger(n) && n >= 1 ? n : null; };
   /** @type {Set<number>} */ const prs = new Set();
+  // The open ones first: one that closes while the updated list is read is
+  // updated after the page that would have had it.
+  const open = gh(["--paginate", `repos/${nwo}/pulls?state=open&per_page=100`, "--jq", ".[].number"]);
+  if (!open.ok) return unread(open.err);
+  for (const s of open.out.split("\n").filter(Boolean)) { const n = number(s); if (n === null) return unlike; prs.add(n); }
   for (let page = 1; ; page++) {
     const got = gh([`repos/${nwo}/pulls?state=all&sort=updated&direction=desc&per_page=${per}&page=${page}`, "--jq", '.[] | "\\(.number) \\(.updated_at)"']);
     if (!got.ok) return unread(got.err);
     const rows = got.out.split("\n").filter(Boolean).map((l) => { const [n, at] = l.split(" "); return { n: number(n), at: Date.parse(at) / 1000 }; });
     if (rows.some((r) => r.n === null || !Number.isFinite(r.at))) return unlike;
-    for (const r of rows) if ((page === 1 && prs.size < limit) || (since !== null && r.at >= since)) prs.add(/** @type {number} */ (r.n));
+    // The first page whole: it's the `limit` most recently updated.
+    for (const r of rows) if (page === 1 || (since !== null && r.at >= since)) prs.add(/** @type {number} */ (r.n));
     if (since === null || rows.length < per || /** @type {any} */ (rows.at(-1)).at < since) break;
   }
-  const open = gh(["--paginate", `repos/${nwo}/pulls?state=open&per_page=100`, "--jq", ".[].number"]);
-  if (!open.ok) return unread(open.err);
-  for (const s of open.out.split("\n").filter(Boolean)) { const n = number(s); if (n === null) return unlike; prs.add(n); }
   return [...prs];
 }
 

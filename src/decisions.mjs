@@ -14,7 +14,6 @@ import { canonical } from "./db/ops.mjs";
 import { latestDecision, decisionsFor, decisionOf, evidenceBy, policyRecord, storeIdentity, BASELINE_OP, LATEST_OP, FILED } from "./db/records.mjs";
 import { checkSignature, checkEnvelope, baselineStatement, baselineFingerprint, latestStatement, entrySeal, orderChain } from "./signing.mjs";
 import { reservedSeal } from "./anchor.mjs";
-import { TICK_STARTED, TICK_STOPPED } from "./status.mjs";
 
 /** @typedef {import("node:sqlite").DatabaseSync} Db */
 /** @typedef {Map<string, { key: import("node:crypto").KeyObject, where: string }>} Keys */
@@ -704,14 +703,16 @@ export function publishedChecked(db, which, { keys, repo, anchor: read = null, p
     for (const { subject } of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ? AND subject GLOB 'pr:[1-9]*' AND substr(subject, 4) NOT GLOB '*[^0-9]*' AND length(subject) <= 18`).all(LATEST_OP))) own.add(Number(String(subject).slice(3)));
     // And each GitHub lists: one the copy no longer names, taken away with every
     // record and entry of it, is read all the same (#285). Every one updated
-    // since the copy's newest tick began, too (#308): a record published and not
-    // yet ordered was published in its store's last tick, after that began, so
-    // on a pull request then open, which GitHub updated as it closed, if it has.
-    // Less an hour, for the host's clock against GitHub's.
-    const tick = /** @type {any} */ (db.prepare(`SELECT MAX(at) AS at FROM event WHERE op IN (?, 'daemon.tick', ?)`).get(TICK_STARTED, TICK_STOPPED))?.at;
-    const since = tick == null ? null : Number(tick) - CLOCK_SLACK_SECONDS;
+    // since the newest tick at which the store's every record was ordered and
+    // every entry published, too (#308): a record published, unordered, and lost
+    // from a copy since was published after that, on a pull request open then,
+    // which GitHub updated as it closed, if it has. Less an hour, for the host's
+    // clock against GitHub's.
+    const witnessed = /** @type {any} */ (db.prepare(`SELECT MAX(json_extract(payload, '$.witnessed')) AS at FROM event
+      WHERE op = 'daemon.tick' AND json_valid(payload) AND json_type(payload, '$.witnessed') IN ('integer', 'real')`).get())?.at;
+    const since = witnessed == null ? null : Number(witnessed) - CLOCK_SLACK_SECONDS;
     if (listed && since === null)
-      faults.push(fault(0, "", "this copy holds no record of its ticks, so a pull request it no longer names, beyond the 100 GitHub lists as most recently updated and those open, can't be ruled out"));
+      faults.push(fault(0, "", "this copy holds no tick at which every record it held was ordered and published, so a pull request it no longer names, beyond the 100 GitHub lists as most recently updated and those open, can't be ruled out"));
     const got = listed ? listed(since) : [];
     if ("why" in got) faults.push(fault(0, "", `the repository's pull requests couldn't be listed from GitHub, so one this copy no longer names may be missed: ${got.why}`));
     else for (const n of got) prs.add(n);

@@ -1129,41 +1129,102 @@ test("a copy is checked against every open pull request, and every one GitHub up
   assert.match(JSON.stringify(listPullRequests("o/r", { gh: pullsOf([{ pr: 5, updated: "soon" }], [], []), since })), /don't read as GitHub's/);
   const failing = (/** @type {string[]} */ args) => (args.some((a) => /state=open/.test(a)) ? { ok: false, out: "", err: "HTTP 502" } : pullsOf(PULLS, [], [])(args));
   assert.match(JSON.stringify(listPullRequests("o/r", { gh: failing, since })), /couldn't be listed: HTTP 502/);
+  // One open as the reads begin, and closed while the updated list is read, as an old one can: the open list, read first, has it.
+  let scanned = false;
+  const racing = (/** @type {string[]} */ args) => {
+    if (args.some((a) => /state=open/.test(a))) return { ok: true, out: scanned ? "" : "3" };
+    scanned = true;
+    return pullsOf(PULLS, [], [])(args);
+  };
+  assert.ok(/** @type {number[]} */ (listPullRequests("o/r", { gh: racing, since })).includes(3), "one that closed while the list was read");
 });
 
-test("a copy is checked against what GitHub updated since its newest tick began, less an hour, and one holding no tick can't be, and says so", async () => {
+/** The newest tick at which the store said every record it held was ordered and published, in seconds. */
+const witnessedOf = (/** @type {any} */ db) => db.prepare("SELECT MAX(json_extract(payload, '$.witnessed')) AS at FROM event WHERE op = 'daemon.tick' AND json_valid(payload)").get().at;
+
+test("a copy is checked against what GitHub updated since its newest tick that ordered and published every record, less an hour, and one with none says so", async () => {
   const h = await history();
   const db = open(h.path);
-  const newest = db.prepare("SELECT MAX(at) AS at FROM event WHERE op IN ('daemon.tick.started', 'daemon.tick', 'daemon.tick.stopped')").get().at;
-  assert.ok(newest > 0, "control: the copy holds its ticks");
+  const witnessed = witnessedOf(db);
+  assert.ok(witnessed > 0, "control: a tick ordered and published every record the store held");
   /** @type {unknown[]} */ const given = [];
-  publishedChecked(db, {}, { keys: h.keys, repo: REPO, anchor: null, published: githubOf(h.published), listed: (/** @type {any} */ since) => { given.push(since); return []; } });
-  assert.deepEqual(given, [newest - 3600]);
-  // A tick begun later, and never ended, as the store's last; then one stopped later still.
-  for (const [op, after] of [["daemon.tick.started", 30], ["daemon.tick.stopped", 60]]) {
-    db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(newest + after, "daemon", op, null, "{}");
+  const check = () => {
     given.length = 0;
-    publishedChecked(db, {}, { keys: h.keys, repo: REPO, anchor: null, published: githubOf(h.published), listed: (/** @type {any} */ since) => { given.push(since); return []; } });
-    assert.deepEqual(given, [newest + after - 3600], op);
-  }
-  // Its ticks taken away: no time to read from.
-  db.prepare("DELETE FROM event WHERE op IN ('daemon.tick.started', 'daemon.tick', 'daemon.tick.stopped')").run();
-  given.length = 0;
-  const blind = publishedChecked(db, {}, { keys: h.keys, repo: REPO, anchor: null, published: githubOf(h.published), listed: (/** @type {any} */ since) => { given.push(since); return []; } });
+    try { return publishedChecked(db, {}, { keys: h.keys, repo: REPO, anchor: null, published: githubOf(h.published), listed: (/** @type {any} */ since) => { given.push(since); return []; } }); }
+    catch (err) { return assert.fail(`the check threw: ${err}`); }
+  };
+  check();
+  assert.deepEqual(given, [witnessed - 3600]);
+  // Later ticks that didn't, ended, begun or stopped, as while a record stays unordered: it holds.
+  for (const op of ["daemon.tick", "daemon.tick.started", "daemon.tick.stopped"])
+    db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(witnessed + 7200, "daemon", op, null, "{}");
+  // Nor one whose record doesn't read, or says no time.
+  for (const payload of ["{", JSON.stringify({ witnessed: "soon" })])
+    db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(witnessed + 7300, "daemon", "daemon.tick", null, payload);
+  check();
+  assert.deepEqual(given, [witnessed - 3600], "later ticks that didn't witness every record don't move it");
+  // A later one that did moves it.
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(witnessed + 9000, "daemon", "daemon.tick", null, JSON.stringify({ witnessed: witnessed + 8000 }));
+  check();
+  assert.deepEqual(given, [witnessed + 8000 - 3600]);
+  // None that did: no time to read from.
+  db.prepare("DELETE FROM event WHERE op = 'daemon.tick'").run();
+  const blind = check();
   db.close();
   assert.deepEqual(given, [null], "still the open ones and the most recent");
-  assert.match(blind.faults.map((f) => f.why).join("\n"), /this copy holds no record of its ticks, so a pull request it no longer names, beyond the 100 GitHub lists as most recently updated and those open, can't be ruled out/);
+  assert.match(blind.faults.map((f) => f.why).join("\n"), /this copy holds no tick at which every record it held was ordered and published, so a pull request it no longer names, beyond the 100 GitHub lists as most recently updated and those open, can't be ruled out/);
+});
+
+test("a tick says it ordered and published every record only where it did: not where an entry couldn't be reserved, nor where the orders couldn't be published again", async () => {
+  const lastTick = (/** @type {string} */ path) => { const db = open(path); const p = JSON.parse(db.prepare("SELECT payload FROM event WHERE op = 'daemon.tick' ORDER BY seq DESC LIMIT 1").get()?.payload ?? "{}"); db.close(); return p; };
+  const dir = credentials();
+  const plain = await ticksOf(() => [PR], 1, host(dir));
+  assert.equal(typeof lastTick(plain.path).witnessed, "number", JSON.stringify(lastTick(plain.path)));
+  // Its record kept and never ordered.
+  const unordered = await ticksOf(() => [PR], 1, { ...host(credentials()), anchor: { ...fileAnchor(credentials()), reserve: () => false } });
+  assert.equal(lastTick(unordered.path).witnessed, undefined, "an entry that couldn't be reserved");
+  // Ordered, and the orders as extended never published.
+  let calls = 0;
+  const failing = await ticksOf(() => [PR], 1, { ...host(credentials()), publish: async () => (++calls === 1 ? { ok: true, id: 1, conclusion: "neutral" } : { ok: false, why: "HTTP 502" }) });
+  assert.ok(calls >= 2, `control: published, then published again: ${calls}`);
+  assert.equal(lastTick(failing.path).witnessed, undefined, "orders that couldn't be published again");
+  // A tick after, with nothing new to order, its orders as published already: it did.
+  const again = await ticksOf(() => [PR], 2, host(credentials()));
+  assert.equal(typeof lastTick(again.path).witnessed, "number", "a second tick, nothing new");
+  // A store that keeps no signed orders, which nothing can witness.
+  const none = await ticksOf(() => [PR], 1, {});
+  assert.equal(lastTick(none.path).witnessed, undefined, "no signed orders kept");
+  // Then the host's anchor unreadable, or another store's, before a second tick.
+  for (const [what, spoil] of /** @type {[string, (dir: string) => void][]} */ ([
+    ["an anchor that can't be read", (dir) => writeFileSync(anchorPath(dir, REPO), "{")],
+    ["an anchor another store's", (dir) => { const a = JSON.parse(readFileSync(anchorPath(dir, REPO), "utf8")); a.store = "e".repeat(32); writeFileSync(anchorPath(dir, REPO), JSON.stringify(a)); }],
+  ])) {
+    const dir = credentials();
+    const first = await ticksOf(() => [PR], 1, host(dir));
+    assert.equal(typeof lastTick(first.path).witnessed, "number", `control: ${what}`);
+    spoil(dir);
+    /** @type {unknown} */ let threw = null;
+    try { await ticksOf(() => [PR], 1, host(dir), first.path); } catch (err) { threw = err; }
+    assert.equal(threw, null, `${what}: the tick ends`);
+    assert.equal(lastTick(first.path).witnessed, undefined, what);
+  }
 });
 
 test("a copy that lost every row of a pull request beyond the 100 most recently updated, whose published record no entry named, is a fault", async () => {
   const dir = credentials();
-  // #42's record kept and published, and never ordered: no entry can be reserved.
-  const { path, published } = await ticksOf(() => [PR], 1, { ...host(dir), anchor: { ...fileAnchor(dir), reserve: () => false } });
+  // #7 judged and ordered; then #42's record kept and published, and never ordered: no entry can be reserved.
+  const real = fileAnchor(dir);
+  let tick = 0;
+  const { path, published } = await ticksOf((t) => { tick = t; return t === 1 ? [7] : [PR]; }, 2,
+    { ...host(dir), anchor: { ...real, reserve: (/** @type {any[]} */ ...a) => (tick === 1 ? real.reserve(...a) : false) } });
   const db = open(path);
-  assert.equal(db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n, 0, "control: no entry names it");
+  assert.equal(db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest' AND subject = ?").get(`pr:${PR}`).n, 0, "control: no entry names it");
   db.prepare("DELETE FROM decision WHERE pr = ?").run(PR);
   db.prepare("DELETE FROM event WHERE subject = ?").run(`pr:${PR}`);
-  // On GitHub, 100 others were updated since #42 closed, after the copy's last tick.
+  // Two hours of ticks since, its record unordered all the while: none ordered and published every record.
+  for (let m = 10; m <= 120; m += 10)
+    db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(Math.floor(Date.now() / 1000) + m * 60, "daemon", "daemon.tick", null, "{}");
+  // On GitHub, 100 others were updated since #42 closed, after the copy's last tick that witnessed every record.
   const closed = new Date(Date.now() + 60_000).toISOString();
   const all = [...Array.from({ length: 100 }, (_, i) => ({ pr: 1000 + i, updated: new Date(Date.now() + 120_000 + i * 1000).toISOString() })).reverse(),
                { pr: PR, updated: closed }];
@@ -1172,3 +1233,4 @@ test("a copy that lost every row of a pull request beyond the 100 most recently 
   db.close();
   assert.match(checked.faults.map((f) => f.why).join("\n"), /the merge policy published this record for it at aaaaaaaa, but this copy doesn't hold it/);
 });
+

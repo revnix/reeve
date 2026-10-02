@@ -18243,7 +18243,7 @@ export const STUBS = [
     name: "github-call-counted",
     why: "run gh without counting the call. The calls a tick makes couldn't be measured, or cut",
     test: "test/github-calls-counted.test.mjs",
-    expectRed: "each call to GitHub is counted under the identity it reads as and its kind, refused or not, and the count starts afresh once taken",
+    expectRed: "each request gh makes for reeve is counted, a paged read's every page, under the identity it reads as and its kind, and the count starts afresh once taken",
     edits: [{ file: "src/github/calls.mjs",
               find: "  counted.set(key, { calls: was.calls + 1, requests: was.requests + (stderr.match(/^\\* Request to /gm) ?? []).length });\n",
               replace: "" }],

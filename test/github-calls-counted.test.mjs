@@ -137,7 +137,7 @@ test("every module that runs gh, run against a gh that records each run, counts 
   writeFileSync(script, `
     const calls = await import(${JSON.stringify(src("github/calls.mjs"))});
     const tries = [
-      async () => (await import(${JSON.stringify(src("github/reconciler.mjs"))})).pinHead("o/r", "main"),
+      async () => (await import(${JSON.stringify(src("github/reconciler.mjs"))})).readTimeline("o/r", 1),
       async () => (await import(${JSON.stringify(src("db/reconcile.mjs"))})).reconcilePrComment({ nwo: "o/r", pr: 1, idemKey: "k" }),
       async () => (await import(${JSON.stringify(src("profile/detect.mjs"))})).detectMergeMethod("o/r"),
       async () => (await import(${JSON.stringify(src("doctor.mjs"))})).checkMergeAuthority("o/r"),

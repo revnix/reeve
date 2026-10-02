@@ -19634,7 +19634,7 @@ export const STUBS = [
     test: "test/merge-ready.test.mjs",
     expectRed: "a task's criteria are the items of its Acceptance criteria section, and the evidence the numbered entries of the pull request's",
     edits: [{ file: "src/acceptance.mjs",
-              find: "(?:\\s+#+)?",
+              find: "(?:\\\\s+#+)?",
               replace: "" }],
   },
   {

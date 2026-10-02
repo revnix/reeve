@@ -2132,15 +2132,13 @@ async function tickOnce(ctx, ran) {
     });
   };
   // Whether every record the store holds is ordered, as the host's anchor
-  // reads now (#308): no order has work left. Not where that can't be read,
-  // nor where the anchor is another store's. A store keeping no orders holds
-  // its every record unordered.
+  // reads now (#308): no order has work left. Not where that can't be read. A
+  // store keeping no orders holds its every record unordered; one whose anchor
+  // is another store's publishes none of its orders, so none is covered.
   const ordersSettled = () => {
     try {
       keysNow();
-      const a = ctx.anchor.read(nwo) ?? noAnchor(), id = storeIdentity(db);
-      if (a.store && a.store !== id) return false;
-      return !pendingOrders(a, id).length;
+      return !pendingOrders(ctx.anchor.read(nwo) ?? noAnchor(), storeIdentity(db)).length;
     } catch { return false; }
   };
   // What each base requires is read afresh every tick. Kept across ticks, a rule

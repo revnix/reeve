@@ -19031,17 +19031,8 @@ export const STUBS = [
     test: "test/published-order.test.mjs",
     expectRed: "a tick says it ordered and published every record only where it did: not where an entry couldn't be reserved, nor where the orders couldn't be published again",
     edits: [{ file: "src/daemon.mjs",
-              find: "      return !pendingOrders(a, id).length;\n    } catch { return false; }",
-              replace: "      return !pendingOrders(a, id).length;\n    } catch { return true; }" }],
-  },
-  {
-    name: "settled-anchor-ours",
-    why: "take another store's anchor as saying no work is left. A store whose orders aren't extended would witness them",
-    test: "test/published-order.test.mjs",
-    expectRed: "a tick says it ordered and published every record only where it did: not where an entry couldn't be reserved, nor where the orders couldn't be published again",
-    edits: [{ file: "src/daemon.mjs",
-              find: "      if (a.store && a.store !== id) return false;\n      return !pendingOrders(a, id).length;",
-              replace: "      return !pendingOrders(a, id).length;" }],
+              find: "      return !pendingOrders(ctx.anchor.read(nwo) ?? noAnchor(), storeIdentity(db)).length;\n    } catch { return false; }",
+              replace: "      return !pendingOrders(ctx.anchor.read(nwo) ?? noAnchor(), storeIdentity(db)).length;\n    } catch { return true; }" }],
   },
   {
     name: "settled-no-work",
@@ -19049,7 +19040,7 @@ export const STUBS = [
     test: "test/published-order.test.mjs",
     expectRed: "a tick says it ordered and published every record only where it did: not where an entry couldn't be reserved, nor where the orders couldn't be published again",
     edits: [{ file: "src/daemon.mjs",
-              find: "      return !pendingOrders(a, id).length;\n    } catch",
+              find: "      return !pendingOrders(ctx.anchor.read(nwo) ?? noAnchor(), storeIdentity(db)).length;\n    } catch",
               replace: "      return true;\n    } catch" }],
   },
 ];

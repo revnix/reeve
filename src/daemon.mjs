@@ -2031,14 +2031,13 @@ async function tickOnce(ctx, ran) {
     const named = (/** @type {number} */ pr, /** @type {string} */ d) => { const o = orders.get(pr); return Boolean(o && "digests" in o && o.digests.has(d)); };
     /** @type {Set<number>} */ const prs = new Set();
     for (const [pr, o] of orders) if ("corrupt" in o || o.top > (a.latest.get(pr) ?? 0)) prs.add(pr);
-    // And every one the host's anchor holds an entry of whose order is short of
-    // it, none left in the store included: cut short, or restored from before,
-    // it's said every tick, though its pull request is never judged again.
-    for (const [pr, n] of a.latest) { const o = orders.get(pr); if (!o || ("top" in o && o.top < n)) prs.add(pr); }
     // And each the anchor holds an entry reserved for, a record noted at its top
     // that its order doesn't name there, or an entry sealed there that it
     // doesn't hold, or a record pinned for (#279): completed, refused or
-    // reported every tick, though its pull request is never judged again.
+    // reported every tick, though its pull request is never judged again. An
+    // order short of the anchor's top, none left in the store included, cut
+    // short or restored from before, names no record there: so is one of these,
+    // or, where the anchor noted no record, is noted again below.
     for (const pr of a.reserved.keys()) prs.add(pr);
     for (const [pr, d] of a.named) { const o = orders.get(pr); if (!o || !("entries" in o) || o.entries.get(a.latest.get(pr) ?? 0) !== d) prs.add(pr); }
     // The chain to the noted top covers its seal too (#303), and an anchor

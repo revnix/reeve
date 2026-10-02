@@ -424,6 +424,19 @@ test("a store stripped of its baseline and signatures isn't given one again wher
   db.close();
   assert.equal(baselines, 0);
   assert.match(r.log, /anchor for o\/r can't be read: it isn't JSON, so it's taken to say this store began signing/);
+  // Stripped of its records too, so nothing is left to bind the anchor over: the unread anchor alone keeps its baseline from it.
+  const bareDir = credentials();
+  const bare = await ticks([at(A)], host(bareDir));
+  db = open(bare);
+  db.prepare("DELETE FROM event WHERE op IN ('signing.baseline', 'decision.latest')").run();
+  db.prepare("DELETE FROM decision").run();
+  db.close();
+  writeFileSync(anchorPath(bareDir, REPO), "{");
+  await run({ evaluate: () => at(B), dbPath: bare, ...host(bareDir) });
+  db = open(bare);
+  const bareBaselines = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n;
+  db.close();
+  assert.equal(bareBaselines, 0, "a store stripped of its records too");
 });
 
 test("reeve why says when the host's anchor for the repository can't be read", async () => {
@@ -805,6 +818,17 @@ test("an order that ran ahead of the host's anchor is noted there by a later tic
   assert.equal("top" in order && order.top, 2, "control: the order ran ahead of it");
   await run({ openPrs: () => [], evaluate: () => at(A), dbPath, prState: () => "CLOSED", prIsFinished: () => true, ...host(dir) });
   assert.equal(readAnchor(dir, REPO)?.latest.get(PR), 2);
+  // An anchor put back to a copy from before the entry, as a host restored from
+  // a backup: nothing reserved or pinned is left to say the order ran ahead.
+  const backDir = credentials();
+  const back = await ticks([at(A)], host(backDir));
+  const before = readFileSync(anchorPath(backDir, REPO));
+  await run({ evaluate: () => at(A, "RED"), dbPath: back, ...host(backDir) });
+  writeFileSync(anchorPath(backDir, REPO), before);
+  const put = readAnchor(backDir, REPO);
+  assert.deepEqual([put?.latest.get(PR), put?.reserved.size, put?.pinned.size], [1, 0, 0], "control: put back behind the order, nothing reserved or pinned");
+  await run({ openPrs: () => [], evaluate: () => at(A), dbPath: back, prState: () => "CLOSED", prIsFinished: () => true, ...host(backDir) });
+  assert.equal(readAnchor(backDir, REPO)?.latest.get(PR), 2, "an anchor put back");
 });
 
 test("the first entry of a pull request's order names every record kept for it before, so none can be taken away unseen", async () => {
@@ -1046,6 +1070,22 @@ test("a store with no order to extend says nothing on the host's anchor, so anot
   assert.equal(baselines, 1, "the store with records was given its baseline");
   assert.match(String(shown), /kept before this store began signing/);
   assert.doesNotMatch(String(shown), /can't be trusted/);
+  // An idle store holding an identity, as a copy of one that had it: the
+  // anchor isn't bound to it, so it says nothing there either.
+  const withIdDir = credentials();
+  const withRecords = await ticks([at(A, "RED")], {});
+  const idleWithId = join(tempDir("reeve-order-idle-id-"), "s.db");
+  const i = open(idleWithId);
+  i.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(1, "daemon", "store.identity", "store", JSON.stringify({ id: "1".repeat(32) }));
+  assert.equal(identityOf(i), "1".repeat(32), "control: it holds an identity");
+  i.close();
+  await run({ openPrs: () => [], evaluate: () => at(A), dbPath: idleWithId, ticks: 2, ...host(withIdDir) });
+  assert.equal(readAnchor(withIdDir, REPO)?.began ?? false, false, "an idle store with an identity the anchor isn't bound to");
+  await closedTick(withRecords, host(withIdDir));
+  const w = open(withRecords);
+  const given = w.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n;
+  w.close();
+  assert.equal(given, 1, "the store with records was given its baseline after it");
 });
 
 test("a baseline made while another reeve holds the host's lock is committed synced to disk all the same", async () => {
@@ -1149,33 +1189,58 @@ test("an entry that doesn't check never counts as naming a record, so the order 
   db.close();
   const r = await closedTick(dbPath, host(dir));
   assert.match(r.log, /#42: its signed order doesn't hold, so it isn't extended/);
+  // Records kept before the store began signing, which its baseline names and
+  // nothing pins, on a host's anchor bound to the store and holding nothing of
+  // the pull request: only the entry, taken as it says, would name them.
+  const bareDir = credentials();
+  const bare = await ticks([at(A), at(B, "RED")], {});
+  await closedTick(bare, unordered(bareDir));
+  const a = readAnchor(bareDir, REPO);
+  db = open(bare);
+  assert.deepEqual([db.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n, a?.store, a?.latest.size, a?.pinned.size, a?.reserved.size],
+                   [1, identityOf(db), 0, 0, 0], "control: a baseline, and an anchor bound to the store, holding nothing of #42");
+  const both = digestsOf(db);
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
+    .run(3, "daemon", "decision.latest", `pr:${PR}`, JSON.stringify({ repo: REPO, n: "x", digest: both[1], records: both, store: null, envelope: "{}" }));
+  db.close();
+  const r2 = await closedTick(bare, host(bareDir));
+  assert.match(r2.log, /#42: its signed order doesn't hold, so it isn't extended/, "records its baseline names, its anchor holding nothing of them");
 });
 
 test("a record this reeve kept, taken away before an entry named it, is named all the same, so replay reports it gone", async () => {
-  const dir = credentials();
-  const dbPath = join(tempDir("reeve-order-taken-first-"), "s.db");
-  open(dbPath).close();
-  let tick = 0, gone = [];
-  // The second and third ticks' records aren't ordered, as no entry can be reserved.
-  const real = fileAnchor(dir);
-  const anchor = { ...real, reserve: (/** @type {any[]} */ ...args) => (tick === 2 || tick === 3 ? false : real.reserve(...args)) };
-  await run({ ticks: 4, dbPath, ...host(dir), anchor, prState: () => "CLOSED", prIsFinished: () => true,
-              evaluate: () => (tick === 1 ? at(A) : at(tick === 2 ? A : B, "RED")),
-              openPrs: () => {
-                tick++;
-                if (tick < 4) return [PR];
-                // Then both are taken away, the latest and the one it superseded, before a tick orders them.
-                const s = open(dbPath);
-                gone = s.prepare("SELECT digest FROM decision WHERE pr = ? AND digest NOT IN (SELECT json_extract(payload, '$.digest') FROM event WHERE op = 'decision.latest')").all(PR).map((r) => r.digest);
-                s.prepare(`DELETE FROM decision WHERE digest IN (${gone.map(() => "?").join(",")})`).run(...gone);
-                s.close();
-                return [];
-              } });
-  const db = open(dbPath);
-  const replayed = replayDecisions(db, { pr: PR }, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorOf(dir) });
-  db.close();
-  assert.equal(gone.length, 2, "control: two records were taken away");
-  for (const g of gone) assert.ok(replayed.some((r) => r.digest === g && /no longer holds it/.test(String(r.why))), `${g}: ${JSON.stringify(replayed)}`);
+  // As kept, its records pinned on the host's anchor, and with those pins gone
+  // too, as an anchor put back from before them: only this reeve then knows of them.
+  for (const unpinned of [false, true]) {
+    const dir = credentials();
+    const dbPath = join(tempDir("reeve-order-taken-first-"), "s.db");
+    open(dbPath).close();
+    let tick = 0, gone = [];
+    // The second and third ticks' records aren't ordered, as no entry can be reserved.
+    const real = fileAnchor(dir);
+    const anchor = { ...real, reserve: (/** @type {any[]} */ ...args) => (tick === 2 || tick === 3 ? false : real.reserve(...args)) };
+    await run({ ticks: 4, dbPath, ...host(dir), anchor, prState: () => "CLOSED", prIsFinished: () => true,
+                evaluate: () => (tick === 1 ? at(A) : at(tick === 2 ? A : B, "RED")),
+                openPrs: () => {
+                  tick++;
+                  if (tick < 4) return [PR];
+                  // Then both are taken away, the latest and the one it superseded, before a tick orders them.
+                  const s = open(dbPath);
+                  gone = s.prepare("SELECT digest FROM decision WHERE pr = ? AND digest NOT IN (SELECT json_extract(payload, '$.digest') FROM event WHERE op = 'decision.latest')").all(PR).map((r) => r.digest);
+                  s.prepare(`DELETE FROM decision WHERE digest IN (${gone.map(() => "?").join(",")})`).run(...gone);
+                  s.close();
+                  if (unpinned) {
+                    const a = JSON.parse(readFileSync(anchorPath(dir, REPO), "utf8"));
+                    a.pinned = {};
+                    writeFileSync(anchorPath(dir, REPO), JSON.stringify(a));
+                  }
+                  return [];
+                } });
+    const db = open(dbPath);
+    const replayed = replayDecisions(db, { pr: PR }, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorOf(dir) });
+    db.close();
+    assert.equal(gone.length, 2, "control: two records were taken away");
+    for (const g of gone) assert.ok(replayed.some((r) => r.digest === g && /no longer holds it/.test(String(r.why))), `${unpinned ? "unpinned, " : ""}${g}: ${JSON.stringify(replayed)}`);
+  }
 });
 
 test("an order that doesn't check is said not to hold, though its pull request's records are all gone", async () => {
@@ -1185,9 +1250,14 @@ test("an order that doesn't check is said not to hold, though its pull request's
   db.prepare("DELETE FROM decision WHERE pr = ?").run(PR);
   db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
     .run(3, "daemon", "decision.latest", `pr:${PR}`, JSON.stringify({ repo: REPO, n: "x", digest: "f".repeat(64), records: [], store: null, envelope: "{}" }));
+  // And one of a pull request the host's anchor holds nothing of: nothing but
+  // its order not holding makes it work.
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
+    .run(4, "daemon", "decision.latest", "pr:77", JSON.stringify({ repo: REPO, n: "x", digest: "f".repeat(64), records: [], store: null, envelope: "{}" }));
   db.close();
   const r = await closedTick(dbPath, host(dir));
   assert.match(r.log, /#42: its signed order doesn't hold, so it isn't extended/);
+  assert.match(r.log, /#77: its signed order doesn't hold, so it isn't extended/);
 });
 
 // ── from #278's ninth review ─────────────────────────────────────────────────
@@ -1349,6 +1419,21 @@ test("an entry filed under another name while a reeve runs is caught by its next
                           s.close();
                         } });
   assert.match(r.log, /#42: its signed order doesn't hold, so it isn't extended — an entry of a signed order in this store is filed under "pr:042"/);
+  // Over records its baseline names, which nothing pins again once the order
+  // doesn't hold: only the order checked again says so.
+  const baseDir = credentials();
+  const base = await ticks([at(A), at(B, "RED")], {});
+  /** @type {any} */ let before = null;
+  const r2 = await run({ ticks: 3, dbPath: base, ...host(baseDir), openPrs: () => [], evaluate: () => at(A), prState: () => "CLOSED", prIsFinished: () => true,
+                         afterTick: async (i) => {
+                           if (i !== 1) return;
+                           const s = open(base);
+                           s.prepare("UPDATE event SET subject = 'pr:042' WHERE op = 'decision.latest'").run();
+                           s.close();
+                           before = readAnchor(baseDir, REPO);
+                         } });
+  assert.deepEqual([[...(before?.latest ?? [])], before?.pinned.size], [[[PR, 1]], 0], "control: ordered and noted, nothing pinned");
+  assert.match(r2.log, /#42: its signed order doesn't hold, so it isn't extended — an entry of a signed order in this store is filed under "pr:042"/, "over records its baseline names");
 });
 
 test("one reeve runs on a store at a time: its lock is held by one, a link to the store included", () => {
@@ -1809,7 +1894,14 @@ test("a record filed under no pull request's number is never ordered or noted, s
   let db = open(dbPath);
   saveDecision(db, { at: 1, seq: 1000, pr: 0, head: B, ...recordOf(REPO, 0, B) });
   db.close();
-  const r = await closedTick(dbPath, host(dir));
+  // The pull requests the host's anchor is asked to reserve an entry of, or note
+  // one: it refuses one under no number too, so it's asked of none.
+  const real = fileAnchor(dir);
+  /** @type {unknown[]} */ const asked = [];
+  const anchor = { ...real, reserve: (/** @type {any[]} */ ...a) => { asked.push(a[2]); return real.reserve(...a); },
+                   note: (/** @type {any[]} */ ...a) => { asked.push(a[1]); return real.note(...a); } };
+  const r = await closedTick(dbPath, { ...host(dir), anchor });
+  assert.deepEqual(asked.filter((pr) => pr !== PR), [], "the anchor asked of no other number");
   db = open(dbPath);
   const unfiled = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest' AND subject NOT GLOB 'pr:[1-9]*'").get().n;
   db.close();

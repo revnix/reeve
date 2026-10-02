@@ -671,7 +671,8 @@ test("a one-shot tick refuses --enforce: once it exits, nothing re-checks its PA
   for (const args of [["tick", NWO, "--enforce"], ["run", NWO, "--tick", "--enforce"]]) {
     const r = reeve(...args);
     assert.equal(r.status, 1, `${args.join(" ")}: ${r.stdout}${r.stderr}`);
-    assert.match(r.stderr, /--enforce/, r.stderr);
+    // Its own refusal: a later one names --enforce too.
+    assert.match(r.stderr, /--enforce needs the daemon\. A one-shot tick would leave the PASS it publishes standing/, r.stderr);
   }
   // In shadow a one-shot tick still runs: halted, it exits 3.
   const shadow = reeve("tick", NWO);

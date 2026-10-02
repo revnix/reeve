@@ -504,7 +504,7 @@ export function validate(profile) {
   // properties, validate, and serialize to nothing.
   for (const c of ["builder", "builder.budget", "builder.capabilities", "builder.cancel",
                    "builder.founder", "builder.lease", "builder.network",
-                   "builder.network.research", "builder.provider", "worker"]) {
+                   "builder.network.research", "builder.provider", "worker", "tasks"]) {
     const v = get(profile, c);
     if (v !== undefined && v !== null && (typeof v !== "object" || Array.isArray(v))) errors.push(`${c} must be an object`);
   }
@@ -529,6 +529,10 @@ export function validate(profile) {
     errors.push("project.kind 'client' forbids authority.profileLocation 'committed': no agent artifacts in a client repo");
   if (vis === "public" && loc === "committed")
     warnings.push("a committed profile in a public repo is visible to everyone; sidecar is the safer default");
+  // Where tasks live is private (#167): a committed profile in a public
+  // repository would publish it.
+  if (vis === "public" && loc === "committed" && get(profile, "tasks.repo") != null)
+    errors.push("tasks.repo names where private tasks live, and a profile committed to a public repository would publish it: keep it in a sidecar profile");
 
   const perm = get(profile, "authority.permission");
   const pol = get(profile, "authority.policy");

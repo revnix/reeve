@@ -3314,7 +3314,11 @@ async function tickOnce(ctx, ran) {
                  : decision.why === ESCALATIONS.FINDINGS_UNMOVED && ffp
                      ? fixAttemptNote(db, nwo, pr, ffp)
                  : null;
-      raise(note ? `#${pr}: needs a human — ${note}` : `#${pr}: ${decision.why}`);
+      // A criterion without evidence is said with the criteria (#167): the
+      // alert is the operator's, never the pull request's.
+      raise(note ? `#${pr}: needs a human — ${note}`
+            : decision.why === ESCALATIONS.ACCEPTANCE_MISSING && decision.detail ? `#${pr}: ${decision.why} — ${decision.detail}`
+            : `#${pr}: ${decision.why}`);
     }
   }
 

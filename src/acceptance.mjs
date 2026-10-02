@@ -28,9 +28,27 @@ function ghApi(args) {
   catch (e) { return { ok: false, out: "", err: netFailure(e) }; }
 }
 
-/** The lines of the Markdown section headed `title`, at any level, to the next heading. @param {unknown} body @param {string} title */
+/**
+ * The lines of `body` a reader sees: an HTML comment, a template's
+ * placeholders say, and a fenced block of code are no part of it.
+ * @param {unknown} body
+ */
+function visible(body) {
+  const text = String(body ?? "").replace(/<!--[\s\S]*?(?:-->|$)/g, "");
+  /** @type {string[]} */ const shown = [];
+  let fence = "";
+  for (const l of text.split(/\r?\n/)) {
+    const m = /^ {0,3}(`{3,}|~{3,})/.exec(l);
+    if (fence) { if (m && m[1][0] === fence[0] && m[1].length >= fence.length) fence = ""; continue; }
+    if (m) { fence = m[1]; continue; }
+    shown.push(l);
+  }
+  return shown;
+}
+
+/** The lines of the Markdown section headed `title`, at any level, to the next heading, as a reader sees it. @param {unknown} body @param {string} title */
 function section(body, title) {
-  const lines = String(body ?? "").split(/\r?\n/);
+  const lines = visible(body);
   const heading = new RegExp(`^#{1,6}\\s+${title}\\s*$`, "i");
   const at = lines.findIndex((l) => heading.test(l.trim()));
   if (at < 0) return [];
@@ -72,11 +90,15 @@ export function missingEvidence(count, given) {
   return Array.from({ length: count }, (_, i) => i + 1).filter((n) => !given.has(n));
 }
 
-/** The pull request the latest checkpoint among `comments` names, as it writes it, or null. @param {string[]} comments */
+/**
+ * The pull request the task's checkpoints say it's delivered by, as they write
+ * it, or null: the latest that names one, as a checkpoint written before a
+ * pull request, or by a step that doesn't say, names none.
+ * @param {string[]} comments
+ */
 function checkpointNames(comments) {
-  const last = comments.filter((c) => c.startsWith(CHECKPOINT)).at(-1);
-  const m = last ? /^pr:\s*(\S+)\s*$/m.exec(last) : null;
-  return m ? m[1] : null;
+  const named = comments.filter((c) => c.startsWith(CHECKPOINT)).map((c) => /^pr:\s*(\S+)\s*$/m.exec(c)?.[1] ?? null).filter((n) => n !== null);
+  return named.at(-1) ?? null;
 }
 
 /** The one JSON string `out` is, or null where it isn't one. @param {string} out */
@@ -105,9 +127,12 @@ function tasksOf({ nwo, pr, tasksRepo, gh }) {
   // repository or a task in it; what went wrong is kept with the input, which
   // stays in the store.
   const unread = (/** @type {string} */ why, /** @type {string | undefined} */ detail) => ({ ok: /** @type {const} */ (false), why, detail: detail ?? "" });
-  const found = gh(["--paginate", `search/issues?q=${encodeURIComponent(`repo:${tasksRepo} is:issue "${named}" in:comments`)}&per_page=100`, "--jq", ".items[].number"]);
+  // Each page says whether GitHub searched everything, then its issues.
+  const found = gh(["--paginate", `search/issues?q=${encodeURIComponent(`repo:${tasksRepo} is:issue "${named}" in:comments`)}&per_page=100`, "--jq", ".incomplete_results, .items[].number"]);
   if (!found.ok) return unread("the task it delivers couldn't be looked for", found.err);
-  const numbers = found.out.split("\n").filter(Boolean).map(Number);
+  const lines = found.out.split("\n").filter(Boolean);
+  if (lines.includes("true")) return unread("the task it delivers couldn't be looked for", "the search came back incomplete");
+  const numbers = lines.filter((l) => l !== "false").map(Number);
   if (numbers.some((n) => !Number.isSafeInteger(n) || n < 1)) return unread("the task it delivers couldn't be looked for", "the search didn't read as GitHub's");
   /** @type {number[]} */ const tasks = [];
   let criteria = 0, blank = false;

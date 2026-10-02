@@ -87,6 +87,11 @@ test("a task's criteria are the items of its Acceptance criteria section, and th
   assert.equal(a.criteriaOf("### Acceptance criteria\n\n  - one\n    - a detail of it\n  - two\n"), 2);
   assert.equal(a.criteriaOf("### Acceptance criteria\n\n - one\n - two\n - three\n"), 3);
   assert.equal(a.criteriaOf("### Acceptance criteria\n\n- one\n+ two\n* three\n"), 3, "every marker Markdown takes for a bullet");
+  // What a reader doesn't see isn't there: a comment, or a fenced block.
+  assert.equal(a.criteriaOf("### Acceptance criteria\n\n<!--\n- an example\n-->\n```\n- in code\n```\n- the one\n"), 1, "hidden criteria");
+  assert.equal(a.criteriaOf("### Acceptance criteria\n\n<!-- - an example -->\n~~~md\n- in code\n~~~\n"), 0, "none shown");
+  assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n<!--\n1. placeholder\n2. placeholder\n-->\n```\n3. in code\n```\n")], [], "hidden evidence");
+  assert.deepEqual([...a.evidenceOf("<!--\n## Acceptance evidence\n\n1. placeholder\n-->\n")], [], "a hidden heading");
   assert.equal(a.criteriaOf("### Acceptance criteria\n\n    - in a code block, not a list\n"), 0, "four spaces in is code");
   assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n  1. a test\n   2. another\n")].sort(), [1, 2]);
 });
@@ -106,7 +111,7 @@ test("the task a pull request delivers is the one whose latest checkpoint names 
   const gh = github({
     "search/issues": ok("12\n13"),
     // Its checkpoint, then a comment that quotes the marker in passing: not a checkpoint.
-    "repos/acme/tasks/issues/12/comments": ok([checkpoint("acme/app#7"), "a note quoting <!-- checkpoint v1 --> in passing"].map((c) => JSON.stringify(c)).join("\n")),
+    "repos/acme/tasks/issues/12/comments": ok([checkpoint("acme/app#7"), "a note quoting one, as an example:\n<!-- checkpoint v1 -->\npr:         acme/app#9\n"].map((c) => JSON.stringify(c)).join("\n")),
     // #13 named it once, and names another pull request now.
     "repos/acme/tasks/issues/13/comments": ok([checkpoint("acme/app#7"), checkpoint("acme/app#9")].map((c) => JSON.stringify(c)).join("\n")),
     "repos/acme/tasks/issues/12": ok(JSON.stringify(TASK)),
@@ -125,6 +130,15 @@ test("the task a pull request delivers is the one whose latest checkpoint names 
   // None names it: no task delivered.
   const none = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", gh: github({ "search/issues": ok("") }), cache: new Map() });
   assert.deepEqual(none, { readable: true, tasks: [], criteria: 0, missing: [] });
+  // A search GitHub says came back incomplete is no search.
+  const partial = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache: new Map(), gh: github({ "search/issues": ok("true\n12") }) });
+  assert.equal(partial.readable, false, "an incomplete search");
+  // A checkpoint after, naming no pull request, doesn't take the task off it.
+  const later = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "## Acceptance evidence\n\n1. a\n2. b\n3. c\n", tasksRepo: "acme/tasks", cache: new Map(), gh: github({
+    "search/issues": ok("false\n12"),
+    "repos/acme/tasks/issues/12/comments": ok([checkpoint("acme/app#7"), "<!-- checkpoint v1 -->\nbranch:     b\ndone:       more\n"].map((c) => JSON.stringify(c)).join("\n")),
+    "repos/acme/tasks/issues/12": ok(JSON.stringify(TASK)) }) });
+  assert.deepEqual(later, { readable: true, tasks: [12], criteria: 3, missing: [] }, "the latest checkpoint naming a pull request");
   // Issues only: a pull request in the tasks' repository is no task.
   /** @type {string[]} */ let asked = [];
   a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache: new Map(), gh: (/** @type {string[]} */ args) => { asked = args; return ok(""); } });
@@ -174,6 +188,12 @@ test("a profile may name where its tasks live, as owner/name", () => {
     ci: { provider: "github-actions" }, merge: { method: "squash", enforcement: "attested" }, reviewers: [] };
   assert.deepEqual(validate({ ...base, tasks: { repo: "acme/tasks" } }).errors, []);
   assert.match(validate({ ...base, tasks: { repo: "not a repo" } }).errors.join("\n"), /tasks\.repo/);
+  // A shorthand that would switch the condition off unseen is refused.
+  for (const tasks of ["acme/tasks", ["acme/tasks"], 7]) assert.match(validate({ ...base, tasks }).errors.join("\n"), /tasks must be an object/, JSON.stringify(tasks));
+  // A profile committed to a public repository never names where private tasks live.
+  const committed = { ...base, authority: { ...base.authority, profileLocation: "committed" }, tasks: { repo: "acme/tasks" } };
+  assert.match(validate(committed).errors.join("\n"), /tasks\.repo .*public/);
+  assert.deepEqual(validate({ ...committed, identity: { ...base.identity, visibility: "private" } }).errors, [], "a private repository's may");
 });
 
 test("evaluatePr asks for acceptance evidence only where the profile names where tasks live", () => {
@@ -197,7 +217,7 @@ test("evaluatePr asks for acceptance evidence only where the profile names where
   } finally { process.env.PATH = path; db.close(); }
 });
 
-test("the watcher takes a criterion without evidence to whoever wrote the pull request, naming it, rather than as a gap", async () => {
+test("the watcher takes a criterion without evidence to a person, naming it, rather than as a gap", async () => {
   const { nextAction, ACTIONS, ESCALATIONS } = await import("../src/watcher.mjs");
   const input = ready();
   input.acceptance = { ...input.acceptance, missing: [2] };
@@ -222,4 +242,12 @@ test("an answer from GitHub that doesn't read as one is unread, never an empty d
     "search/issues": ok("12"), "repos/acme/tasks/issues/12/comments": ok(JSON.stringify(checkpoint("acme/app#7"))), "repos/acme/tasks/issues/12": ok("") }) });
   assert.equal(garbled.readable, false, "a task body that doesn't read");
   assert.equal(cache.size, 0, "and nothing kept for it");
+});
+
+test("the alert a criterion without evidence raises names the criteria", async () => {
+  const { run, EVAL } = await import("./fixtures/tick-harness.mjs");
+  const clauses = EVAL.verdict.clauses.map((/** @type {any} */ c) => ({ ...c, state: "PASS" }));
+  const verdict = { state: "BLOCK", summary: "acceptance blocked", clauses: [...clauses, { id: "acceptance", state: "BLOCK", detail: "no acceptance evidence for criterion 2 of the 3 the task delivered names" }] };
+  const r = await run({ openPrs: () => [42], evaluate: () => ({ ...EVAL, verdict, checks: { verdict: "GREEN", caused: [], failing: [] } }) });
+  assert.match(r.esc, /#42: a criterion of the task it delivers has no acceptance evidence — no acceptance evidence for criterion 2 of the 3/, r.esc);
 });

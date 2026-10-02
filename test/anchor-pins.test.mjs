@@ -1209,6 +1209,8 @@ async function keptUnpinned() {
   const db = open(dbPath);
   const [green, red] = digestsOf(db);
   db.close();
+  // A wrong value fails here, rather than as the store is asked for it.
+  assert.ok(green && red, "control: both records kept");
   return { dir, dbPath, green, red };
 }
 

@@ -1070,6 +1070,22 @@ test("a store with no order to extend says nothing on the host's anchor, so anot
   assert.equal(baselines, 1, "the store with records was given its baseline");
   assert.match(String(shown), /kept before this store began signing/);
   assert.doesNotMatch(String(shown), /can't be trusted/);
+  // An idle store holding an identity, as a copy of one that had it: the
+  // anchor isn't bound to it, so it says nothing there either.
+  const withIdDir = credentials();
+  const withRecords = await ticks([at(A, "RED")], {});
+  const idleWithId = join(tempDir("reeve-order-idle-id-"), "s.db");
+  const i = open(idleWithId);
+  i.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(1, "daemon", "store.identity", "store", JSON.stringify({ id: "1".repeat(32) }));
+  assert.equal(identityOf(i), "1".repeat(32), "control: it holds an identity");
+  i.close();
+  await run({ openPrs: () => [], evaluate: () => at(A), dbPath: idleWithId, ticks: 2, ...host(withIdDir) });
+  assert.equal(readAnchor(withIdDir, REPO)?.began ?? false, false, "an idle store with an identity the anchor isn't bound to");
+  await closedTick(withRecords, host(withIdDir));
+  const w = open(withRecords);
+  const given = w.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n;
+  w.close();
+  assert.equal(given, 1, "the store with records was given its baseline after it");
 });
 
 test("a baseline made while another reeve holds the host's lock is committed synced to disk all the same", async () => {
@@ -1192,30 +1208,39 @@ test("an entry that doesn't check never counts as naming a record, so the order 
 });
 
 test("a record this reeve kept, taken away before an entry named it, is named all the same, so replay reports it gone", async () => {
-  const dir = credentials();
-  const dbPath = join(tempDir("reeve-order-taken-first-"), "s.db");
-  open(dbPath).close();
-  let tick = 0, gone = [];
-  // The second and third ticks' records aren't ordered, as no entry can be reserved.
-  const real = fileAnchor(dir);
-  const anchor = { ...real, reserve: (/** @type {any[]} */ ...args) => (tick === 2 || tick === 3 ? false : real.reserve(...args)) };
-  await run({ ticks: 4, dbPath, ...host(dir), anchor, prState: () => "CLOSED", prIsFinished: () => true,
-              evaluate: () => (tick === 1 ? at(A) : at(tick === 2 ? A : B, "RED")),
-              openPrs: () => {
-                tick++;
-                if (tick < 4) return [PR];
-                // Then both are taken away, the latest and the one it superseded, before a tick orders them.
-                const s = open(dbPath);
-                gone = s.prepare("SELECT digest FROM decision WHERE pr = ? AND digest NOT IN (SELECT json_extract(payload, '$.digest') FROM event WHERE op = 'decision.latest')").all(PR).map((r) => r.digest);
-                s.prepare(`DELETE FROM decision WHERE digest IN (${gone.map(() => "?").join(",")})`).run(...gone);
-                s.close();
-                return [];
-              } });
-  const db = open(dbPath);
-  const replayed = replayDecisions(db, { pr: PR }, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorOf(dir) });
-  db.close();
-  assert.equal(gone.length, 2, "control: two records were taken away");
-  for (const g of gone) assert.ok(replayed.some((r) => r.digest === g && /no longer holds it/.test(String(r.why))), `${g}: ${JSON.stringify(replayed)}`);
+  // As kept, its records pinned on the host's anchor, and with those pins gone
+  // too, as an anchor put back from before them: only this reeve then knows of them.
+  for (const unpinned of [false, true]) {
+    const dir = credentials();
+    const dbPath = join(tempDir("reeve-order-taken-first-"), "s.db");
+    open(dbPath).close();
+    let tick = 0, gone = [];
+    // The second and third ticks' records aren't ordered, as no entry can be reserved.
+    const real = fileAnchor(dir);
+    const anchor = { ...real, reserve: (/** @type {any[]} */ ...args) => (tick === 2 || tick === 3 ? false : real.reserve(...args)) };
+    await run({ ticks: 4, dbPath, ...host(dir), anchor, prState: () => "CLOSED", prIsFinished: () => true,
+                evaluate: () => (tick === 1 ? at(A) : at(tick === 2 ? A : B, "RED")),
+                openPrs: () => {
+                  tick++;
+                  if (tick < 4) return [PR];
+                  // Then both are taken away, the latest and the one it superseded, before a tick orders them.
+                  const s = open(dbPath);
+                  gone = s.prepare("SELECT digest FROM decision WHERE pr = ? AND digest NOT IN (SELECT json_extract(payload, '$.digest') FROM event WHERE op = 'decision.latest')").all(PR).map((r) => r.digest);
+                  s.prepare(`DELETE FROM decision WHERE digest IN (${gone.map(() => "?").join(",")})`).run(...gone);
+                  s.close();
+                  if (unpinned) {
+                    const a = JSON.parse(readFileSync(anchorPath(dir, REPO), "utf8"));
+                    a.pinned = {};
+                    writeFileSync(anchorPath(dir, REPO), JSON.stringify(a));
+                  }
+                  return [];
+                } });
+    const db = open(dbPath);
+    const replayed = replayDecisions(db, { pr: PR }, { keys: knownKeys({ local: dir }), repo: REPO, anchor: anchorOf(dir) });
+    db.close();
+    assert.equal(gone.length, 2, "control: two records were taken away");
+    for (const g of gone) assert.ok(replayed.some((r) => r.digest === g && /no longer holds it/.test(String(r.why))), `${unpinned ? "unpinned, " : ""}${g}: ${JSON.stringify(replayed)}`);
+  }
 });
 
 test("an order that doesn't check is said not to hold, though its pull request's records are all gone", async () => {

@@ -88,9 +88,14 @@ function reasonOf(c) {
 /** Up to ten of `list`, said, and how many more. @param {any[]} list @param {(c: any) => string} say */
 const some = (list, say) => list.slice(0, 10).map(say).join(", ") + (list.length > 10 ? `, and ${list.length - 10} more` : "");
 
-/** @param {any} db @param {string} op @param {number} since @param {number} now */
-const events = (db, op, since, now) => /** @type {any[]} */ (db.prepare(
-  `SELECT seq, at, subject, payload FROM event WHERE op = ? AND at >= ? AND at <= ? ORDER BY seq`).all(op, since, now))
+/**
+ * The events `op` from `since` to `now`, in seconds, and to event `upTo`
+ * where it's given: a trial read again is the trial as it was read, though an
+ * event recorded since falls in its last second (#335).
+ * @param {any} db @param {string} op @param {number} since @param {number} now @param {number | null} [upTo]
+ */
+const events = (db, op, since, now, upTo = null) => /** @type {any[]} */ (db.prepare(
+  `SELECT seq, at, subject, payload FROM event WHERE op = ? AND at >= ? AND at <= ? AND (? IS NULL OR seq <= ?) ORDER BY seq`).all(op, since, now, upTo, upTo))
   .map((r) => { let p = {}; try { p = JSON.parse(r.payload ?? "{}") ?? {}; } catch { /* a payload that can't be read says nothing */ }
                 return { seq: Number(r.seq), at: Number(r.at), pr: Number(String(r.subject ?? "").replace(/^pr:/, "")), p }; });
 
@@ -104,9 +109,10 @@ const events = (db, op, since, now) => /** @type {any[]} */ (db.prepare(
  * person recorded (#294), or `{ why }` where they couldn't be read.
  * @param {any} db
  * @param {{ repo: string, since: number, now: number, merged: Merged[] | { why: string },
- *           seeded?: import("./seeded.mjs").Result[] | null, audits?: Audit[] | { why: string } }} o
+ *           seeded?: import("./seeded.mjs").Result[] | null, audits?: Audit[] | { why: string }, upTo?: number | null,
+ *           kinds?: Record<string, number | null> | null }} o
  */
-export function trialReport(db, { repo, since, now, merged, seeded = null, audits = [] }) {
+export function trialReport(db, { repo, since, now, merged, seeded = null, audits = [], upTo = null, kinds: seenKinds = null }) {
   // Running time, from the ticks, recorded as each starts and as it ends
   // (#297). The time inside a tick, from its start to its end, or to now for one
   // still running, is running while the tick has taken no more than
@@ -119,9 +125,9 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
   // unable to list the pull requests or thrown, to the next start (#301), a
   // report made before it included. A store written before starts were
   // recorded holds only ends, and every gap there is between ticks.
-  const ended = events(db, "daemon.tick", since, now);
-  const started = events(db, TICK_STARTED, since, now);
-  const stopped = events(db, TICK_STOPPED, since, now);
+  const ended = events(db, "daemon.tick", since, now, upTo);
+  const started = events(db, TICK_STARTED, since, now, upTo);
+  const stopped = events(db, TICK_STOPPED, since, now, upTo);
   // A tick under way as the report starts, the last recorded before it began,
   // and when it started, which its limit counts from.
   const before = /** @type {any} */ (db.prepare(`SELECT op, at FROM event WHERE op IN ('daemon.tick', ?, ?) AND at < ? ORDER BY seq DESC LIMIT 1`).get(TICK_STARTED, TICK_STOPPED, since));
@@ -152,8 +158,8 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
   // the second it ends is the next tick's to judge.
   const wasDown = (/** @type {number} */ t) => down.some((d) => t >= d.from && t < d.to);
 
-  const decided = events(db, "pr.decided", since, now);
-  const queued = events(db, "queue.decided", since, now);
+  const decided = events(db, "pr.decided", since, now, upTo);
+  const queued = events(db, "queue.decided", since, now, upTo);
 
   // Each merged pull request, its final head, and how it was judged there: by
   // the verdict that stood when it merged, so not one kept after it.
@@ -181,12 +187,14 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
   const clause = (/** @type {any} */ p, /** @type {string} */ id) => (Array.isArray(p.clauses) ? p.clauses.find((c) => c?.id === id)?.state : undefined);
   const firstPr = (/** @type {(e: any) => boolean} */ f) => decided.find(f)?.pr ?? null;
   // A new push after a review: a head first seen in the period, after a review
-  // round on another head of the same pull request.
-  const pushedAfterReview = /** @type {any[]} */ (db.prepare(
+  // round on another head of the same pull request. Read from the review rows,
+  // which are rebuilt as a review is edited, so a trial checked again is given
+  // the kinds it saw as it was first read (#339).
+  const pushedAfterReview = seenKinds ? [] : /** @type {any[]} */ (db.prepare(
     `SELECT DISTINCT h.pr FROM head_seen h JOIN review_round r ON r.pr = h.pr AND r.nwo = h.nwo AND r.head_full <> h.sha
       WHERE h.nwo = ? AND h.first_seen_at >= ? AND h.first_seen_at <= ? AND r.event_at < h.first_seen_at ORDER BY h.pr`).all(repo, since, now)).map((r) => Number(r.pr));
   /** @type {Record<string, number | null>} */
-  const kinds = {
+  const kinds = seenKinds ?? {
     "a pull request that passes": firstPr((e) => e.p.state === "PASS"),
     "failing CI": firstPr((e) => e.p.action === "FIX_CI" || /^failing:/.test(String(e.p.why ?? ""))),
     "a conflict with the base": firstPr((e) => /conflicts with its base/.test(String(e.p.why ?? ""))),
@@ -400,7 +408,7 @@ export function trialRanOn(db, { since, until, code, policy }) {
  * @param {any} db
  * @param {{ nwo: string, store: string, named: boolean, since: number, now: number, trialSince: string,
  *           merged: any, seeded: any, code: any, policy: string | null, audits: () => any }} o
- * @returns {{ ok: boolean, reasons: string[] }}
+ * @returns {{ ok: boolean, reasons: string[], kinds?: Record<string, number | null> }}
  */
 export function trialForEnforcing(db, { nwo, store, named, since, now, trialSince, merged, seeded, code, policy, audits }) {
   const bound = storeIsOf(db, nwo, { named });
@@ -410,13 +418,15 @@ export function trialForEnforcing(db, { nwo, store, named, since, now, trialSinc
     return { ok: false, reasons: [`${store} holds a record dated ${when(newest)}, after now: the clock has gone back since it was written, and a shadow trial can't be read across that. To enforce, run this again once the clock has passed it`] };
   const reasons = [];
   const first = audits();
-  const passed = trialGate(trialReport(db, { repo: nwo, since, now, merged, seeded, audits: first.ok ? first.audits : { why: first.why } }), { since });
+  const report = trialReport(db, { repo: nwo, since, now, merged, seeded, audits: first.ok ? first.audits : { why: first.why } });
+  const passed = trialGate(report, { since });
   if ("why" in passed) reasons.push(`${passed.why}. To enforce, run the trial until it passes: reeve trial ${nwo} --since ${trialSince} --seeded says what's short`);
   const ranOn = trialRanOn(db, { since, until: now, code, policy });
   if ("why" in ranOn) reasons.push(`${ranOn.why}. To enforce, run the trial again on this code and policy, from after ${when(ranOn.after)}`);
   if (JSON.stringify(audits()) !== JSON.stringify(first))
     reasons.push("an audit was recorded while the shadow trial was read, so what it says may not be what was read. To enforce, run this again");
-  return { ok: !reasons.length, reasons };
+  // The kinds of case it saw, for the trial checked again each tick (#339).
+  return { ok: !reasons.length, reasons, kinds: report.kinds };
 }
 
 /**
@@ -428,14 +438,16 @@ export function trialForEnforcing(db, { nwo, store, named, since, now, trialSinc
  * checked again with them where one was recorded meanwhile: three times at
  * most, and audits that keep changing leave it unchecked. `{ ok }`, or why not.
  * @param {any} db
- * @param {{ nwo: string, since: number, until: number, merged: any, seeded: any, code: any, policy: string | null, audits: () => any }} o
+ * @param {{ nwo: string, since: number, until: number, upTo?: number | null, kinds?: Record<string, number | null> | null, merged: any, seeded: any, code: any, policy: string | null, audits: () => any }} o
  * @returns {{ ok: true } | { ok: false, why: string }}
  */
-export function trialHolds(db, { nwo, since, until, merged, seeded, code, policy, audits }) {
+export function trialHolds(db, { nwo, since, until, upTo = null, kinds = null, merged, seeded, code, policy, audits }) {
+  // Not bounded by `upTo`: what's recorded after start-up is this process's,
+  // by this code under this policy.
   const ranOn = trialRanOn(db, { since, until, code, policy });
   let read = audits();
   for (let check = 0; check < 3; check++) {
-    const passed = trialGate(trialReport(db, { repo: nwo, since, now: until, merged, seeded, audits: read.ok ? read.audits : { why: read.why } }), { since });
+    const passed = trialGate(trialReport(db, { repo: nwo, since, now: until, merged, seeded, upTo, kinds, audits: read.ok ? read.audits : { why: read.why } }), { since });
     const again = audits();
     if (JSON.stringify(again) !== JSON.stringify(read)) { read = again; continue; }
     if ("why" in passed) return { ok: false, why: passed.why };

@@ -64,6 +64,8 @@ const describe = (fn, text, extra = {}) => Object.assign(fn, { describe: text, .
 
 const isStr = describe(v => (typeof v === "string" && v.length ? null : "must be a non-empty string"),
                        "a non-empty string");
+const isNwo = describe(v => (typeof v === "string" && /^[\w.-]+\/[\w.-]+$/.test(v) ? null : "must be owner/name"),
+                       "a repository, owner/name");
 const isBool = describe(v => (typeof v === "boolean" ? null : "must be a boolean"),
                         "true or false");
 const isInt = describe(v => (Number.isInteger(v) ? null : "must be an integer"),
@@ -295,6 +297,11 @@ export const FIELDS = {
   // by construction. These rows still reach the review pipeline, which can say
   // "refused"; classification only knows how to say "passing".
   "ci.reviewerStatusContexts": [false, isArr(isStr)],
+
+  // Where the tasks pull requests deliver live (#167): the repository whose
+  // issues they are, owner/name. Named, each pull request a task's latest
+  // checkpoint names must give acceptance evidence for its criteria.
+  "tasks.repo":             [false, isNwo],
 
   "merge.method":           [true,  oneOf(MERGE_METHOD)],  // MEASURED from parent counts, not settings
   "merge.deleteBranch":     [false, isBool],

@@ -75,7 +75,7 @@ const cl = (id, state, detail = "") => ({ id, state, detail });
 export const EVAL = {
   ok: true, pr: 42, state: "open", head: HEAD, title: "t", headRef: "f", baseRef: "main",
   verdict: { state: "BLOCK", summary: "ci is red",
-             clauses: CLAUSE_IDS.filter(id => id !== "hold")
+             clauses: CLAUSE_IDS.filter(id => id !== "hold" && id !== "acceptance")
                .map(id => (id === "ci" ? cl("ci", "BLOCK", "failing: unit") : cl(id, "PASS"))) },
   rounds: { n: 1, softCap: 5, hardCap: 10, unspilledCritical: 0 },
   checks: { verdict: "RED", caused: ["unit"], failing: [{ name: "unit", id: "1" }] },

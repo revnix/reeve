@@ -107,6 +107,22 @@ test("enforcing, a tick whose trial no longer passes publishes in shadow from th
   assert.deepEqual(asked, [1, 2], "checked while enforcing, and not again once in shadow");
 });
 
+test("a judgment made after the trial was read, in the same second it was read to, isn't the trial's", () => {
+  const { db, window, audit } = passedTrial();
+  const right = audit(() => true);
+  const upTo = Number(/** @type {any} */ (db.prepare("SELECT MAX(seq) AS n FROM event").get()).n);
+  // The first enforcing tick judges #30 in the trial's last second.
+  const record = { subject: { repo: R, pr: 30, head: sha("9") }, code: CODE, policy: POLICY, observedAt: window.until };
+  const digest = digestOf(record);
+  const seq = Number(db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(window.until, "daemon", "pr.decided", "pr:30",
+    JSON.stringify({ head: sha("9"), state: "PASS", summary: "", action: "WAIT", why: "", clauses: [], record: digest })).lastInsertRowid);
+  db.prepare("INSERT INTO decision(digest,pr,head,record,first_at,last_at,first_seq,last_seq) VALUES(?,?,?,?,?,?,?,?)").run(digest, 30, sha("9"), JSON.stringify(record), window.until, window.until, seq, seq);
+  assert.deepEqual(T.trialHolds(db, { ...window, upTo, audits: () => ({ ok: true, audits: [right] }) }), { ok: true });
+  // Without the bound, it would read as a call the audit never saw.
+  assert.equal(T.trialHolds(db, { ...window, audits: () => ({ ok: true, audits: [right] }) }).ok, false, "control: read to the second, it's taken as the trial's");
+  db.close();
+});
+
 test("an audit recorded while the trial is checked again is read too, and audits that keep changing leave it unchecked", () => {
   const { db, window, audit } = passedTrial();
   const right = audit(() => true);
@@ -157,4 +173,50 @@ test("reeve run --enforce gives the daemon the shadow trial it checked at start-
   const ctx = bin.slice(bin.indexOf("    const ctx = {\n      nwo, profile, db: open(dbPath),"));
   assert.match(ctx.slice(0, 20_000), /\n      trialHolds: recheck && \(\(\) => recheck\(ctx\.db\)\),/, "the run's context carries the check, on its store");
   assert.match(bin, /trialHolds\(db, \{ \.\.\.window, audits \}\)/, "the same trial, its audits read again");
+  assert.match(bin, /const window = \{[^}]*\bupTo\b/, "to the event it was read to");
+});
+
+test("a withdrawal that couldn't read what stands as the trial stopped passing is made by the next tick that can, and said meanwhile", async () => {
+  const daemon = await import("../src/daemon.mjs");
+  const head = (/** @type {number} */ n) => String(n).repeat(40);
+  const dir = tempDir("reeve-trial-withdraw-");
+  let unreadable = false, tick = 0;
+  /** @type {any[]} */ const withdrawn = [];
+  const real = open(join(dir, "s.db"));
+  const bound = (/** @type {any} */ t, /** @type {any} */ k) => { const v = t[k]; return typeof v === "function" ? v.bind(t) : v; };
+  // The store, but what reeve has published can't be read while `unreadable`.
+  const db = new Proxy(real, { get: (t, k) => (k !== "prepare" ? bound(t, k) : (/** @type {string} */ sql) => {
+    if (unreadable && /SELECT/.test(sql) && /pr\.published/.test(sql)) throw new Error("database disk image is malformed");
+    return t.prepare(sql);
+  }) });
+  const { OFFLINE_READS } = await import("./fixtures/offline-github.mjs");
+  const ctx = {
+    // GitHub out of reach, for the reads nothing below answers.
+    ...OFFLINE_READS,
+    nwo: "acme/widget", db, logPath: join(dir, "log.txt"), haltMarker: join(dir, "HALT"), execute: false, shadow: false, running: 0,
+    profile: { identity: { key: "acme/widget", defaultBranch: "main" }, authority: { policy: "propose_only" },
+      ci: { provider: "github-actions", requiredChecks: [] }, watch: { maxWorkers: 1, maxOpenPrs: 1 }, reviewers: [] },
+    // #7 first; then #8 alone, #7 past the number watched.
+    openPrs: () => (tick === 1 ? [7] : [8]), prState: () => "OPEN",
+    evaluate: (/** @type {any} */ { pr: n }) => ({ ok: true, pr: n, state: "open", head: head(n), title: "t", headRef: `f${n}`, baseRef: "main", updatedAt: "2026-10-02T10:00:00Z",
+      verdict: { state: "PASS", head: head(n), summary: "pass", clauses: [] }, rounds: { n: 1, softCap: 5, hardCap: 10, unspilledCritical: 0 },
+      checks: { verdict: "GREEN", caused: [], failing: [] }, reviewers: [], threads: { readable: true, total: 0, unresolved: 0, seen: 0 }, settled: { settled: true } }),
+    enforcement: async () => ({ state: "enforced", why: "", fix: null, required: true }),
+    trialHolds: () => (tick === 1 ? { ok: true } : { ok: false, why: "an audit since marks a call false" }),
+    publish: async (/** @type {any} */ a) => ({ ok: true, id: 100 + Number(a.verdict.head[0]), conclusion: "success", name: a.shadow ? "merge-policy (shadow)" : "merge-policy" }),
+    withdraw: async (/** @type {any} */ a) => { withdrawn.push({ tick, head: a.head }); return { ok: true }; },
+    observe: () => ({ observations: [], incomplete: false, threads: { readable: true, total: 0, unresolved: 0, seen: 0 } }),
+    derivePr: () => ({}), reviewState: () => ({ readable: true, total: 0, open: 0, resolved: 0, unspilledCritical: 0, rounds: 1 }),
+    readQueue: () => ({ ok: true, queue: false, entries: [] }),
+  };
+  tick = 1; await daemon.tick(ctx);
+  // The trial stops passing on a tick that can't read what stands.
+  tick = 2; unreadable = true;
+  const second = await daemon.tick(ctx);
+  assert.equal(withdrawn.filter((w) => w.head === head(7)).length, 0, "control: nothing could be withdrawn");
+  assert.ok([...(second.escalations?.keys?.() ?? [])].some((c) => /couldn't read which PASSes it has standing/.test(c)), "and it's said, standing in the tick's own alerts");
+  tick = 3; unreadable = false;
+  await daemon.tick(ctx);
+  assert.ok(withdrawn.some((w) => w.tick === 3 && w.head === head(7)), `the next tick withdraws #7's: ${JSON.stringify(withdrawn)}`);
+  real.close();
 });

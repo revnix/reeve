@@ -2609,6 +2609,9 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       const nowAt = Math.floor(Date.now() / 1000);
       const merged = mergedSince(nwo, sinceAt, { until: nowAt });
       const trialDb = open(dbPath);
+      // The last event the trial is read to (#335): one recorded later, in the
+      // same second, is no part of it when it's checked again.
+      const upTo = Number(/** @type {any} */ (trialDb.prepare("SELECT COALESCE(MAX(seq), 0) AS n FROM event").get()).n);
       let trial;
       try {
         trial = trialForEnforcing(trialDb, { nwo, store: dbPath, named: opt("db") != null, since: sinceAt, now: nowAt, trialSince, merged, seeded,
@@ -2626,7 +2629,7 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       // And checked again on each tick (#331): the same trial, to the time it
       // was read to now, with what GitHub said merged then and the seeded cases
       // as they ran, its audits read again each time.
-      const window = { nwo, since: sinceAt, until: nowAt, merged, seeded, code: runningCode(), policy: policyHashFor(profile, nwo) };
+      const window = { nwo, since: sinceAt, until: nowAt, upTo, merged, seeded, code: runningCode(), policy: policyHashFor(profile, nwo) };
       const audits = () => readAudits(auditDirFor(HOME, nwo), nwo, { notes: auditNotesFor(HOME, nwo) });
       recheck = (db) => trialHolds(db, { ...window, audits });
     }

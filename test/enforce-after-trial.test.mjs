@@ -17,7 +17,10 @@ import * as trial from "../src/trial.mjs";
 import { open, storeLock } from "../src/db/ops.mjs";
 import { statePathFor } from "../src/paths.mjs";
 import { withDefaults } from "../src/profile/schema.mjs";
+import { digestOf, policyOf } from "../src/evidence.mjs";
+import { TICK_STARTED, TICK_STOPPED } from "../src/status.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
+import { run } from "./fixtures/tick-harness.mjs";
 import { offlineEnv } from "./fixtures/offline-github.mjs";
 
 const REEVE = fileURLToPath(new URL("../bin/reeve", import.meta.url));
@@ -145,38 +148,153 @@ test("a store holding a record dated after now is refused, as the clock has gone
   assert.doesNotMatch(r.stderr, /1 call\(s\) on 1 pull request\(s\) to audit/, "the trial isn't read past now");
 });
 
+const CODE = { commit: "c".repeat(40), tree: "t".repeat(40), dirty: false };
+const HEAD = "a".repeat(40);
+/** A store of its own, for one case. */
+const fresh = () => open(join(tempDir("reeve-trial-ran-on-"), "s.db"));
+/**
+ * A judgment of pull request 1 at `at`, as the daemon records one: its event,
+ * naming the record it was judged from, and that record, kept under its digest
+ * in the same seq. `over` changes the record, and `row` the row it's kept in,
+ * once its digest is taken; `op` is the event's; `kept: false` records the event
+ * alone, as a judgment whose record couldn't be made.
+ * @param {any} db @param {number} at
+ * @param {{ over?: any, row?: any, op?: string, kept?: boolean }} [o]
+ */
+function judge(db, at, { over = {}, row = {}, op = "pr.decided", kept = true } = {}) {
+  const record = { subject: { repo: "acme/widget", pr: 1, head: HEAD }, code: CODE, policy: "p1", observedAt: at, ...over };
+  const digest = digestOf(record);
+  const payload = op === "queue.decided" ? { head: HEAD, state: "PASS", record: kept ? digest : null } : { head: HEAD, state: "PASS", ...(kept ? { record: digest } : {}) };
+  const seq = Number(db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(at, "daemon", op, "pr:1", JSON.stringify(payload)).lastInsertRowid);
+  const r = { pr: 1, head: HEAD, record: JSON.stringify(record), first_seq: seq, last_seq: seq, ...row };
+  if (kept) db.prepare("INSERT INTO decision(digest,pr,head,record,first_at,last_at,first_seq,last_seq) VALUES(?,?,?,?,?,?,?,?)")
+    .run(digest, r.pr, r.head, r.record, at, at, r.first_seq, r.last_seq);
+}
+/**
+ * A tick's start, end or stop at `at`, as the daemon records each, saying the
+ * code and policy it ran; `mark: null` says neither, as one recorded before
+ * ticks said.
+ * @param {any} db @param {number} at @param {{ op?: string, mark?: any }} [o]
+ */
+const ticked = (db, at, { op = TICK_STARTED, mark = { code: CODE, policy: "p1" } } = {}) =>
+  db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(at, "daemon", op, null, JSON.stringify(mark ?? {}));
+/** Whether the trial in `db` from SINCE ran on CODE under p1, or what `o` says. @param {any} db @param {any} [o] */
+const ranOn = (db, o = {}) => T.trialRanOn(db, { since: SINCE, until: SINCE + 1000, code: CODE, policy: "p1", ...o });
+
 test("the shadow trial counts toward enforcing only where every judgment it saw was made by the code and under the policy about to enforce", () => {
   assert.equal(typeof T.trialRanOn, "function", "src/trial.mjs has no trialRanOn");
-  const db = open(join(tempDir("reeve-trial-ran-on-"), "s.db"));
-  const code = { commit: "c".repeat(40), tree: "t".repeat(40), dirty: false };
-  const judged = (/** @type {number} */ at, /** @type {any} */ over = {}) => db.prepare(
-    "INSERT INTO decision(digest,pr,head,record,first_at,last_at,first_seq,last_seq) VALUES(?,?,?,?,?,?,?,?)")
-    .run(`d${at}`, 1, "a".repeat(40), JSON.stringify({ subject: { repo: "acme/widget", pr: 1, head: "a".repeat(40) }, code, policy: "p1", ...over }), at, at, at, at);
-  judged(SINCE + 100); judged(SINCE + 200);
-  assert.deepEqual(T.trialRanOn(db, { since: SINCE, until: SINCE + 1000, code, policy: "p1" }), { ok: true });
+  const db = fresh();
+  judge(db, SINCE + 100); judge(db, SINCE + 200, { op: "queue.decided" });
+  assert.deepEqual(ranOn(db), { ok: true });
   // Code that can't be told is no proof it's the same, though the policy is.
-  const unreadable = T.trialRanOn(db, { since: SINCE, until: SINCE + 1000, code: { commit: null }, policy: "p1" });
+  const unreadable = ranOn(db, { code: { commit: null } });
   assert.equal(unreadable.ok, false, "untold code isn't this code");
   assert.match(unreadable.why, /2 judgment\(s\) whose code or policy can't be told/);
   // Before the trial began: not the trial's.
-  judged(SINCE - 100, { code: { ...code, commit: "o".repeat(40) } });
-  assert.deepEqual(T.trialRanOn(db, { since: SINCE, until: SINCE + 1000, code, policy: "p1" }), { ok: true });
+  judge(db, SINCE - 100, { over: { code: { ...CODE, commit: "o".repeat(40) } } });
+  assert.deepEqual(ranOn(db), { ok: true });
   // Other code within it, and another policy after that.
-  judged(SINCE + 300, { code: { ...code, commit: "o".repeat(40) } });
-  judged(SINCE + 400, { policy: "p0" });
-  const other = T.trialRanOn(db, { since: SINCE, until: SINCE + 1000, code, policy: "p1" });
+  judge(db, SINCE + 300, { over: { code: { ...CODE, commit: "o".repeat(40) } } });
+  judge(db, SINCE + 400, { over: { policy: "p0" }, op: "queue.decided" });
+  const other = ranOn(db);
   assert.equal(other.ok, false);
   assert.equal(other.after, SINCE + 400, "the trial would begin again after the last judgment made otherwise");
   assert.match(other.why, /2 judgment\(s\) made by other code or under another policy/);
   db.close();
 });
 
+test("a judgment the shadow trial saw without the record it was judged from is no proof of the code and policy about to enforce", () => {
+  // Each alone in a store of its own: a judgment whose record couldn't be kept,
+  // on a pull request and on the queue, and one naming a record the store doesn't hold.
+  for (const [what, make] of /** @type {[string, (db: any) => void][]} */ ([
+    ["a pull request's, its record not kept", (db) => judge(db, SINCE + 100, { kept: false })],
+    ["the queue's, its record not kept", (db) => judge(db, SINCE + 100, { op: "queue.decided", kept: false })],
+    ["one naming a record the store doesn't hold", (db) => { judge(db, SINCE + 100); db.prepare("DELETE FROM decision WHERE first_at = ?").run(SINCE + 100); }],
+  ])) {
+    const db = fresh();
+    judge(db, SINCE + 50);
+    make(db);
+    const r = ranOn(db);
+    assert.equal(r.ok, false, what);
+    assert.match(r.why, /1 judgment\(s\) whose code or policy can't be told/, what);
+    assert.equal(r.after, SINCE + 100, what);
+    db.close();
+  }
+});
+
+test("a record that doesn't hold as it was kept is no proof of the code and policy about to enforce, though it names them", () => {
+  for (const [what, o] of /** @type {[string, any][]} */ ([
+    // Changed in place, still naming this code and policy: its digest is the old one's.
+    ["its record changed since it was kept", { row: { record: JSON.stringify({ subject: { repo: "acme/widget", pr: 1, head: HEAD }, code: CODE, policy: "p1", observedAt: 1 }) } }],
+    // Whole, but another pull request's record, which this judgment names.
+    ["another pull request's record", { over: { subject: { repo: "acme/widget", pr: 2, head: HEAD } }, row: { pr: 2 } }],
+    // Whole, but kept as another judgment's: its seqs aren't this one's.
+    ["another judgment's record", { row: { first_seq: 1000, last_seq: 1000 } }],
+  ])) {
+    const db = fresh();
+    judge(db, SINCE + 100, o);
+    const r = ranOn(db);
+    assert.equal(r.ok, false, what);
+    assert.match(r.why, /1 judgment\(s\) whose code or policy can't be told/, what);
+    db.close();
+  }
+});
+
+test("the time the shadow trial ran counts toward enforcing only where every tick in it ran the code and policy about to enforce", () => {
+  // Every tick of the trial on this code and policy: its start, end and stop.
+  const same = fresh();
+  ticked(same, SINCE + 10); ticked(same, SINCE + 20, { op: "daemon.tick" }); ticked(same, SINCE + 30); ticked(same, SINCE + 40, { op: TICK_STOPPED });
+  // One the other version ran, before the trial began: not the trial's.
+  ticked(same, SINCE - 10, { op: "daemon.tick", mark: { code: { ...CODE, commit: "o".repeat(40) }, policy: "p1" } });
+  assert.deepEqual(ranOn(same), { ok: true });
+  // Each alone, among this code's ticks: an end by the version before, a stop
+  // that says nothing, and a start under another policy.
+  for (const [what, op, mark, says] of /** @type {[string, string, any, RegExp][]} */ ([
+    ["the end of a tick the version before ran", "daemon.tick", { code: { ...CODE, commit: "o".repeat(40) }, policy: "p1" }, /1 tick\(s\) run by other code or under another policy/],
+    ["a stop that says nothing of what ran it", TICK_STOPPED, null, /1 tick\(s\) whose code or policy can't be told/],
+    ["a start under another policy", TICK_STARTED, { code: CODE, policy: "p0" }, /1 tick\(s\) run by other code or under another policy/],
+  ])) {
+    const db = fresh();
+    ticked(db, SINCE + 10); ticked(db, SINCE + 20, { op: "daemon.tick" });
+    ticked(db, SINCE + 30, { op, mark });
+    const r = ranOn(db);
+    assert.equal(r.ok, false, what);
+    assert.match(r.why, says, what);
+    assert.equal(r.after, SINCE + 30, what);
+    db.close();
+  }
+});
+
+test("each tick says the code and policy it ran, at its start, its end and a stop, so a trial is told by them", async () => {
+  const dbPath = join(tempDir("reeve-trial-ticks-"), "s.db");
+  const from = Math.floor(Date.now() / 1000);
+  let n = 0;
+  // A tick that ends, and one that stops, unable to list the pull requests.
+  const out = await run({ dbPath, ticks: 2, code: CODE, openPrs: () => (n++ ? null : []) });
+  const policy = policyOf(out.ctx.profile).hash;
+  const db = open(dbPath);
+  const marks = /** @type {any[]} */ (db.prepare("SELECT op, payload FROM event WHERE op IN (?, 'daemon.tick', ?) ORDER BY seq").all(TICK_STARTED, TICK_STOPPED))
+    .map((e) => ({ op: e.op, ...JSON.parse(e.payload) }));
+  assert.deepEqual(marks.map((m) => m.op), [TICK_STARTED, "daemon.tick", TICK_STARTED, TICK_STOPPED]);
+  for (const m of marks) assert.deepEqual({ code: m.code, policy: m.policy }, { code: CODE, policy }, m.op);
+  const until = Math.floor(Date.now() / 1000) + 1;
+  assert.deepEqual(T.trialRanOn(db, { since: from, until, code: CODE, policy }), { ok: true });
+  assert.match(T.trialRanOn(db, { since: from, until, code: { ...CODE, commit: "o".repeat(40) }, policy }).why ?? "", /4 tick\(s\) run by other code/);
+  db.close();
+  // And a tick that throws, once it knows what it runs.
+  const thrownPath = join(tempDir("reeve-trial-ticks-"), "s.db");
+  await assert.rejects(run({ dbPath: thrownPath, code: CODE, openPrs: () => { throw new Error("the list couldn't be read"); } }), /the list couldn't be read/);
+  const thrown = open(thrownPath);
+  const stop = JSON.parse(/** @type {any} */ (thrown.prepare("SELECT payload FROM event WHERE op = ?").get(TICK_STOPPED))?.payload ?? "{}");
+  assert.deepEqual(stop.code, CODE, "the stop of a tick that threw");
+  assert.match(String(stop.policy), /^[0-9a-f]{64}$/);
+  thrown.close();
+});
+
 test("reeve run --enforce refuses a trial made by other code than it runs, saying when the trial would begin again", () => {
   const r = runEnforcing(["--trial-since", "2026-09-30T09:14Z"], (_home, db) => {
     const s = open(db);
-    s.prepare("INSERT INTO decision(digest,pr,head,record,first_at,last_at,first_seq,last_seq) VALUES(?,?,?,?,?,?,?,?)")
-      .run("d1", 1, "a".repeat(40), JSON.stringify({ subject: { repo: "acme/widget", pr: 1, head: "a".repeat(40) },
-        code: { commit: "o".repeat(40), tree: "t".repeat(40), dirty: false }, policy: "p0" }), SINCE + 600, SINCE + 600, 1, 1);
+    judge(s, SINCE + 600, { over: { code: { commit: "o".repeat(40), tree: "t".repeat(40), dirty: false }, policy: "p0" } });
     s.close();
   });
   assert.equal(r.status, 1, r.stdout + r.stderr);

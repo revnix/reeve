@@ -18,6 +18,7 @@ import { netTimeoutMs, netFailure } from "./net-bound.mjs";
 import { syncFolder } from "./signing.mjs";
 import { TICK_STARTED, TICK_STOPPED } from "./status.mjs";
 import { sameCode } from "./decisions.mjs";
+import { decisionOf } from "./db/records.mjs";
 
 /** A gap between ticks longer than this is downtime, as #158 says. */
 export const GAP_SECONDS = 15 * 60;
@@ -345,30 +346,45 @@ export function trialGate(report, { since }) {
 }
 
 /**
- * Whether every judgment the shadow trial saw, from `since` to `until`, was made
- * by `code` under `policy`, the code and policy about to enforce (#166): a trial
- * vouches only for what it watched, so a deploy or a policy changed since begins
- * it again. One whose code or policy can't be told is no proof it's the same.
- * `{ ok }`, or why not, with when the last judgment made otherwise was: the
- * trial would begin again after it.
+ * Whether every judgment the shadow trial saw, and every tick it ran, from
+ * `since` to `until`, was made by `code` under `policy`, the code and policy
+ * about to enforce (#166): a trial vouches only for what it watched, so a deploy
+ * or a policy changed since begins it again. A judgment is told by the record
+ * it was judged from, whole and kept as its own; one without such a record, or
+ * a tick that doesn't say, is no proof it's the same. `{ ok }`, or why not, with
+ * when the last made otherwise was: the trial would begin again after it.
  * @param {any} db @param {{ since: number, until: number, code: any, policy: string | null }} o
  * @returns {{ ok: true } | { ok: false, why: string, after: number }}
  */
 export function trialRanOn(db, { since, until, code, policy }) {
-  const rows = /** @type {{ record: string, last_at: number }[]} */ (db.prepare(
-    "SELECT record, last_at FROM decision WHERE last_at >= ? AND first_at <= ? ORDER BY last_at").all(since, until));
-  let other = 0, untold = 0, after = 0;
-  for (const row of rows) {
-    /** @type {any} */ let record = null;
-    try { record = JSON.parse(row.record); } catch { /* untold, below */ }
-    const same = record ? sameCode(record.code, code) : null;
-    if (same === true && policy != null && record.policy === policy) continue;
-    if (same === null || policy == null || record?.policy == null) untold++; else other++;
-    after = Math.max(after, Number(row.last_at));
+  const count = { judgment: { other: 0, untold: 0 }, tick: { other: 0, untold: 0 } };
+  let after = 0;
+  /** One judgment or tick, at `at`, said to be made by `by` under `under`. @param {"judgment" | "tick"} what @param {number} at @param {any} by @param {any} under */
+  const tell = (what, at, by, under) => {
+    const same = by ? sameCode(by, code) : null;
+    if (same === true && policy != null && under === policy) return;
+    if (same === null || policy == null || under == null) count[what].untold++; else count[what].other++;
+    after = Math.max(after, at);
+  };
+  // Each judgment, by its record: the one its event names, kept as that pull
+  // request's at that event, and whole.
+  const rowOf = db.prepare("SELECT * FROM decision WHERE digest = ?");
+  for (const e of [...events(db, "pr.decided", since, until), ...events(db, "queue.decided", since, until)]) {
+    const row = typeof e.p.record === "string" ? /** @type {any} */ (rowOf.get(e.p.record)) : null;
+    const own = row && Number(row.pr) === e.pr && Number(row.first_seq) <= e.seq && e.seq <= Number(row.last_seq);
+    const d = own ? decisionOf(row) : null;
+    const record = d && !d.corrupt ? d.record : null;
+    tell("judgment", e.at, record?.code, record?.policy);
   }
-  if (!other && !untold) return { ok: true };
-  const said = [other ? `${other} judgment(s) made by other code or under another policy than this reeve would enforce with` : "",
-                untold ? `${untold} judgment(s) whose code or policy can't be told` : ""].filter(Boolean).join(", and ");
+  // Each tick, its start, end or stop: the time the trial ran is counted from them.
+  for (const op of [TICK_STARTED, "daemon.tick", TICK_STOPPED])
+    for (const e of events(db, op, since, until)) tell("tick", e.at, e.p.code, e.p.policy);
+  const { judgment: j, tick: t } = count;
+  if (!j.other && !j.untold && !t.other && !t.untold) return { ok: true };
+  const said = [j.other ? `${j.other} judgment(s) made by other code or under another policy than this reeve would enforce with` : "",
+                t.other ? `${t.other} tick(s) run by other code or under another policy than this reeve would enforce with` : "",
+                j.untold ? `${j.untold} judgment(s) whose code or policy can't be told` : "",
+                t.untold ? `${t.untold} tick(s) whose code or policy can't be told` : ""].filter(Boolean).join(", and ");
   return { ok: false, after, why: `the shadow trial from ${when(since)} saw ${said}` };
 }
 

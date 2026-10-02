@@ -1410,24 +1410,31 @@ export const CANARY_PAGE = "guardian:sandbox:canary-failed";
  * still running.
  */
 export async function tick(ctx) {
-  let r;
-  try { r = await tickOnce(ctx); }
-  catch (err) { noteTickStopped(ctx.db); throw err; }
-  if (r?.halted || r?.unreadable) noteTickStopped(ctx.db);
+  // What the tick runs, on each of its records (#166). One that fails before
+  // it's known says nothing of it.
+  let r, ran = null;
+  try {
+    // The code a verdict is recorded as judged by, taken before anything is read
+    // or evaluated: a checkout that moves during the tick's reads doesn't change
+    // what this process loaded (#165). The policy, as its records name it.
+    ran = { code: ctx.code ?? (ctx.codeVersion ?? runningCode)(), policy: policyFor(ctx.profile).hash };
+    r = await tickOnce(ctx, ran);
+  }
+  catch (err) { noteTickStopped(ctx.db, now(), ran); throw err; }
+  if (r?.halted || r?.unreadable) noteTickStopped(ctx.db, now(), ran);
   return r;
 }
 
-async function tickOnce(ctx) {
-  // The code a verdict is recorded as judged by, taken before anything is read
-  // or evaluated: a checkout that moves during the tick's reads doesn't change
-  // what this process loaded (#165).
-  const code = ctx.code ?? (ctx.codeVersion ?? runningCode)();
+/** @param {any} ctx @param {{ code: any, policy: string }} ran */
+async function tickOnce(ctx, ran) {
+  const { code } = ran;
   // Which tick this is, for what counts only in a row.
   const tickNo = ctx.tickNo = (ctx.tickNo ?? 0) + 1;
   const { nwo, profile, db, execute = false, shadow = true } = ctx;
   // Recorded as it starts, and again as it ends: the time between is running,
-  // however long the tick takes (#297).
-  noteTickStart(db);
+  // however long the tick takes (#297). Each says what ran: the time a shadow
+  // trial ran vouches for that code and policy only (#166).
+  noteTickStart(db, now(), ran);
   // Enforcing, a base where no rule requires reeve's check gets its results in
   // shadow (#166): enforcing there would say it gates what it can't. Where a
   // rule requires it, its results go out enforcing, though someone can bypass
@@ -4877,7 +4884,7 @@ async function tickOnce(ctx) {
     catch (err) { log(logPath, `supply derive failed — ${err.message}`); }
   }
 
-  noteTick(db);
+  noteTick(db, now(), ran);
 
   return { decisions, escalations, halted: false };
 }

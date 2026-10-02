@@ -424,6 +424,19 @@ test("a store stripped of its baseline and signatures isn't given one again wher
   db.close();
   assert.equal(baselines, 0);
   assert.match(r.log, /anchor for o\/r can't be read: it isn't JSON, so it's taken to say this store began signing/);
+  // Stripped of its records too, so nothing is left to bind the anchor over: the unread anchor alone keeps its baseline from it.
+  const bareDir = credentials();
+  const bare = await ticks([at(A)], host(bareDir));
+  db = open(bare);
+  db.prepare("DELETE FROM event WHERE op IN ('signing.baseline', 'decision.latest')").run();
+  db.prepare("DELETE FROM decision").run();
+  db.close();
+  writeFileSync(anchorPath(bareDir, REPO), "{");
+  await run({ evaluate: () => at(B), dbPath: bare, ...host(bareDir) });
+  db = open(bare);
+  const bareBaselines = db.prepare("SELECT count(*) AS n FROM event WHERE op = 'signing.baseline'").get().n;
+  db.close();
+  assert.equal(bareBaselines, 0, "a store stripped of its records too");
 });
 
 test("reeve why says when the host's anchor for the repository can't be read", async () => {

@@ -123,6 +123,23 @@ test("a judgment made after the trial was read, in the same second it was read t
   db.close();
 });
 
+test("a case the trial saw at start-up stays seen, though the review rows that showed it are rebuilt since", () => {
+  const { db, window, audit } = passedTrial();
+  const right = audit(() => true);
+  // The kinds of case as the trial was read at start-up.
+  const kinds = T.trialReport(db, { repo: R, since: window.since, now: window.until, merged: window.merged, seeded: window.seeded, audits: [right] }).kinds;
+  assert.equal(kinds["a new push after a review"], 23, "control: seen at start-up");
+  // reeve run --enforce has them from the trial it checks at start-up.
+  const atStart = T.trialForEnforcing(db, { nwo: R, store: "s.db", named: false, since: window.since, now: window.until + 10, trialSince: "x",
+    merged: window.merged, seeded: window.seeded, code: CODE, policy: POLICY, audits: () => ({ ok: true, audits: [right] }) });
+  assert.deepEqual(atStart.kinds, kinds, JSON.stringify(atStart.reasons));
+  // The review that showed it edited so it's no round, and its row rebuilt away.
+  db.prepare("DELETE FROM review_round WHERE pr = 23").run();
+  assert.deepEqual(T.trialHolds(db, { ...window, kinds, audits: () => ({ ok: true, audits: [right] }) }), { ok: true });
+  assert.equal(T.trialHolds(db, { ...window, audits: () => ({ ok: true, audits: [right] }) }).ok, false, "control: read from the rows as they are now, it's missing");
+  db.close();
+});
+
 test("an audit recorded while the trial is checked again is read too, and audits that keep changing leave it unchecked", () => {
   const { db, window, audit } = passedTrial();
   const right = audit(() => true);
@@ -174,6 +191,7 @@ test("reeve run --enforce gives the daemon the shadow trial it checked at start-
   assert.match(ctx.slice(0, 20_000), /\n      trialHolds: recheck && \(\(\) => recheck\(ctx\.db\)\),/, "the run's context carries the check, on its store");
   assert.match(bin, /trialHolds\(db, \{ \.\.\.window, audits \}\)/, "the same trial, its audits read again");
   assert.match(bin, /const window = \{[^}]*\bupTo\b/, "to the event it was read to");
+  assert.match(bin, /const window = \{[^}]*\bkinds: trial\.kinds\b/, "with the kinds of case it saw");
 });
 
 test("a withdrawal that couldn't read what stands as the trial stopped passing is made by the next tick that can, and said meanwhile", async () => {

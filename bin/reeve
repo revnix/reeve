@@ -2629,7 +2629,7 @@ ${published ? "published in deploy/signing-keys/" : `not published yet: copy it 
       // And checked again on each tick (#331): the same trial, to the time it
       // was read to now, with what GitHub said merged then and the seeded cases
       // as they ran, its audits read again each time.
-      const window = { nwo, since: sinceAt, until: nowAt, upTo, merged, seeded, code: runningCode(), policy: policyHashFor(profile, nwo) };
+      const window = { nwo, since: sinceAt, until: nowAt, upTo, kinds: trial.kinds, merged, seeded, code: runningCode(), policy: policyHashFor(profile, nwo) };
       const audits = () => readAudits(auditDirFor(HOME, nwo), nwo, { notes: auditNotesFor(HOME, nwo) });
       recheck = (db) => trialHolds(db, { ...window, audits });
     }

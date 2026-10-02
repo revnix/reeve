@@ -40,8 +40,12 @@ function ghApi(args) {
 
 /** The elements HTML never closes. */
 const VOID = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
-/** A tag as GitHub writes one: lower case, each attribute's value in double quotes. */
-const TAG = /<(\/?)([a-z][a-z0-9]*)((?: [a-z][a-z0-9-]*(?:="[^"]*")?)*)>/y;
+/**
+ * A tag as GitHub writes one: lower case, a custom element's name with
+ * hyphens (a table comes wrapped in one), each attribute's value in double
+ * quotes.
+ */
+const TAG = /<(\/?)([a-z][a-z0-9-]*)((?: [a-z][a-z0-9-]*(?:="[^"]*")?)*)>/y;
 
 /**
  * The elements of `html`, as GitHub renders a body, or null where it isn't as
@@ -75,6 +79,9 @@ function tree(html) {
 
 /** The text a node shows, its tags aside. @param {Node} n @returns {string} */
 const textOf = (n) => (typeof n === "string" ? n : n.kids.map(textOf).join(""));
+
+/** Whether a node shows a reader anything: text, or an image. Formatting with nothing in it shows nothing. @param {Node} n @returns {boolean} */
+const shows = (n) => (typeof n === "string" ? n.trim() !== "" : n.tag === "img" || n.kids.some(shows));
 
 /**
  * What every section headed `title`, at any level, holds: the body's blocks
@@ -137,8 +144,8 @@ export function criteriaOf(html) {
 
 /**
  * The criteria a pull request's "Acceptance evidence" section gives evidence
- * for, from GitHub's HTML of its description: each numbered entry with
- * something in it, by the number a reader sees. Null where the HTML isn't
+ * for, from GitHub's HTML of its description: each numbered entry that
+ * shows something, by the number a reader sees. Null where the HTML isn't
  * GitHub's.
  * @param {unknown} html @returns {Set<number> | null}
  */
@@ -147,7 +154,7 @@ export function evidenceOf(html) {
   if (!root) return null;
   /** @type {Set<number>} */ const given = new Set();
   for (const { item, number } of topItems(sections(root, "Acceptance evidence")))
-    if (number !== null && item.kids.some((k) => typeof k !== "string" || k.trim())) given.add(number);
+    if (number !== null && shows(item)) given.add(number);
   return given;
 }
 

@@ -131,6 +131,10 @@ test("a task's criteria are the items of its Acceptance criteria section, and th
   assert.deepEqual(evidence("## Acceptance evidence\n\n3. third\n4. fourth\n"), [3, 4], "from its start");
   assert.deepEqual(evidence("## Acceptance evidence\n\n<ol><li value=\"2\">b</li><li>c</li></ol>\n"), [2, 3], "from an item's value");
   assert.deepEqual(evidence("## Acceptance evidence\n\n- a\n- b\n"), [], "bullets");
+  // A table, which GitHub wraps in an element of its own, is read through.
+  assert.deepEqual(evidence("## Acceptance evidence\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n1. x\n"), [1], "a table before the entries");
+  // An entry shows something, text or an image: formatting with nothing in it is no evidence.
+  assert.deepEqual(evidence("## Acceptance evidence\n\n1. <b></b>\n2. [](https://example.com)\n3. ![shot](https://example.com/a.png)\n4. <strong> </strong>\n5. done\n"), [3, 5], "formatting alone");
 });
 
 test("HTML that isn't as GitHub writes it is unread, never a count", async () => {

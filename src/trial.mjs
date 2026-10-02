@@ -10,7 +10,6 @@
 // silence. Their audit is kept apart from the store, each one with who made it
 // and when (#294), and read back by every report.
 
-import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -20,6 +19,7 @@ import { TICK_STARTED, TICK_STOPPED } from "./status.mjs";
 import { sameCode } from "./decisions.mjs";
 import { decisionOf } from "./db/records.mjs";
 
+import { gh as runGh } from "./github/calls.mjs";
 /** A gap between ticks longer than this is downtime, as #158 says. */
 export const GAP_SECONDS = 15 * 60;
 /** A tick longer than this is downtime too: a daemon stopped partway, not one running (#297). */
@@ -951,7 +951,7 @@ export function putBackAudits(copy, where, dir, repo, { notes = null, fsync = fs
 
 /** `gh`, as the person running this reads GitHub, bounded as every read is (#282). @param {string[]} args */
 function gh(args) {
-  try { return { ok: true, out: execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,
+  try { return { ok: true, out: runGh(args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,
                                                             timeout: netTimeoutMs(), killSignal: "SIGKILL" }) }; }
   catch (e) { return { ok: false, out: "", err: netFailure(e) }; }
 }

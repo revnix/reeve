@@ -1,7 +1,7 @@
 // Reconcilers: given an idempotency key and args, answer "did this already happen?"
 // WITHOUT trusting local state. Every one is a read against the external system.
-import { execFileSync } from "node:child_process";
-const sh = (cmd, args, opts={}) => execFileSync(cmd, args, { encoding:"utf8", ...opts }).trim();
+import { runCommand } from "../github/calls.mjs";
+const sh = (cmd, args, opts={}) => String(runCommand(cmd, args, { encoding:"utf8", ...opts })).trim();
 const ghJson = (args) => { try { return JSON.parse(sh("gh", args)); } catch (e) { return null; } };
 
 export const MARKER = (idemKey) => `<!-- ops:${idemKey} -->`;

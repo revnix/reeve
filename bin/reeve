@@ -62,6 +62,7 @@ import { readStart, isSameProcess } from "../src/supervisor.mjs";
 import { HEARTBEAT_SECONDS } from "../src/db/ops.mjs";
 
 
+import { gh as runGh } from "../src/github/calls.mjs";
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
 // Every other command in this file is `console.error(...); process.exit(1)`.
@@ -121,7 +122,7 @@ const guardianHubAccess = () => hubAccess(hubPathFor(HOME));
 // happen is inventing one.
 const repoIdFromGitHub = (nwo) => {
   try {
-    const out = execFileSync("gh", ["api", `repos/${nwo}`, "--jq", ".id"],
+    const out = runGh(["api", `repos/${nwo}`, "--jq", ".id"],
                              { encoding: "utf8", timeout: 15_000 }).trim();
     const id = Number(out);
     return Number.isInteger(id) && id > 0 ? id : null;

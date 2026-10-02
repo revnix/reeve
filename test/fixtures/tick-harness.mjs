@@ -89,7 +89,7 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
                     resolveRepoIdFn, project, keepDir = false, seams = null,
                     haltMarker, openPrs, containment, ticks = 1, dbPath, evaluate, treeOf, code, codeVersion,
                     readQueue, evaluateQueue, publish, withdraw, signer, anchor, keys, durably, prState, prIsFinished,
-                    afterTick, shadow = true, enforcement } = {}) => {
+                    afterTick, shadow = true, enforcement, trialHolds } = {}) => {
   const dir = tempDir("reeve-prov-");
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
@@ -195,6 +195,8 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     ...(readQueue ? { readQueue } : {}),
     // Enforcing, how each base's enforcement is measured (#166).
     ...(enforcement ? { enforcement } : {}),
+    // Enforcing, the shadow trial checked again each tick (#331).
+    ...(trialHolds ? { trialHolds } : {}),
     ...(evaluateQueue ? { evaluateQueue } : {}),
     ...(withdraw ? { withdraw } : {}),
     // What signs each decision record (#165). Unset, the tick keeps its records

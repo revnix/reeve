@@ -57,9 +57,12 @@ function section(body, title) {
   const lines = visible(body);
   // A heading is indented three spaces at most: four in, it's code.
   const heading = new RegExp(`^ {0,3}(#{1,6})\\s+${title}(?:\\s+#+)?\\s*$`, "i");
-  const at = lines.findIndex((l) => heading.test(l.trimEnd()));
+  let at = -1, level = 0;
+  for (let i = 0; i < lines.length && at < 0; i++) {
+    const h = heading.exec(lines[i].trimEnd());
+    if (h) { at = i; level = h[1].length; }
+  }
   if (at < 0) return [];
-  const level = /** @type {RegExpExecArray} */ (heading.exec(lines[at].trimEnd()))[1].length;
   const rest = lines.slice(at + 1);
   const end = rest.findIndex((l) => { const h = /^ {0,3}(#{1,6})\s/.exec(l); return h !== null && h[1].length <= level; });
   return end < 0 ? rest : rest.slice(0, end);

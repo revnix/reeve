@@ -19544,8 +19544,8 @@ export const STUBS = [
     test: "test/merge-ready.test.mjs",
     expectRed: "a task's criteria are the items of its Acceptance criteria section, and the evidence the numbered entries of the pull request's",
     edits: [{ file: "src/acceptance.mjs",
-              find: "  const at = lines.findIndex((l) => heading.test(l.trimEnd()));",
-              replace: "  const at = lines.findIndex((l) => heading.test(l.trim()));" }],
+              find: "    const h = heading.exec(lines[i].trimEnd());",
+              replace: "    const h = heading.exec(lines[i].trim());" }],
   },
   {
     name: "checkpoint-case-insensitive",

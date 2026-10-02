@@ -49,11 +49,12 @@ function visible(body) {
 /** The lines of the Markdown section headed `title`, at any level, to the next heading, as a reader sees it. @param {unknown} body @param {string} title */
 function section(body, title) {
   const lines = visible(body);
-  const heading = new RegExp(`^#{1,6}\\s+${title}\\s*$`, "i");
-  const at = lines.findIndex((l) => heading.test(l.trim()));
+  // A heading is indented three spaces at most: four in, it's code.
+  const heading = new RegExp(`^ {0,3}#{1,6}\\s+${title}\\s*$`, "i");
+  const at = lines.findIndex((l) => heading.test(l.trimEnd()));
   if (at < 0) return [];
   const rest = lines.slice(at + 1);
-  const end = rest.findIndex((l) => /^#{1,6}\s/.test(l.trim()));
+  const end = rest.findIndex((l) => /^ {0,3}#{1,6}\s/.test(l));
   return end < 0 ? rest : rest.slice(0, end);
 }
 
@@ -140,7 +141,8 @@ function tasksOf({ nwo, pr, tasksRepo, gh }) {
     const comments = gh(["--paginate", `repos/${tasksRepo}/issues/${n}/comments?per_page=100`, "--jq", ".[].body | @json"]);
     const bodies = comments.ok ? strings(comments.out) : null;
     if (!bodies) return unread("the checkpoints of the task it may deliver couldn't be read", comments.err ?? "they don't read as GitHub's");
-    if (checkpointNames(bodies) !== named) continue;
+    // GitHub's names are the same whatever their letters' case.
+    if (checkpointNames(bodies)?.toLowerCase() !== named.toLowerCase()) continue;
     const issue = gh([`repos/${tasksRepo}/issues/${n}`, "--jq", ".body // \"\" | @json"]);
     const body = issue.ok ? one(issue.out) : null;
     if (body === null) return unread("the task it delivers couldn't be read", issue.err ?? "it doesn't read as GitHub's");
@@ -158,19 +160,23 @@ function tasksOf({ nwo, pr, tasksRepo, gh }) {
  * delivers, how many criteria they name, and which have no evidence. Not
  * `readable` where the tasks couldn't be looked for, which is never "none".
  * The tasks found are kept per pull request, and looked for again on a new
- * head, or an hour on.
+ * head, or an hour on; none found is looked for again each time.
  * @param {{ nwo: string, pr: number, head: string, body: unknown, tasksRepo: string, gh?: Gh, cache?: Map<string, Kept>, now?: number }} o
  * @returns {{ readable: true, tasks: number[], criteria: number, missing: number[] } | { readable: false, why: string, detail: string }}
  */
 export function acceptanceOf({ nwo, pr, head, body, tasksRepo, gh = ghApi, cache = KEPT, now = Math.floor(Date.now() / 1000) }) {
+  // What's an hour old goes, a closed pull request's with it.
+  for (const [k, v] of cache) if (now - v.at > TASK_KEPT_SECONDS) cache.delete(k);
   const key = `${nwo}#${pr}`;
   let kept = cache.get(key);
-  if (!kept || kept.head !== head || now - kept.at > TASK_KEPT_SECONDS) {
+  if (!kept || kept.head !== head) {
     const t = tasksOf({ nwo, pr, tasksRepo, gh });
     // Kept only once read: one that couldn't be is looked for again next time.
     if ("why" in t) return { readable: false, why: t.why, detail: t.detail };
     kept = { head, at: now, tasks: t.tasks, criteria: t.criteria };
-    cache.set(key, kept);
+    // And only once found: a checkpoint naming the pull request may be
+    // written after it, and is read on the next tick.
+    if (t.tasks.length) cache.set(key, kept);
   }
   if (!kept.tasks.length) return { readable: true, tasks: [], criteria: 0, missing: [] };
   return { readable: true, tasks: kept.tasks, criteria: kept.criteria, missing: missingEvidence(kept.criteria, evidenceOf(body)) };

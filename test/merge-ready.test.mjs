@@ -92,6 +92,8 @@ test("a task's criteria are the items of its Acceptance criteria section, and th
   assert.equal(a.criteriaOf("### Acceptance criteria\n\n<!-- - an example -->\n~~~md\n- in code\n~~~\n"), 0, "none shown");
   assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n<!--\n1. placeholder\n2. placeholder\n-->\n```\n3. in code\n```\n")], [], "hidden evidence");
   assert.deepEqual([...a.evidenceOf("<!--\n## Acceptance evidence\n\n1. placeholder\n-->\n")], [], "a hidden heading");
+  assert.deepEqual([...a.evidenceOf("Example:\n\n    ## Acceptance evidence\n\n1. not evidence\n")], [], "a heading indented four is code");
+  assert.deepEqual([...a.evidenceOf("   ## Acceptance evidence\n\n1. evidence\n")], [1], "one indented three is a heading");
   assert.equal(a.criteriaOf("### Acceptance criteria\n\n    - in a code block, not a list\n"), 0, "four spaces in is code");
   assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n  1. a test\n   2. another\n")].sort(), [1, 2]);
 });
@@ -141,6 +143,10 @@ test("the task a pull request delivers is the one whose latest checkpoint names 
     "repos/acme/tasks/issues/12/comments": ok([checkpoint("acme/app#7"), "<!-- checkpoint v1 -->\nbranch:     b\ndone:       more\n"].map((c) => JSON.stringify(c)).join("\n")),
     "repos/acme/tasks/issues/12": ok(JSON.stringify(TASK)) }) });
   assert.deepEqual(later, { readable: true, tasks: [12], criteria: 3, missing: [] }, "the latest checkpoint naming a pull request");
+  // A checkpoint naming the repository in other letters' case names the same pull request.
+  const cased = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "## Acceptance evidence\n\n1. a\n2. b\n3. c\n", tasksRepo: "acme/tasks", cache: new Map(), gh: github({
+    "search/issues": ok("12"), "repos/acme/tasks/issues/12/comments": ok(JSON.stringify(checkpoint("Acme/App#7"))), "repos/acme/tasks/issues/12": ok(JSON.stringify(TASK)) }) });
+  assert.deepEqual(cased, { readable: true, tasks: [12], criteria: 3, missing: [] }, "Acme/App#7 is acme/app#7");
   // Issues only: a pull request in the tasks' repository is no task.
   /** @type {string[]} */ let asked = [];
   a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache: new Map(), gh: (/** @type {string[]} */ args) => { asked = args; return ok(""); } });
@@ -174,13 +180,34 @@ test("the task is asked for again on a new head, and otherwise at most hourly", 
     return { ok: false, out: "", err: "unexpected" };
   };
   const cache = new Map();
-  const ask = (/** @type {string} */ head, /** @type {number} */ now) => a.acceptanceOf({ nwo: "acme/app", pr: 7, head, body: "", tasksRepo: "acme/tasks", gh, cache, now });
+  /** The search as it answers now: a task found, or none. */
+  let found = true;
+  const finding = (/** @type {string[]} */ args) => {
+    if (args.some((x) => x.startsWith("search/"))) { searches++; return { ok: true, out: found ? "12" : "" }; }
+    const path = args.find((x) => x.startsWith("repos/")) ?? "";
+    if (/comments/.test(path)) return { ok: true, out: JSON.stringify(checkpoint("acme/app#7")) };
+    return { ok: true, out: JSON.stringify(TASK) };
+  };
+  const ask = (/** @type {string} */ head, /** @type {number} */ now, g = finding) => a.acceptanceOf({ nwo: "acme/app", pr: 7, head, body: "", tasksRepo: "acme/tasks", gh: g, cache, now });
   ask(HEAD, 1000); ask(HEAD, 1000 + 1800);
-  assert.equal(searches, 1, "the same head within the hour: asked once");
+  assert.equal(searches, 1, "a task found, the same head within the hour: asked once");
   ask("b".repeat(40), 1000 + 1801);
   assert.equal(searches, 2, "a new head: asked again");
   ask("b".repeat(40), 1000 + 1801 + 3601);
   assert.equal(searches, 3, "an hour on: asked again");
+  // No task found isn't kept: a checkpoint written since is read on the next tick.
+  found = false;
+  const none = ask("c".repeat(40), 9000);
+  assert.deepEqual(none.readable && none.tasks, []);
+  found = true;
+  assert.deepEqual(ask("c".repeat(40), 9001).readable && ask("c".repeat(40), 9001).tasks, [12], "found on the next look");
+  // A pull request's entry goes once it's an hour old, looked up or not.
+  const kept = new Map();
+  a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", gh: finding, cache: kept, now: 1000 });
+  assert.equal(kept.has("acme/app#7"), true, "control: kept");
+  a.acceptanceOf({ nwo: "acme/app", pr: 8, head: HEAD, body: "", tasksRepo: "acme/tasks", gh: finding, cache: kept, now: 1000 + 3601 });
+  assert.equal(kept.has("acme/app#7"), false, "#7's, an hour old, is gone");
+  void gh;
 });
 
 test("a profile may name where its tasks live, as owner/name", () => {
@@ -246,10 +273,13 @@ test("an answer from GitHub that doesn't read as one is unread, never an empty d
   assert.equal(cache.size, 0, "and nothing kept for it");
 });
 
-test("the alert a criterion without evidence raises names the criteria", async () => {
+test("a criterion without evidence is one standing alert, and the tick's log names the criteria", async () => {
   const { run, EVAL } = await import("./fixtures/tick-harness.mjs");
   const clauses = EVAL.verdict.clauses.map((/** @type {any} */ c) => ({ ...c, state: "PASS" }));
   const verdict = { state: "BLOCK", summary: "acceptance blocked", clauses: [...clauses, { id: "acceptance", state: "BLOCK", detail: "no acceptance evidence for criterion 2 of the 3 the task delivered names" }] };
   const r = await run({ openPrs: () => [42], evaluate: () => ({ ...EVAL, verdict, checks: { verdict: "GREEN", caused: [], failing: [] } }) });
-  assert.match(r.esc, /#42: a criterion of the task it delivers has no acceptance evidence — no acceptance evidence for criterion 2 of the 3/, r.esc);
+  // One cause, the same however the criteria change, so it stands rather than being raised anew.
+  assert.match(r.esc, /(^|\| )#42: a criterion of the task it delivers has no acceptance evidence( \||$)/, r.esc);
+  // Which, in the tick's log.
+  assert.match(r.log, /#42: no acceptance evidence for criterion 2 of the 3/, r.log.slice(-1500));
 });

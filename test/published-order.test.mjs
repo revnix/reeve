@@ -1228,6 +1228,13 @@ test("a tick says it ordered and published every record only where it did: not w
   // A tick after, with nothing new to order, its orders as published already: it did.
   const again = await ticksOf(() => [PR], 2, host(credentials()));
   assert.equal(typeof lastTick(again.path).witnessed, "number", "a second tick, nothing new");
+  // A second tick, nothing new to order, its publication kept back as GitHub holds evidence further on there: it didn't.
+  let tickNo = 0;
+  const keptBack = await ticksOf((n) => { tickNo = n; return [PR]; }, 2, { ...host(credentials()),
+    publish: async () => (tickNo === 2 ? { ok: true, id: 1, conclusion: "neutral", behind: "evidence further on is kept there" } : { ok: true, id: 1, conclusion: "neutral" }) });
+  const marks = (() => { const db = open(keptBack.path); const m = db.prepare("SELECT json_extract(payload, '$.witnessed') AS w FROM event WHERE op = 'daemon.tick' ORDER BY seq").all().map((r) => r.w); db.close(); return m; })();
+  assert.equal(typeof marks[0], "number", "control: the first tick did");
+  assert.equal(marks[1], null, "a publication GitHub didn't keep");
   // A store that keeps no signed orders, which nothing can witness.
   const none = await ticksOf(() => [PR], 1, {});
   assert.equal(lastTick(none.path).witnessed, undefined, "no signed orders kept");

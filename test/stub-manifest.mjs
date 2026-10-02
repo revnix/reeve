@@ -15851,7 +15851,7 @@ export const STUBS = [
     test: "test/published-order.test.mjs",
     expectRed: "each result the daemon publishes names the record it kept, and where the pull request's signed order stood",
     edits: [{ file: "src/daemon.mjs",
-              find: "    if (lastEntrySeq(db) <= args.evidence.store.to) { covered(args.evidence); return true; }\n",
+              find: "    if (lastEntrySeq(db) <= args.evidence.store.to) { if (!lastAtHead.behind) covered(args.evidence); return true; }\n",
               replace: "" }],
   },
   {

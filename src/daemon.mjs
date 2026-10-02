@@ -1957,7 +1957,7 @@ async function tickOnce(ctx, ran) {
   const holdsRecord = (/** @type {string} */ digest) => holdsWhole(db)(digest);
   // The last result this tick published at a pull request's head with evidence,
   // under which name, and what it was published with.
-  /** @type {{ pr: number, name: string, args: any } | null} */ let lastAtHead = null;
+  /** @type {{ pr: number, name: string, args: any, behind?: boolean } | null} */ let lastAtHead = null;
   // How far the signed orders this tick published reach: the newest entry a
   // commitment it published covers (#308). None, where the store holds none.
   let coveredTo = 0;
@@ -1976,7 +1976,7 @@ async function tickOnce(ctx, ran) {
   const republishOrders = async () => {
     if (!lastAtHead || !ordering) return true;
     const { pr, name, args } = lastAtHead;
-    if (lastEntrySeq(db) <= args.evidence.store.to) { covered(args.evidence); return true; }
+    if (lastEntrySeq(db) <= args.evidence.store.to) { if (!lastAtHead.behind) covered(args.evidence); return true; }
     let st = null;
     try { st = standingAt(db, pr).find((x) => x.name === name && x.head === args.verdict.head); } catch { return false; }
     if (st?.op !== "pr.published" || st.state !== args.verdict.state) return false;
@@ -3218,7 +3218,8 @@ async function tickOnce(ctx, ran) {
       failures.delete(pr);
       // Again once published, with the run it went to.
       note("pr.published", { head: e.head, state: e.verdict.state, name: pub.name ?? name, id: pub.id ?? null });
-      if (published?.evidence) lastAtHead = { pr, name: pub.name ?? name, args: published };
+      // Whether GitHub kept it, or evidence further on there (#334).
+      if (published?.evidence) lastAtHead = { pr, name: pub.name ?? name, args: published, behind: Boolean(pub.behind) };
     } else {
       log(logPath, `    could not publish: ${pub.why}`);
       // The next tick publishes again, so one failure is a retry away. Three in a

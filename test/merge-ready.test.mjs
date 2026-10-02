@@ -5,7 +5,7 @@
 // unmet.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { computeVerdict } from "../src/verdict.mjs";
 import { evaluatePr, clearRequirements } from "../src/pr.mjs";
@@ -16,6 +16,10 @@ import { tempDir } from "./fixtures/temp.mjs";
 /** The module, or why it can't be had. */
 const acceptance = async () => { try { return await import("../src/acceptance.mjs"); } catch (err) { return assert.fail(`src/acceptance.mjs: ${err}`); } };
 const HEAD = "a".repeat(40);
+/** GitHub's rendering of each Markdown text the tests read, as `scripts/render-markdown.mjs` had it from GitHub. @type {Record<string, string>} */
+const RENDERINGS = JSON.parse(readFileSync(new URL("./fixtures/acceptance-rendered.json", import.meta.url), "utf8"));
+/** `md` as GitHub renders it. @param {string} md @returns {string} */
+const rendered = (md) => RENDERINGS[md] ?? assert.fail(`no rendering of ${JSON.stringify(md)}: add it to test/fixtures/acceptance-rendered.json and run scripts/render-markdown.mjs`);
 
 /** A pull request every condition holds for, and the task it delivers evidenced. */
 const ready = () => (/** @type {any} */ ({
@@ -76,40 +80,67 @@ test("acceptance evidence: a task delivered with every criterion evidenced passe
 
 test("a task's criteria are the items of its Acceptance criteria section, and the evidence the numbered entries of the pull request's", async () => {
   const a = await acceptance();
+  // Each read as GitHub renders it: what a body hides, nests or numbers is GitHub's to say.
+  const criteria = (/** @type {string} */ md) => a.criteriaOf(rendered(md));
+  const evidence = (/** @type {string} */ md) => { const e = a.evidenceOf(rendered(md)); return e && [...e].sort((x, y) => x - y); };
   const task = "### Objective\n\nx\n\n### Acceptance criteria\n\n- WHEN a, THE SYSTEM SHALL b.\n  Verified by: a test.\n  - a detail of it, not a criterion\n- THE SYSTEM SHALL c.\n  Verified by: d.\n\n### Allowed paths\n\n- `src/**`\n";
-  assert.equal(a.criteriaOf(task), 2);
-  assert.equal(a.criteriaOf("### Objective\n\nno criteria here\n"), 0);
+  assert.equal(criteria(task), 2);
+  assert.equal(criteria("### Objective\n\nno criteria here\n"), 0);
   const pr = "## Why\n\n1. not evidence\n\n## Acceptance evidence\n\n1. `test/x.test.mjs` fails first, then passes\n2.\n3. https://example.com/shot.png\n\n## Tests\n\n4. not evidence either\n";
-  assert.deepEqual([...a.evidenceOf(pr)].sort(), [1, 3], "an entry with nothing in it is no evidence");
-  assert.deepEqual([...a.evidenceOf("no section")], []);
-  assert.deepEqual(a.missingEvidence(3, a.evidenceOf(pr)), [2]);
+  assert.deepEqual(evidence(pr), [1, 3], "an entry with nothing in it is no evidence");
+  assert.deepEqual(evidence("no section"), []);
+  assert.deepEqual(a.missingEvidence(3, new Set(evidence(pr))), [2]);
   // A list indented one to three spaces is top-level all the same; an item indented under one isn't.
-  assert.equal(a.criteriaOf("### Acceptance criteria\n\n  - one\n    - a detail of it\n  - two\n"), 2);
-  assert.equal(a.criteriaOf("### Acceptance criteria\n\n - one\n - two\n - three\n"), 3);
-  assert.equal(a.criteriaOf("### Acceptance criteria\n\n- one\n+ two\n* three\n"), 3, "every marker Markdown takes for a bullet");
+  assert.equal(criteria("### Acceptance criteria\n\n  - one\n    - a detail of it\n  - two\n"), 2);
+  assert.equal(criteria("### Acceptance criteria\n\n - one\n - two\n - three\n"), 3);
+  assert.equal(criteria("### Acceptance criteria\n\n- one\n+ two\n* three\n"), 3, "every marker Markdown takes for a bullet");
+  assert.equal(criteria("### Acceptance criteria\n\n- one\n-\ttwo\n"), 2, "a tab after the marker");
+  assert.equal(criteria("### Acceptance criteria\n\n- [ ] one\n- [x] two\n"), 2, "a task list's");
   // What a reader doesn't see isn't there: a comment, or a fenced block.
-  assert.equal(a.criteriaOf("### Acceptance criteria\n\n<!--\n- an example\n-->\n```\n- in code\n```\n- the one\n"), 1, "hidden criteria");
-  assert.equal(a.criteriaOf("### Acceptance criteria\n\n<!-- - an example -->\n~~~md\n- in code\n~~~\n"), 0, "none shown");
-  assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n<!--\n1. placeholder\n2. placeholder\n-->\n```\n3. in code\n```\n")], [], "hidden evidence");
-  assert.deepEqual([...a.evidenceOf("<!--\n## Acceptance evidence\n\n1. placeholder\n-->\n")], [], "a hidden heading");
-  assert.deepEqual([...a.evidenceOf("Example:\n\n    ## Acceptance evidence\n\n1. not evidence\n")], [], "a heading indented four is code");
-  assert.deepEqual([...a.evidenceOf("   ## Acceptance evidence\n\n1. evidence\n")], [1], "one indented three is a heading");
+  assert.equal(criteria("### Acceptance criteria\n\n<!--\n- an example\n-->\n```\n- in code\n```\n- the one\n"), 1, "hidden criteria");
+  assert.equal(criteria("### Acceptance criteria\n\n<!-- - an example -->\n~~~md\n- in code\n~~~\n"), 0, "none shown");
+  assert.equal(criteria("### Acceptance criteria\n\n- a\n  <div>\n  ```\n- b\n  </div>\n"), 2, "a fence in an HTML block hides nothing after it");
+  assert.deepEqual(evidence("## Acceptance evidence\n\n<!--\n1. placeholder\n2. placeholder\n-->\n```\n3. in code\n```\n"), [], "hidden evidence");
+  assert.deepEqual(evidence("<!--\n## Acceptance evidence\n\n1. placeholder\n-->\n"), [], "a hidden heading");
+  assert.deepEqual(evidence("Example:\n\n    ## Acceptance evidence\n\n1. not evidence\n"), [], "a heading indented four is code");
+  assert.deepEqual(evidence("   ## Acceptance evidence\n\n1. evidence\n"), [1], "one indented three is a heading");
+  assert.deepEqual(evidence("## Acceptance evidence\n\n```md\n```js\n1. in code still\n```\n"), [], "a fence with an info string doesn't close one");
+  assert.equal(criteria("### Acceptance criteria\n\n    - in a code block, not a list\n"), 0, "four spaces in is code");
   // An entry nested under another is part of it, not evidence of its own; one indented less is a sibling.
-  assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n1. evidence for one\n   2. a detail of it\n")].sort(), [1], "nested under 1");
-  assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n1. one\n  2. two\n")].sort(), [1, 2], "indented less than 1's text: a sibling");
-  assert.equal(a.criteriaOf("### Acceptance criteria\n\n1. one\n  2. two\n     1. a detail of two\n"), 2, "numbered criteria, one nested");
-  // A fence closes only on a line of the fence alone: one with an info string is inside the block.
-  assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n```md\n```js\n1. in code still\n```\n")], [], "a fence with an info string doesn't close one");
-  // A heading may close with hashes.
-  assert.deepEqual([...a.evidenceOf("## Acceptance evidence ##\n\n1. evidence\n")], [1], "closing hashes");
-  assert.equal(a.criteriaOf("### Acceptance criteria ###\n\n- one\n"), 1);
-  // A section runs through its own subsections, to a heading of its level or above.
-  assert.equal(a.criteriaOf("## Acceptance criteria\n\n- one\n\n### More of them\n\n- two\n\n## Allowed paths\n\n- not one\n"), 2, "a subsection's criteria");
-  assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n1. a\n\n### The rest\n\n2. b\n\n# Tests\n\n3. not\n")].sort(), [1, 2], "a subsection's evidence");
-  // An ordered marker is nine digits at most: past that, it's text.
-  assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n0000000001. not an entry\n")], [], "ten digits");
-  assert.equal(a.criteriaOf("### Acceptance criteria\n\n    - in a code block, not a list\n"), 0, "four spaces in is code");
-  assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n  1. a test\n   2. another\n")].sort(), [1, 2]);
+  assert.deepEqual(evidence("## Acceptance evidence\n\n1. evidence for one\n   2. a detail of it\n"), [1], "nested under 1");
+  assert.deepEqual(evidence("## Acceptance evidence\n\n1. one\n\n   2. a detail of it\n"), [1], "a list nested under 1");
+  assert.deepEqual(evidence("## Acceptance evidence\n\n1. one\n  2. two\n"), [1, 2], "indented less than 1's text: a sibling");
+  assert.deepEqual(evidence("## Acceptance evidence\n\n  1. a test\n   2. another\n"), [1, 2]);
+  assert.equal(criteria("### Acceptance criteria\n\n1. one\n  2. two\n     1. a detail of two\n"), 2, "numbered criteria, one nested");
+  // Headings as GitHub reads them: closing hashes, underlined, in any case.
+  assert.deepEqual(evidence("## Acceptance evidence ##\n\n1. evidence\n"), [1], "closing hashes");
+  assert.equal(criteria("### Acceptance criteria ###\n\n- one\n"), 1);
+  assert.equal(criteria("Acceptance criteria\n---\n\n- one\n- two\n"), 2, "an underlined heading");
+  assert.equal(criteria("### ACCEPTANCE CRITERIA\n\n- one\n"), 1, "in capitals");
+  // A section runs through its own subsections, to a heading of its level or above, and a heading inside an item is the item's.
+  assert.equal(criteria("## Acceptance criteria\n\n- one\n\n### More of them\n\n- two\n\n## Allowed paths\n\n- not one\n"), 2, "a subsection's criteria");
+  assert.equal(criteria("## Acceptance criteria\n\n- one\n\n### Group\n\n  - two\n"), 2, "a subsection's list, indented otherwise");
+  assert.equal(criteria("## Acceptance criteria\n\n- first\n  ## Details\n- second\n\n## Next\n\n- not one\n"), 2, "a heading inside an item");
+  assert.deepEqual(evidence("## Acceptance evidence\n\n1. a\n\n### The rest\n\n2. b\n\n# Tests\n\n3. not\n"), [1, 2], "a subsection's evidence");
+  // Every section so headed, and the items in it whatever block holds them, a quote or a folded part.
+  assert.equal(criteria("### Acceptance criteria\n\n- one\n\n### Notes\n\nx\n\n### Acceptance criteria\n\n- two\n"), 2, "a second section");
+  assert.equal(criteria("### Acceptance criteria\n\n> - quoted one\n\n<details><summary>More</summary>\n\n- folded one\n\n</details>\n"), 2, "quoted and folded");
+  // Numbered as a reader sees the numbers: from the list's start, or an item's own value; text is no entry, nor a bullet.
+  assert.deepEqual(evidence("## Acceptance evidence\n\n0000000001. not an entry\n"), [], "ten digits");
+  assert.deepEqual(evidence("## Acceptance evidence\n\n1. a\n1. b\n1. c\n"), [1, 2, 3], "shown as 1, 2 and 3");
+  assert.deepEqual(evidence("## Acceptance evidence\n\n3. third\n4. fourth\n"), [3, 4], "from its start");
+  assert.deepEqual(evidence("## Acceptance evidence\n\n<ol><li value=\"2\">b</li><li>c</li></ol>\n"), [2, 3], "from an item's value");
+  assert.deepEqual(evidence("## Acceptance evidence\n\n- a\n- b\n"), [], "bullets");
+});
+
+test("HTML that isn't as GitHub writes it is unread, never a count", async () => {
+  const a = await acceptance();
+  const whole = "<h3>Acceptance criteria</h3>\n<ul>\n<li>a</li>\n</ul>\n";
+  assert.equal(a.criteriaOf(whole), 1, "control");
+  assert.equal(a.criteriaOf(`${whole}<`), null, "a < that opens no tag, as GitHub escapes every other");
+  assert.equal(a.criteriaOf("<h3>Acceptance criteria</h3>\n<ul>\n<li>a</ul></li>\n"), null, "tags closed out of order");
+  assert.equal(a.criteriaOf("<h3>Acceptance criteria</h3>\n<ul>\n<li>a\n"), null, "a tag left open");
+  assert.equal(a.evidenceOf("<h2>Acceptance evidence</h2>\n<ol>\n<li>a</li>\n</ol>\n<"), null);
 });
 
 /** GitHub as `gh api` answers: a search, an issue's comments and body, by the path asked. */
@@ -119,7 +150,7 @@ const github = (/** @type {Record<string, { ok: boolean, out: string, err?: stri
   return hit ? hit[1] : { ok: false, out: "", err: `not a read this test answers: ${path}` };
 };
 const checkpoint = (/** @type {string} */ pr) => `<!-- checkpoint v1 -->\nbranch:     b\nhead:       c\npr:         ${pr}\ndone:       d\n`;
-const TASK = "### Acceptance criteria\n\n- one\n- two\n- three\n";
+const TASK = rendered("### Acceptance criteria\n\n- one\n- two\n- three\n");
 
 test("the task a pull request delivers is the one whose latest checkpoint names it, found from the private side", async () => {
   const a = await acceptance();
@@ -132,44 +163,44 @@ test("the task a pull request delivers is the one whose latest checkpoint names 
     "repos/acme/tasks/issues/13/comments": ok([checkpoint("acme/app#7"), checkpoint("acme/app#9")].map((c) => JSON.stringify(c)).join("\n")),
     "repos/acme/tasks/issues/12": ok(JSON.stringify(TASK)),
   });
-  const got = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "## Acceptance evidence\n\n1. a\n2. b\n", tasksRepo: "acme/tasks", gh, cache: new Map() });
+  const got = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, html: rendered("## Acceptance evidence\n\n1. a\n2. b\n"), tasksRepo: "acme/tasks", gh, cache: new Map() });
   assert.deepEqual(got, { readable: true, tasks: [12], criteria: 3, missing: [3] });
   // Two delivered, one naming no criteria: none can be evidenced for it.
-  const blank = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "## Acceptance evidence\n\n1. a\n2. b\n3. c\n", tasksRepo: "acme/tasks", cache: new Map(), gh: github({
+  const blank = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, html: rendered("## Acceptance evidence\n\n1. a\n2. b\n3. c\n"), tasksRepo: "acme/tasks", cache: new Map(), gh: github({
     "search/issues": ok("false\n12\n14"),
     "repos/acme/tasks/issues/12/comments": ok(JSON.stringify(checkpoint("acme/app#7"))),
     "repos/acme/tasks/issues/14/comments": ok(JSON.stringify(checkpoint("acme/app#7"))),
     "repos/acme/tasks/issues/12": ok(JSON.stringify(TASK)),
-    "repos/acme/tasks/issues/14": ok(JSON.stringify("### Objective\n\nno criteria\n")),
+    "repos/acme/tasks/issues/14": ok(JSON.stringify(rendered("### Objective\n\nno criteria\n"))),
   }) });
   assert.deepEqual(blank, { readable: true, tasks: [12, 14], criteria: 0, missing: [] }, "a task naming no criteria");
   // None names it: no task delivered.
-  const none = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", gh: github({ "search/issues": ok("false") }), cache: new Map() });
+  const none = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, html: "", tasksRepo: "acme/tasks", gh: github({ "search/issues": ok("false") }), cache: new Map() });
   assert.deepEqual(none, { readable: true, tasks: [], criteria: 0, missing: [] });
   // An answer with no word on whether the search was whole is no answer.
-  const silent = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache: new Map(), gh: github({ "search/issues": ok("") }) });
+  const silent = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, html: "", tasksRepo: "acme/tasks", cache: new Map(), gh: github({ "search/issues": ok("") }) });
   assert.equal(silent.readable, false, "an empty answer");
   // A search GitHub says came back incomplete is no search.
   // Its task readable all the same: only the search's word stands between it and "found".
-  const partial = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache: new Map(), gh: github({
+  const partial = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, html: "", tasksRepo: "acme/tasks", cache: new Map(), gh: github({
     "search/issues": ok("true\n12"), "repos/acme/tasks/issues/12/comments": ok(JSON.stringify(checkpoint("acme/app#7"))), "repos/acme/tasks/issues/12": ok(JSON.stringify(TASK)) }) });
   assert.equal(partial.readable, false, "an incomplete search");
   // A checkpoint after, naming no pull request, doesn't take the task off it.
-  const later = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "## Acceptance evidence\n\n1. a\n2. b\n3. c\n", tasksRepo: "acme/tasks", cache: new Map(), gh: github({
+  const later = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, html: rendered("## Acceptance evidence\n\n1. a\n2. b\n3. c\n"), tasksRepo: "acme/tasks", cache: new Map(), gh: github({
     "search/issues": ok("false\n12"),
     "repos/acme/tasks/issues/12/comments": ok([checkpoint("acme/app#7"), "<!-- checkpoint v1 -->\nbranch:     b\ndone:       more\n"].map((c) => JSON.stringify(c)).join("\n")),
     "repos/acme/tasks/issues/12": ok(JSON.stringify(TASK)) }) });
   assert.deepEqual(later, { readable: true, tasks: [12], criteria: 3, missing: [] }, "the latest checkpoint naming a pull request");
   // A checkpoint naming the repository in other letters' case names the same pull request.
-  const cased = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "## Acceptance evidence\n\n1. a\n2. b\n3. c\n", tasksRepo: "acme/tasks", cache: new Map(), gh: github({
+  const cased = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, html: rendered("## Acceptance evidence\n\n1. a\n2. b\n3. c\n"), tasksRepo: "acme/tasks", cache: new Map(), gh: github({
     "search/issues": ok("false\n12"), "repos/acme/tasks/issues/12/comments": ok(JSON.stringify(checkpoint("Acme/App#7"))), "repos/acme/tasks/issues/12": ok(JSON.stringify(TASK)) }) });
   assert.deepEqual(cased, { readable: true, tasks: [12], criteria: 3, missing: [] }, "Acme/App#7 is acme/app#7");
   // Issues only: a pull request in the tasks' repository is no task.
   /** @type {string[]} */ let asked = [];
-  a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache: new Map(), gh: (/** @type {string[]} */ args) => { asked = args; return ok(""); } });
+  a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, html: "", tasksRepo: "acme/tasks", cache: new Map(), gh: (/** @type {string[]} */ args) => { asked = args; return ok(""); } });
   assert.match(decodeURIComponent(asked.find((x) => x.startsWith("search/")) ?? ""), /\bis:issue\b/);
   // The search read whole: the task on its second page is found.
-  const paged = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache: new Map(), gh: (/** @type {string[]} */ args) => {
+  const paged = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, html: "", tasksRepo: "acme/tasks", cache: new Map(), gh: (/** @type {string[]} */ args) => {
     if (args.some((x) => x.startsWith("search/"))) return ok(args.includes("--paginate") ? ["false", ...Array.from({ length: 100 }, (_, i) => 200 + i), "false", 12].join("\n") : ["false", ...Array.from({ length: 100 }, (_, i) => 200 + i)].join("\n"));
     const path = args.find((x) => x.startsWith("repos/")) ?? "";
     if (/issues\/12\/comments/.test(path)) return ok(JSON.stringify(checkpoint("acme/app#7")));
@@ -179,11 +210,11 @@ test("the task a pull request delivers is the one whose latest checkpoint names 
   } });
   assert.deepEqual(paged.readable && paged.tasks, [12], "every page of the search");
   // The search can't be read: unknown, never "no task".
-  const unread = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", gh: github({ "search/issues": { ok: false, out: "", err: "HTTP 502" } }), cache: new Map() });
+  const unread = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, html: "", tasksRepo: "acme/tasks", gh: github({ "search/issues": { ok: false, out: "", err: "HTTP 502" } }), cache: new Map() });
   assert.equal(unread.readable, false);
   // Said where a public pull request shows it: never the private repository, nor a task's number.
   assert.doesNotMatch(String(unread.why), /acme\/tasks/);
-  const unreadTask = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache: new Map(), gh: github({
+  const unreadTask = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, html: "", tasksRepo: "acme/tasks", cache: new Map(), gh: github({
     "search/issues": ok("false\n12"), "repos/acme/tasks/issues/12/comments": { ok: false, out: "", err: "HTTP 502 for repos/acme/tasks/issues/12" } }) });
   assert.equal(unreadTask.readable, false);
   assert.doesNotMatch(String(unreadTask.why), /acme\/tasks|#12\b/);
@@ -205,7 +236,7 @@ test("the task is asked for again on a new head, and otherwise at most hourly", 
     if (/comments/.test(path)) return { ok: true, out: JSON.stringify(checkpoint("acme/app#7")) };
     return { ok: true, out: JSON.stringify(TASK) };
   };
-  const ask = (/** @type {string} */ head, /** @type {number} */ now, g = finding) => a.acceptanceOf({ nwo: "acme/app", pr: 7, head, body: "", tasksRepo: "acme/tasks", gh: g, cache, now });
+  const ask = (/** @type {string} */ head, /** @type {number} */ now, g = finding) => a.acceptanceOf({ nwo: "acme/app", pr: 7, head, html: "", tasksRepo: "acme/tasks", gh: g, cache, now });
   ask(HEAD, 1000); ask(HEAD, 1000 + 1800);
   assert.equal(searches, 1, "a task found, the same head within the hour: asked once");
   ask("b".repeat(40), 1000 + 1801);
@@ -220,10 +251,20 @@ test("the task is asked for again on a new head, and otherwise at most hourly", 
   assert.deepEqual(ask("c".repeat(40), 9001).readable && ask("c".repeat(40), 9001).tasks, [12], "found on the next look");
   // A pull request's entry goes once it's an hour old, looked up or not.
   const kept = new Map();
-  a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", gh: finding, cache: kept, now: 1000 });
+  a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, html: "", tasksRepo: "acme/tasks", gh: finding, cache: kept, now: 1000 });
   assert.equal(kept.has("acme/app#7"), true, "control: kept");
-  a.acceptanceOf({ nwo: "acme/app", pr: 8, head: HEAD, body: "", tasksRepo: "acme/tasks", gh: finding, cache: kept, now: 1000 + 3601 });
+  a.acceptanceOf({ nwo: "acme/app", pr: 8, head: HEAD, html: "", tasksRepo: "acme/tasks", gh: finding, cache: kept, now: 1000 + 3601 });
   assert.equal(kept.has("acme/app#7"), false, "#7's, an hour old, is gone");
+  // Which tasks is kept, never what they ask: a criterion added since is asked for on the next look.
+  let body = TASK;
+  searches = 0;
+  const edited = new Map();
+  const editing = (/** @type {string[]} */ args) => (args.includes("repos/acme/tasks/issues/12") ? { ok: true, out: JSON.stringify(body) } : finding(args));
+  const look = () => a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, html: rendered("## Acceptance evidence\n\n1. a\n2. b\n3. c\n"), tasksRepo: "acme/tasks", gh: editing, cache: edited, now: 1000 });
+  assert.deepEqual(look(), { readable: true, tasks: [12], criteria: 3, missing: [] });
+  body = rendered("### Acceptance criteria\n\n- one\n- two\n- three\n- four\n");
+  assert.deepEqual(look(), { readable: true, tasks: [12], criteria: 4, missing: [4] }, "the criterion added since");
+  assert.equal(searches, 1, "the task itself kept");
   void gh;
 });
 
@@ -281,13 +322,31 @@ test("an answer from GitHub that doesn't read as one is unread, never an empty d
   for (const out of ["", "not json", "{}"]) {
     assert.equal(a.pullBody("acme/app", 7, { gh: () => ({ ok: true, out }) }).ok, false, JSON.stringify(out));
   }
-  assert.deepEqual(a.pullBody("acme/app", 7, { gh: () => ({ ok: true, out: JSON.stringify("") }) }), { ok: true, body: "" }, "an empty description, as GitHub says it");
+  assert.deepEqual(a.pullBody("acme/app", 7, { gh: () => ({ ok: true, out: JSON.stringify("") }) }), { ok: true, html: "" }, "an empty description, as GitHub says it");
   const ok = (/** @type {string} */ out) => ({ ok: true, out });
   const cache = new Map();
-  const garbled = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache, gh: github({
+  const garbled = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, html: "", tasksRepo: "acme/tasks", cache, gh: github({
     "search/issues": ok("false\n12"), "repos/acme/tasks/issues/12/comments": ok(JSON.stringify(checkpoint("acme/app#7"))), "repos/acme/tasks/issues/12": ok("") }) });
   assert.equal(garbled.readable, false, "a task body that doesn't read");
-  assert.equal(cache.size, 0, "and nothing kept for it");
+  // What it asks is never kept: read again, it's had.
+  const again = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, html: "", tasksRepo: "acme/tasks", cache, gh: github({
+    "search/issues": ok("false\n12"), "repos/acme/tasks/issues/12/comments": ok(JSON.stringify(checkpoint("acme/app#7"))), "repos/acme/tasks/issues/12": ok(JSON.stringify(TASK)) }) });
+  assert.deepEqual(again, { readable: true, tasks: [12], criteria: 3, missing: [1, 2, 3] });
+  // HTML that isn't GitHub's, the task's or the description's: unknown, never a pass.
+  const reads = (/** @type {string} */ task) => github({
+    "search/issues": ok("false\n12"), "repos/acme/tasks/issues/12/comments": ok(JSON.stringify(checkpoint("acme/app#7"))), "repos/acme/tasks/issues/12": ok(JSON.stringify(task)) });
+  assert.equal(a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, html: "", tasksRepo: "acme/tasks", cache: new Map(), gh: reads("<h3>Acceptance criteria</h3>\n<ul>\n<li>a\n") }).readable, false, "the task's");
+  assert.equal(a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, html: "<h2>Acceptance evidence</h2>\n<ol>\n<li>a\n", tasksRepo: "acme/tasks", cache: new Map(), gh: reads(TASK) }).readable, false, "the description's");
+  // Each asked for as GitHub renders it, not as it's written.
+  /** @type {string[][]} */ const asked = [];
+  const asking = (/** @type {string[]} */ args) => { asked.push(args); return reads(TASK)(args); };
+  a.pullBody("acme/app", 7, { gh: asking });
+  a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, html: "", tasksRepo: "acme/tasks", cache: new Map(), gh: asking });
+  for (const path of ["repos/acme/app/pulls/7", "repos/acme/tasks/issues/12"]) {
+    const read = asked.find((args) => args.includes(path)) ?? [];
+    assert.ok(read.includes("Accept: application/vnd.github.html+json"), `${path}: ${read.join(" ")}`);
+    assert.match(read.join(" "), /\.body_html\b/, path);
+  }
 });
 
 test("a criterion without evidence is one standing alert, and the tick's log names the criteria", async () => {

@@ -933,7 +933,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   let acceptance = null;
   if (profile.tasks?.repo) {
     const desc = pullBody(nwo, pr);
-    acceptance = "why" in desc ? { readable: false, why: desc.why } : acceptanceOf({ nwo, pr, head: pin.sha, body: desc.body, tasksRepo: profile.tasks.repo });
+    acceptance = "why" in desc ? { readable: false, why: desc.why } : acceptanceOf({ nwo, pr, head: pin.sha, html: desc.html, tasksRepo: profile.tasks.repo });
   }
 
   let ledgerBlockers = null, ledgerBlockerIds = null;

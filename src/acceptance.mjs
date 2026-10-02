@@ -8,16 +8,26 @@
  * which may be public: the issue, in the repository the profile names as
  * where tasks live (`tasks.repo`), whose latest checkpoint names the pull
  * request. A pull request no task's checkpoint names delivers none.
+ *
+ * Both are read as GitHub renders them, never as they're written: GitHub's own
+ * HTML of the task and of the description, whose headings, lists and numbers
+ * are what a reader sees, however the Markdown spelled them.
  */
 import { gh as runGh } from "./github/calls.mjs";
 import { netTimeoutMs, netFailure } from "./net-bound.mjs";
 
-/** How long the tasks found for a pull request at a head are kept before they're looked for again, in seconds. */
+/**
+ * How long the tasks found for a pull request at a head are kept before
+ * they're looked for again, in seconds. What they ask is read each time.
+ */
 const TASK_KEPT_SECONDS = 3600;
 /** The line a checkpoint comment begins with. */
 const CHECKPOINT = "<!-- checkpoint v1 -->";
+/** How a body is asked for as GitHub renders it. */
+const RENDERED = "Accept: application/vnd.github.html+json";
 /** @typedef {(args: string[]) => { ok: boolean, out: string, err?: string }} Gh */
-/** @typedef {{ head: string, at: number, tasks: number[], criteria: number }} Kept */
+/** @typedef {{ head: string, at: number, tasks: number[] }} Kept */
+/** @typedef {{ tag: string, attrs: string, kids: Node[] }} El @typedef {El | string} Node */
 /** The tasks found for each pull request, by `owner/name#N`, for as long as this process runs. @type {Map<string, Kept>} */
 const KEPT = new Map();
 
@@ -28,88 +38,116 @@ function ghApi(args) {
   catch (e) { return { ok: false, out: "", err: netFailure(e) }; }
 }
 
+/** The elements HTML never closes. */
+const VOID = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
+/** A tag as GitHub writes one: lower case, each attribute's value in double quotes. */
+const TAG = /<(\/?)([a-z][a-z0-9]*)((?: [a-z][a-z0-9-]*(?:="[^"]*")?)*)>/y;
+
 /**
- * The lines of `body` a reader sees: an HTML comment, a template's
- * placeholders say, and a fenced block of code are no part of it.
- * @param {unknown} body
+ * The elements of `html`, as GitHub renders a body, or null where it isn't as
+ * GitHub writes it: a "<" that opens no tag, as GitHub escapes every other, or
+ * tags that don't close in the order they opened.
+ * @param {string} html @returns {El | null}
  */
-function visible(body) {
-  const text = String(body ?? "").replace(/<!--[\s\S]*?(?:-->|$)/g, "");
-  /** @type {string[]} */ const shown = [];
-  let fence = "";
-  for (const l of text.split(/\r?\n/)) {
-    const m = /^ {0,3}(`{3,}|~{3,})/.exec(l);
-    // Closed only by a fence alone on its line: one with an info string is inside.
-    if (fence) { if (m && m[1][0] === fence[0] && m[1].length >= fence.length && /^ {0,3}(`{3,}|~{3,})\s*$/.test(l)) fence = ""; continue; }
-    if (m) { fence = m[1]; continue; }
-    shown.push(l);
+function tree(html) {
+  /** @type {El} */ const root = { tag: "", attrs: "", kids: [] };
+  const open = [root];
+  for (let at = 0; at < html.length;) {
+    const lt = html.indexOf("<", at);
+    const text = lt < 0 ? html.slice(at) : html.slice(at, lt);
+    if (text) open[open.length - 1].kids.push(text);
+    if (lt < 0) break;
+    TAG.lastIndex = lt;
+    const m = TAG.exec(html);
+    if (!m) return null;
+    at = TAG.lastIndex;
+    if (m[1]) {
+      if (open.length < 2 || open[open.length - 1].tag !== m[2]) return null;
+      open.pop();
+      continue;
+    }
+    const el = { tag: m[2], attrs: m[3], kids: [] };
+    open[open.length - 1].kids.push(el);
+    if (!VOID.has(m[2])) open.push(el);
   }
-  return shown;
+  return open.length === 1 ? root : null;
+}
+
+/** The text a node shows, its tags aside. @param {Node} n @returns {string} */
+const textOf = (n) => (typeof n === "string" ? n : n.kids.map(textOf).join(""));
+
+/**
+ * What every section headed `title`, at any level, holds: the body's blocks
+ * after its heading, through its own subsections, to the next heading of its
+ * level or above. A heading inside another block, a list item, is part of it.
+ * @param {El} root @param {string} title @returns {Node[]}
+ */
+function sections(root, title) {
+  /** @type {Node[]} */ const held = [];
+  let level = 0;
+  for (const n of root.kids) {
+    const h = typeof n === "string" ? null : /^h([1-6])$/.exec(n.tag);
+    if (h && Number(h[1]) <= level) level = 0;
+    if (h && !level && textOf(n).toLowerCase() === title.toLowerCase()) { level = Number(h[1]); continue; }
+    if (level) held.push(n);
+  }
+  return held;
+}
+
+/** A whole-number attribute, as GitHub writes one, or null. @param {string} attrs @param {string} name */
+function numberIn(attrs, name) {
+  const m = new RegExp(` ${name}="(-?\\d+)"`).exec(attrs);
+  return m ? Number(m[1]) : null;
 }
 
 /**
- * The lines of the Markdown section headed `title`, at any level, as a reader
- * sees it: through its own subsections, to the next heading of its level or
- * above.
- * @param {unknown} body @param {string} title
+ * The list items among `nodes` that no other item holds, whatever block holds
+ * them, each with the number a reader sees beside it: an ordered list's,
+ * counted from its start or from an item's own value; none for a bullet.
+ * @param {Node[]} nodes @returns {{ item: El, number: number | null }[]}
  */
-function section(body, title) {
-  const lines = visible(body);
-  // A heading is indented three spaces at most: four in, it's code.
-  const heading = new RegExp(`^ {0,3}(#{1,6})\\s+${title}(?:\\s+#+)?\\s*$`, "i");
-  let at = -1, level = 0;
-  for (let i = 0; i < lines.length && at < 0; i++) {
-    const h = heading.exec(lines[i].trimEnd());
-    if (h) { at = i; level = h[1].length; }
-  }
-  if (at < 0) return [];
-  const rest = lines.slice(at + 1);
-  const end = rest.findIndex((l) => { const h = /^ {0,3}(#{1,6})\s/.exec(l); return h !== null && h[1].length <= level; });
-  return end < 0 ? rest : rest.slice(0, end);
+function topItems(nodes) {
+  /** @type {{ item: El, number: number | null }[]} */ const items = [];
+  const walk = (/** @type {Node} */ n) => {
+    if (typeof n === "string") return;
+    if (n.tag === "li") { items.push({ item: n, number: null }); return; }
+    const ordered = n.tag === "ol";
+    let next = numberIn(n.attrs, "start") ?? 1;
+    for (const k of n.kids) {
+      if (!ordered || typeof k === "string" || k.tag !== "li") { walk(k); continue; }
+      const number = numberIn(k.attrs, "value") ?? next;
+      items.push({ item: k, number });
+      next = number + 1;
+    }
+  };
+  for (const n of nodes) walk(n);
+  return items;
 }
 
 /**
- * The markers of a list's top-level items among `lines`, as Markdown nests
- * them: "-", "+", "*" or an item's number. An item indented as far as the
- * text of the top-level item before it is part of that one, as a line of its
- * "Verified by" is; a list indented four spaces or more is code.
- * @param {string[]} lines @returns {string[]}
+ * How many acceptance criteria a task names, from GitHub's HTML of its body:
+ * the items of its "Acceptance criteria" section. Null where the HTML isn't
+ * GitHub's.
+ * @param {unknown} html @returns {number | null}
  */
-function topItems(lines) {
-  /** @type {string[]} */ const markers = [];
-  let text = -1;
-  for (const l of lines) {
-    // An ordered marker is nine digits at most: past that, it's text.
-    const m = /^( *)([-*+]|\d{1,9}[.)])( +)\S/.exec(l);
-    if (!m) continue;
-    const indent = m[1].length;
-    if (text < 0 ? indent > 3 : indent >= text) continue;
-    markers.push(m[2]);
-    // Where its text begins: past the marker and its spaces, or one space on
-    // where five or more begin code within it.
-    text = indent + m[2].length + (m[3].length > 4 ? 1 : m[3].length);
-  }
-  return markers;
-}
-
-/**
- * How many acceptance criteria a task's body names: the top-level items of its
- * "Acceptance criteria" section.
- * @param {unknown} body
- */
-export function criteriaOf(body) {
-  return topItems(section(body, "Acceptance criteria")).length;
+export function criteriaOf(html) {
+  const root = tree(String(html ?? ""));
+  return root && topItems(sections(root, "Acceptance criteria")).length;
 }
 
 /**
  * The criteria a pull request's "Acceptance evidence" section gives evidence
- * for: each numbered entry with something after its number.
- * @param {unknown} body @returns {Set<number>}
+ * for, from GitHub's HTML of its description: each numbered entry with
+ * something in it, by the number a reader sees. Null where the HTML isn't
+ * GitHub's.
+ * @param {unknown} html @returns {Set<number> | null}
  */
-export function evidenceOf(body) {
+export function evidenceOf(html) {
+  const root = tree(String(html ?? ""));
+  if (!root) return null;
   /** @type {Set<number>} */ const given = new Set();
-  // Its top-level numbered entries: one nested under another is part of it.
-  for (const marker of topItems(section(body, "Acceptance evidence"))) if (/^\d/.test(marker)) given.add(Number.parseInt(marker, 10));
+  for (const { item, number } of topItems(sections(root, "Acceptance evidence")))
+    if (number !== null && item.kids.some((k) => typeof k !== "string" || k.trim())) given.add(number);
   return given;
 }
 
@@ -142,19 +180,22 @@ function strings(out) {
 }
 
 /**
- * The tasks in `tasksRepo` whose latest checkpoint names `nwo#pr`, by number,
- * and how many acceptance criteria they name between them: none where one
- * names none. Found by a search, and each checked by reading its checkpoints,
- * as the search matches one naming the pull request once and another since.
+ * Why the acceptance evidence couldn't be read. Said on a pull request that
+ * may be public, so never naming the private repository or a task in it; what
+ * went wrong is kept with the input, which stays in the store.
+ * @param {string} why @param {string | undefined} detail
+ */
+const unread = (why, detail) => ({ ok: /** @type {const} */ (false), why, detail: detail ?? "" });
+
+/**
+ * The tasks in `tasksRepo` whose latest checkpoint names `nwo#pr`, by number.
+ * Found by a search, and each checked by reading its checkpoints, as the
+ * search matches one naming the pull request once and another since.
  * @param {{ nwo: string, pr: number, tasksRepo: string, gh: Gh }} o
- * @returns {{ ok: true, tasks: number[], criteria: number } | { ok: false, why: string, detail: string }}
+ * @returns {{ ok: true, tasks: number[] } | { ok: false, why: string, detail: string }}
  */
 function tasksOf({ nwo, pr, tasksRepo, gh }) {
   const named = `${nwo}#${pr}`;
-  // Said on a pull request that may be public, so never naming the private
-  // repository or a task in it; what went wrong is kept with the input, which
-  // stays in the store.
-  const unread = (/** @type {string} */ why, /** @type {string | undefined} */ detail) => ({ ok: /** @type {const} */ (false), why, detail: detail ?? "" });
   // Each page says whether GitHub searched everything, then its issues.
   const found = gh(["--paginate", `search/issues?q=${encodeURIComponent(`repo:${tasksRepo} is:issue "${named}" in:comments`)}&per_page=100`, "--jq", ".incomplete_results, .items[].number"]);
   if (!found.ok) return unread("the task it delivers couldn't be looked for", found.err);
@@ -164,35 +205,48 @@ function tasksOf({ nwo, pr, tasksRepo, gh }) {
   const numbers = lines.filter((l) => l !== "false").map(Number);
   if (numbers.some((n) => !Number.isSafeInteger(n) || n < 1)) return unread("the task it delivers couldn't be looked for", "the search didn't read as GitHub's");
   /** @type {number[]} */ const tasks = [];
-  let criteria = 0, blank = false;
   for (const n of [...new Set(numbers)].sort((a, b) => a - b)) {
     const comments = gh(["--paginate", `repos/${tasksRepo}/issues/${n}/comments?per_page=100`, "--jq", ".[].body | @json"]);
     const bodies = comments.ok ? strings(comments.out) : null;
     if (!bodies) return unread("the checkpoints of the task it may deliver couldn't be read", comments.err ?? "they don't read as GitHub's");
     // GitHub's names are the same whatever their letters' case.
-    if (checkpointNames(bodies)?.toLowerCase() !== named.toLowerCase()) continue;
-    const issue = gh([`repos/${tasksRepo}/issues/${n}`, "--jq", ".body // \"\" | @json"]);
-    const body = issue.ok ? one(issue.out) : null;
-    if (body === null) return unread("the task it delivers couldn't be read", issue.err ?? "it doesn't read as GitHub's");
-    const c = criteriaOf(body);
-    if (!c) blank = true;
-    tasks.push(n);
-    criteria += c;
+    if (checkpointNames(bodies)?.toLowerCase() === named.toLowerCase()) tasks.push(n);
   }
-  return { ok: true, tasks, criteria: blank ? 0 : criteria };
+  return { ok: true, tasks };
 }
 
 /**
- * The acceptance evidence of pull request `pr` of `nwo` at `head`, its
- * description `body`, against the tasks it delivers in `tasksRepo`: which it
- * delivers, how many criteria they name, and which have no evidence. Not
- * `readable` where the tasks couldn't be looked for, which is never "none".
- * The tasks found are kept per pull request, and looked for again on a new
- * head, or an hour on; none found is looked for again each time.
- * @param {{ nwo: string, pr: number, head: string, body: unknown, tasksRepo: string, gh?: Gh, cache?: Map<string, Kept>, now?: number }} o
+ * How many acceptance criteria `tasks` in `tasksRepo` name between them, each
+ * read as GitHub renders it now: none where one names none.
+ * @param {{ tasks: number[], tasksRepo: string, gh: Gh }} o
+ * @returns {{ ok: true, criteria: number } | { ok: false, why: string, detail: string }}
+ */
+function criteriaIn({ tasks, tasksRepo, gh }) {
+  let criteria = 0, blank = false;
+  for (const n of tasks) {
+    const issue = gh(["-H", RENDERED, `repos/${tasksRepo}/issues/${n}`, "--jq", ".body_html // \"\" | @json"]);
+    const html = issue.ok ? one(issue.out) : null;
+    const c = html === null ? null : criteriaOf(html);
+    if (c === null) return unread("the task it delivers couldn't be read", issue.err ?? "it doesn't read as GitHub's");
+    if (!c) blank = true;
+    criteria += c;
+  }
+  return { ok: true, criteria: blank ? 0 : criteria };
+}
+
+/**
+ * The acceptance evidence of pull request `pr` of `nwo` at `head`, `html` its
+ * description as GitHub renders it, against the tasks it delivers in
+ * `tasksRepo`: which it delivers, how many criteria they name, and which have
+ * no evidence. Not `readable` where the tasks couldn't be looked for, which is
+ * never "none", or either couldn't be read. Which tasks it delivers is kept
+ * per pull request, and looked for again on a new head, or an hour on; none
+ * found is looked for again each time. What they ask is read each time, as a
+ * task may gain a criterion while it's delivered.
+ * @param {{ nwo: string, pr: number, head: string, html: unknown, tasksRepo: string, gh?: Gh, cache?: Map<string, Kept>, now?: number }} o
  * @returns {{ readable: true, tasks: number[], criteria: number, missing: number[] } | { readable: false, why: string, detail: string }}
  */
-export function acceptanceOf({ nwo, pr, head, body, tasksRepo, gh = ghApi, cache = KEPT, now = Math.floor(Date.now() / 1000) }) {
+export function acceptanceOf({ nwo, pr, head, html, tasksRepo, gh = ghApi, cache = KEPT, now = Math.floor(Date.now() / 1000) }) {
   // What's an hour old goes, a closed pull request's with it.
   for (const [k, v] of cache) if (now - v.at > TASK_KEPT_SECONDS) cache.delete(k);
   const key = `${nwo}#${pr}`;
@@ -201,23 +255,27 @@ export function acceptanceOf({ nwo, pr, head, body, tasksRepo, gh = ghApi, cache
     const t = tasksOf({ nwo, pr, tasksRepo, gh });
     // Kept only once read: one that couldn't be is looked for again next time.
     if ("why" in t) return { readable: false, why: t.why, detail: t.detail };
-    kept = { head, at: now, tasks: t.tasks, criteria: t.criteria };
+    kept = { head, at: now, tasks: t.tasks };
     // And only once found: a checkpoint naming the pull request may be
     // written after it, and is read on the next tick.
     if (t.tasks.length) cache.set(key, kept);
   }
   if (!kept.tasks.length) return { readable: true, tasks: [], criteria: 0, missing: [] };
-  return { readable: true, tasks: kept.tasks, criteria: kept.criteria, missing: missingEvidence(kept.criteria, evidenceOf(body)) };
+  const c = criteriaIn({ tasks: kept.tasks, tasksRepo, gh });
+  if ("why" in c) return { readable: false, why: c.why, detail: c.detail };
+  const given = evidenceOf(html);
+  if (!given) return { readable: false, why: "its description couldn't be read", detail: "it doesn't read as GitHub's" };
+  return { readable: true, tasks: kept.tasks, criteria: c.criteria, missing: missingEvidence(c.criteria, given) };
 }
 
 /**
- * Pull request `pr`'s description, as GitHub has it now, for its acceptance
- * evidence: `body`, or why it couldn't be read.
+ * Pull request `pr`'s description, as GitHub renders it now, for its
+ * acceptance evidence: `html`, or why it couldn't be read.
  * @param {string} nwo @param {number} pr @param {{ gh?: Gh }} [o]
- * @returns {{ ok: true, body: string } | { ok: false, why: string }}
+ * @returns {{ ok: true, html: string } | { ok: false, why: string }}
  */
 export function pullBody(nwo, pr, { gh = ghApi } = {}) {
-  const got = gh([`repos/${nwo}/pulls/${pr}`, "--jq", ".body // \"\" | @json"]);
-  const body = got.ok ? one(got.out) : null;
-  return body === null ? { ok: false, why: `its description couldn't be read: ${got.err ?? "it doesn't read as GitHub's"}` } : { ok: true, body };
+  const got = gh(["-H", RENDERED, `repos/${nwo}/pulls/${pr}`, "--jq", ".body_html // \"\" | @json"]);
+  const html = got.ok ? one(got.out) : null;
+  return html === null ? { ok: false, why: `its description couldn't be read: ${got.err ?? "it doesn't read as GitHub's"}` } : { ok: true, html };
 }

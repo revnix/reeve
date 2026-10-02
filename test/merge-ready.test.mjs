@@ -103,6 +103,11 @@ test("a task's criteria are the items of its Acceptance criteria section, and th
   // A heading may close with hashes.
   assert.deepEqual([...a.evidenceOf("## Acceptance evidence ##\n\n1. evidence\n")], [1], "closing hashes");
   assert.equal(a.criteriaOf("### Acceptance criteria ###\n\n- one\n"), 1);
+  // A section runs through its own subsections, to a heading of its level or above.
+  assert.equal(a.criteriaOf("## Acceptance criteria\n\n- one\n\n### More of them\n\n- two\n\n## Allowed paths\n\n- not one\n"), 2, "a subsection's criteria");
+  assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n1. a\n\n### The rest\n\n2. b\n\n# Tests\n\n3. not\n")].sort(), [1, 2], "a subsection's evidence");
+  // An ordered marker is nine digits at most: past that, it's text.
+  assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n0000000001. not an entry\n")], [], "ten digits");
   assert.equal(a.criteriaOf("### Acceptance criteria\n\n    - in a code block, not a list\n"), 0, "four spaces in is code");
   assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n  1. a test\n   2. another\n")].sort(), [1, 2]);
 });

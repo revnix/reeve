@@ -47,15 +47,21 @@ function visible(body) {
   return shown;
 }
 
-/** The lines of the Markdown section headed `title`, at any level, to the next heading, as a reader sees it. @param {unknown} body @param {string} title */
+/**
+ * The lines of the Markdown section headed `title`, at any level, as a reader
+ * sees it: through its own subsections, to the next heading of its level or
+ * above.
+ * @param {unknown} body @param {string} title
+ */
 function section(body, title) {
   const lines = visible(body);
   // A heading is indented three spaces at most: four in, it's code.
-  const heading = new RegExp(`^ {0,3}#{1,6}\\s+${title}(?:\\s+#+)?\\s*$`, "i");
+  const heading = new RegExp(`^ {0,3}(#{1,6})\\s+${title}(?:\\s+#+)?\\s*$`, "i");
   const at = lines.findIndex((l) => heading.test(l.trimEnd()));
   if (at < 0) return [];
+  const level = /** @type {RegExpExecArray} */ (heading.exec(lines[at].trimEnd()))[1].length;
   const rest = lines.slice(at + 1);
-  const end = rest.findIndex((l) => /^ {0,3}#{1,6}\s/.test(l));
+  const end = rest.findIndex((l) => { const h = /^ {0,3}(#{1,6})\s/.exec(l); return h !== null && h[1].length <= level; });
   return end < 0 ? rest : rest.slice(0, end);
 }
 
@@ -70,7 +76,8 @@ function topItems(lines) {
   /** @type {string[]} */ const markers = [];
   let text = -1;
   for (const l of lines) {
-    const m = /^( *)([-*+]|\d+[.)])( +)\S/.exec(l);
+    // An ordered marker is nine digits at most: past that, it's text.
+    const m = /^( *)([-*+]|\d{1,9}[.)])( +)\S/.exec(l);
     if (!m) continue;
     const indent = m[1].length;
     if (text < 0 ? indent > 3 : indent >= text) continue;

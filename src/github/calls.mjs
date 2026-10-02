@@ -2,9 +2,9 @@
 /**
  * Every call reeve makes to GitHub, counted (#168).
  *
- * Each place that runs `gh` runs it here, so the requests a tick makes of
- * GitHub, and those for each pull request it reads, can be measured before
- * they're cut. Requests, not runs of gh: a paged read makes one for each page,
+ * Each place that runs `gh` runs it here, and reeve's App counts here what it
+ * sends with fetch, so the requests a tick makes of GitHub, and those for each
+ * pull request it reads, can be measured before they're cut. Requests, not runs of gh: a paged read makes one for each page,
  * which gh says on stderr when GH_DEBUG is set, one `* Request to` line each,
  * with no header or body. Each is counted under the identity it reads as,
  * reeve's App or the login on the machine, and its kind: the command, or the
@@ -51,14 +51,29 @@ export function kindOf(args) {
 export function gh(args, options = {}, { who = "ambient" } = {}) {
   const r = runner("gh", args, { ...options, encoding: "utf8", env: { ...(options.env ?? process.env), GH_DEBUG: "1" } });
   const stderr = String(r.stderr ?? "");
-  const key = `${who}\u0000${kindOf(args)}`;
-  const was = counted.get(key) ?? { calls: 0, requests: 0 };
-  counted.set(key, { calls: was.calls + 1, requests: was.requests + (stderr.match(/^\* Request to /gm) ?? []).length });
+  note(who, kindOf(args), (stderr.match(/^\* Request to /gm) ?? []).length);
   const said = stderr.split("\n").filter((line) => !REQUEST_LINE.test(line)).join("\n");
   const failed = { status: r.status, signal: r.signal, stdout: r.stdout, stderr: said };
   if (r.error) throw Object.assign(r.error, failed);
   if (r.status !== 0) throw Object.assign(new Error(`Command failed: gh ${args.join(" ")}\n${said}`), failed);
   return String(r.stdout ?? "");
+}
+
+/**
+ * One request reeve made of GitHub without gh, to `path`, counted as gh's are,
+ * whether or not it was answered: reeve's App signing in, which sends its own
+ * JWT with fetch. Each asked again is one more.
+ * @param {string} path @param {{ who?: Who }} [o]
+ */
+export function countRequest(path, { who = "ambient" } = {}) {
+  note(who, `api ${shape(path)}`, 1);
+}
+
+/** One call, under `who` and of `kind`, that made `requests` requests. @param {Who} who @param {string} kind @param {number} requests */
+function note(who, kind, requests) {
+  const key = `${who}\u0000${kind}`;
+  const was = counted.get(key) ?? { calls: 0, requests: 0 };
+  counted.set(key, { calls: was.calls + 1, requests: was.requests + requests });
 }
 
 /**

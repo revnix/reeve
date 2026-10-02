@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { resolveHome } from "../home.mjs";
 import { netTimeoutMs } from "../net-bound.mjs";
 
-import { gh as runGh } from "./calls.mjs";
+import { gh as runGh, countRequest } from "./calls.mjs";
 // A FUNCTION, not a constant. As a module-level constant this was evaluated
 // at import -- before `bin/reeve` had resolved `--home` -- and it consulted
 // `homedir()` rather than the reeve home at all, so no home setting of any
@@ -87,6 +87,8 @@ async function apiAsApp(jwt, path, init = {}, { pause = (ms) => new Promise((r) 
   let why = "";
   for (let attempt = 1; attempt <= 2; attempt++) {
     if (attempt > 1) await pause(2000);
+    // Counted as it's sent, answered or not (#168).
+    countRequest(path, { who: "app" });
     try {
       const r = await fetch(`https://api.github.com/${path}`, {
         ...init,

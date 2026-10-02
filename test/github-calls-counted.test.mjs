@@ -107,13 +107,18 @@ test("a tick logs the GitHub calls it made, in all and per pull request, and non
   };
   try {
     // The tick as the harness runs it, and the same with three more calls of its own, and one before it starts.
-    const plain = logged((await run({ openPrs: () => [42], evaluate: () => ({ ...EVAL }) })).log);
+    const plainLog = (await run({ openPrs: () => [42], evaluate: () => ({ ...EVAL }) })).log;
+    const plain = logged(plainLog);
+    assert.doesNotMatch(plainLog, /outside a tick/, "none made before it, none said");
     calls.gh(["api", "repos/o/r"]);
     let evaluated = 0;
-    const more = logged((await run({
+    const moreLog = (await run({
       openPrs: () => { calls.gh(["pr", "list", "--repo", "o/r"]); return [42]; },
       evaluate: () => { evaluated++; calls.gh(["api", "repos/o/r/pulls/42"], {}, { who: "app" }); calls.gh(["api", "repos/o/r/pulls/42/reviews"]); return { ...EVAL }; },
-    })).log);
+    })).log;
+    const more = logged(moreLog);
+    // The one before it, said apart, as made between ticks.
+    assert.match(moreLog, /github: 1 request\(s\) in 1 call\(s\) outside a tick \(ambient 1\)\n/, moreLog.slice(-1500));
     // The list once, and each evaluation's two: none from before the tick.
     assert.ok(evaluated >= 1);
     assert.equal(more.total - plain.total, 1 + 2 * evaluated, `the tick's own, and not the one before it: ${JSON.stringify({ plain, more, evaluated })}`);
@@ -167,5 +172,82 @@ test("a tick that stops early still logs the GitHub calls it made", async () => 
     // The open pull requests couldn't be listed: the tick ends there.
     const r = await run({ openPrs: () => { calls.gh(["pr", "list", "--repo", "o/r"]); return null; } });
     assert.match(r.log, /github: 1 request\(s\) in 1 call\(s\) this tick/, r.log.slice(-1200));
+  } finally { calls.runGhWith(was); }
+});
+
+test("reeve's App's own requests, made signing in, are counted as the App's, each one asked again as well", async () => {
+  const calls = await counting();
+  const { findInstallation, mintInstallationToken } = await import("../src/github/app.mjs");
+  const was = globalThis.fetch;
+  let asked = 0;
+  // GitHub, as fetch reaches it: the first request gets no answer, and each after it is answered.
+  globalThis.fetch = /** @type {any} */ (async () => {
+    if (++asked === 1) throw new TypeError("fetch failed");
+    return new Response(JSON.stringify({ id: 5, token: "t" }), { status: 200 });
+  });
+  try {
+    calls.takeCalls();
+    const pause = async () => {};
+    assert.equal((await findInstallation("jwt", "o/r", { pause })).ok, true);
+    assert.equal((await mintInstallationToken("jwt", 5, { pause })).ok, true);
+    const got = calls.takeCalls();
+    assert.equal(asked, 3, "control: the installation was asked for twice");
+    assert.deepEqual(got.byWho, { app: 3 }, JSON.stringify(got));
+    assert.equal(got.calls, 3);
+    assert.deepEqual(got.byKind, { "api repos/:nwo/installation": 2, "api app/installations/:n/access_tokens": 1 });
+  } finally { globalThis.fetch = was; }
+});
+
+test("the daemon logs every GitHub request it makes, those between ticks too: withdrawing after a tick threw, and as it stops", async () => {
+  const calls = await counting();
+  const daemon = await import("../src/daemon.mjs");
+  const { open } = await import("../src/db/ops.mjs");
+  const { OFFLINE_READS } = await import("./fixtures/offline-github.mjs");
+  let ran = 0;
+  const answer = answers("[]");
+  const was = calls.runGhWith(/** @type {any} */ ((...a) => { ran++; return answer(...a); }));
+  const dir = tempDir("reeve-gh-between-");
+  const head = (/** @type {number} */ n) => String(n).repeat(40);
+  const ctx = {
+    ...OFFLINE_READS,
+    nwo: "o/r", profile: { identity: { key: "o/r", defaultBranch: "main" }, authority: { policy: "propose_only" },
+      ci: { provider: "github-actions", requiredChecks: [] }, watch: { maxWorkers: 1, maxOpenPrs: 20 }, reviewers: [] },
+    db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"), haltMarker: join(dir, "HALT"),
+    execute: false, shadow: false, running: 0,
+    openPrs: () => [7, 8], prState: () => "OPEN",
+    evaluate: (/** @type {any} */ { pr: n }) => ({ ok: true, pr: n, state: "open", head: head(n), title: "t", headRef: `f${n}`,
+      baseRef: "main", updatedAt: "2026-09-26T10:00:00Z", verdict: { state: "PASS", head: head(n), summary: "pass", clauses: [] },
+      rounds: { n: 1, softCap: 5, hardCap: 10, unspilledCritical: 0 }, checks: { verdict: "GREEN", caused: [], failing: [] },
+      reviewers: [], threads: { readable: true, total: 0, unresolved: 0, seen: 0 }, settled: { settled: true } }),
+    publish: async (/** @type {any} */ a) => ({ ok: true, id: 100 + Number(a.verdict.head[0]), conclusion: "success", name: "merge-policy" }),
+    // Each withdrawal asks GitHub once, as reeve's App.
+    withdraw: async (/** @type {any} */ a) => { calls.gh(["api", `repos/o/r/check-runs/${a.id ?? 1}`, "-X", "PATCH"], {}, { who: "app" }); return { ok: true }; },
+    observe: () => ({ observations: [], incomplete: false, threads: { readable: true, total: 0, unresolved: 0, seen: 0 } }),
+    derivePr: () => ({}), reviewState: () => ({ readable: true, total: 0, open: 0, resolved: 0, unspilledCritical: 0, rounds: 1 }),
+  };
+  try {
+    await daemon.tick(ctx);
+    calls.takeCalls();
+    const before = readFileSync(ctx.logPath, "utf8").length;
+    ran = 0;
+    let ticks = 0;
+    // Stopped by its second tick, or after five seconds whatever it does.
+    const deadline = setTimeout(() => process.emit("SIGTERM"), 5000);
+    // The first tick throws, so both PASSes are withdrawn; the second publishes them again, and the stop withdraws them.
+    await daemon.run({ ...ctx, intervalMs: 20, tick: async (/** @type {any} */ c) => {
+      if (++ticks === 1) throw new Error("database is locked");
+      process.emit("SIGTERM");
+      return daemon.tick(c);
+    } });
+    clearTimeout(deadline);
+    const log = readFileSync(ctx.logPath, "utf8").slice(before);
+    const lines = [...log.matchAll(/github: (\d+) request\(s\) in (\d+) call\(s\)/g)];
+    assert.ok(ran >= 4, `control: both withdrawals asked GitHub for each PASS: ${ran}`);
+    assert.equal(lines.reduce((sum, m) => sum + Number(m[1]), 0), ran, `every request logged, once: ${log}`);
+    assert.ok(log.lastIndexOf("github: ") < log.indexOf("daemon stopped"), "the stop's withdrawals, before the daemon says it stopped: " + log);
+    // Said apart from the ticks', and for no pull request.
+    const outside = [...log.matchAll(/github: [^\n]*outside a tick[^\n]*/g)].map((m) => m[0]);
+    assert.ok(outside.length >= 2, log);
+    for (const line of outside) assert.doesNotMatch(line, /per pull request/, line);
   } finally { calls.runGhWith(was); }
 });

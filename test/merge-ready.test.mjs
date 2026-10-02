@@ -86,6 +86,7 @@ test("a task's criteria are the items of its Acceptance criteria section, and th
   // A list indented one to three spaces is top-level all the same; an item indented under one isn't.
   assert.equal(a.criteriaOf("### Acceptance criteria\n\n  - one\n    - a detail of it\n  - two\n"), 2);
   assert.equal(a.criteriaOf("### Acceptance criteria\n\n - one\n - two\n - three\n"), 3);
+  assert.equal(a.criteriaOf("### Acceptance criteria\n\n- one\n+ two\n* three\n"), 3, "every marker Markdown takes for a bullet");
   assert.equal(a.criteriaOf("### Acceptance criteria\n\n    - in a code block, not a list\n"), 0, "four spaces in is code");
   assert.deepEqual([...a.evidenceOf("## Acceptance evidence\n\n  1. a test\n   2. another\n")].sort(), [1, 2]);
 });
@@ -124,6 +125,10 @@ test("the task a pull request delivers is the one whose latest checkpoint names 
   // None names it: no task delivered.
   const none = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", gh: github({ "search/issues": ok("") }), cache: new Map() });
   assert.deepEqual(none, { readable: true, tasks: [], criteria: 0, missing: [] });
+  // Issues only: a pull request in the tasks' repository is no task.
+  /** @type {string[]} */ let asked = [];
+  a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache: new Map(), gh: (/** @type {string[]} */ args) => { asked = args; return ok(""); } });
+  assert.match(decodeURIComponent(asked.find((x) => x.startsWith("search/")) ?? ""), /\bis:issue\b/);
   // The search read whole: the task on its second page is found.
   const paged = a.acceptanceOf({ nwo: "acme/app", pr: 7, head: HEAD, body: "", tasksRepo: "acme/tasks", cache: new Map(), gh: (/** @type {string[]} */ args) => {
     if (args.some((x) => x.startsWith("search/"))) return ok(args.includes("--paginate") ? [...Array.from({ length: 100 }, (_, i) => 200 + i), 12].join("\n") : Array.from({ length: 100 }, (_, i) => 200 + i).join("\n"));

@@ -47,7 +47,7 @@ function section(body, title) {
  * @param {unknown} body
  */
 export function criteriaOf(body) {
-  const items = section(body, "Acceptance criteria").map((l) => /^( *)(?:[-*]|\d+[.)])\s+\S/.exec(l)).filter((m) => m !== null);
+  const items = section(body, "Acceptance criteria").map((l) => /^( *)(?:[-*+]|\d+[.)])\s+\S/.exec(l)).filter((m) => m !== null);
   const top = items.length ? /** @type {RegExpExecArray} */ (items[0])[1].length : 0;
   if (top > 3) return 0;
   return items.filter((m) => /** @type {RegExpExecArray} */ (m)[1].length < top + 2).length;
@@ -105,7 +105,7 @@ function tasksOf({ nwo, pr, tasksRepo, gh }) {
   // repository or a task in it; what went wrong is kept with the input, which
   // stays in the store.
   const unread = (/** @type {string} */ why, /** @type {string | undefined} */ detail) => ({ ok: /** @type {const} */ (false), why, detail: detail ?? "" });
-  const found = gh(["--paginate", `search/issues?q=${encodeURIComponent(`repo:${tasksRepo} "${named}" in:comments`)}&per_page=100`, "--jq", ".items[].number"]);
+  const found = gh(["--paginate", `search/issues?q=${encodeURIComponent(`repo:${tasksRepo} is:issue "${named}" in:comments`)}&per_page=100`, "--jq", ".items[].number"]);
   if (!found.ok) return unread("the task it delivers couldn't be looked for", found.err);
   const numbers = found.out.split("\n").filter(Boolean).map(Number);
   if (numbers.some((n) => !Number.isSafeInteger(n) || n < 1)) return unread("the task it delivers couldn't be looked for", "the search didn't read as GitHub's");

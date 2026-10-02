@@ -19430,4 +19430,22 @@ export const STUBS = [
               find: "  return all && all.length === 1 ? all[0] : null;",
               replace: "  return all?.[0] ?? \"\";" }],
   },
+  {
+    name: "criteria-every-bullet-marker",
+    why: "count a criterion only under some of Markdown's bullet markers. One under + would go unasked for evidence",
+    test: "test/merge-ready.test.mjs",
+    expectRed: "a task's criteria are the items of its Acceptance criteria section, and the evidence the numbered entries of the pull request's",
+    edits: [{ file: "src/acceptance.mjs",
+              find: "/^( *)(?:[-*+]|\\d+[.)])\\s+\\S/",
+              replace: "/^( *)(?:[-*]|\\d+[.)])\\s+\\S/" }],
+  },
+  {
+    name: "task-search-issues-only",
+    why: "search the tasks' repository's pull requests too. One whose comments name the pull request would be taken as a task",
+    test: "test/merge-ready.test.mjs",
+    expectRed: "the task a pull request delivers is the one whose latest checkpoint names it, found from the private side",
+    edits: [{ file: "src/acceptance.mjs",
+              find: "`repo:${tasksRepo} is:issue \"${named}\" in:comments`",
+              replace: "`repo:${tasksRepo} \"${named}\" in:comments`" }],
+  },
 ];

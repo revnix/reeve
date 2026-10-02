@@ -11,15 +11,15 @@
 // Deliberately absent: lines changed, PR count, token count. All three reward
 // churn, and all three were headline stats on the board this replaces.
 
-import { execFileSync } from "node:child_process";
 import { netTimeoutMs, netFailure } from "./net-bound.mjs";
 import { explainDecision } from "./decisions.mjs";
 import { SelectorError } from "./db/records.mjs";
 
+import { gh as runGh } from "./github/calls.mjs";
 const SPARK = "▁▂▃▄▅▆▇█";
 
 function sh(args) {
-  try { return { ok: true, out: execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim() }; }
+  try { return { ok: true, out: runGh(args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim() }; }
   catch (e) { return { ok: false, out: "", err: netFailure(e) }; }
 }
 

@@ -17,10 +17,10 @@ import { POLICY_APP, POLICY_CONTEXT, LEGACY_CONTEXTS } from "./github/reconciler
 import { reviewState } from "./review/derive.mjs";
 import { compare } from "./review/shadow.mjs";
 import { authenticate, apiAsInstallation, loadAppCredentials } from "./github/app.mjs";
-import { execFileSync } from "node:child_process";
 import { netTimeoutMs, netFailure } from "./net-bound.mjs";
 import { evidenceText, readEvidence, evidenceBehind } from "./published.mjs";
 
+import { gh as runGh } from "./github/calls.mjs";
 /**
  * The profile's CI settings, as far as this module reads them.
  * @typedef {{ ci?: { requiredChecks?: string[], reviewerStatusContexts?: string[], appSlug?: string } }} CiProfile
@@ -31,7 +31,7 @@ import { evidenceText, readEvidence, evidenceBehind } from "./published.mjs";
  */
 
 function ghJson(args) {
-  try { return { ok: true, out: execFileSync("gh", ["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim() }; }
+  try { return { ok: true, out: runGh(["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim() }; }
   catch (e) { return { ok: false, out: "", err: netFailure(e) }; }
 }
 

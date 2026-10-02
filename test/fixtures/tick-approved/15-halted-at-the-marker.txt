@@ -13,6 +13,7 @@ cancelQueued	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"owner":"guardian
 == 3 LOG FILE
 <ts> HALTED: <tmp> exists — no work will be started; releasing this guardian's scheduler claims and finishing what it already owed
 <ts> provider: withdrew a queued request while halted (o/r#42:FIX_CI)
+<ts> github: 0 request(s) in 0 call(s) this tick
 
 == 4 RESULT
 {"halted":true,"unreadable":null,"decisions":[]}

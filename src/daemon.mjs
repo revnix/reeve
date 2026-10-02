@@ -60,6 +60,7 @@ import { BASELINE_OP, LATEST_OP, STORE_ID_OP, FILED, latestDecision, storeIdenti
 import { signedOrder, strayEntry, baselineLost, otherRepository, signingState, holdsWhole, ordersCommitment, lastEntrySeq } from "./decisions.mjs";
 import { noAnchor, reservedSeal } from "./anchor.mjs";
 
+import { gh as runGh, takeCalls } from "./github/calls.mjs";
 /** The worker actions whose result is pushed to the pull request's head branch, which a fork's isn't reeve's to push to (#320). */
 const FIX_ACTIONS = Object.freeze(["FIX_CI", "FIX_FINDINGS"]);
 
@@ -771,7 +772,7 @@ export function log(logPath, line) {
 /** A pull request's state, "OPEN", "CLOSED" or "MERGED", or null when it can't be read. */
 export function prStateOf(nwo, pr) {
   try {
-    return execFileSync("gh", ["pr", "view", String(pr), "--repo", nwo,
+    return runGh(["pr", "view", String(pr), "--repo", nwo,
       "--json", "state", "--jq", ".state"], { encoding: "utf8", timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim() || null;
   } catch { return null; }
 }
@@ -843,7 +844,7 @@ export function finishedSubjects(db, nwo, open, io = {}) {
 
 export function openPrs(nwo, limit = 20) {   // bounded; the caller LOGS when the bound bites
   try {
-    const out = execFileSync("gh", ["pr", "list", "--repo", nwo, "--state", "open",
+    const out = runGh(["pr", "list", "--repo", nwo, "--state", "open",
       "--limit", String(limit), "--json", "number", "--jq", ".[].number"], { encoding: "utf8", timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim();
     return out ? out.split("\n").map(Number) : [];
   } catch { return null; }   // null means "could not ask", which is not "none"
@@ -1413,8 +1414,25 @@ export async function tick(ctx) {
   let r;
   try { r = await tickOnce(ctx); }
   catch (err) { noteTickStopped(ctx.db); throw err; }
+  // On every way a tick ends: one that failed or halted spent its requests too.
+  finally { logGitHubCalls(ctx); }
   if (r?.halted || r?.unreadable) noteTickStopped(ctx.db);
   return r;
+}
+
+/**
+ * The GitHub requests a tick made, in all and per pull request it listed
+ * (#168), logged as it ends, however it ends: measured, before they're cut.
+ * `outside`: those made between ticks instead, starting up or withdrawing
+ * after a tick threw, logged as the next tick starts, and those stopping, as
+ * the daemon stops; each where there were any.
+ */
+function logGitHubCalls(ctx, { outside = false } = {}) {
+  const made = takeCalls();
+  if (!ctx.logPath || (outside && !made.calls)) return;
+  const who = Object.entries(made.byWho).sort(([a], [b]) => a.localeCompare(b)).map(([w, n]) => `${w} ${n}`).join(", ");
+  const perPr = outside || ctx.tickPrs == null ? "" : `, ${(ctx.tickPrs ? made.requests / ctx.tickPrs : 0).toFixed(1)} per pull request`;
+  log(resolve(ctx.logPath), `github: ${made.requests} request(s) in ${made.calls} call(s) ${outside ? "outside a tick" : "this tick"}${perPr}${who ? ` (${who})` : ""}`);
 }
 
 async function tickOnce(ctx) {
@@ -1428,6 +1446,10 @@ async function tickOnce(ctx) {
   // Recorded as it starts, and again as it ends: the time between is running,
   // however long the tick takes (#297).
   noteTickStart(db);
+  // The GitHub requests counted from here are this tick's (#168), and for as
+  // many pull requests as it lists. Those made since the last are logged apart.
+  logGitHubCalls(ctx, { outside: true });
+  ctx.tickPrs = null;
   // Enforcing, a base where no rule requires reeve's check gets its results in
   // shadow (#166): enforcing there would say it gates what it can't. Where a
   // rule requires it, its results go out enforcing, though someone can bypass
@@ -2771,6 +2793,7 @@ async function tickOnce(ctx) {
   // it is always the SAME 20 -- so the remainder would never be looked at once,
   // silently, forever.
   const CAP = profile.watch?.maxOpenPrs ?? 20;
+  ctx.tickPrs = prs.length;
   log(logPath, `tick: ${nwo} — ${prs.length} open PR(s)` +
       (prs.length >= CAP ? ` — AT THE ${CAP} CAP: any beyond this are not being watched at all` : ""));
 
@@ -5065,5 +5088,6 @@ export async function run(ctx) {
   // What it couldn't withdraw stands until reeve publishes there again, with
   // nothing checking, so a person is told.
   tellStuck(ctx, await withdrawStanding(ctx, "the merge policy stopped"));
+  logGitHubCalls(ctx, { outside: true });
   log(logPath, "daemon stopped");
 }

@@ -28,6 +28,7 @@ import { resolveHome } from "./home.mjs";
 import { HUB_SCHEMA_VERSION } from "./build/hubdb.mjs";
 import { GATE_CHECK } from "./build/gatestate.mjs";
 
+import { runCommand } from "./github/calls.mjs";
 const BROKEN = "BROKEN";
 const DEGRADED = "DEGRADED";
 const OK = "OK";
@@ -36,7 +37,7 @@ const UNKNOWN = "UNKNOWN";
 /** Shell out without throwing: a failed probe is data, not a crash. */
 function sh(cmd, args, opts = {}) {
   try {
-    return { ok: true, out: execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...opts }).trim() };
+    return { ok: true, out: runCommand(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...opts }).trim() };
   } catch (e) {
     return { ok: false, out: "", err: String(e.stderr || e.message).trim() };
   }

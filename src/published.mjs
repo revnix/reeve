@@ -5,10 +5,10 @@
 // of whoever can change the store, so a copy of the store checked elsewhere,
 // away from the host's anchor, is checked against what was published.
 
-import { execFileSync } from "node:child_process";
 import { POLICY_APP, POLICY_CONTEXT } from "./github/reconciler.mjs";
 import { netTimeoutMs, netFailure } from "./net-bound.mjs";
 
+import { gh as runGh } from "./github/calls.mjs";
 /**
  * What one result published: the record kept for its verdict; the pull
  * request's signed order as it stood, `null` where it had no entry yet; and a
@@ -101,7 +101,7 @@ export function evidenceBehind(e, prior, entryAt = null, commitAt = null, holds 
 
 /** `gh api`, as the person running this reads GitHub, bounded as every read is (#282): `out` or `err`. @param {string[]} args */
 function ghApi(args) {
-  try { return { ok: true, out: execFileSync("gh", ["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,
+  try { return { ok: true, out: runGh(["api", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,
                                                                    timeout: netTimeoutMs(), killSignal: "SIGKILL" }).trim() }; }
   catch (e) { return { ok: false, out: "", err: netFailure(e) }; }
 }

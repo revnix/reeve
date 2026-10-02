@@ -9,10 +9,10 @@
 // able to look is not the same as having looked and found nothing.
 
 import { readFileSync, existsSync } from "node:fs";
-import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
 
+import { runCommand } from "./github/calls.mjs";
 const PKG_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 /** Where a repo's checked-in baseline lives: committed under deploy/, never under test/. */
@@ -28,7 +28,7 @@ export function baselinePathFor(nwo) {
 // item of every page as one line of JSON. `--slurp` would wrap the pages in one
 // array instead, but the gh in Ubuntu's own archive (2.46) doesn't have it and
 // answers "unknown flag: --slurp" (docs/measured/2026-09-27-gh-2.46-has-no-slurp.md).
-export const ghApi = (path, { list = false, exec = execFileSync } = {}) => {
+export const ghApi = (path, { list = false, exec = runCommand } = {}) => {
   const read = args => exec("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 60000 });
   if (!list) return JSON.parse(read(["api", path]));
   return read(["api", "--paginate", "--jq", ".[] | tojson", path]).split("\n").filter(Boolean).map(line => JSON.parse(line));

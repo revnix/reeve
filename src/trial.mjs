@@ -373,6 +373,37 @@ export function trialRanOn(db, { since, until, code, policy }) {
 }
 
 /**
+ * Whether `reeve run --enforce` may enforce on the shadow trial in the store
+ * `db`, read with its lock held (#166): the reasons it may not, each with what
+ * would fix it. The store must be `nwo`'s; hold no record dated after `now`, the
+ * trial's end, as then the clock has gone back and the trial can't be read
+ * across it; and its trial must have passed, by the code and under the policy
+ * about to enforce. `audits` reads the audits recorded: once for the report,
+ * and again once all of it's read, as one recorded meanwhile may say a call the
+ * report took as right was false.
+ * @param {any} db
+ * @param {{ nwo: string, store: string, named: boolean, since: number, now: number, trialSince: string,
+ *           merged: any, seeded: any, code: any, policy: string | null, audits: () => any }} o
+ * @returns {{ ok: boolean, reasons: string[] }}
+ */
+export function trialForEnforcing(db, { nwo, store, named, since, now, trialSince, merged, seeded, code, policy, audits }) {
+  const bound = storeIsOf(db, nwo, { named });
+  if ("why" in bound) return { ok: false, reasons: [`${store} isn't ${nwo}'s to read its shadow trial from: ${bound.why}`] };
+  const newest = Number(/** @type {any} */ (db.prepare("SELECT MAX(at) AS at FROM event").get())?.at) || 0;
+  if (newest > now)
+    return { ok: false, reasons: [`${store} holds a record dated ${when(newest)}, after now: the clock has gone back since it was written, and a shadow trial can't be read across that. To enforce, run this again once the clock has passed it`] };
+  const reasons = [];
+  const first = audits();
+  const passed = trialGate(trialReport(db, { repo: nwo, since, now, merged, seeded, audits: first.ok ? first.audits : { why: first.why } }), { since });
+  if ("why" in passed) reasons.push(`${passed.why}. To enforce, run the trial until it passes: reeve trial ${nwo} --since ${trialSince} --seeded says what's short`);
+  const ranOn = trialRanOn(db, { since, until: now, code, policy });
+  if ("why" in ranOn) reasons.push(`${ranOn.why}. To enforce, run the trial again on this code and policy, from after ${when(ranOn.after)}`);
+  if (JSON.stringify(audits()) !== JSON.stringify(first))
+    reasons.push("an audit was recorded while the shadow trial was read, so what it says may not be what was read. To enforce, run this again");
+  return { ok: !reasons.length, reasons };
+}
+
+/**
  * The report, for a person to read.
  * @param {ReturnType<typeof trialReport>} r @param {string} nwo
  */

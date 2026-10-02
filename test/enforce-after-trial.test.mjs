@@ -130,10 +130,9 @@ test("--trial-since is taken only by reeve run --enforce, and refused anywhere i
   assert.doesNotMatch(shadow.stdout + shadow.stderr, /daemon starting/);
 });
 
-test("the shadow trial's report runs to when the store's lock is held, so a call recorded before then is never left out", () => {
-  // A call the reeve that held the store recorded as it let go: dated a minute
-  // on, so a cutoff taken before the lock leaves it out, and one taken once it's
-  // held, as late as the store's newest record, doesn't.
+test("a store holding a record dated after now is refused, as the clock has gone back and a trial can't be read across it", () => {
+  // Dated a minute on: a trial run to the store's newest record would stretch
+  // into the future, and count running time it never had.
   const r = runEnforcing(["--trial-since", "2026-09-30T09:14Z"], (_home, db) => {
     const s = open(db);
     s.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
@@ -142,7 +141,8 @@ test("the shadow trial's report runs to when the store's lock is held, so a call
     s.close();
   });
   assert.equal(r.status, 1, r.stdout + r.stderr);
-  assert.match(r.stderr, /no false call on audit: 1 call\(s\) on 1 pull request\(s\) to audit/, "the call is in the trial: " + r.stderr.slice(-800));
+  assert.match(r.stderr, /holds a record dated .*, after now: the clock has gone back since it was written, and a shadow trial can't be read across that/);
+  assert.doesNotMatch(r.stderr, /1 call\(s\) on 1 pull request\(s\) to audit/, "the trial isn't read past now");
 });
 
 test("the shadow trial counts toward enforcing only where every judgment it saw was made by the code and under the policy about to enforce", () => {
@@ -182,4 +182,21 @@ test("reeve run --enforce refuses a trial made by other code than it runs, sayin
   assert.equal(r.status, 1, r.stdout + r.stderr);
   assert.match(r.stderr, /the shadow trial from 2026-09-30 09:14Z saw 1 judgment\(s\) made by other code or under another policy than this reeve would enforce with/);
   assert.match(r.stderr, /run the trial again on this code and policy, from after 2026-09-30 09:24Z/);
+});
+
+test("an audit recorded while the shadow trial is read refuses enforcing, since what it says may not be what was read", () => {
+  assert.equal(typeof T.trialForEnforcing, "function", "src/trial.mjs has no trialForEnforcing");
+  const db = open(join(tempDir("reeve-trial-audits-"), "s.db"));
+  const now = Math.floor(Date.now() / 1000);
+  const base = { nwo: "acme/widget", store: "s.db", named: false, since: SINCE, now, merged: [], seeded: null, trialSince: "2026-09-30T09:14Z",
+                 code: { commit: "c".repeat(40), tree: "t".repeat(40), dirty: false }, policy: "p1" };
+  // The same audits read twice, and one recorded between the reads.
+  const steady = T.trialForEnforcing(db, { ...base, audits: () => ({ ok: true, audits: [] }) });
+  assert.doesNotMatch(steady.reasons.join("\n"), /an audit was recorded while/);
+  let reads = 0;
+  const changed = T.trialForEnforcing(db, { ...base, audits: () => ({ ok: true, audits: reads++ ? [{ name: "000001.json", calls: [] }] : [] }) });
+  assert.equal(changed.ok, false);
+  assert.match(changed.reasons.join("\n"), /an audit was recorded while the shadow trial was read, so what it says may not be what was read\. To enforce, run this again/);
+  assert.equal(reads, 2, "read once for the report, and again once all of it's read");
+  db.close();
 });

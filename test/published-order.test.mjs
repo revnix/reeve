@@ -4,7 +4,7 @@
 // the host, against what GitHub keeps, with no anchor to check it against.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, copyFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -16,7 +16,7 @@ import { storeIdentity } from "../src/db/records.mjs";
 
 // Read off the module, so a test of a name it doesn't export fails, rather than every test.
 const { explainDecision, replayDecisions, publishedChecked } = decisions;
-import { evidenceText, readEvidence, readPublished } from "../src/published.mjs";
+import { evidenceText, readEvidence, readPublished, listPullRequests } from "../src/published.mjs";
 import * as pr from "../src/pr.mjs";
 import { publishVerdict } from "../src/pr.mjs";
 import { computeVerdict } from "../src/verdict.mjs";
@@ -560,10 +560,15 @@ test("reeve replay --published checks a copy away from the host, reading the mer
     writeFileSync(join(bin, `runs-${head}`), JSON.stringify({ name: "merge-policy (shadow)", app: "merge-policy",
                                                                 summary: `${p.verdict.state}: ${p.verdict.summary}\n${evidenceText(p.evidence)}` }) + "\n");
   writeFileSync(join(bin, "gh"), `#!/bin/sh
+echo "$*" >> "${bin}/asked"
 case "$2" in
   repos/${REPO}/pulls/${PR}) echo ${B} ;;
-  "repos/${REPO}/pulls?state=all"*) echo ${PR} ;;
-  --paginate) sha=$(echo "$3" | sed -E 's#.*/commits/([0-9a-f]+)/.*#\\1#'); cat "${bin}/runs-$sha" 2>/dev/null ;;
+  "repos/${REPO}/pulls?state=all"*"&page=1") for i in $(seq 100); do echo "${PR} 2099-01-01T00:00:00Z"; done ;;
+  "repos/${REPO}/pulls?state=all"*) ;;
+  --paginate) case "$3" in
+    "repos/${REPO}/pulls?state=open"*) ;;
+    *) sha=$(echo "$3" | sed -E 's#.*/commits/([0-9a-f]+)/.*#\\1#'); cat "${bin}/runs-$sha" 2>/dev/null ;;
+  esac ;;
   *) echo "not a read this test answers: $*" >&2; exit 1 ;;
 esac
 `);
@@ -575,6 +580,10 @@ esac
   const whole = spawnSync(process.execPath, [REEVE, "replay", REPO, "--db", h.path, "--published"], { encoding: "utf8", env });
   assert.equal(whole.status, 0, whole.stdout + whole.stderr);
   assert.match(whole.stdout, /checked against 2 result\(s\) the merge policy published/);
+  // Read back past the 100 most recently updated, to the copy's newest tick, and every open one.
+  const asked = readFileSync(join(bin, "asked"), "utf8");
+  assert.match(asked, /pulls\?state=all[^\n]*&page=2/, asked);
+  assert.match(asked, /pulls\?state=open/, asked);
 
   const db = open(h.path);
   db.prepare("DELETE FROM event WHERE op = 'decision.latest' AND json_extract(payload, '$.n') = 2").run();
@@ -1081,4 +1090,85 @@ test("evidence over every entry goes forward over evidence over each top that it
   // Without a store to ask, evidence of another kind at the same event can't be compared, and isn't held to it.
   const same = { ...tops, store: { ...st(9, "f"), chained: true } };
   assert.deepEqual(await publishOver(tops, same), { written: same, behind: null });
+});
+
+// ── #308: a lost pull request beyond the 100 most recently updated ────────────
+
+/**
+ * GitHub's pull requests of o/r, as `gh api` lists them: `all`, newest updated
+ * first, each with when it was updated, and the numbers of those `open`. Each
+ * read is written down in `asked`.
+ * @param {{ pr: number, updated: string }[]} all @param {number[]} open_ @param {string[]} asked
+ */
+const pullsOf = (all, open_, asked) => (/** @type {string[]} */ args) => {
+  const path = args.find((a) => a.startsWith("repos/")) ?? "";
+  asked.push(path);
+  if (/[?&]state=open/.test(path)) return { ok: true, out: open_.join("\n") };
+  const page = Number(/[?&]page=(\d+)/.exec(path)?.[1] ?? 1);
+  const rows = all.slice((page - 1) * 100, page * 100);
+  const withTimes = args.some((a) => /updated_at/.test(a));
+  return { ok: true, out: rows.map((r) => (withTimes ? `${r.pr} ${r.updated}` : String(r.pr))).join("\n") };
+};
+/** 250 pull requests, #250 updated last, each a minute before the one after it. */
+const PULLS = Array.from({ length: 250 }, (_, i) => ({ pr: 250 - i, updated: new Date(Date.UTC(2026, 9, 1, 12) - i * 60_000).toISOString() }));
+
+test("a copy is checked against every open pull request, and every one GitHub updated since a time it names, beside the 100 most recently updated", () => {
+  const asked = [];
+  // Since #120 was updated: #250 to #120, and #3, open though untouched since.
+  const since = Date.parse(/** @type {any} */ (PULLS.find((p) => p.pr === 120)).updated) / 1000;
+  const got = listPullRequests("o/r", { gh: pullsOf(PULLS, [3], asked), since });
+  assert.ok(Array.isArray(got), JSON.stringify(got));
+  const prs = new Set(/** @type {number[]} */ (got));
+  for (const n of [250, 151, 150, 120, 3]) assert.ok(prs.has(n), `#${n}: ${[...prs].sort((a, b) => a - b).join(",")}`);
+  assert.ok(!prs.has(119) && !prs.has(51), "none updated before it, beyond the 100 most recent");
+  assert.equal(asked.filter((a) => /state=all/.test(a)).length, 2, "the list read until it reached that time, and no further");
+  // With no time, the 100 most recently updated and the open ones.
+  const plain = new Set(/** @type {number[]} */ (listPullRequests("o/r", { gh: pullsOf(PULLS, [3], []) })));
+  assert.ok(plain.has(151) && plain.has(3) && !plain.has(150), [...plain].join(","));
+  // A time that doesn't read, and an open list that can't be read, read as no list.
+  assert.match(JSON.stringify(listPullRequests("o/r", { gh: pullsOf([{ pr: 5, updated: "soon" }], [], []), since })), /don't read as GitHub's/);
+  const failing = (/** @type {string[]} */ args) => (args.some((a) => /state=open/.test(a)) ? { ok: false, out: "", err: "HTTP 502" } : pullsOf(PULLS, [], [])(args));
+  assert.match(JSON.stringify(listPullRequests("o/r", { gh: failing, since })), /couldn't be listed: HTTP 502/);
+});
+
+test("a copy is checked against what GitHub updated since its newest tick began, less an hour, and one holding no tick can't be, and says so", async () => {
+  const h = await history();
+  const db = open(h.path);
+  const newest = db.prepare("SELECT MAX(at) AS at FROM event WHERE op IN ('daemon.tick.started', 'daemon.tick', 'daemon.tick.stopped')").get().at;
+  assert.ok(newest > 0, "control: the copy holds its ticks");
+  /** @type {unknown[]} */ const given = [];
+  publishedChecked(db, {}, { keys: h.keys, repo: REPO, anchor: null, published: githubOf(h.published), listed: (/** @type {any} */ since) => { given.push(since); return []; } });
+  assert.deepEqual(given, [newest - 3600]);
+  // A tick begun later, and never ended, as the store's last; then one stopped later still.
+  for (const [op, after] of [["daemon.tick.started", 30], ["daemon.tick.stopped", 60]]) {
+    db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(newest + after, "daemon", op, null, "{}");
+    given.length = 0;
+    publishedChecked(db, {}, { keys: h.keys, repo: REPO, anchor: null, published: githubOf(h.published), listed: (/** @type {any} */ since) => { given.push(since); return []; } });
+    assert.deepEqual(given, [newest + after - 3600], op);
+  }
+  // Its ticks taken away: no time to read from.
+  db.prepare("DELETE FROM event WHERE op IN ('daemon.tick.started', 'daemon.tick', 'daemon.tick.stopped')").run();
+  given.length = 0;
+  const blind = publishedChecked(db, {}, { keys: h.keys, repo: REPO, anchor: null, published: githubOf(h.published), listed: (/** @type {any} */ since) => { given.push(since); return []; } });
+  db.close();
+  assert.deepEqual(given, [null], "still the open ones and the most recent");
+  assert.match(blind.faults.map((f) => f.why).join("\n"), /this copy holds no record of its ticks, so a pull request it no longer names, beyond the 100 GitHub lists as most recently updated and those open, can't be ruled out/);
+});
+
+test("a copy that lost every row of a pull request beyond the 100 most recently updated, whose published record no entry named, is a fault", async () => {
+  const dir = credentials();
+  // #42's record kept and published, and never ordered: no entry can be reserved.
+  const { path, published } = await ticksOf(() => [PR], 1, { ...host(dir), anchor: { ...fileAnchor(dir), reserve: () => false } });
+  const db = open(path);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM event WHERE op = 'decision.latest'").get().n, 0, "control: no entry names it");
+  db.prepare("DELETE FROM decision WHERE pr = ?").run(PR);
+  db.prepare("DELETE FROM event WHERE subject = ?").run(`pr:${PR}`);
+  // On GitHub, 100 others were updated since #42 closed, after the copy's last tick.
+  const closed = new Date(Date.now() + 60_000).toISOString();
+  const all = [...Array.from({ length: 100 }, (_, i) => ({ pr: 1000 + i, updated: new Date(Date.now() + 120_000 + i * 1000).toISOString() })).reverse(),
+               { pr: PR, updated: closed }];
+  const checked = publishedChecked(db, {}, { keys: publishedKeys(dir), repo: REPO, anchor: null, published: githubOf(published),
+                                            listed: (/** @type {any} */ since) => listPullRequests(REPO, { gh: pullsOf(all, [], []), since }) });
+  db.close();
+  assert.match(checked.faults.map((f) => f.why).join("\n"), /the merge policy published this record for it at aaaaaaaa, but this copy doesn't hold it/);
 });

@@ -14,6 +14,7 @@ import { canonical } from "./db/ops.mjs";
 import { latestDecision, decisionsFor, decisionOf, evidenceBy, policyRecord, storeIdentity, BASELINE_OP, LATEST_OP, FILED } from "./db/records.mjs";
 import { checkSignature, checkEnvelope, baselineStatement, baselineFingerprint, latestStatement, entrySeal, orderChain } from "./signing.mjs";
 import { reservedSeal } from "./anchor.mjs";
+import { TICK_STARTED, TICK_STOPPED } from "./status.mjs";
 
 /** @typedef {import("node:sqlite").DatabaseSync} Db */
 /** @typedef {Map<string, { key: import("node:crypto").KeyObject, where: string }>} Keys */
@@ -660,6 +661,9 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
   return out;
 }
 
+/** How far the host's clock may be from GitHub's, in seconds, where a time of one is read against the other's (#308). */
+const CLOCK_SLACK_SECONDS = 3600;
+
 /**
  * A copy of a store checked against what the merge policy published of it
  * (#274). Each result it posts on a pull request's head names the record kept
@@ -684,7 +688,7 @@ function orderReplayed(db, replayed, which, keys, repo, anchor) {
  * @param {{ pr?: number | null, digest?: string | null }} which
  * @param {{ keys: Keys, repo: string, anchor?: AnchorRead | null,
  *           published: (pr: number, heads: string[]) => { evidence: (import("./published.mjs").Evidence & { head: string })[] } | { why: string },
- *           listed?: (() => number[] | { why: string }) | null }} o
+ *           listed?: ((since: number | null) => number[] | { why: string }) | null }} o
  * @returns {{ faults: Replayed[], results: number, prs: number, unchecked: number[] }}
  */
 export function publishedChecked(db, which, { keys, repo, anchor: read = null, published, listed = null }) {
@@ -699,8 +703,16 @@ export function publishedChecked(db, which, { keys, repo, anchor: read = null, p
     for (const { pr } of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT pr FROM decision WHERE ${FILED}`).all())) own.add(Number(pr));
     for (const { subject } of /** @type {any[]} */ (db.prepare(`SELECT DISTINCT subject FROM event WHERE op = ? AND subject GLOB 'pr:[1-9]*' AND substr(subject, 4) NOT GLOB '*[^0-9]*' AND length(subject) <= 18`).all(LATEST_OP))) own.add(Number(String(subject).slice(3)));
     // And each GitHub lists: one the copy no longer names, taken away with every
-    // record and entry of it, is read all the same (#285).
-    const got = listed ? listed() : [];
+    // record and entry of it, is read all the same (#285). Every one updated
+    // since the copy's newest tick began, too (#308): a record published and not
+    // yet ordered was published in its store's last tick, after that began, so
+    // on a pull request then open, which GitHub updated as it closed, if it has.
+    // Less an hour, for the host's clock against GitHub's.
+    const tick = /** @type {any} */ (db.prepare(`SELECT MAX(at) AS at FROM event WHERE op IN (?, 'daemon.tick', ?)`).get(TICK_STARTED, TICK_STOPPED))?.at;
+    const since = tick == null ? null : Number(tick) - CLOCK_SLACK_SECONDS;
+    if (listed && since === null)
+      faults.push(fault(0, "", "this copy holds no record of its ticks, so a pull request it no longer names, beyond the 100 GitHub lists as most recently updated and those open, can't be ruled out"));
+    const got = listed ? listed(since) : [];
     if ("why" in got) faults.push(fault(0, "", `the repository's pull requests couldn't be listed from GitHub, so one this copy no longer names may be missed: ${got.why}`));
     else for (const n of got) prs.add(n);
   }

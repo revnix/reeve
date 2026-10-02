@@ -107,19 +107,34 @@ function ghApi(args) {
 }
 
 /**
- * The pull requests of `nwo` GitHub lists, open and closed, most recently
- * updated first, to `limit` (#285): read from GitHub, not from any copy of the
- * store, so one a copy no longer names is found all the same. `why` where
- * GitHub couldn't be read.
- * @param {string} nwo @param {{ gh?: (args: string[]) => { ok: boolean, out: string, err?: string }, limit?: number }} [o]
+ * The pull requests of `nwo` GitHub lists (#285), read from GitHub, not from
+ * any copy of the store, so one a copy no longer names is found all the same:
+ * the `limit` most recently updated, every one open, and, where `since` is
+ * given, in seconds, every one updated since (#308). Read a page at a time,
+ * most recently updated first, to the first page that reaches back before
+ * `since`. `why` where GitHub couldn't be read.
+ * @param {string} nwo
+ * @param {{ gh?: (args: string[]) => { ok: boolean, out: string, err?: string }, limit?: number, since?: number | null }} [o]
  * @returns {number[] | { why: string }}
  */
-export function listPullRequests(nwo, { gh = ghApi, limit = 100 } = {}) {
-  const got = gh([`repos/${nwo}/pulls?state=all&sort=updated&direction=desc&per_page=${Math.min(100, limit)}`, "--jq", ".[].number"]);
-  if (!got.ok) return { why: `the pull requests of ${nwo} couldn't be listed: ${got.err}` };
-  const prs = got.out.split("\n").filter(Boolean).map(Number);
-  if (prs.some((n) => !Number.isSafeInteger(n) || n < 1)) return { why: `the pull requests of ${nwo} don't read as GitHub's` };
-  return prs.slice(0, limit);
+export function listPullRequests(nwo, { gh = ghApi, limit = 100, since = null } = {}) {
+  const per = Math.min(100, limit);
+  const unread = (/** @type {string | undefined} */ err) => ({ why: `the pull requests of ${nwo} couldn't be listed: ${err}` });
+  const unlike = { why: `the pull requests of ${nwo} don't read as GitHub's` };
+  const number = (/** @type {string} */ s) => { const n = Number(s); return Number.isSafeInteger(n) && n >= 1 ? n : null; };
+  /** @type {Set<number>} */ const prs = new Set();
+  for (let page = 1; ; page++) {
+    const got = gh([`repos/${nwo}/pulls?state=all&sort=updated&direction=desc&per_page=${per}&page=${page}`, "--jq", '.[] | "\\(.number) \\(.updated_at)"']);
+    if (!got.ok) return unread(got.err);
+    const rows = got.out.split("\n").filter(Boolean).map((l) => { const [n, at] = l.split(" "); return { n: number(n), at: Date.parse(at) / 1000 }; });
+    if (rows.some((r) => r.n === null || !Number.isFinite(r.at))) return unlike;
+    for (const r of rows) if ((page === 1 && prs.size < limit) || (since !== null && r.at >= since)) prs.add(/** @type {number} */ (r.n));
+    if (since === null || rows.length < per || /** @type {any} */ (rows.at(-1)).at < since) break;
+  }
+  const open = gh(["--paginate", `repos/${nwo}/pulls?state=open&per_page=100`, "--jq", ".[].number"]);
+  if (!open.ok) return unread(open.err);
+  for (const s of open.out.split("\n").filter(Boolean)) { const n = number(s); if (n === null) return unlike; prs.add(n); }
+  return [...prs];
 }
 
 /**

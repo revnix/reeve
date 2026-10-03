@@ -49,4 +49,6 @@ export const OFFLINE_READS = Object.freeze({
   // The head's tree, for the subject of a verdict's evidence (#165): unreadable,
   // which the record keeps as unknown.
   treeOf: () => null,
+  // What merged since the tick's last look (#342): unread, so none is judged.
+  mergedSince: () => ({ why: WHY }),
 });

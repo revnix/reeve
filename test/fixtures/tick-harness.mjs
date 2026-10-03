@@ -89,7 +89,7 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
                     resolveRepoIdFn, project, keepDir = false, seams = null,
                     haltMarker, openPrs, containment, ticks = 1, dbPath, evaluate, treeOf, code, codeVersion,
                     readQueue, evaluateQueue, publish, withdraw, signer, anchor, keys, durably, prState, prIsFinished,
-                    afterTick, shadow = true, enforcement, trialHolds } = {}) => {
+                    afterTick, shadow = true, enforcement, trialHolds, mergedList, judgeAtMerge, runSelfAudit } = {}) => {
   const dir = tempDir("reeve-prov-");
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
@@ -197,6 +197,13 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     ...(enforcement ? { enforcement } : {}),
     // Enforcing, the shadow trial checked again each tick (#331).
     ...(trialHolds ? { trialHolds } : {}),
+    // What merged since the last look, and how a merge is judged (#342). Unset,
+    // what merged is the offline read's, which can't be read, so none is judged.
+    ...(mergedList ? { mergedList } : {}),
+    ...(judgeAtMerge ? { judgeAtMerge } : {}),
+    // The tick's audit of itself, run after its last stop for a halt and before
+    // it looks for what merged: a test puts what happens that late in a tick here.
+    ...(runSelfAudit ? { runSelfAudit } : {}),
     ...(evaluateQueue ? { evaluateQueue } : {}),
     ...(withdraw ? { withdraw } : {}),
     // What signs each decision record (#165). Unset, the tick keeps its records

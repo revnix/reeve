@@ -13,7 +13,7 @@ readQueue	["o/r","main"]
 hub	[]
 hub	[]
 queuedRequests	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"repoId":7}]
-measureContainment	[{"readQueue":"<fn>","reconcile":"<fn>","resolveCause":"<fn>","flakeProbe":"<fn>","observe":"<fn>","mergeRate":"<fn>","treeOf":"<fn>","nwo":"o/r","db":"<DatabaseSync>","logPath":"<tmp>","execute":true,"shadow":true,"running":0,"containment":null,"keychain":{"measured":true,"items":[],"why":null},"claudeBin":"/bin/sh","cliVersion":"test","capacity":"<fn>","profile":{"identity":{"key":"o/r","defaultBranch":"main","worktreeRoot":"<tmp>","checkout":"<tmp>"},"authority":{"policy":"propose_and_merge"},"rounds":{"softCap":5,"hardCap":10,"maxFixAttemptsPerFinding":1},"ci":{"provider":"github-actions","requiredChecks":[]},"watch":{"maxWorkers":5,"workerBudgetMinutes":1,"maxTurns":5}},"hub":"<fn>","repoId":7,"lstart":"boot-1","providerClaim":"<fn>","providerRelease":"<fn>","openPrs":"<fn>","evaluate":"<fn>","publish":"<fn>","spawnWorker":"<fn>","measureContainment":"<fn>","providerBind":"<fn>","oauthToken":"<fn>","prepareCheckout":"<fn>","reapProvider":"<fn>","cancelQueued":"<fn>","providerHeartbeat":"<fn>","noteRateLimit":"<fn>","queuedRequests":"<fn>","tickNo":1,"tickPrs":1,"orderKept":"<Map>","orderChecked":"<Map>","providerRetry":"<Map>","cooldownRetry":"<Map>","ingestComplete":"<Map>","publishFailures":"<Map>","queuePublishFailures":"<Map>","prepBackoff":"<Map>","lastBackupAt":<epoch>},{"identity":{"key":"o/r","defaultBranch":"main","worktreeRoot":"<tmp>","checkout":"<tmp>"},"authority":{"policy":"propose_and_merge"},"rounds":{"softCap":5,"hardCap":10,"maxFixAttemptsPerFinding":1},"ci":{"provider":"github-actions","requiredChecks":[]},"watch":{"maxWorkers":5,"workerBudgetMinutes":1,"maxTurns":5}},"o/r","<tmp>",{"beforeSpawn":"<fn>","onSpawn":"<fn>"}]
+measureContainment	[{"readQueue":"<fn>","reconcile":"<fn>","resolveCause":"<fn>","flakeProbe":"<fn>","observe":"<fn>","mergeRate":"<fn>","treeOf":"<fn>","mergedList":"<fn>","nwo":"o/r","db":"<DatabaseSync>","logPath":"<tmp>","execute":true,"shadow":true,"running":0,"containment":null,"keychain":{"measured":true,"items":[],"why":null},"claudeBin":"/bin/sh","cliVersion":"test","capacity":"<fn>","profile":{"identity":{"key":"o/r","defaultBranch":"main","worktreeRoot":"<tmp>","checkout":"<tmp>"},"authority":{"policy":"propose_and_merge"},"rounds":{"softCap":5,"hardCap":10,"maxFixAttemptsPerFinding":1},"ci":{"provider":"github-actions","requiredChecks":[]},"watch":{"maxWorkers":5,"workerBudgetMinutes":1,"maxTurns":5}},"hub":"<fn>","repoId":7,"lstart":"boot-1","providerClaim":"<fn>","providerRelease":"<fn>","openPrs":"<fn>","evaluate":"<fn>","publish":"<fn>","spawnWorker":"<fn>","measureContainment":"<fn>","providerBind":"<fn>","oauthToken":"<fn>","prepareCheckout":"<fn>","reapProvider":"<fn>","cancelQueued":"<fn>","providerHeartbeat":"<fn>","noteRateLimit":"<fn>","queuedRequests":"<fn>","tickNo":1,"tickPrs":1,"orderKept":"<Map>","orderChecked":"<Map>","providerRetry":"<Map>","cooldownRetry":"<Map>","ingestComplete":"<Map>","publishFailures":"<Map>","queuePublishFailures":"<Map>","prepBackoff":"<Map>","lastBackupAt":<epoch>},{"identity":{"key":"o/r","defaultBranch":"main","worktreeRoot":"<tmp>","checkout":"<tmp>"},"authority":{"policy":"propose_and_merge"},"rounds":{"softCap":5,"hardCap":10,"maxFixAttemptsPerFinding":1},"ci":{"provider":"github-actions","requiredChecks":[]},"watch":{"maxWorkers":5,"workerBudgetMinutes":1,"maxTurns":5}},"o/r","<tmp>",{"beforeSpawn":"<fn>","onSpawn":"<fn>"}]
 hub	[]
 hub	[]
 providerClaim	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"owner":"guardian","repoId":7,"runRef":"canary:o/r","pid":<pid>,"lstart":"boot-1","isAlive":"<fn>"}]
@@ -32,6 +32,7 @@ spawnWorker	[{"bin":"/bin/sh","args":["-p","You are repairing one CI failure on 
 hub	[]
 hub	[]
 providerRelease	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"owner":"guardian","repoId":7,"runRef":"o/r#42:FIX_CI","id":2,"token":"tok-fixture-1","isAlive":"<fn>"}]
+mergedList	["o/r",<now-86400>,{"until":<now>}]
 
 == 2 ESCALATIONS
 #42: the worker changed its checkout's git configuration; the checkout is preserved at <tmp> for inspection
@@ -51,6 +52,7 @@ reeve has no notification channel, so escalations reach a log only
 <ts> backup FAILED: no state store found to snapshot
 <ts> self: BROKEN reeve has never backed up o/r — nothing under <tmp>
 <ts> self: DEGRADED reeve has no notification channel, so escalations reach a log only — set notify.provider, notify.url and notify.topic in the profile
+<ts> merges: what merged since <ts> couldn't be read, so none is judged this tick — a test never reaches GitHub
 <ts> NEEDS YOU: #42: the worker changed its checkout's git configuration; the checkout is preserved at <tmp> for inspection
 <ts> NEEDS YOU: guardian:checkout:config-tampered
 <ts> NEEDS YOU: reeve has never backed up o/r

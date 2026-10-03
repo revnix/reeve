@@ -26,6 +26,7 @@ spawnWorker	[{"bin":"/bin/sh","args":["-p","You are repairing one CI failure on 
 hub	[]
 hub	[]
 providerRelease	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"owner":"guardian","repoId":7,"runRef":"o/r#42:FIX_CI","id":1,"token":"tok-fixture-1","isAlive":"<fn>"}]
+mergedList	["o/r",<now-86400>,{"until":<now>}]
 
 == 2 ESCALATIONS
 #42: the worker changed its checkout's git configuration; the checkout is preserved at <tmp> for inspection
@@ -45,6 +46,7 @@ reeve has no notification channel, so escalations reach a log only
 <ts> backup FAILED: no state store found to snapshot
 <ts> self: BROKEN reeve has never backed up o/r — nothing under <tmp>
 <ts> self: DEGRADED reeve has no notification channel, so escalations reach a log only — set notify.provider, notify.url and notify.topic in the profile
+<ts> merges: what merged since <ts> couldn't be read, so none is judged this tick — a test never reaches GitHub
 <ts> NEEDS YOU: #42: the worker changed its checkout's git configuration; the checkout is preserved at <tmp> for inspection
 <ts> NEEDS YOU: guardian:checkout:config-tampered
 <ts> NEEDS YOU: reeve has never backed up o/r

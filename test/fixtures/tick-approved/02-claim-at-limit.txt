@@ -17,6 +17,7 @@ capacity	[{"maxWorkers":5,"running":0}]
 hub	[]
 hub	[]
 providerClaim	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"owner":"guardian","repoId":7,"runRef":"o/r#42:FIX_CI","pid":<pid>,"lstart":"boot-1","isAlive":"<fn>"}]
+mergedList	["o/r",<now-86400>,{"until":<now>}]
 
 == 2 ESCALATIONS
 reeve has never backed up o/r
@@ -31,6 +32,7 @@ reeve has no notification channel, so escalations reach a log only
 <ts> backup FAILED: no state store found to snapshot
 <ts> self: BROKEN reeve has never backed up o/r — nothing under <tmp>
 <ts> self: DEGRADED reeve has no notification channel, so escalations reach a log only — set notify.provider, notify.url and notify.topic in the profile
+<ts> merges: what merged since <ts> couldn't be read, so none is judged this tick — a test never reaches GitHub
 <ts> NEEDS YOU: reeve has never backed up o/r
 <ts> NEEDS YOU: reeve has no notification channel, so escalations reach a log only
 <ts> did NOT push: no notify channel configured

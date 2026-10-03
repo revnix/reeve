@@ -12,6 +12,7 @@ publish	[{"nwo":"o/r","verdict":{"state":"BLOCK","summary":"ci is red","clauses"
 readQueue	["o/r","main"]
 capacity	[{"maxWorkers":5,"running":0}]
 hub	[]
+mergedList	["o/r",<now-86400>,{"until":<now>}]
 
 == 2 ESCALATIONS
 reeve has never backed up o/r
@@ -27,6 +28,7 @@ the repository numeric id is unknown; provider leases cannot be scoped
 <ts> backup FAILED: no state store found to snapshot
 <ts> self: BROKEN reeve has never backed up o/r — nothing under <tmp>
 <ts> self: DEGRADED reeve has no notification channel, so escalations reach a log only — set notify.provider, notify.url and notify.topic in the profile
+<ts> merges: what merged since <ts> couldn't be read, so none is judged this tick — a test never reaches GitHub
 <ts> NEEDS YOU: the repository numeric id is unknown; provider leases cannot be scoped
 <ts> NEEDS YOU: reeve has never backed up o/r
 <ts> NEEDS YOU: reeve has no notification channel, so escalations reach a log only

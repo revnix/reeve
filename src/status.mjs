@@ -134,6 +134,13 @@ export function noteTickStart(db, at = Math.floor(Date.now() / 1000), ran = null
 /** The event a tick that stopped without judging is recorded as (#301): halted, unable to list the pull requests, or thrown. */
 export const TICK_STOPPED = "daemon.tick.stopped";
 
+/** The event a merge's judgment, made after it as it stood at it, is kept as (#342): subject `pr:N`, its payload the merge and the verdict on it. */
+export const MERGE_JUDGED = "merge.judged";
+/** The event a tick's look for what merged is kept as (#342): `upTo`, in seconds, the time every merge up to which is judged. */
+export const MERGES_LOOKED = "merges.looked";
+/** The event a merge's first judgment that didn't settle is kept as (#342): when judging it was first tried, which the hour it's tried again for runs from. */
+export const MERGE_TRIED = "merge.tried";
+
 /**
  * A tick's stop, recorded where it ends without judging (#301). Its start was
  * recorded, and without this, a report made before the next tick would take it

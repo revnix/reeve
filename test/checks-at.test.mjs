@@ -20,8 +20,8 @@ const runJson = (/** @type {string} */ name, /** @type {string | null} */ conclu
   JSON.stringify({ name, id, status: completed != null ? "completed" : started != null ? "in_progress" : "queued", conclusion: completed == null ? null : conclusion,
                    started_at: started == null ? null : at(started), completed_at: completed == null ? null : at(completed), app: { id: app, slug }, check_suite: { id: suite } });
 /** A commit status as `statuses` gives one, a line of `.[]`. */
-const statusJson = (/** @type {string} */ context, /** @type {string} */ state, /** @type {number} */ created) =>
-  JSON.stringify({ context, state, description: "", created_at: at(created), updated_at: at(created) });
+const statusJson = (/** @type {string} */ context, /** @type {string} */ state, /** @type {number} */ created, id = 1) =>
+  JSON.stringify({ id, context, state, description: "", created_at: at(created), updated_at: at(created) });
 
 /** `fn` with gh answering, by the path asked, the lines given for check runs, statuses and the merge commit. */
 const withGh = (/** @type {{ runs?: string[], statuses?: string[], activity?: string[], period?: string, log?: string, suites?: string, runsFail?: boolean, later?: { runs?: string[], statuses?: string[] } }} */ answers,
@@ -104,6 +104,10 @@ test("a status stands as it was last set by the time, its context in any case", 
   const got = withGh({ statuses: [statusJson("deploy", "failure", 60), statusJson("deploy", "success", -60), statusJson("deploy", "pending", -600),
                                   statusJson("docs", "pending", -30)] }, () => r.readChecksAt("o/r", HEAD, T));
   assert.deepEqual(got.rows.map((/** @type {any} */ x) => [x.name, x.state, x.conclusion]).sort(), [["deploy", "completed", "success"], ["docs", "running", null]]);
+  // Of two set in one second, the newer by its id, in whatever order GitHub lists them (newest first, as it does).
+  const first = statusJson("deploy", "success", -60, 1), second = statusJson("deploy", "failure", -60, 2);
+  for (const statuses of [[second, first], [first, second]])
+    assert.deepEqual(withGh({ statuses }, () => r.readChecksAt("o/r", HEAD, T)).rows.map((/** @type {any} */ x) => x.conclusion), ["failure"], "a tie");
   // GitHub takes a status's context whatever its case: CI set again as ci is one status.
   const recased = withGh({ statuses: [statusJson("CI", "failure", -60), statusJson("ci", "success", -30)] }, () => r.readChecksAt("o/r", HEAD, T));
   assert.deepEqual(recased.rows.map((/** @type {any} */ x) => [x.name, x.conclusion]), [["ci", "success"]]);

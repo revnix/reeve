@@ -227,6 +227,8 @@ function checkRunRow(c) {
 function statusRow(x) {
   return {
     name: x.context, source: "status",
+    // Its own: of two set in one second, the newer by it (#342).
+    id: x.id != null ? String(x.id) : null,
     state: x.state === "pending" ? "running" : "completed",
     conclusion: x.state === "pending" ? null : x.state,
     // A rate-limited CodeRabbit reports state=success with the truth relegated

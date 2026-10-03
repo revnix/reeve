@@ -20060,4 +20060,13 @@ export const STUBS = [
               find: "const vouched = (/** @type {any} */ r) => r.app === \"github-actions\" || ",
               replace: "const vouched = (/** @type {any} */ r) => true || " }],
   },
+  {
+    name: "status-carries-id",
+    why: "read a status without its id. Of two set in one second, the older could stand for the newer",
+    test: "test/checks-at.test.mjs",
+    expectRed: "a status stands as it was last set by the time, its context in any case",
+    edits: [{ file: "src/github/reconciler.mjs",
+              find: "    id: x.id != null ? String(x.id) : null,\n",
+              replace: "" }],
+  },
 ];

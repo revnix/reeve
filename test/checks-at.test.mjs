@@ -24,7 +24,7 @@ const statusJson = (/** @type {string} */ context, /** @type {string} */ state, 
   JSON.stringify({ context, state, description: "", created_at: at(created), updated_at: at(created) });
 
 /** `fn` with gh answering, by the path asked, the lines given for check runs, statuses and the merge commit. */
-const withGh = (/** @type {{ runs?: string[], statuses?: string[], activity?: string[], period?: string, log?: string, runsFail?: boolean, later?: { runs?: string[], statuses?: string[] } }} */ answers,
+const withGh = (/** @type {{ runs?: string[], statuses?: string[], activity?: string[], period?: string, log?: string, suites?: string, runsFail?: boolean, later?: { runs?: string[], statuses?: string[] } }} */ answers,
                 /** @type {() => any} */ fn) => {
   const bin = tempDir("reeve-checks-at-bin-");
   const lines = (/** @type {string[]} */ xs) => xs.map((x) => `'${x}'`).join(" ");
@@ -36,6 +36,7 @@ case "$p" in
     [ -n "$all" ] && printf '%s\\n' ${lines(answers.later?.runs ?? [])};;
   */commits/${HEAD}/statuses*) printf '%s\\n' ${lines(answers.statuses ?? [])}
     [ -n "$all" ] && printf '%s\\n' ${lines(answers.later?.statuses ?? [])};;
+  */commits/${HEAD}/check-suites*) printf '%s\\n' '${answers.suites ?? "1"}';;
   */activity*time_period=${answers.period ?? "day"}*) printf '%s\\n' ${lines(answers.activity ?? [])};;
   *) echo "not a read this test answers: $p" >&2; exit 1;;
 esac
@@ -65,6 +66,12 @@ test("a check's attempt that finished by the time stands, and one begun since, o
   // An older attempt reset since doesn't matter: a newer one stood.
   const older = withGh({ runs: [runJson("Build", "failure", 600, 900, { id: 1 }), runJson("Build", "success", -300, -200, { id: 2 })] }, () => r.readChecksAt("o/r", HEAD, T));
   assert.deepEqual(older.ok && older.rows.map((/** @type {any} */ x) => [x.conclusion, x.id]), [["success", "2"]]);
+  // Of two begun in one second, the newer by its id, in whatever order GitHub lists them.
+  const made = runJson("Build", "success", -300, -200, { id: 1 }), remade = runJson("Build", "failure", -300, -250, { id: 2 });
+  for (const runs of [[made, remade], [remade, made]]) {
+    const tied = withGh({ runs }, () => r.readChecksAt("o/r", HEAD, T));
+    assert.deepEqual(tied.rows.map((/** @type {any} */ x) => [x.conclusion, x.id]), [["failure", "2"]], "a tie");
+  }
   // Of two begun by then, the one begun last, in whatever order GitHub lists them.
   const both = withGh({ runs: [runJson("Build", "failure", -300, -200, { id: 2 }), runJson("Build", "success", -600, -500, { id: 1 })] },
                       () => r.readChecksAt("o/r", HEAD, T));
@@ -102,14 +109,19 @@ test("a reading at a time is whole or unread, and leaves out what readChecks lea
                      () => r.readChecksAt("o/r", HEAD, T, { reviewerContexts: ["CodeRabbit"] }));
   assert.deepEqual(got.rows.map((/** @type {any} */ x) => x.name), ["Build"], "reeve's own check and a reviewer's status");
   assert.deepEqual(got.reviewerRows.map((/** @type {any} */ x) => x.name), ["CodeRabbit"]);
+  // What's left out is no part of what stood: reeve's own check re-run since leaves the rest read.
+  const own = withGh({ runs: [runJson("Build", "success", -60, -30), runJson(r.POLICY_CONTEXT, "neutral", -60, -30, { slug: r.POLICY_APP, suite: 9, id: 3 }),
+                              runJson(r.POLICY_CONTEXT, "neutral", 60, 90, { slug: r.POLICY_APP, suite: 9, id: 4 })] }, () => r.readChecksAt("o/r", HEAD, T));
+  assert.equal(own.ok, true, own.why);
   // Every page of both: what a later page holds stood as much as the first's.
   const paged = withGh({ runs: [runJson("Build", "success", -60, -30)], statuses: [], later: { runs: [runJson("Lint", "failure", -60, -30)], statuses: [statusJson("deploy", "failure", -30)] } },
                        () => r.readChecksAt("o/r", HEAD, T));
   assert.deepEqual(paged.rows.map((/** @type {any} */ x) => x.name).sort(), ["Build", "Lint", "deploy"], "every page");
-  // GitHub lists the runs of a commit's latest thousand suites only: as many may not be all.
-  const many = withGh({ runs: Array.from({ length: 1000 }, (_, i) => runJson(`Job ${i}`, "success", -60, -30, { suite: i + 1, id: i + 1 })) },
-                      () => r.readChecksAt("o/r", HEAD, T));
-  assert.equal(many.ok, false, "a thousand suites");
+  // GitHub lists the runs of a commit's latest thousand suites only, and a suite may hold no run: counted as GitHub counts them.
+  const many = withGh({ runs: [runJson("Build", "success", -60, -30)], suites: "1001" }, () => r.readChecksAt("o/r", HEAD, T));
+  assert.equal(many.ok, false, "more than a thousand suites");
+  assert.equal(withGh({ runs: [runJson("Build", "success", -60, -30)], suites: "1000" }, () => r.readChecksAt("o/r", HEAD, T)).ok, true, "a thousand, all listed");
+  assert.equal(withGh({ runs: [runJson("Build", "success", -60, -30)], suites: "many" }, () => r.readChecksAt("o/r", HEAD, T)).ok, false, "a count that doesn't read");
 });
 
 test("the commit a merge went onto is the base branch's before the merge, as GitHub's activity records it", async () => {

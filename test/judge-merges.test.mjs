@@ -13,6 +13,8 @@ import { tempDir } from "./fixtures/temp.mjs";
 const M = await import("../src/merges.mjs").catch((err) => ({ judgeMerges: () => assert.fail(`src/merges.mjs: ${err}`), MERGE_JUDGED: "", MERGES_LOOKED: "",
                                                                FIRST_LOOK_SECONDS: NaN, JUDGED_A_TICK: NaN, AGAIN_FOR_SECONDS: NaN }));
 const { judgeMerges, MERGE_JUDGED, MERGES_LOOKED, FIRST_LOOK_SECONDS, JUDGED_A_TICK, AGAIN_FOR_SECONDS } = M;
+/** The event a merge's first judgment that didn't settle is kept as, or a name no event has while the source has none. */
+const MERGE_TRIED = /** @type {any} */ (M).MERGE_TRIED ?? "no such event yet";
 
 const NWO = "o/r";
 const T = 1_800_000_000;
@@ -88,7 +90,7 @@ test("one tick judges only so many, the oldest first, and the look reaches no fu
   } finally { w.db.close(); }
 });
 
-test("a judgment only reading again settles is made again next tick, and kept as it is once the merge is an hour old", () => {
+test("a judgment only reading again settles is made again next tick, and kept as it is an hour after it was first tried", () => {
   for (const [what, judge] of /** @type {[string, (m: any) => any][]} */ ([
     ["a read to make again", () => verdict("UNKNOWN", "retry")],
     ["something still settling", () => verdict("UNKNOWN", "waiting")],
@@ -106,16 +108,31 @@ test("a judgment only reading again settles is made again next tick, and kept as
       assert.equal(/** @type {any} */ (w.look(T + 300, young, () => verdict("BLOCK"))).judged, 1, what);
       assert.deepEqual(w.events(MERGE_JUDGED).map((e) => [e.subject, e.state]), [["pr:8", "PASS"], ["pr:7", "BLOCK"]]);
     } finally { w.db.close(); }
-    // Never settled: kept as unknown once the merge is an hour old, so the look moves on.
-    const old = world();
+    // Never settled: kept as unknown an hour after it was first tried, so the look moves on.
+    const stuck = world();
     try {
-      assert.equal(/** @type {any} */ (old.look(T - 600 + AGAIN_FOR_SECONDS - 1, [merge(7, 600)], judge)).judged, 0, `${what}: just under the hour`);
-      assert.deepEqual(old.look(T - 600 + AGAIN_FOR_SECONDS, [merge(7, 600)], judge), { ok: true, judged: 1, waiting: 0 }, what);
-      const [kept] = old.events(MERGE_JUDGED);
-      assert.equal(kept.state, "UNKNOWN", what);
-      assert.equal(old.events(MERGES_LOOKED).at(-1).upTo, T - 600 + AGAIN_FOR_SECONDS);
-    } finally { old.db.close(); }
+      assert.equal(/** @type {any} */ (stuck.look(T, [merge(7, 600)], judge)).judged, 0, what);
+      assert.equal(/** @type {any} */ (stuck.look(T + AGAIN_FOR_SECONDS - 1, [merge(7, 600)], judge)).judged, 0, `${what}: just under the hour`);
+      assert.deepEqual(stuck.events(MERGE_TRIED).map((e) => [e.at, e.subject, e.head, e.mergedAt]), [[T, "pr:7", sha("a"), T - 600]], `${what}: when it was first tried, kept once`);
+      assert.deepEqual(stuck.look(T + AGAIN_FOR_SECONDS, [merge(7, 600)], judge), { ok: true, judged: 1, waiting: 0 }, what);
+      assert.equal(stuck.events(MERGE_JUDGED)[0].state, "UNKNOWN", what);
+      assert.equal(stuck.events(MERGES_LOOKED).at(-1).upTo, T + AGAIN_FOR_SECONDS);
+    } finally { stuck.db.close(); }
   }
+});
+
+test("a merge found long after it, the daemon down since, is given the same hour: one read that fails isn't its verdict", () => {
+  const w = world();
+  try {
+    const old = [merge(7, 5 * 3600)];
+    assert.deepEqual(w.look(T, old, () => verdict("UNKNOWN", "retry")), { ok: true, judged: 0, waiting: 1 }, "not kept, though it merged hours ago");
+    assert.deepEqual(w.look(T + 300, old, () => verdict("PASS")), { ok: true, judged: 1, waiting: 0 });
+    assert.deepEqual(w.events(MERGE_JUDGED).map((e) => e.state), ["PASS"]);
+    // The hour is each merge's own: another of the pull request, tried earlier, doesn't spend it.
+    const again = [merge(7, -600, { head: sha("b") })];
+    w.look(T + 2 * AGAIN_FOR_SECONDS, again, () => verdict("UNKNOWN", "retry"));
+    assert.equal(w.events(MERGE_JUDGED).length, 1, "its first try, not its hour's end");
+  } finally { w.db.close(); }
 });
 
 test("a look never reaches back before where it started, though the earliest merge left merged in that very second", () => {
@@ -142,9 +159,10 @@ test("an unknown only a person settles is kept at once: reading again changes no
 test("a merge that couldn't be judged is kept with why, and one GitHub names no merge commit for isn't judged at all", () => {
   const w = world();
   try {
-    const now = T + AGAIN_FOR_SECONDS;
-    w.look(now, [merge(7, 600), merge(8, 300, { mergeCommit: null })], () => ({ ok: false, why: "its head couldn't be pinned" }));
-    assert.deepEqual(w.judgedWith.map((a) => a.merge.pr), [7], "nothing asked of a merge with no commit");
+    const list = [merge(7, 600), merge(8, 300, { mergeCommit: null })];
+    w.look(T, list, () => ({ ok: false, why: "its head couldn't be pinned" }));
+    w.look(T + AGAIN_FOR_SECONDS, list, () => ({ ok: false, why: "its head couldn't be pinned" }));
+    assert.deepEqual(w.judgedWith.map((a) => a.merge.pr), [7, 7], "nothing asked of a merge with no commit");
     const kept = w.events(MERGE_JUDGED);
     assert.deepEqual(kept.map((e) => [e.subject, e.state]), [["pr:7", "UNKNOWN"], ["pr:8", "UNKNOWN"]]);
     assert.match(kept[0].summary, /couldn't be judged: its head couldn't be pinned/);

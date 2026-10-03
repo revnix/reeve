@@ -12,11 +12,11 @@
  */
 import { judgeAtMerge } from "./at-merge.mjs";
 import { isBuilderPr } from "./pr.mjs";
-import { MERGE_JUDGED, MERGES_LOOKED } from "./status.mjs";
+import { MERGE_JUDGED, MERGES_LOOKED, MERGE_TRIED } from "./status.mjs";
 import { mergedSince } from "./trial.mjs";
 
 // The events' names live with the tick's own, where what reads them finds them without this module.
-export { MERGE_JUDGED, MERGES_LOOKED };
+export { MERGE_JUDGED, MERGES_LOOKED, MERGE_TRIED };
 /**
  * How far back the first look reaches: a day. Every later look starts where the
  * last reached, however long the daemon was down between them, so this is only
@@ -25,7 +25,12 @@ export { MERGE_JUDGED, MERGES_LOOKED };
 export const FIRST_LOOK_SECONDS = 86400;
 /** How many merges one tick judges: the rest wait for the next, oldest first. */
 export const JUDGED_A_TICK = 3;
-/** How long after its merge a judgment only reading again settles is made again, before it's kept as it is. */
+/**
+ * How long a judgment only reading again settles is made again, from when the
+ * merge was first tried, before it's kept as it is. From the first try and not
+ * from the merge: a merge found hours after it, the daemon down since, is
+ * given the same hour.
+ */
 export const AGAIN_FOR_SECONDS = 3600;
 
 const iso = (/** @type {number} */ t) => new Date(t * 1000).toISOString().replace(/\.\d+Z$/, "Z");
@@ -35,7 +40,8 @@ const iso = (/** @type {number} */ t) => new Date(t * 1000).toISOString().replac
  * the oldest `limit` not yet judged, each as it stood at its merge, and each
  * kept as a `merge.judged` event with what judged it, `ran`. A judgment only
  * reading again settles, or one that couldn't be made, is made again next tick
- * while the merge is younger than AGAIN_FOR_SECONDS, and kept as it is after.
+ * for AGAIN_FOR_SECONDS from when the merge was first tried, kept as a
+ * `merge.tried` event, and kept as it is after.
  * A builder's pull request is judged with its hold unreadable: a hold isn't
  * kept as it stood at the merge.
  * @param {{ nwo: string, profile: any, db: any, now: number, ran?: { code?: any, policy?: string | null } | null,
@@ -51,10 +57,12 @@ export function judgeMerges({ nwo, profile, db, now, ran = null, merged = merged
     log(`merges: what merged since ${iso(from)} couldn't be read, so none is judged this tick — ${list.why}`);
     return { ok: false, why: list.why };
   }
-  const kept = db.prepare("SELECT payload FROM event WHERE op = ? AND subject = ?");
-  const isJudged = (/** @type {import("./trial.mjs").Merged} */ m) => /** @type {any[]} */ (kept.all(MERGE_JUDGED, `pr:${m.pr}`)).some((r) => {
+  const kept = db.prepare("SELECT at, payload FROM event WHERE op = ? AND subject = ? ORDER BY seq");
+  /** The first event `op` of this merge: its pull request's, at its head, merged when it did. */
+  const eventOf = (/** @type {string} */ op, /** @type {import("./trial.mjs").Merged} */ m) => /** @type {any[]} */ (kept.all(op, `pr:${m.pr}`)).find((r) => {
     try { const p = JSON.parse(r.payload); return p?.head === m.head && p?.mergedAt === m.mergedAt; } catch { return false; }
   });
+  const isJudged = (/** @type {import("./trial.mjs").Merged} */ m) => Boolean(eventOf(MERGE_JUDGED, m));
   const keep = db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)");
   const waiting = list.filter((m) => !isJudged(m));
   /** When each merge left unjudged this tick merged. @type {number[]} */ const left = [];
@@ -70,7 +78,10 @@ export function judgeMerges({ nwo, profile, db, now, ran = null, merged = merged
     } catch (err) { e = { ok: false, why: `judging it threw: ${/** @type {Error} */ (err).message}` }; }
     const v = e.ok ? e.verdict : { state: "UNKNOWN", kind: "retry", summary: `it couldn't be judged: ${e.why}`, clauses: [] };
     const again = v.state === "UNKNOWN" && (v.kind === "retry" || v.kind === "waiting");
-    if (again && now - m.mergedAt < AGAIN_FOR_SECONDS) {
+    // When it was first tried: kept the first time a judgment doesn't settle.
+    const tried = !again ? null : eventOf(MERGE_TRIED, m)?.at
+      ?? (keep.run(now, "daemon", MERGE_TRIED, `pr:${m.pr}`, JSON.stringify({ head: m.head, mergedAt: m.mergedAt })), now);
+    if (tried !== null && now - tried < AGAIN_FOR_SECONDS) {
       left.push(m.mergedAt);
       log(`  merged #${m.pr}: not judged yet, and read again next tick — ${v.summary}`);
       continue;

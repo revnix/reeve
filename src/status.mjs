@@ -138,6 +138,8 @@ export const TICK_STOPPED = "daemon.tick.stopped";
 export const MERGE_JUDGED = "merge.judged";
 /** The event a tick's look for what merged is kept as (#342): `upTo`, in seconds, the time every merge up to which is judged. */
 export const MERGES_LOOKED = "merges.looked";
+/** The event a merge's first judgment that didn't settle is kept as (#342): when judging it was first tried, which the hour it's tried again for runs from. */
+export const MERGE_TRIED = "merge.tried";
 
 /**
  * A tick's stop, recorded where it ends without judging (#301). Its start was

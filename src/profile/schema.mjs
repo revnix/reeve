@@ -291,6 +291,13 @@ export const FIELDS = {
   // independent review of the queued revision does: skipped at a pull request's
   // head by design, and judged at the queue's commit, where they must pass (#286).
   "ci.queueOnlyChecks":     [false, isArr(isStr)],
+  // The job by which CI decides what a commit can affect, as a repository's
+  // integration suites are skipped by a change that can't reach them (#344).
+  // Named with the checks it may skip, or not at all.
+  "ci.decidedSkips.by":     [false, isStr],
+  // The required checks that job may skip: one of them skipped passes where
+  // every run of the job at the commit succeeded, and no check failed there.
+  "ci.decidedSkips.checks": [false, isArr(isStr)],
   // Commit-status contexts published by REVIEWERS. Excluded from check
   // classification entirely: a rate-limited CodeRabbit reports state=success with
   // the truth in the description, so a reviewer's status read as CI is a fail-open
@@ -504,7 +511,7 @@ export function validate(profile) {
   // properties, validate, and serialize to nothing.
   for (const c of ["builder", "builder.budget", "builder.capabilities", "builder.cancel",
                    "builder.founder", "builder.lease", "builder.network",
-                   "builder.network.research", "builder.provider", "worker", "tasks"]) {
+                   "builder.network.research", "builder.provider", "worker", "tasks", "ci.decidedSkips"]) {
     const v = get(profile, c);
     if (v !== undefined && v !== null && (typeof v !== "object" || Array.isArray(v))) errors.push(`${c} must be an object`);
   }
@@ -588,6 +595,9 @@ export function validate(profile) {
     if (c.includes("${{")) errors.push(`ci.requiredChecks contains an unexpanded matrix expression: ${c}`);
   }
   // And a queue-only check is matched by the name GitHub reports, as a required one is (#286).
+  // A job named with no checks it may skip, or checks with no job to decide, decides nothing (#344).
+  if ((get(profile, "ci.decidedSkips.by") == null) !== (get(profile, "ci.decidedSkips.checks") == null))
+    errors.push("ci.decidedSkips names both the job that decides, by, and the required checks it may skip, checks");
   for (const c of get(profile, "ci.queueOnlyChecks") ?? [])
     if (typeof c === "string" && c.includes("${{")) errors.push(`ci.queueOnlyChecks contains an unexpanded matrix expression: ${c}`);
 

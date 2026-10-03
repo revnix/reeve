@@ -284,9 +284,14 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
  * known: only theirs then count, failing, running or cancelled, and another's
  * failure is named in `ancillaryFailing` rather than held against every pull
  * request (#288). Null counts every check, as a base whose rules couldn't be
- * read, or that requires none, can't say which matter.
+ * read, or that requires none, can't say which matter. `decided`, a profile's
+ * `{ by, checks }`, names the job by which CI decides what a commit can affect
+ * and the required checks it may skip: one of them skipped passes where every
+ * run of that job at the commit succeeded, as GitHub's run from the App that
+ * skipped it, and no check failed there, as a job skipped for a failed one it
+ * needs looks the same (#344).
  */
-export function classify(allRows, requiredChecks = [], { requiredKnown = true, evidence = true, queueOnly = [], failuresOf = null } = {}) {
+export function classify(allRows, requiredChecks = [], { requiredKnown = true, evidence = true, queueOnly = [], failuresOf = null, decided = null } = {}) {
   // A row with no name is a PARSE DEFECT, not a check. It cannot be reported to a
   // fixer ("failing: undefined") and it must not block on its own, but it must
   // also not vanish silently, so it is counted and surfaced.
@@ -331,7 +336,12 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
   const notRunRequired = evidence ? required.filter(c => notRun(meeting(c))) : [];
   // Only skipped: one that failed was RED above, and one that never reported is missing.
   const deferred = notRunRequired.filter(c => queueOnly.includes(c.context) && meeting(c).every(r => r.conclusion === "skipped"));
-  const skipped = notRunRequired.filter(c => !deferred.includes(c));
+  const deciders = rows.filter(r => r.name === decided?.by);
+  const decidedSkip = (c) => !failingAll.length && (decided?.checks ?? []).includes(c.context) && deciders.length > 0 &&
+    meeting(c).every(s => s.conclusion === "skipped" &&
+      deciders.every(d => d.source === "check_run" && d.conclusion === "success" && String(d.appId) === String(s.appId)));
+  const decidedOnes = notRunRequired.filter(c => !deferred.includes(c) && decidedSkip(c));
+  const skipped = notRunRequired.filter(c => !deferred.includes(c) && !decidedOnes.includes(c));
   if (skipped.length) return { verdict: "SKIPPED_REQUIRED", why: `required check(s) skipped or neutral, so they never reported a pass: ${skipped.map(label).join(", ")}`,
     failing, running, skipped: skipped.map(c => c.context), malformed };
   // Green needs the whole required set: a requirement unread may be one no row
@@ -339,6 +349,7 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
   const green = (result) => (evidence && !requiredKnown ? { verdict: "UNKNOWN", failing: [], running: [], malformed,
     why: "the base's required checks couldn't be read, so whether each one passed can't be told" }
     : { ...result, ...(deferred.length ? { queueOnly: deferred.map(c => c.context) } : {}),
+        ...(decidedOnes.length ? { decided: decidedOnes.map(c => c.context), decidedBy: decided?.by } : {}),
         ...(ancillaryFailing.length ? { ancillaryFailing } : {}) });
   // A head where nothing ran has no evidence at all, however many rows say so.
   // Unless every required check was left to the merge queue: then the head

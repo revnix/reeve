@@ -112,7 +112,9 @@ expectRefusal("the wrong schemaVersion",
     .map(f => { try { return readFileSync(new URL(f, import.meta.url), "utf8"); } catch { return ""; } }).join("\n");
   const read = new Set([...src.matchAll(/\b(?:profile|p|ctx\.profile)\?\.(\w+)\?\.(\w+)/g)].map(m => `${m[1]}.${m[2]}`));
   const declared = new Set(Object.keys(FIELDS));
-  const missing = [...read].filter(k => !declared.has(k));
+  // Two levels are read, so a container read on to its own keys, as
+  // ci.decidedSkips's are (#344), counts where the schema declares keys in it.
+  const missing = [...read].filter(k => !declared.has(k) && ![...declared].some(d => d.startsWith(`${k}.`)));
   console.log(`${missing.length === 0 ? "PASS" : "FAIL"}  every profile key the code reads is declared in the schema`);
   if (missing.length) { console.log("        undeclared:", missing.join(", ")); fail++; }
 }
@@ -401,8 +403,9 @@ expectRefusal("budgets that are not an object", withBudget([]), /builder\.budget
   // earlier edit updated the comparison and missed the string inside the
   // template literal -- two places holding one fact, and the one a reader sees
   // was the wrong one. The label is derived from the constant now.
-  // 37 with `tasks.repo`, where the tasks pull requests deliver live (#167).
-  const PINNED_DOCUMENTED = 37;
+  // 37 with `tasks.repo`, where the tasks pull requests deliver live (#167);
+  // 39 with `ci.decidedSkips.by` and `.checks`, the skips CI decides (#344).
+  const PINNED_DOCUMENTED = 39;
   const pinned = documented === PINNED_DOCUMENTED;
   console.log(`${pinned ? "PASS" : "FAIL"}  control: ${PINNED_DOCUMENTED} of the declared keys carry a description`);
   if (!pinned) {

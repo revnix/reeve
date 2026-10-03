@@ -167,7 +167,7 @@ export function evaluateQueueEntry({ nwo, entry, input, baseRef, profile, db = n
   const reviewerContexts = profile.ci?.reviewerStatusContexts ?? [];
   const got = read(nwo, entry.sha, { reviewerContexts });
   const req = requirements({ nwo, baseRef, profile });
-  const c = classifyRead(got, req);
+  const c = classifyRead(got, checkRules(req, profile));
   const reading = { ...c, sha: entry.sha, rows: got?.rows ?? [],
     suitesComplete: c.verdict === "MISSING_REQUIRED" ? missingSettled(nwo, entry.sha, c.missingChecks, profile) : null };
   const key = `${nwo}@merge-queue`;
@@ -328,8 +328,8 @@ export function requiredChecksOf({ nwo, baseRef, profile = /** @type {CiProfile}
  * passes nothing, since the surface that went unread may hold a failure, and
  * says so with `readable: false`; but a failure it did read is one, and stays RED.
  */
-export function classifyRead(read, { required = [], known = true, queueOnly = [], failuresOf = null } = {}, { evidence = true } = {}) {
-  const c = classify(read?.rows ?? [], required, { requiredKnown: known, evidence, queueOnly, failuresOf });
+export function classifyRead(read, { required = [], known = true, queueOnly = [], failuresOf = null, decided = null } = {}, { evidence = true } = {}) {
+  const c = classify(read?.rows ?? [], required, { requiredKnown: known, evidence, queueOnly, failuresOf, decided });
   // Checks judged while the base's requirements couldn't be read are read again,
   // whatever else left them unknown, no check reported yet say: only reading
   // the requirements again settles them.
@@ -804,7 +804,20 @@ export function baseContainedIn({ nwo, base, head, gh = ghJson }) {
  * head's: the queue's commit is judged against the required checks alone.
  * @param {{ required?: any[], known?: boolean }} req @param {any} profile @param {boolean | null} [queued]
  */
-export const headCheckRequirements = (req, profile, queued = null) => ({ ...req, queueOnly: queued === true ? (profile?.ci?.queueOnlyChecks ?? []) : [] });
+export const headCheckRequirements = (req, profile, queued = null) => ({ ...checkRules(req, profile), queueOnly: queued === true ? (profile?.ci?.queueOnlyChecks ?? []) : [] });
+
+/**
+ * What a commit a pull request may merge at, its head or the queue's, is judged
+ * against (#344): the required checks; only their failures, as the customer's
+ * rule is that every required job succeeded, another's named beside them; and
+ * the required checks CI's own decision may skip, where the profile names the
+ * job that decides.
+ * @param {{ required?: any[], known?: boolean }} req @param {any} profile
+ */
+export const checkRules = (req, profile) => {
+  const by = profile?.ci?.decidedSkips?.by;
+  return { ...req, failuresOf: gatingOf(req), decided: by ? { by, checks: profile?.ci?.decidedSkips?.checks ?? [] } : null };
+};
 
 export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}, hold = null }) {
   // Reuses the caller's anchor when it has one, so the head is pinned ONCE per

@@ -20653,6 +20653,8 @@ export const STUBS = [
     edits: [{ file: "src/pr.mjs",
               find: "n) => !counts || counts.some(",
               replace: "n) => (counts ?? []).some(" }],
+  },
+  {
     name: "merges-first-look-reach",
     why: "start the first look at now. Every merge before the first tick of this code would go unjudged",
     test: "test/judge-merges.test.mjs",
@@ -20712,8 +20714,8 @@ export const STUBS = [
     test: "test/judge-merges.test.mjs",
     expectRed: "one tick judges only so many, the oldest first, and the look reaches no further than the earliest left",
     edits: [{ file: "src/merges.mjs",
-              find: "upTo: left.length ? Math.max(from, Math.min(...left) - 1) : now",
-              replace: "upTo: now" }],
+              find: "Math.min(now - LISTED_WITHIN_SECONDS, ...left.map((t) => t - 1))",
+              replace: "Math.min(now - LISTED_WITHIN_SECONDS)" }],
   },
   {
     name: "merges-look-never-back",
@@ -20721,8 +20723,8 @@ export const STUBS = [
     test: "test/judge-merges.test.mjs",
     expectRed: "a look never reaches back before where it started, though the earliest merge left merged in that very second",
     edits: [{ file: "src/merges.mjs",
-              find: "Math.max(from, Math.min(...left) - 1)",
-              replace: "Math.min(...left) - 1" }],
+              find: "upTo: Math.max(from, Math.min(now - LISTED_WITHIN_SECONDS, ...left.map((t) => t - 1))) }));",
+              replace: "upTo: Math.min(now - LISTED_WITHIN_SECONDS, ...left.map((t) => t - 1)) }));" }],
   },
   {
     name: "merges-no-commit-unjudged",
@@ -20885,6 +20887,8 @@ export const STUBS = [
     edits: [{ file: "src/pr.mjs",
               find: "until != null && !(Date.parse(String(t)) / 1000 < until) && !(Date.parse(String(t)) / 1000 > until);",
               replace: "until != null && Date.parse(String(t)) / 1000 === until;" }],
+  },
+  {
     name: "merges-hour-from-first-try",
     why: "count the hour a judgment is made again for from the merge. One found hours after it, the daemon down since, would be kept on its first failed read",
     test: "test/judge-merges.test.mjs",
@@ -20910,5 +20914,14 @@ export const STUBS = [
     edits: [{ file: "src/merges.mjs",
               find: "const tried = !again ? null : eventOf(MERGE_TRIED, m)?.at",
               replace: "const tried = !again ? null : /** @type {any[]} */ (kept.all(MERGE_TRIED, `pr:${m.pr}`))[0]?.at" }],
+  },
+  {
+    name: "merges-look-behind-now",
+    why: "reach the look right up to now. A merge GitHub hadn't listed yet would be passed over for good",
+    test: "test/judge-merges.test.mjs",
+    expectRed: "a merge GitHub lists only some minutes after it happened is still judged: a look reaches to a little before now",
+    edits: [{ file: "src/merges.mjs",
+              find: "Math.min(now - LISTED_WITHIN_SECONDS, ...left.map((t) => t - 1))",
+              replace: "Math.min(now, ...left.map((t) => t - 1))" }],
   },
 ];

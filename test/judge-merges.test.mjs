@@ -15,6 +15,8 @@ const M = await import("../src/merges.mjs").catch((err) => ({ judgeMerges: () =>
 const { judgeMerges, MERGE_JUDGED, MERGES_LOOKED, FIRST_LOOK_SECONDS, JUDGED_A_TICK, AGAIN_FOR_SECONDS } = M;
 /** The event a merge's first judgment that didn't settle is kept as, or a name no event has while the source has none. */
 const MERGE_TRIED = /** @type {any} */ (M).MERGE_TRIED ?? "no such event yet";
+/** How long before now a look takes GitHub to have listed every merge, or none while the source says none. */
+const LAG = /** @type {any} */ (M).LISTED_WITHIN_SECONDS ?? 0;
 
 const NWO = "o/r";
 const T = 1_800_000_000;
@@ -61,12 +63,12 @@ test("each merge since the last look is judged once, as it stood, and kept as it
                                 code: { commit: "c0de" }, policy: "p0licy" });
     // Never as a pull request's decision: nothing that reads its latest decision reads a merge's.
     assert.equal(w.db.prepare("SELECT COUNT(*) n FROM event WHERE op IN ('pr.decided', 'queue.decided')").get().n, 0);
-    assert.deepEqual(w.events(MERGES_LOOKED).map((e) => e.upTo), [T], "every merge up to now is judged");
+    assert.deepEqual(w.events(MERGES_LOOKED).map((e) => e.upTo), [T - LAG], "every merge GitHub has had time to list is judged");
     // The next look starts where this one reached, and judges none again, though GitHub lists it again.
     assert.deepEqual(w.look(T + 300, [merge(8, 300, { head: sha("b"), mergeCommit: sha("e") })]), { ok: true, judged: 0, waiting: 0 });
-    assert.equal(w.asked[1].since, T);
+    assert.equal(w.asked[1].since, T - LAG);
     assert.equal(w.judgedWith.length, 2, "none judged twice");
-    assert.deepEqual(w.events(MERGES_LOOKED).map((e) => e.upTo), [T, T + 300]);
+    assert.deepEqual(w.events(MERGES_LOOKED).map((e) => e.upTo), [T - LAG, T + 300 - LAG]);
     // One merged again at another head, reopened it can't be, but the same number re-listed with another head is another merge.
     assert.equal(/** @type {any} */ (w.look(T + 600, [merge(8, -500, { head: sha("c") })])).judged, 1);
   } finally { w.db.close(); }
@@ -75,18 +77,37 @@ test("each merge since the last look is judged once, as it stood, and kept as it
 test("one tick judges only so many, the oldest first, and the look reaches no further than the earliest left", () => {
   const w = world();
   try {
-    const five = [5, 4, 3, 2, 1].map((n) => merge(n, n * 100));
+    const five = [5, 4, 3, 2, 1].map((n) => merge(n, n * 1000));
     const got = w.look(T, five);
     assert.deepEqual(got, { ok: true, judged: JUDGED_A_TICK, waiting: 5 - JUDGED_A_TICK });
     assert.deepEqual(w.events(MERGE_JUDGED).map((e) => e.subject), ["pr:5", "pr:4", "pr:3"]);
-    // The earliest left merged at T - 200: every merge before that second is judged.
-    assert.deepEqual(w.events(MERGES_LOOKED).map((e) => e.upTo), [T - 201]);
+    // The earliest left merged at T - 2000: every merge before that second is judged.
+    assert.deepEqual(w.events(MERGES_LOOKED).map((e) => e.upTo), [T - 2001]);
     assert.match(w.said.join("\n"), /3 judged[^\n]*2 left for the next tick/);
     // The next tick asks from there, and judges the rest.
     assert.deepEqual(w.look(T + 300, five), { ok: true, judged: 2, waiting: 0 });
-    assert.equal(w.asked[1].since, T - 201);
+    assert.equal(w.asked[1].since, T - 2001);
     assert.deepEqual(w.events(MERGE_JUDGED).map((e) => e.subject), ["pr:5", "pr:4", "pr:3", "pr:2", "pr:1"]);
-    assert.equal(w.events(MERGES_LOOKED).at(-1).upTo, T + 300);
+    assert.equal(w.events(MERGES_LOOKED).at(-1).upTo, T + 300 - LAG);
+  } finally { w.db.close(); }
+});
+
+test("a merge GitHub lists only some minutes after it happened is still judged: a look reaches to a little before now", () => {
+  const w = world();
+  try {
+    assert.ok(LAG >= 300, `GitHub's search lists a merge after it happens: ${LAG}`);
+    // Merged a minute before the look, and not listed yet.
+    w.look(T, []);
+    assert.deepEqual(w.events(MERGES_LOOKED).map((e) => e.upTo), [T - LAG]);
+    // Listed by the next look, which asks from before it.
+    const listed = (/** @type {number} */ since) => (T - 60 >= since ? [merge(7, 60)] : []);
+    assert.deepEqual(w.look(T + 300, listed), { ok: true, judged: 1, waiting: 0 });
+    // And the look never goes back for it: the first reaches no further back than it started.
+    const first = world();
+    try {
+      first.look(T, [], undefined, {});
+      assert.ok(first.events(MERGES_LOOKED)[0].upTo >= T - Math.max(LAG, FIRST_LOOK_SECONDS));
+    } finally { first.db.close(); }
   } finally { w.db.close(); }
 });
 
@@ -99,10 +120,10 @@ test("a judgment only reading again settles is made again next tick, and kept as
   ])) {
     const w = world();
     try {
-      const young = [merge(7, 600), merge(8, 300)];
+      const young = [merge(7, 1600), merge(8, 1300)];
       assert.deepEqual(w.look(T, young, (m) => (m.pr === 7 ? judge(m) : verdict("PASS"))), { ok: true, judged: 1, waiting: 1 }, what);
       assert.deepEqual(w.events(MERGE_JUDGED).map((e) => e.subject), ["pr:8"], `${what}: not kept, and the one after it is`);
-      assert.deepEqual(w.events(MERGES_LOOKED).map((e) => e.upTo), [T - 601], `${what}: the look stops before it`);
+      assert.deepEqual(w.events(MERGES_LOOKED).map((e) => e.upTo), [T - 1601], `${what}: the look stops before it`);
       assert.match(w.said.join("\n"), /merged #7: not judged yet, and read again next tick/);
       // Settled on reading again: kept.
       assert.equal(/** @type {any} */ (w.look(T + 300, young, () => verdict("BLOCK"))).judged, 1, what);
@@ -114,9 +135,11 @@ test("a judgment only reading again settles is made again next tick, and kept as
       assert.equal(/** @type {any} */ (stuck.look(T, [merge(7, 600)], judge)).judged, 0, what);
       assert.equal(/** @type {any} */ (stuck.look(T + AGAIN_FOR_SECONDS - 1, [merge(7, 600)], judge)).judged, 0, `${what}: just under the hour`);
       assert.deepEqual(stuck.events(MERGE_TRIED).map((e) => [e.at, e.subject, e.head, e.mergedAt]), [[T, "pr:7", sha("a"), T - 600]], `${what}: when it was first tried, kept once`);
+      // The one left holds the look before it, however far on now is.
+      assert.equal(stuck.events(MERGES_LOOKED).at(-1).upTo, T - 601, what);
       assert.deepEqual(stuck.look(T + AGAIN_FOR_SECONDS, [merge(7, 600)], judge), { ok: true, judged: 1, waiting: 0 }, what);
       assert.equal(stuck.events(MERGE_JUDGED)[0].state, "UNKNOWN", what);
-      assert.equal(stuck.events(MERGES_LOOKED).at(-1).upTo, T + AGAIN_FOR_SECONDS);
+      assert.equal(stuck.events(MERGES_LOOKED).at(-1).upTo, T + AGAIN_FOR_SECONDS - LAG);
     } finally { stuck.db.close(); }
   }
 });
@@ -139,11 +162,13 @@ test("a look never reaches back before where it started, though the earliest mer
   const w = world();
   try {
     w.look(T, []);
-    // Merged in the second of the last look, and listed only after it.
-    w.look(T + 300, [merge(7, 0)], () => verdict("UNKNOWN", "retry"));
-    assert.deepEqual(w.events(MERGES_LOOKED).map((e) => e.upTo), [T, T], "not a second further back each tick");
-    w.look(T + 600, [merge(7, 0)], () => verdict("PASS"));
-    assert.equal(w.asked.at(-1).since, T, "and it's asked from there, the merge's own second within it");
+    const from = T - LAG;
+    // Merged in the very second the last look reached to, and left.
+    const m = merge(7, LAG);
+    w.look(T + 300, [m], () => verdict("UNKNOWN", "retry"));
+    assert.deepEqual(w.events(MERGES_LOOKED).map((e) => e.upTo), [from, from], "not a second further back each tick");
+    w.look(T + 600, [m], () => verdict("PASS"));
+    assert.equal(w.asked.at(-1).since, from, "and it's asked from there, the merge's own second within it");
     assert.deepEqual(w.events(MERGE_JUDGED).map((e) => e.subject), ["pr:7"]);
   } finally { w.db.close(); }
 });
@@ -177,10 +202,10 @@ test("a look that can't read what merged judges nothing and keeps no look, so th
     w.look(T, []);
     assert.deepEqual(w.look(T + 300, { why: "HTTP 502" }), { ok: false, why: "HTTP 502" });
     assert.equal(w.judgedWith.length, 0);
-    assert.deepEqual(w.events(MERGES_LOOKED).map((e) => e.upTo), [T], "no look kept for it");
+    assert.deepEqual(w.events(MERGES_LOOKED).map((e) => e.upTo), [T - LAG], "no look kept for it");
     assert.match(w.said.join("\n"), /couldn't be read[^\n]*HTTP 502/);
     w.look(T + 600, []);
-    assert.equal(w.asked.at(-1).since, T, "from the last look that read");
+    assert.equal(w.asked.at(-1).since, T - LAG, "from the last look that read");
     // A look that doesn't read, a store's damaged row say, is no look: the first look's reach again.
     w.db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(T + 700, "daemon", MERGES_LOOKED, null, "{not json");
     w.look(T + 900, []);

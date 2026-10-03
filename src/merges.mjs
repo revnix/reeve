@@ -8,7 +8,8 @@
  * A judgment is kept as its own event, `merge.judged`, and never as a
  * pull request's decision: nothing is published for a merge, and nothing that
  * reads a pull request's latest decision reads it. `merges.looked` keeps how
- * far the look has reached: every merge up to it is judged.
+ * far the look has reached: every merge up to it is judged, and it stays a
+ * little behind now, as GitHub lists a merge some time after it happens.
  */
 import { judgeAtMerge } from "./at-merge.mjs";
 import { isBuilderPr } from "./pr.mjs";
@@ -23,6 +24,13 @@ export { MERGE_JUDGED, MERGES_LOOKED, MERGE_TRIED };
  * how much of what merged before reeve first looked it judges.
  */
 export const FIRST_LOOK_SECONDS = 86400;
+/**
+ * How long before now a look takes GitHub to have listed every merge. What
+ * merged is read from GitHub's search, which lists a merge some time after it
+ * happens: a look that reached to now would pass over one not listed yet, for
+ * good.
+ */
+export const LISTED_WITHIN_SECONDS = 900;
 /** How many merges one tick judges: the rest wait for the next, oldest first. */
 export const JUDGED_A_TICK = 3;
 /**
@@ -92,8 +100,9 @@ export function judgeMerges({ nwo, profile, db, now, ran = null, merged = merged
     judged++;
     log(`  merged #${m.pr}: judged as it stood at its merge, ${iso(m.mergedAt)} — ${v.state}${v.state === "PASS" ? "" : ` (${v.summary})`}`);
   }
-  // Every merge up to here is judged: up to now, or to just before the earliest left.
-  keep.run(now, "daemon", MERGES_LOOKED, null, JSON.stringify({ upTo: left.length ? Math.max(from, Math.min(...left) - 1) : now }));
+  // Every merge up to here is judged: to a little before now, as GitHub may not
+  // have listed the latest yet, and to just before the earliest left.
+  keep.run(now, "daemon", MERGES_LOOKED, null, JSON.stringify({ upTo: Math.max(from, Math.min(now - LISTED_WITHIN_SECONDS, ...left.map((t) => t - 1))) }));
   if (judged || left.length) log(`merges: ${judged} judged as they stood at their merge${left.length ? `, ${left.length} left for the next tick` : ""}`);
   return { ok: true, judged, waiting: left.length };
 }

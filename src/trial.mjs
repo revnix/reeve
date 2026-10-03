@@ -91,6 +91,16 @@ function reasonOf(c) {
 const some = (list, say) => list.slice(0, 10).map(say).join(", ") + (list.length > 10 ? `, and ${list.length - 10} more` : "");
 
 /**
+ * What binds an audit to a merge's judgment as the store keeps it (#342): a
+ * digest of its event's payload, as a judgment at a head has its decision
+ * record. A merge's judgment keeps no record, and the call it's of is named by
+ * its verdict alone, so without this an audit of one would be taken for an
+ * audit of another made under its number, in a store restored from before.
+ * @param {unknown} payload the event's payload, as kept
+ */
+const judgmentDigest = (payload) => createHash("sha256").update(String(payload ?? "")).digest("hex");
+
+/**
  * The events `op` from `since` to `now`, in seconds, and to event `upTo`
  * where it's given: a trial read again is the trial as it was read, though an
  * event recorded since falls in its last second (#335).
@@ -99,7 +109,8 @@ const some = (list, say) => list.slice(0, 10).map(say).join(", ") + (list.length
 const events = (db, op, since, now, upTo = null) => /** @type {any[]} */ (db.prepare(
   `SELECT seq, at, subject, payload FROM event WHERE op = ? AND at >= ? AND at <= ? AND (? IS NULL OR seq <= ?) ORDER BY seq`).all(op, since, now, upTo, upTo))
   .map((r) => { let p = {}; try { p = JSON.parse(r.payload ?? "{}") ?? {}; } catch { /* a payload that can't be read says nothing */ }
-                return { seq: Number(r.seq), at: Number(r.at), pr: Number(String(r.subject ?? "").replace(/^pr:/, "")), p }; });
+                return { seq: Number(r.seq), at: Number(r.at), pr: Number(String(r.subject ?? "").replace(/^pr:/, "")), p,
+                         ...(op === MERGE_JUDGED ? { digest: judgmentDigest(r.payload) } : {}) }; });
 
 /**
  * The trial of `repo` from `since` to `now`, both in seconds, against its
@@ -182,12 +193,13 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
     // commit reeve judged before the merge: a pull request the queue held,
     // then dropped, may have merged another way.
     const inQueue = m.mergeCommit ? queued.filter((e) => e.pr === m.pr && e.p.head === m.mergeCommit && e.at <= m.mergedAt).at(-1) : undefined;
-    // Its judgment as it stood at its merge: this merge's, the latest. It stands
+    // Its judgment as it stood at its merge: this merge's, of the commit GitHub
+    // says it merged as, whose base's rules it was judged by; the latest. It stands
     // over the verdict that stood when it merged, which a tick before the merge
     // gave on what it could see then; so a merge while the daemon was down, or
     // between two ticks, is judged rather than missed (the founder, 2026-10-02).
     // An unknown one says nothing of the merge, which is then as it was.
-    const late = atMerges.filter((e) => e.pr === m.pr && e.p.head === m.head && e.p.mergedAt === m.mergedAt).at(-1);
+    const late = atMerges.filter((e) => e.pr === m.pr && e.p.head === m.head && e.p.mergedAt === m.mergedAt && e.p.mergeCommit === m.mergeCommit).at(-1);
     const told = late && (late.p.state === "PASS" || late.p.state === "BLOCK") ? late : null;
     if (last) standing.add(last.seq);
     if (inQueue) standing.add(inQueue.seq);
@@ -219,6 +231,16 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
     "a new push after a review": pushedAfterReview[0] ?? null,
     "a merge through the merge queue": merges.find((m) => m.queue)?.pr ?? null,
   };
+  // A kind no head showed may show in a merge's judgment as it stood (#342):
+  // passing only once its checks finished, or merged past a failing check or
+  // an open thread. A conflict can't: it merged. Kinds given as first read
+  // hold these already, and are left as given.
+  if (!seenKinds) {
+    const shown = (/** @type {(e: any) => boolean} */ f) => atMerges.find(f)?.pr ?? null;
+    kinds["a pull request that passes"] ??= shown((e) => e.p.state === "PASS");
+    kinds["failing CI"] ??= shown((e) => clause(e.p, "ci") === "BLOCK");
+    kinds["unresolved threads"] ??= shown((e) => clause(e.p, "threads") === "BLOCK");
+  }
 
   // What a person must judge: every call the daemon made in the period, at a
   // pull request's head or on the queue's commit, merged or not, since every
@@ -250,7 +272,8 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
     c.record = e.p.record ?? c.record;
     if (standing.has(e.seq)) c.final = true;
     calls.set(id, c);
-    judged.set(e.seq, { id, record: e.p.record ?? null });
+    // What an audit of it keeps: its decision record, or for a merge's judgment, which has none, its event as kept.
+    judged.set(e.seq, { id, record: where === "merge" ? e.digest : e.p.record ?? null });
   }
   const toAudit = [...calls.values()].sort((a, b) => a.pr - b.pr || a.first - b.first);
   // Each call's mark, as a person's latest audit of it gave it: an audit made
@@ -270,7 +293,8 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
     if (!e) return null;
     let p = {};
     try { p = JSON.parse(e.payload ?? "{}") ?? {}; } catch { /* a payload that can't be read says nothing */ }
-    return { id: callOf(repo, e.op === "queue.decided" ? "queue" : e.op === MERGE_JUDGED ? "merge" : "head", Number(String(e.subject ?? "").replace(/^pr:/, "")), p).id, record: /** @type {any} */ (p).record ?? null };
+    return { id: callOf(repo, e.op === "queue.decided" ? "queue" : e.op === MERGE_JUDGED ? "merge" : "head", Number(String(e.subject ?? "").replace(/^pr:/, "")), p).id,
+             record: e.op === MERGE_JUDGED ? judgmentDigest(e.payload) : /** @type {any} */ (p).record ?? null };
   };
   if (Array.isArray(audits)) for (const a of [...audits].sort((x, y) => (x.seq ?? 0) - (y.seq ?? 0) || x.at - y.at))
     for (const m of a.calls) {

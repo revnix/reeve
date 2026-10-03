@@ -20059,7 +20059,7 @@ export const STUBS = [
     test: "test/checks-at.test.mjs",
     expectRed: "an earlier merge of a push of the merge queue went onto the tip before that push",
     edits: [{ file: "src/github/reconciler.mjs",
-              find: "  if (!merged.length) return queuedOnto(nwo, mergeCommit, items);\n",
+              find: "  if (!merged.length) return queuedOnto(nwo, mergeCommit, items, mergedAt);\n",
               replace: "" }],
   },
   {
@@ -20115,6 +20115,15 @@ export const STUBS = [
     edits: [{ file: "src/github/reconciler.mjs",
               find: " || !/^[0-9a-f]{40}$/.test(String(from[0].after))) return null;",
               replace: ") return null;" }],
+  },
+  {
+    name: "queued-onto-at-merge-time",
+    why: "take a push of the queue from that tip whenever it was. A branch set back to a commit of the push and built on again has a later one, which carried other merges",
+    test: "test/checks-at.test.mjs",
+    expectRed: "an earlier merge of a push of the merge queue went onto the tip before that push",
+    edits: [{ file: "src/github/reconciler.mjs",
+              find: "    if (!(Math.abs(Date.parse(String(from[0].timestamp)) / 1000 - mergedAt) <= QUEUE_PUSH_DATED_WITHIN)) return null;\n",
+              replace: "" }],
   },
   {
     name: "queued-onto-ahead",

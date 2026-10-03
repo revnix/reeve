@@ -392,7 +392,7 @@ export function mergedOnto(nwo, baseRef, mergeCommit, mergedAt, now = Math.floor
   const period = ACTIVITY_PERIODS.find(([, covers]) => now - mergedAt < covers)?.[0];
   if (!period) return null;
   const r = gh(`repos/${nwo}/activity?ref=${encodeURIComponent(`refs/heads/${baseRef}`)}&time_period=${period}&per_page=100`,
-               ".[] | {activity_type, before, after} | @json", { paginate: true });
+               ".[] | {activity_type, before, after, timestamp} | @json", { paginate: true });
   if (!r.ok) return null;
   /** @type {any[]} */ const items = [];
   for (const line of r.out.split("\n").filter(Boolean)) {
@@ -400,9 +400,16 @@ export function mergedOnto(nwo, baseRef, mergeCommit, mergedAt, now = Math.floor
   }
   const merged = items.filter(x => x?.after === mergeCommit && (x.activity_type === "pr_merge" || x.activity_type === "merge_queue_merge"));
   // No record ends at the merge's commit: it may be an earlier merge of a push of the queue.
-  if (!merged.length) return queuedOnto(nwo, mergeCommit, items);
+  if (!merged.length) return queuedOnto(nwo, mergeCommit, items, mergedAt);
   return merged.length === 1 && /^[0-9a-f]{40}$/.test(String(merged[0].before)) ? merged[0].before : null;
 }
+
+/**
+ * How far, in seconds, the record of a push of the queue may be dated from a
+ * merge it carried. GitHub dates a merge up to two seconds after the push's
+ * record, measured on forty merges on 2026-10-03; a minute allows for a slow one.
+ */
+const QUEUE_PUSH_DATED_WITHIN = 60;
 
 /**
  * The tip a push of the merge queue went onto, for a merge the push carried
@@ -412,11 +419,14 @@ export function mergedOnto(nwo, baseRef, mergeCommit, mergedAt, now = Math.floor
  * and the first has the tip before the push. So the merge commit's first
  * parents are followed, through one page of its ancestors as GitHub lists
  * them, a commit before its parent, down to a tip that one push of the queue
- * went on from. GitHub's comparison of that push's two ends then has to list
- * the merge's commit. Null where any of it isn't shown.
- * @param {string} nwo @param {string} mergeCommit @param {any[]} activity the branch's records
+ * went on from. That push has to be the one at the merge's own time: a branch
+ * set back to a commit of the push, and built on again, has a later push of the
+ * queue from that commit, which carried other merges. And GitHub's comparison
+ * of the push's two ends has to list the merge's commit. Null where any of it
+ * isn't shown.
+ * @param {string} nwo @param {string} mergeCommit @param {any[]} activity the branch's records @param {number} mergedAt when it merged, in seconds
  */
-function queuedOnto(nwo, mergeCommit, activity) {
+function queuedOnto(nwo, mergeCommit, activity, mergedAt) {
   const listed = gh(`repos/${nwo}/commits?sha=${mergeCommit}&per_page=100`, ".[] | {sha, parent: .parents[0].sha} | @json");
   let at = mergeCommit;
   for (const line of listed.out.split("\n").filter(Boolean)) {
@@ -427,6 +437,7 @@ function queuedOnto(nwo, mergeCommit, activity) {
     const from = activity.filter(x => x?.before === at);
     if (!from.length) continue;
     if (from.length !== 1 || from[0].activity_type !== "merge_queue_merge" || !/^[0-9a-f]{40}$/.test(String(from[0].after))) return null;
+    if (!(Math.abs(Date.parse(String(from[0].timestamp)) / 1000 - mergedAt) <= QUEUE_PUSH_DATED_WITHIN)) return null;
     const compared = gh(`repos/${nwo}/compare/${at}...${from[0].after}`, "{status, commits: [.commits[].sha]} | @json");
     try {
       const got = JSON.parse(compared.out);

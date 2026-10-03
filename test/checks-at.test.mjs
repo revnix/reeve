@@ -206,7 +206,10 @@ test("an earlier merge of a push of the merge queue went onto the tip before tha
   const act = (/** @type {string} */ type, /** @type {string} */ before, /** @type {string} */ after) => JSON.stringify({ activity_type: type, before, after });
   // The queue put several merges on the branch in one push. GitHub's activity records it once, from the tip before to the last merge's commit.
   const LAST = "c".repeat(40), EARLIER = "b".repeat(40), ENDS = `${PARENT}...${LAST}`;
-  const push = act("merge_queue_merge", PARENT, LAST);
+  /** A record of a push of the queue, dated `s` seconds from the merge's time: GitHub dates a merge a second or two after the push that carried it. */
+  const queued = (/** @type {string} */ before, /** @type {string} */ after, /** @type {number | null} */ s = -1) =>
+    JSON.stringify({ activity_type: "merge_queue_merge", before, after, ...(s === null ? {} : { timestamp: at(s) }) });
+  const push = queued(PARENT, LAST);
   /** A commit as the read of a commit's ancestors gives one. */
   const commit = (/** @type {string} */ sha, /** @type {string | null} */ parent) => JSON.stringify({ sha, parent });
   /** GitHub's comparison of a push's two ends, as the read gives it. */
@@ -225,11 +228,21 @@ test("an earlier merge of a push of the merge queue went onto the tip before tha
   assert.equal(onto({ ...two, ancestors: { [MERGE]: ["not json", commit(MERGE, PARENT)] } }), null, "ancestors with a line that doesn't read");
   assert.equal(onto({ ...two, activity: [act("pr_merge", PARENT, LAST)] }), null, "from that tip a pull request was merged, by no push of the queue");
   assert.equal(onto({ ...two, activity: [act("push", PARENT, LAST)] }), null, "from that tip a push");
-  assert.equal(onto({ ...two, activity: [push, act("merge_queue_merge", PARENT, "f".repeat(40))], compare: { ...two.compare, [`${PARENT}...${"f".repeat(40)}`]: compared([MERGE]) } }), null,
+  assert.equal(onto({ ...two, activity: [push, queued(PARENT, "f".repeat(40))], compare: { ...two.compare, [`${PARENT}...${"f".repeat(40)}`]: compared([MERGE]) } }), null,
                "two records from one tip");
-  assert.equal(onto({ ...two, activity: [act("merge_queue_merge", PARENT, "not-a-sha")], compare: { [`${PARENT}...not-a-sha`]: compared([MERGE]) } }), null, "a push that ends at no commit");
-  assert.equal(onto({ activity: [act("merge_queue_merge", "main", LAST)], ancestors: { [MERGE]: [commit(MERGE, "main")] }, compare: { [`main...${LAST}`]: compared([MERGE, LAST]) } }), null,
+  assert.equal(onto({ ...two, activity: [queued(PARENT, "not-a-sha")], compare: { [`${PARENT}...not-a-sha`]: compared([MERGE]) } }), null, "a push that ends at no commit");
+  assert.equal(onto({ activity: [queued("main", LAST)], ancestors: { [MERGE]: [commit(MERGE, "main")] }, compare: { [`main...${LAST}`]: compared([MERGE, LAST]) } }), null,
                "a parent that is no commit");
+  // The push has to be the one at the merge's own time. A branch set back to a commit of the push and built on again
+  // has a later push of the queue from that commit, which carried other merges, whatever a comparison of its ends lists.
+  assert.equal(onto({ ...two, activity: [queued(PARENT, LAST, 2 * 3600)] }), null, "a push from that tip two hours after the merge");
+  assert.equal(onto({ ...two, activity: [queued(PARENT, LAST, -2 * 3600)] }), null, "one two hours before it");
+  assert.equal(onto({ ...two, activity: [queued(PARENT, LAST, null)] }), null, "one with no time");
+  assert.equal(onto({ ...two, activity: [JSON.stringify({ activity_type: "merge_queue_merge", before: PARENT, after: LAST, timestamp: "not a time" })] }), null, "one whose time doesn't read");
+  assert.equal(onto({ ...two, activity: [queued(PARENT, LAST, -60)] }), PARENT, "a minute before the merge is dated: within what's allowed");
+  assert.equal(onto({ ...two, activity: [queued(PARENT, LAST, 60)] }), PARENT, "a minute after");
+  assert.equal(onto({ ...two, activity: [queued(PARENT, LAST, -61)] }), null, "more than a minute before");
+  assert.equal(onto({ ...two, activity: [queued(PARENT, LAST, 61)] }), null, "more than a minute after");
   assert.equal(onto({ ...two, compare: {} }), null, "the comparison unread");
   assert.equal(onto({ ...two, compare: { [ENDS]: "not json" } }), null, "a comparison that doesn't read");
   assert.equal(onto({ ...two, compare: { [ENDS]: compared([EARLIER, LAST]) } }), null, "a push that didn't carry it");
@@ -237,6 +250,6 @@ test("an earlier merge of a push of the merge queue went onto the tip before tha
   // A record that ends at the merge's own commit is the merge's, as before, and nothing more is asked.
   const log = join(tempDir("reeve-checks-at-log-"), "asked");
   writeFileSync(log, "");
-  assert.equal(withGh({ ...two, activity: [act("merge_queue_merge", PARENT, MERGE)], log }, () => r.mergedOnto("o/r", "main", MERGE, T, T + 3600)), PARENT);
+  assert.equal(withGh({ ...two, activity: [act("merge_queue_merge", PARENT, MERGE)], log }, () => r.mergedOnto("o/r", "main", MERGE, T, T + 3600)), PARENT, "with no time asked of it");
   assert.doesNotMatch(readFileSync(log, "utf8"), /commits|compare/, "its own record found, nothing more asked");
 });

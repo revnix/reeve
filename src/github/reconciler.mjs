@@ -288,8 +288,8 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
  * `{ by, checks }`, names the job by which CI decides what a commit can affect
  * and the required checks it may skip: one of them skipped passes where every
  * run of that job at the commit succeeded, as GitHub's run from the App that
- * skipped it, and no check failed there, as a job skipped for a failed one it
- * needs looks the same (#344).
+ * skipped it, and no check failed, was cancelled or went stale there, as a job
+ * skipped for one it needs that didn't succeed looks the same (#344).
  */
 export function classify(allRows, requiredChecks = [], { requiredKnown = true, evidence = true, queueOnly = [], failuresOf = null, decided = null } = {}) {
   // A row with no name is a PARSE DEFECT, not a check. It cannot be reported to a
@@ -337,7 +337,7 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
   // Only skipped: one that failed was RED above, and one that never reported is missing.
   const deferred = notRunRequired.filter(c => queueOnly.includes(c.context) && meeting(c).every(r => r.conclusion === "skipped"));
   const deciders = rows.filter(r => r.name === decided?.by);
-  const decidedSkip = (c) => !failingAll.length && (decided?.checks ?? []).includes(c.context) && deciders.length > 0 &&
+  const decidedSkip = (c) => !failingAll.length && !uninformative.length && (decided?.checks ?? []).includes(c.context) && deciders.length > 0 &&
     meeting(c).every(s => s.conclusion === "skipped" &&
       deciders.every(d => d.source === "check_run" && d.conclusion === "success" && String(d.appId) === String(s.appId)));
   const decidedOnes = notRunRequired.filter(c => !deferred.includes(c) && decidedSkip(c));

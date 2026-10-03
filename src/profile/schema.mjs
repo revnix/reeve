@@ -596,8 +596,12 @@ export function validate(profile) {
   }
   // And a queue-only check is matched by the name GitHub reports, as a required one is (#286).
   // A job named with no checks it may skip, or checks with no job to decide, decides nothing (#344).
-  if ((get(profile, "ci.decidedSkips.by") == null) !== (get(profile, "ci.decidedSkips.checks") == null))
-    errors.push("ci.decidedSkips names both the job that decides, by, and the required checks it may skip, checks");
+  const decidedChecks = get(profile, "ci.decidedSkips.checks");
+  if ((get(profile, "ci.decidedSkips.by") == null) !== (decidedChecks == null) || (Array.isArray(decidedChecks) && !decidedChecks.length))
+    errors.push("ci.decidedSkips names both the job that decides, by, and at least one required check it may skip, checks");
+  // Matched against the names GitHub reports, which a matrix has expanded.
+  for (const [key, names] of [["ci.decidedSkips.by", [get(profile, "ci.decidedSkips.by")]], ["ci.decidedSkips.checks", decidedChecks ?? []]])
+    for (const c of names) if (typeof c === "string" && c.includes("${{")) errors.push(`${key} contains an unexpanded matrix expression: ${c}`);
   for (const c of get(profile, "ci.queueOnlyChecks") ?? [])
     if (typeof c === "string" && c.includes("${{")) errors.push(`ci.queueOnlyChecks contains an unexpanded matrix expression: ${c}`);
 

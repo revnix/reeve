@@ -191,7 +191,7 @@ export function evaluateQueueEntry({ nwo, entry, input, baseRef, profile, db = n
   const queued = { ...input, reviewers, head: entry.sha,
     checks: { verdict: s.verdict, settled: s.settled, why: s.why, readable: c.readable !== false, failing: c.failing, inherited: [],
               impostors: got?.impostors ?? [], shadowRequired: req.shadowRequired, legacyRequired: req.legacyRequired,
-              passed: passedChecks(got?.rows) },
+              passed: passedChecks(got?.rows), ...checksShown(c) },
     base: baseHealthOf(base, { complete: baseRead?.ok === true, inHead }) };
   return { ok: true, input: queued, verdict: computeVerdict(queued) };
 }
@@ -814,6 +814,14 @@ export const headCheckRequirements = (req, profile, queued = null) => ({ ...chec
  * job that decides.
  * @param {{ required?: any[], known?: boolean }} req @param {any} profile
  */
+/**
+ * What a reading passed without its run, or saw failing where no rule requires
+ * it, carried to the verdict, which names both (#344).
+ * @param {any} c
+ */
+export const checksShown = (c) => ({ ...(c.decided?.length ? { decided: c.decided, decidedBy: c.decidedBy } : {}),
+                                      ...(c.ancillaryFailing?.length ? { ancillaryFailing: c.ancillaryFailing } : {}) });
+
 export const checkRules = (req, profile) => {
   const by = profile?.ci?.decidedSkips?.by;
   return { ...req, failuresOf: gatingOf(req), decided: by ? { by, checks: profile?.ci?.decidedSkips?.checks ?? [] } : null };
@@ -973,7 +981,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     checks: { verdict: s.verdict, settled: s.settled, why: s.why, readable: c.readable !== false, failing: c.failing, inherited: c.inherited,
               // Another App's check under reeve's own name: kept, never dropped.
               impostors: read.impostors ?? [], shadowRequired: req.shadowRequired, legacyRequired: req.legacyRequired,
-              queueOnly: c.queueOnly ?? [], passed: passedChecks(rows) },
+              queueOnly: c.queueOnly ?? [], passed: passedChecks(rows), ...checksShown(c) },
     base: baseHealthOf(base, { complete: baseRead?.ok === true, inHead }),
     reviewers, rounds, threads, cleared: facts.cleared,
     bodyFindings: facts.bodyFindings, unreadableBodies: facts.unreadableBodies,

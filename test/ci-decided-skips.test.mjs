@@ -5,7 +5,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
-import { classifyRead, evaluateQueueEntry, headCheckRequirements } from "../src/pr.mjs";
+import { rmSync, writeFileSync } from "node:fs";
+import { classifyRead, clearRequirements, evaluatePr, evaluateQueueEntry, headCheckRequirements } from "../src/pr.mjs";
 import { computeVerdict } from "../src/verdict.mjs";
 import { validate } from "../src/profile/schema.mjs";
 import { open } from "../src/db/ops.mjs";
@@ -63,6 +64,9 @@ test("a skip stays unpassed where the decider failed, didn't run, isn't GitHub's
 test("a skip isn't taken as decided beside any failure, as a job skipped for a failed one it needs looks the same", () => {
   const head = judged([run("Build", "success"), run(DECIDER, "success"), run(POSTGRES, "skipped"), run(WINDOWS, "failure")]);
   assert.equal(head.verdict, "SKIPPED_REQUIRED", head.why);
+  // Nor beside one cancelled or stale, which a job it needs may be as well.
+  for (const conclusion of ["cancelled", "stale"])
+    assert.notEqual(judged([run("Build", "success"), run(DECIDER, "success"), run(POSTGRES, "skipped"), run("Prepare", conclusion)]).verdict, "GREEN", conclusion);
 });
 
 test("at a head only a failing required check blocks; another's failure is named, and doesn't hold it", () => {
@@ -97,8 +101,10 @@ test("at the merge queue's commit the same two rules hold", () => {
     const decided = atQueue([run("Build", "success"), run(DECIDER, "success"), run(POSTGRES, "skipped")], 42);
     assert.ok(decided.ok, decided.why);
     assert.equal(ci(decided)?.state, "PASS", JSON.stringify(ci(decided)));
+    assert.match(String(ci(decided)?.detail), /Integration \(postgres\) skipped, as Decide what this commit can affect decided/);
     const beside = atQueue([run("Build", "success"), run(POSTGRES, "success"), run(WINDOWS, "failure")], 43);
     assert.equal(ci(beside)?.state, "PASS", JSON.stringify(ci(beside)));
+    assert.match(String(ci(beside)?.detail), /Pre-push gates \(windows-latest\) failing, which no rule requires/);
   } finally { db.close(); }
 });
 
@@ -113,4 +119,46 @@ test("a profile names the job that decides, and the required checks it may skip,
   assert.match(withCi({ decidedSkips: { checks: [POSTGRES] } }), /ci\.decidedSkips/, "the checks alone");
   assert.match(withCi({ decidedSkips: DECIDER }), /ci\.decidedSkips must be an object/);
   assert.match(withCi({ decidedSkips: { by: DECIDER, checks: [7] } }), /ci\.decidedSkips\.checks/);
+  assert.match(withCi({ decidedSkips: { by: DECIDER, checks: [] } }), /ci\.decidedSkips/, "a job with no checks to decide");
+  // A matrix name never matches the name GitHub reports, so it would decide nothing.
+  assert.match(withCi({ decidedSkips: { by: DECIDER, checks: ["Integration (${{ matrix.db }})"] } }), /ci\.decidedSkips\.checks contains an unexpanded matrix expression/);
+  assert.match(withCi({ decidedSkips: { by: "Decide (${{ matrix.os }})", checks: [POSTGRES] } }), /ci\.decidedSkips\.by contains an unexpanded matrix expression/);
+});
+
+test("through evaluatePr, the verdict at a head names a decided skip, and a failure no rule requires", () => {
+  const HEAD = A, BASE = "b".repeat(40);
+  const runJson = (/** @type {string} */ name, /** @type {string} */ conclusion) =>
+    JSON.stringify({ name, status: "completed", conclusion, id: 1, completed_at: new Date().toISOString(), app: { slug: "github-actions", id: 1 } });
+  const db = open(join(tempDir("reeve-decided-head-db-"), "s.db"));
+  const page = JSON.stringify({ data: { repository: { pullRequest: { mergeStateStatus: "CLEAN", mergeable: "MERGEABLE", reviewDecision: null,
+    reviews: { totalCount: 0 }, reviewThreads: { totalCount: 0, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } } });
+  const requires = JSON.stringify({ type: "required_status_checks", parameters: { required_status_checks: [{ context: "CI Gate" }, { context: POSTGRES }] } });
+  /** The head's `ci` clause after three ticks, gh answering with `head`'s check runs. */
+  const ciAt = (/** @type {string[]} */ head, /** @type {number} */ pr) => {
+    const bin = tempDir("reeve-decided-bin-");
+    const path = process.env.PATH;
+    writeFileSync(join(bin, "gh"), `#!/bin/sh\nfor a in "$@"; do case "$a" in repos/*|graphql) p="$a";; esac; done\ncase "$p" in\n  graphql) echo '${page}';;\n` +
+      `  */commits/${BASE}/check-runs*) echo '${runJson("CI Gate", "success")}';;\n  */check-suites*) echo '[{"app":{"slug":"github-actions"},"status":"completed"}]';;\n` +
+      `  */rules/branches/*) echo '${requires}';;\n  */branches/main) echo '{"protected":true,"protection":{"enabled":false}}';;\n` +
+      `  */commits/${HEAD}/check-runs*) printf '%s\\n' ${head.map((h) => `'${h}'`).join(" ")};;\n  *) ;;\nesac\n`, { mode: 0o755 });
+    writeFileSync(join(bin, "git"), `#!/bin/sh\n[ "$1" = ls-remote ] && printf '%s\\trefs/heads/main\\n' ${BASE}\nexit 0\n`, { mode: 0o755 });
+    const anchor = { ok: true, headRef: "feature", baseRef: "main", state: "OPEN", title: "t", updatedAt: "2026-10-03T00:00:00Z",
+                     head: HEAD, pin: { ok: true, sha: HEAD }, authorLogin: "someone" };
+    try {
+      process.env.PATH = `${bin}:${path}`;
+      clearRequirements();
+      /** @type {any} */ let r;
+      for (let k = 0; k < 3; k++) r = evaluatePr({ nwo: "o/r", pr, profile: { ...decides, reviewers: [] }, db, anchor });
+      assert.ok(r.ok, r.why);
+      return r.verdict.clauses.find((/** @type {any} */ c) => c.id === "ci");
+    } finally { process.env.PATH = path; rmSync(bin, { recursive: true, force: true }); }
+  };
+  try {
+    const decided = ciAt([runJson("CI Gate", "success"), runJson(DECIDER, "success"), runJson(POSTGRES, "skipped")], 7);
+    assert.equal(decided?.state, "PASS", JSON.stringify(decided));
+    assert.match(String(decided?.detail), /Integration \(postgres\) skipped, as Decide what this commit can affect decided/);
+    const beside = ciAt([runJson("CI Gate", "success"), runJson(POSTGRES, "success"), runJson(WINDOWS, "failure")], 8);
+    assert.equal(beside?.state, "PASS", JSON.stringify(beside));
+    assert.match(String(beside?.detail), /Pre-push gates \(windows-latest\) failing, which no rule requires/);
+  } finally { db.close(); }
 });

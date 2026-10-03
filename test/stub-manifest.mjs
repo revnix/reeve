@@ -20654,4 +20654,13 @@ export const STUBS = [
               find: "n) => !counts || counts.some(",
               replace: "n) => (counts ?? []).some(" }],
   },
+  {
+    name: "reviewer-time-unread",
+    why: "take a reviewer's review with no time that reads as said before the merge. A pending one begun since would cover what merged unreviewed",
+    test: "test/judge-at-merge.test.mjs",
+    expectRed: "a reviewer's word in the very second of the merge, which can't be put before it or after, leaves its review unknown",
+    edits: [{ file: "src/pr.mjs",
+              find: "until != null && !(Date.parse(String(t)) / 1000 < until) && !(Date.parse(String(t)) / 1000 > until);",
+              replace: "until != null && Date.parse(String(t)) / 1000 === until;" }],
+  },
 ];

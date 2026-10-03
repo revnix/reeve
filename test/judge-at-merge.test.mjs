@@ -272,6 +272,9 @@ test("a reviewer's word in the very second of the merge, which can't be put befo
   assert.equal(judged({ ...checks, reviews: [reviewed(0)] }, blocking).review.state, "UNKNOWN", "a review object in it");
   // Another's word in that second says nothing of this reviewer.
   assert.equal(judged({ ...checks, comments: [clean(-60), `someone\t${at(0)}\tmerging`] }, blocking).review.state, "PASS", "control: another's");
+  // Nor can a review with no time that reads be put before the merge: a pending one, begun since, has none.
+  const untimed = judged({ ...checks, reviews: [`codex[bot]\t${HEAD}\tPENDING\t\tNo major issues found.`] }, blocking).review;
+  assert.equal(untimed.state, "UNKNOWN", JSON.stringify(untimed));
 });
 
 test("a thread made after the merge is no thread of it, and the rest of its reviews stay read", async () => {

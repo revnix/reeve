@@ -381,7 +381,8 @@ const CLEAN_COMMIT = "Reviewed commit:\\**\\s*`?([0-9a-f]{7,40})`?";
  * `until`, in seconds, reads only what a reviewer said by then (#342): a merge
  * judged after it isn't covered, or refused, by a word said since. A reviewer
  * who said something in that very second, which can't be put before it or
- * after, is UNPLACED.
+ * after, is UNPLACED; so is one whose word has no time that reads, as a review
+ * not yet submitted has none.
  */
 export function readReviewerStates(nwo, pr, head, reviewers, io = null, until = null) {
   // Injected for tests: classifying a reviewer is pure once the rows are in hand,
@@ -425,7 +426,8 @@ export function readReviewerStates(nwo, pr, head, reviewers, io = null, until = 
   const by = (/** @type {string | undefined} */ t) => until == null || !(Date.parse(String(t)) / 1000 > until);
   cRows = cRows.filter((r) => by(r[1]));
   rRows = rRows.filter((r) => by(r[3]));
-  const tied = (/** @type {string | undefined} */ t) => until != null && Date.parse(String(t)) / 1000 === until;
+  // Neither before `until` nor after it: in its very second, or with no time that reads.
+  const tied = (/** @type {string | undefined} */ t) => until != null && !(Date.parse(String(t)) / 1000 < until) && !(Date.parse(String(t)) / 1000 > until);
 
   return reviewers.map(rev => {
     const mine = l => String(l).toLowerCase().includes(rev.login.toLowerCase());

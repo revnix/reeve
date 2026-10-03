@@ -238,7 +238,9 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
   if (!seenKinds) {
     const shown = (/** @type {(e: any) => boolean} */ f) => atMerges.find(f)?.pr ?? null;
     kinds["a pull request that passes"] ??= shown((e) => e.p.state === "PASS");
-    kinds["failing CI"] ??= shown((e) => clause(e.p, "ci") === "BLOCK");
+    // A red check, as at a head: a merge blocked at its checks for a required one missing or skipped, or another's
+    // result under reeve's name, showed no failing CI.
+    kinds["failing CI"] ??= shown((e) => clause(e.p, "ci") === "BLOCK" && /^failing:/.test(String(e.p.clauses.find((/** @type {any} */ c) => c?.id === "ci")?.detail ?? "")));
     kinds["unresolved threads"] ??= shown((e) => clause(e.p, "threads") === "BLOCK");
   }
 

@@ -20977,8 +20977,17 @@ export const STUBS = [
     test: "test/trial-merges-judged.test.mjs",
     expectRed: "a kind of case shown only by a merge's judgment as it stood is a kind seen",
     edits: [{ file: "src/trial.mjs",
-              find: "    kinds[\"failing CI\"] ??= shown((e) => clause(e.p, \"ci\") === \"BLOCK\");\n",
+              find: "    kinds[\"failing CI\"] ??= shown((e) => clause(e.p, \"ci\") === \"BLOCK\" && /^failing:/.test(String(e.p.clauses.find((/** @type {any} */ c) => c?.id === \"ci\")?.detail ?? \"\")));\n",
               replace: "" }],
+  },
+  {
+    name: "trial-kinds-at-merge-ci-red",
+    why: "see failing CI in any merge blocked at its checks. One blocked for a required check skipped, with none red, would show a kind the trial never saw",
+    test: "test/trial-merges-judged.test.mjs",
+    expectRed: "a kind of case shown only by a merge's judgment as it stood is a kind seen",
+    edits: [{ file: "src/trial.mjs",
+              find: " && /^failing:/.test(String(e.p.clauses.find((/** @type {any} */ c) => c?.id === \"ci\")?.detail ?? \"\")));",
+              replace: ");" }],
   },
   {
     name: "trial-kinds-at-merge-threads",

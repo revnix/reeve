@@ -237,13 +237,16 @@ test("a kind of case shown only by a merge's judgment as it stood is a kind seen
   const passed = merge(1, 50 * MIN, "a"), red = merge(2, 51 * MIN, "b"), open = merge(3, 52 * MIN, "c");
   s.decided(T0 + 40 * MIN, 1, sha("a"), "BLOCK");
   // One of a merge from before the trial, judged in it first, isn't this trial's case.
-  s.late(T0 + 60 * MIN, { pr: 9, mergedAt: T0 - HOUR, head: sha("f") }, "BLOCK", { clauses: [{ id: "ci", state: "BLOCK" }, { id: "threads", state: "BLOCK" }] });
+  s.late(T0 + 60 * MIN, { pr: 9, mergedAt: T0 - HOUR, head: sha("f") }, "BLOCK", { clauses: [{ id: "ci", state: "BLOCK", detail: "failing: unit" }, { id: "threads", state: "BLOCK" }] });
   s.late(T0 + 60 * MIN, passed, "PASS");
-  s.late(T0 + 60 * MIN, red, "BLOCK", { clauses: [{ id: "ci", state: "BLOCK" }] });
+  // Blocked at its checks with none of them red, a required one skipped say, is no failing CI: as at a head, only a failing check is.
+  const skipped = merge(4, 49 * MIN, "e");
+  s.late(T0 + 60 * MIN, skipped, "BLOCK", { clauses: [{ id: "ci", state: "BLOCK", detail: "a required check was skipped: Build" }] });
+  s.late(T0 + 60 * MIN, red, "BLOCK", { clauses: [{ id: "ci", state: "BLOCK", detail: "failing: unit" }] });
   s.late(T0 + 60 * MIN, open, "BLOCK", { clauses: [{ id: "threads", state: "BLOCK" }] });
-  const r = trial.trialReport(s.db, { repo: R, since: T0, now: T0 + 2 * HOUR, merged: [passed, red, open] });
+  const r = trial.trialReport(s.db, { repo: R, since: T0, now: T0 + 2 * HOUR, merged: [passed, skipped, red, open] });
   assert.equal(r.kinds["a pull request that passes"], 1);
-  assert.equal(r.kinds["failing CI"], 2);
+  assert.equal(r.kinds["failing CI"], 2, "the merge with a red check, not the one blocked at its checks before it");
   assert.equal(r.kinds["unresolved threads"], 3);
   assert.equal(r.kinds["a conflict with the base"], null, "a merge can't show a conflict: it merged");
   // Kinds given as the trial was first read are left as given, a kind not seen then with them.

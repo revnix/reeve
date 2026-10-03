@@ -7,7 +7,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
-import { derivePr, reviewState } from "../src/review/derive.mjs";
+import { derivePr, deriveSupply, reviewState } from "../src/review/derive.mjs";
 import { clearRequirements } from "../src/pr.mjs";
 import { ingest, noteHead } from "../src/review/ingest.mjs";
 import { open } from "../src/db/ops.mjs";
@@ -45,6 +45,8 @@ test("a pull request's reviews folded up to a time leave out what was made after
     ingest(db, NWO, 1, [{ ...thread("PRRT_untimed", T), event_at: null }], { at: T + 120 });
     derivePr(db, NWO, 1, PROFILE, { at: T + 120, head: HEAD, until: T });
     assert.equal(reviewState(db, NWO, 1, PROFILE, { at: T + 120, head: HEAD }).total, 2, "kept");
+    // A fold asked no time has nothing to place at one.
+    assert.equal(derivePr(db, NWO, 1, PROFILE, { at: T + 120, head: HEAD }).unplaced, null);
   } finally { db.close(); }
 });
 
@@ -71,10 +73,21 @@ const threadPage = (/** @type {number} */ begun) => JSON.stringify({ data: { rep
  * merge went onto and its checks then, and the base's tip now, red.
  */
 /** @typedef {{ then: string[], now: string[], required?: string[], onto?: boolean, log?: string, comments?: string[], reviews?: string[], page?: string,
- *              rulesetAt?: number | null, orgRuleset?: boolean, classic?: boolean, queue?: string[] }} Shape */
+ *              rulesetAt?: number | null, orgRuleset?: boolean, classic?: boolean, queue?: string[],
+ *              suite?: { result: string, evals?: any[] } | string | null, suites?: number, suiteTwice?: boolean, suiteFails?: boolean, noRules?: boolean }} Shape */
+/** A rule's result in GitHub's record of a push, as the reader's query gives one. */
+const rule = (/** @type {number} */ id, result = "pass", /** @type {string | null} */ details = null, enforcement = "active") => ({ source: "ruleset", id, result, enforcement, details });
+/** GitHub's record of the base's rules passing, the rulesets `ids` judging. */
+const passedBy = (/** @type {number[]} */ ids) => ({ result: "pass", evals: ids.map((id) => rule(id)) });
 const afterMerge = (/** @type {Shape} */ o, /** @type {() => any} */ fn) => {
   const bin = tempDir("reeve-judge-at-merge-bin-");
   const lines = (/** @type {string[]} */ xs) => xs.map((x) => `'${x}'`).join(" ");
+  // The base's pushes as GitHub records its rules judging each: another's first, then the merge's.
+  const suites = [JSON.stringify({ id: 20, after_sha: ONTO }),
+                  ...Array.from({ length: o.suite === null ? 0 : o.suites ?? 1 }, (_, i) => JSON.stringify({ id: 21 + i, after_sha: MERGE })),
+                  // GitHub gives a list's first page twice where it runs past one (measured 2026-10-03): the same record again.
+                  ...(o.suiteTwice ? [JSON.stringify({ id: 21, after_sha: MERGE })] : [])];
+  const suite = typeof o.suite === "string" ? o.suite : JSON.stringify(o.suite ?? passedBy([11]));
   writeFileSync(join(bin, "gh"), `#!/bin/sh
 for a in "$@"; do case "$a" in repos/*|orgs/*|search/*|graphql) p="$a";; esac; done
 ${o.log ? `echo "$p" >> '${o.log}'` : ""}
@@ -82,6 +95,9 @@ case "$p" in
   graphql) echo '${o.page ?? page}';;
   */issues/7/comments*) printf '%s\n' ${lines(o.comments ?? [])};;
   */pulls/7/reviews*) printf '%s\n' ${lines(o.reviews ?? [])};;
+  */rulesets/rule-suites/20) echo '${JSON.stringify({ result: "bypass", evals: [rule(11, "fail", "another push")] })}';;
+  */rulesets/rule-suites/*) echo '${suite}';;
+  */rulesets/rule-suites*) ${o.suiteFails ? "exit 1" : `printf '%s\n' ${lines(suites)}`};;
   orgs/acme/rulesets/11) echo '${JSON.stringify({ id: 11, updated_at: at(o.rulesetAt ?? -86400) })}';;
   */rulesets/11) echo '${o.orgRuleset ? "{}" : JSON.stringify({ id: 11, ...(o.rulesetAt === null ? {} : { updated_at: at(o.rulesetAt ?? -86400) }) })}';;
   */commits/${MERGE}/check-runs*filter=all*) printf '%s\n' ${lines(o.queue ?? [])};;
@@ -92,7 +108,7 @@ case "$p" in
   */commits/${BASE_NOW}/check-runs*) printf '%s\\n' '${runJson("Build", "failure", 100, 200)}';;
   */check-suites*) printf '%s\n' ${[5, 7, 8].map((id) => `'${JSON.stringify({ id, created_at: at(-3600) })}'`).join(" ")} '${JSON.stringify({ id: 9, created_at: at(30) })}';;
   */activity*) ${o.onto === false ? "" : `echo '${JSON.stringify({ activity_type: "merge_queue_merge", before: ONTO, after: MERGE })}'`};;
-  */rules/branches/*) printf '%s\n' '${o.orgRuleset ? requires(o.required ?? ["Build"]).replace('"Repository","ruleset_source":"o/r"', '"Organization","ruleset_source":"acme"') : requires(o.required ?? ["Build"])}' ${o.queue ? `'${QUEUE_RULE}'` : ""};;
+  */rules/branches/*) ${o.noRules ? "exit 0;" : ""} printf '%s\n' '${o.orgRuleset ? requires(o.required ?? ["Build"]).replace('"Repository","ruleset_source":"o/r"', '"Organization","ruleset_source":"acme"') : requires(o.required ?? ["Build"])}' ${o.queue ? `'${QUEUE_RULE}'` : ""};;
   */branches/main) echo '${JSON.stringify({ protected: true, protection: { enabled: o.classic === true } })}';;
   *) ;;
 esac
@@ -136,14 +152,75 @@ test("a merge's base is judged at the commit it went onto, not the branch's tip 
   assert.doesNotMatch(readFileSync(log, "utf8"), /commits\/(null|undefined)\b/, "nothing asked of a commit not found");
 });
 
-test("GitHub's merge meets what the base's rules made it enforce", async () => {
-  const c = judged({ then: [runJson("Build", "success", -600, -300)], now: [] });
+test("a merge is judged by GitHub's own record of the base's rules at it: passed, or gone past", async () => {
+  const then = [runJson("Build", "success", -600, -300)];
+  const c = judged({ then, now: [] });
   assert.equal(c.mergeable.state, "PASS", JSON.stringify(c.mergeable));
   assert.match(String(c.mergeable.detail), /merged/i);
-  assert.equal(c.input.mergeParts, null, "the base's parts not read now, for a merge GitHub already let through");
-  // A live pull request never reads as merged: GitHub's merge states have no such one.
+  assert.equal(c.input.mergeParts, null, "the base's parts not read now, for a merge already made");
+  // The one record listed twice, as GitHub lists a first page again, is one record.
+  assert.equal(judged({ then, now: [], suiteTwice: true }).mergeable.state, "PASS", "listed twice");
+  // A bypass went past each rule that failed, which is named; one only evaluated, not enforced, isn't one.
+  const past = judged({ then, now: [], suite: { result: "bypass", evals: [rule(11, "fail", "At least 1 approving review is required."), rule(11),
+                                                                           rule(11, "fail", "Only evaluated.", "evaluate")] } });
+  assert.equal(past.mergeable.state, "BLOCK", JSON.stringify(past.mergeable));
+  assert.match(String(past.mergeable.detail), /approving review/);
+  assert.doesNotMatch(String(past.mergeable.detail), /Only evaluated/);
+  assert.equal(past.state, "BLOCK", "a merge past the rules doesn't pass, whatever else did");
+});
+
+test("a merge GitHub keeps no one record of its rules judging is unknown, never taken as passed", async () => {
+  const then = [runJson("Build", "success", -600, -300)];
+  const mergeable = (/** @type {Partial<Shape>} */ o) => judged({ then, now: [], ...o }).mergeable;
+  // None kept, as for a base no ruleset governs; and two for the one commit, which can't be told apart.
+  for (const o of [{ suite: null }, { suites: 2 }]) {
+    const m = mergeable(o);
+    assert.equal(m.state, "UNKNOWN", JSON.stringify(m));
+    assert.equal(m.kind, "person", "reading again finds no more");
+  }
+  // One that couldn't be read is read again.
+  for (const o of [{ suiteFails: true }, { suite: "not a record" }]) {
+    const m = mergeable(o);
+    assert.equal(m.state, "UNKNOWN", JSON.stringify(m));
+    assert.equal(m.kind, "retry");
+  }
+  // A result that's neither isn't a pass.
+  assert.equal(mergeable({ suite: { result: "fail", evals: [rule(11, "fail")] } }).state, "UNKNOWN", "a result GitHub gives no merge");
   const { computeVerdict } = await import("../src/verdict.mjs");
-  assert.equal(computeVerdict({ mergeState: "MERGED" }).clauses.find((x) => x.id === "mergeable")?.state, "PASS");
+  assert.equal(computeVerdict({ mergeState: "MERGED" }).clauses.find((x) => x.id === "mergeable")?.state, "UNKNOWN", "a merge with no reading of its rules");
+});
+
+test("a merge judged days after it asks GitHub over a period that reaches it", async () => {
+  const log = join(tempDir("reeve-judge-at-merge-log-"), "asked");
+  writeFileSync(log, "");
+  afterMerge({ then: [], now: [], log }, () => {
+    const db = open(join(tempDir("reeve-judge-at-merge-store-"), "s.db"));
+    try {
+      const e = judgeAtMerge({ nwo: NWO, merge: { ...MERGED, mergedAt: Math.floor(Date.now() / 1000) - 3 * 86400 }, profile, db });
+      assert.ok(e.ok, e.why);
+    } finally { db.close(); }
+  });
+  assert.match(readFileSync(log, "utf8"), /\/activity\?[^\n]*time_period=week/, "the commit it went onto, asked of the week");
+});
+
+test("a merge's rules are read from GitHub's record over a period that reaches the push, made before the merge", async () => {
+  const asked = (/** @type {number} */ ago) => {
+    const log = join(tempDir("reeve-judge-at-merge-log-"), "asked");
+    writeFileSync(log, "");
+    afterMerge({ then: [], now: [], log }, () => {
+      const db = open(join(tempDir("reeve-judge-at-merge-store-"), "s.db"));
+      try { assert.ok(judgeAtMerge({ nwo: NWO, merge: { ...MERGED, mergedAt: Math.floor(Date.now() / 1000) - ago }, profile, db }).ok); }
+      finally { db.close(); }
+    });
+    return readFileSync(log, "utf8").match(/rule-suites\?[^\n]*time_period=(\w+)/)?.[1] ?? null;
+  };
+  assert.equal(asked(3600), "day");
+  // The queue's commit is recorded when it's made, before it merges: a merge near a day old is asked of the week.
+  assert.equal(asked(86400 - 3600), "week");
+  assert.equal(asked(3 * 86400), "week");
+  assert.equal(asked(20 * 86400), "month");
+  // Past what GitHub keeps, nothing is asked, and the merge's rules are unknown.
+  assert.equal(asked(40 * 86400), null);
 });
 
 test("a required check only another App reported, which it may since have rewritten, leaves the merge's checks unknown", async () => {
@@ -166,19 +243,35 @@ test("a review thread made after the merge counts nothing against it", async () 
   assert.notDeepEqual(unmet(before), unmet(none));
 });
 
+/** A clean pass by the blocking reviewer, at `when`, naming the merged head, as the reviewers' read gives a comment. */
+const clean = (/** @type {number} */ when) => `codex[bot]\t${at(when)}\tNo major issues found. Reviewed commit: ${HEAD.slice(0, 10)}`;
+/** And a review object of its, its time GitHub's submitted_at. */
+const reviewed = (/** @type {number} */ when) => `codex[bot]\t${HEAD}\tCOMMENTED\t${at(when)}\tNo major issues found.`;
+
 test("a reviewer's word after the merge counts nothing for it", async () => {
   const blocking = { ...profile, reviewers: PROFILE.reviewers };
   const checks = { then: [runJson("Build", "success", -600, -300)], now: [] };
-  /** A clean pass by the blocking reviewer, at `when`, naming the merged head. */
-  const clean = (/** @type {number} */ when) => `codex[bot]\t${at(when)}\tNo major issues found. Reviewed commit: ${HEAD.slice(0, 10)}`;
   const none = judged(checks, blocking);
   assert.notEqual(none.review.state, "PASS", "control: unreviewed");
   assert.deepEqual(judged({ ...checks, comments: [clean(60)] }, blocking).review.state, none.review.state, "a clean pass after it");
   assert.equal(judged({ ...checks, comments: [clean(-60)] }, blocking).review.state, "PASS", "control: one before it");
-  // And a review object, its time GitHub's submitted_at.
-  const verdict = (/** @type {number} */ when) => `codex[bot]\t${HEAD}\tCOMMENTED\t${at(when)}\tNo major issues found.`;
-  assert.deepEqual(judged({ ...checks, reviews: [verdict(60)] }, blocking).review.state, none.review.state, "a review after it");
-  assert.equal(judged({ ...checks, reviews: [verdict(-60)] }, blocking).review.state, "PASS", "control: one before it");
+  // And a review object.
+  assert.deepEqual(judged({ ...checks, reviews: [reviewed(60)] }, blocking).review.state, none.review.state, "a review after it");
+  assert.equal(judged({ ...checks, reviews: [reviewed(-60)] }, blocking).review.state, "PASS", "control: one before it");
+});
+
+test("a reviewer's word in the very second of the merge, which can't be put before it or after, leaves its review unknown", async () => {
+  const blocking = { ...profile, reviewers: PROFILE.reviewers };
+  const checks = { then: [runJson("Build", "success", -600, -300)], now: [] };
+  const tied = judged({ ...checks, comments: [clean(0)] }, blocking).review;
+  assert.equal(tied.state, "UNKNOWN", JSON.stringify(tied));
+  assert.match(String(tied.detail), /second/);
+  // Though an earlier word covered it: one in that second may take it back as well as give it.
+  const refusal = `codex[bot]\t${at(0)}\tYou have reached your Codex usage limits`;
+  assert.equal(judged({ ...checks, comments: [clean(-60), refusal] }, blocking).review.state, "UNKNOWN", "a refusal in it, after a clean pass");
+  assert.equal(judged({ ...checks, reviews: [reviewed(0)] }, blocking).review.state, "UNKNOWN", "a review object in it");
+  // Another's word in that second says nothing of this reviewer.
+  assert.equal(judged({ ...checks, comments: [clean(-60), `someone\t${at(0)}\tmerging`] }, blocking).review.state, "PASS", "control: another's");
 });
 
 test("a thread made after the merge is no thread of it, and the rest of its reviews stay read", async () => {
@@ -224,4 +317,86 @@ test("a merge through the queue is judged on the queue's commit for the checks r
 test("a hold the caller read stands in the judgment", async () => {
   const c = judged({ then: [runJson("Build", "success", -600, -300)], now: [] }, profile, () => {}, { readable: false, why: "the hub couldn't be read" });
   assert.equal(c.hold?.state, "UNKNOWN", JSON.stringify(c.hold));
+});
+
+test("a merge's checks are unknown where a ruleset that judged it applies no longer", async () => {
+  const then = [runJson("Build", "success", -600, -300)];
+  // One removed since, which GitHub lists no more: what it required then can't be told.
+  const gone = judged({ then, now: [], suite: passedBy([11, 12]) });
+  assert.equal(gone.ci.state, "UNKNOWN", JSON.stringify(gone.ci));
+  assert.match(String(gone.ci.detail), /rules/);
+  // The only one, removed: a base with no rules now isn't one that had none then.
+  assert.equal(judged({ then, now: [], noRules: true }).ci.state, "UNKNOWN", "none left");
+  // And with no record of what judged it, whether they've changed can't be told.
+  assert.equal(judged({ then, now: [], suite: null }).ci.state, "UNKNOWN", "no record of what judged it");
+  assert.equal(judged({ then, now: [], suite: passedBy([11]) }).ci.state, "PASS", "control: the one that judged it, still there");
+});
+
+test("a merge's acceptance evidence, kept only as it reads now, is unknown, and isn't read", async () => {
+  const log = join(tempDir("reeve-judge-at-merge-log-"), "asked");
+  writeFileSync(log, "");
+  const c = judged({ then: [runJson("Build", "success", -600, -300)], now: [], log }, { ...profile, tasks: { repo: "o/tasks" } });
+  assert.equal(c.acceptance?.state, "UNKNOWN", JSON.stringify(c.acceptance));
+  assert.match(String(c.acceptance.detail), /as they stood/);
+  const asked = readFileSync(log, "utf8").split("\n");
+  assert.ok(!asked.includes(`repos/${NWO}/pulls/7`), "its description as it reads now isn't read");
+  assert.ok(!asked.some((l) => l.startsWith("search/")), "nor is the task looked for");
+});
+
+test("judging a merge leaves the store's fold of its reviews whole, for what reads reviewers across pull requests", async () => {
+  const blocking = { ...profile, reviewers: PROFILE.reviewers };
+  /** The reviewer's refusal, said after the merge. */
+  const refusal = { source: "codex", external_id: "comment:5", kind: "issue_comment", head_sha: null, event_at: T + 60, edited_at: null,
+                    payload: { login: "codex[bot]", body: "You have reached your Codex usage limits" } };
+  afterMerge({ then: [runJson("Build", "success", -600, -300)], now: [] }, () => {
+    const db = open(join(tempDir("reeve-judge-at-merge-store-"), "s.db"));
+    try {
+      ingest(db, NWO, 7, [refusal], { at: T + 120 });
+      const e = judgeAtMerge({ nwo: NWO, merge: MERGED, profile: blocking, db, now: T + 600 });
+      assert.ok(e.ok, e.why);
+      assert.deepEqual(db.prepare("SELECT outcome FROM review_round WHERE nwo=? AND pr=?").all(NWO, 7).map((/** @type {any} */ r) => r.outcome), ["refusal"],
+                       "the refusal since is still folded");
+      assert.deepEqual(deriveSupply(db, NWO, blocking, { at: T + 600 }).map((s) => s.state), ["down"], "so the reviewer still reads as down");
+    } finally { db.close(); }
+  });
+});
+
+test("a merge's blocking findings are those that stood at it", async () => {
+  const then = [runJson("Build", "success", -600, -300)];
+  /** The ledger's clause, a finding of `status` blocking the pull request: the block made at `made`, the finding last changed at `changed`. */
+  const findings = (/** @type {string} */ status, /** @type {number} */ made, /** @type {number} */ changed) => judged({ then, now: [] }, profile, (db) => {
+    const node = db.prepare("INSERT OR IGNORE INTO node (id, kind, title, status, created_at, updated_at) VALUES (?,?,?,?,?,?)");
+    node.run("pr:7", "pr", "the pull request", "open", T - 900, T - 900);
+    node.run("finding:1", "finding", "a finding", status, T - 900, T + changed);
+    db.prepare("INSERT INTO edge (src, dst, type, at) VALUES (?,?,?,?)").run("finding:1", "pr:7", "BLOCKS", T + made);
+  }).findings;
+  assert.equal(findings("open", -120, -60).state, "BLOCK", "control: one open then, unchanged since");
+  assert.equal(findings("done", -120, -60).state, "PASS", "control: one settled before it");
+  assert.equal(findings("open", 60, 60).state, "PASS", "one made since blocked nothing of it");
+  // One changed since may have stood otherwise then: settled since, it blocked; reopened since, it didn't.
+  assert.equal(findings("done", -120, 60).state, "UNKNOWN", "settled since");
+  assert.equal(findings("open", -120, 60).state, "UNKNOWN", "changed since, and open now");
+  assert.equal(findings("open", -120, 0).state, "UNKNOWN", "changed in the merge's very second");
+});
+
+test("a review that reads dismissed now, which it may not have been at the merge, leaves its reviews unknown", async () => {
+  const blocking = { ...profile, reviewers: PROFILE.reviewers };
+  const checks = { then: [runJson("Build", "success", -600, -300)], now: [] };
+  /** The blocking reviewer's review, stating a finding in its body, made at `when`. */
+  const review = (/** @type {string} */ state, /** @type {number} */ when) => ({
+    source: "codex", external_id: "review:5", kind: "review", head_sha: HEAD, event_at: T + when, edited_at: null,
+    payload: { login: "codex[bot]", state, commit_id: HEAD, body: "**![P1 Badge](x)** a finding" } });
+  const none = judged(checks, blocking);
+  const c = judged(checks, blocking, (db) => ingest(db, NWO, 7, [review("DISMISSED", -60)], { at: T - 30 }));
+  assert.equal(c.bodyFindings.state, "UNKNOWN", JSON.stringify(c.bodyFindings));
+  assert.match(String(c.bodyFindings.detail), /dismissed/);
+  assert.equal(c.input.threads.readable, false, "nor are its threads read from a fold that can't be placed");
+  // One made since is none of the merge, dismissed or not.
+  assert.equal(judged(checks, blocking, (db) => ingest(db, NWO, 7, [review("DISMISSED", 60)], { at: T + 90 })).bodyFindings.state, none.bodyFindings.state, "control: one made since");
+});
+
+test("a thread begun in the very second of the merge, which can't be put before it or after, leaves its reviews unknown", async () => {
+  const c = judged({ then: [runJson("Build", "success", -600, -300)], now: [] }, profile, (db) => ingest(db, NWO, 7, [thread("PRRT_tied", T)], { at: T + 30 }));
+  assert.equal(c.threads.state, "UNKNOWN", JSON.stringify(c.threads));
+  assert.match(String(c.input.threads.why), /second/);
 });

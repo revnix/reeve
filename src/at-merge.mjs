@@ -6,10 +6,12 @@
  * merge is judged after it rather than missed.
  *
  * Its head's checks, and its base's at the commit the merge went onto, are
- * read as they stood then. What the base's rules made GitHub enforce, met, as
- * GitHub merged it. Its reviews are read after it, and what was made since is
- * left out; edits and resolutions are read as they are then, as GitHub keeps no
- * time for them (decided with the founder on 2026-10-03).
+ * read as they stood then. What the base's rules made of it is read from
+ * GitHub's own record of them judging its push: passed, or gone past by a
+ * bypass. Its reviews are read after it, and what was made since is left out;
+ * edits and resolutions are read as they are then, as GitHub keeps no time for
+ * them (decided with the founder on 2026-10-03). What can't be read as it
+ * stood is unknown, never taken as it reads now.
  */
 import { evaluatePr } from "./pr.mjs";
 import { observe, ingest, noteHead } from "./review/ingest.mjs";
@@ -30,6 +32,13 @@ export function judgeAtMerge({ nwo, merge, profile, db, now = Math.floor(Date.no
   noteHead(db, nwo, pr, head, mergedAt);
   const seen = observe(nwo, pr);
   ingest(db, nwo, pr, seen.observations, { at: now });
-  derivePr(db, nwo, pr, profile, { at: now, head, complete: !seen.incomplete, until: mergedAt });
-  return evaluatePr({ nwo, pr, profile, db, anchor, hold, io: { foldPrecedesEvaluation: true }, asOf: { at: mergedAt, mergeCommit } });
+  const folded = derivePr(db, nwo, pr, profile, { at: now, head, complete: !seen.incomplete, until: mergedAt });
+  try {
+    return evaluatePr({ nwo, pr, profile, db, anchor, hold, io: { foldPrecedesEvaluation: true }, asOf: { at: mergedAt, mergeCommit, unplaced: folded.unplaced } });
+  } finally {
+    // The fold up to the merge stands in the store only for this judgment. The
+    // whole one is put back: what reads reviewers across pull requests, their
+    // supply for one, reads the rounds made since too.
+    derivePr(db, nwo, pr, profile, { at: now, head, complete: !seen.incomplete });
+  }
 }

@@ -115,7 +115,7 @@ const NODE_PATH_RE = new RegExp(pathForms(process.execPath), "g");
  */
 const EPOCH_RE = /"(observedAt|expiresAt)"\s*:\s*(\d+)/g;
 /** The read of what merged, as the seam log records it: since when, and up to when. */
-const MERGES_RE = /^(mergedSince\t\["[^"]*",)(\d+)(,\{"until":)(\d+)/gm;
+const MERGES_RE = /^(mergedList\t\["[^"]*",)(\d+)(,\{"until":)(\d+)/gm;
 
 /** A stamp's distance from the artifact's origin. Signed, so a stamp BEFORE the
  *  origin is visible rather than silently clamped. */

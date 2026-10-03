@@ -50,5 +50,5 @@ export const OFFLINE_READS = Object.freeze({
   // which the record keeps as unknown.
   treeOf: () => null,
   // What merged since the tick's last look (#342): unread, so none is judged.
-  mergedSince: () => ({ why: WHY }),
+  mergedList: () => ({ why: WHY }),
 });

@@ -6,7 +6,8 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import { writeFileSync } from "node:fs";
 import { open } from "../src/db/ops.mjs";
-import { mergedSince } from "../src/trial.mjs";
+import { tick } from "../src/daemon.mjs";
+import { OFFLINE_READS } from "./fixtures/offline-github.mjs";
 import { run } from "./fixtures/tick-harness.mjs";
 import { tempDir } from "./fixtures/temp.mjs";
 
@@ -18,6 +19,9 @@ const { judgeMerges, MERGE_JUDGED, MERGES_LOOKED, FIRST_LOOK_SECONDS, JUDGED_A_T
 const MERGE_TRIED = /** @type {any} */ (M).MERGE_TRIED ?? "no such event yet";
 /** How long before now a look takes GitHub to have listed every merge, or none while the source says none. */
 const LAG = /** @type {any} */ (M).LISTED_WITHIN_SECONDS ?? 0;
+/** The read of what merged, or one that reads nothing while the source has none. */
+const mergedList = /** @type {any} */ (M).mergedList ?? (() => ({ why: "src/merges.mjs has no mergedList" }));
+const PAGES_AT_MOST = /** @type {any} */ (M).PAGES_AT_MOST ?? 0;
 
 const NWO = "o/r";
 const T = 1_800_000_000;
@@ -52,7 +56,7 @@ test("each merge since the last look is judged once, as it stood, and kept as it
     const got = w.look(T, [merge(7, 600), merge(8, 300, { head: sha("b"), mergeCommit: sha("e") })]);
     assert.deepEqual(got, { ok: true, judged: 2, waiting: 0 });
     // The first look reaches back a day, and asks for what judging a merge needs.
-    assert.deepEqual(w.asked[0], { nwo: NWO, since: T - FIRST_LOOK_SECONDS, until: T, whole: true });
+    assert.deepEqual(w.asked[0], { nwo: NWO, since: T - FIRST_LOOK_SECONDS, until: T });
     assert.deepEqual(w.judgedWith.map((a) => a.merge), [
       { pr: 7, head: sha("a"), mergedAt: T - 600, mergeCommit: sha("d"), baseRef: "main", headRef: "feature", title: "pull request 7" },
       { pr: 8, head: sha("b"), mergedAt: T - 300, mergeCommit: sha("e"), baseRef: "main", headRef: "feature", title: "pull request 8" }]);
@@ -245,37 +249,102 @@ test("a builder's merged pull request is judged with its hold unreadable, and an
       assert.equal(a.hold?.readable, false, `#${a.merge.pr}`);
       assert.match(a.hold.why, /hold/);
     }
+    // One whose author GitHub doesn't give may be the builder's: who opened it is no evidence a builder didn't.
+    w.look(T + 300, [merge(10, 100, { author: null })]);
+    assert.equal(w.judgedWith.at(-1).hold?.readable, false, "an author that can't be read");
+    assert.match(w.judgedWith.at(-1).hold.why, /who opened it/);
   } finally { w.db.close(); }
 });
 
-test("what merged is read with what judging it needs: its branches, its title, and its author as GitHub's REST API names one", () => {
-  /** @type {string[][]} */ const asked = [];
-  const rows = [
-    { number: 7, mergedAt: new Date((T - 600) * 1000).toISOString(), headRefOid: sha("a"), mergeCommit: { oid: sha("d") }, baseRefName: "main", headRefName: "feature",
-      title: "a pull request", author: { login: "app/merge-policy", is_bot: true } },
-    { number: 8, mergedAt: new Date((T - 300) * 1000).toISOString(), headRefOid: sha("b"), mergeCommit: { oid: sha("e") }, baseRefName: "release", headRefName: "fix",
-      title: "another", author: { login: "someone", is_bot: false } },
-  ];
-  const read = (/** @type {any[]} */ list, o = {}) => mergedSince(NWO, T - 900, { until: T, run: (args) => { asked.push(args); return { ok: true, out: JSON.stringify(list) }; }, ...o });
-  const got = /** @type {any[]} */ (read(rows, { whole: true }));
-  assert.match(asked[0].join(" "), /--json number,mergedAt,headRefOid,mergeCommit,baseRefName,headRefName,author,title /);
-  assert.deepEqual(got.map((m) => [m.pr, m.baseRef, m.headRef, m.title, m.author]),
-                   [[7, "main", "feature", "a pull request", "merge-policy[bot]"], [8, "release", "fix", "another", "someone"]]);
-  // A person whose login starts as an App's is named in gh isn't one.
-  assert.equal(/** @type {any[]} */ (read([{ ...rows[1], author: { login: "app/le", is_bot: false } }], { whole: true }))[0].author, "app/le");
-  // One with no base named vouches for nothing.
-  assert.match(/** @type {any} */ (read([{ ...rows[0], baseRefName: "" }], { whole: true })).why ?? "", /no base named/);
-  // Unasked, none of it is read, and the read is the one the trial's report makes.
-  const plain = /** @type {any[]} */ (read(rows));
-  assert.match(asked.at(-1)?.join(" ") ?? "", /--json number,mergedAt,headRefOid,mergeCommit --limit/);
-  assert.deepEqual(Object.keys(plain[0]).sort(), ["head", "mergeCommit", "mergedAt", "pr"]);
+const iso = (/** @type {number} */ t) => new Date(t * 1000).toISOString().replace(/\.\d+Z$/, "Z");
+/** A closed pull request as GitHub's list gives one through the read's query: merged `merged` seconds before T, or not at all, and last changed `changed` before T. */
+const closed = (/** @type {number} */ number, /** @type {{ merged?: number | null, changed?: number, [k: string]: any }} */ { merged = null, changed, ...over } = {}) =>
+  JSON.stringify({ number, merged_at: merged == null ? null : iso(T - merged), updated_at: iso(T - (changed ?? merged ?? 0)), head: sha("a"), mergeCommit: sha("d"),
+                   baseRef: "main", headRef: "feature", author: "someone", title: `pull request ${number}`, ...over });
+/** What merged since `since`, up to T, read from `pages`: each a list of rows, "fail" for a read that fails, or a function of the page asked and how many reads were made. */
+const listed = (/** @type {any} */ pages, since = T - 900) => {
+  /** @type {string[]} */ const asked = [];
+  const got = mergedList(NWO, since, { until: T, run: (/** @type {string[]} */ args) => {
+    asked.push(args.join(" "));
+    const n = Number(/[?&]page=(\d+)/.exec(args.join(" "))?.[1]);
+    const p = typeof pages === "function" ? pages(n, asked.length) : pages[n - 1];
+    return p === "fail" ? { ok: false, out: "", err: "HTTP 502" } : { ok: true, out: (p ?? []).join("\n") };
+  } });
+  return { got, asked };
+};
+/** The pull requests a reading holds, which must be a reading: a failed one says why. */
+const prsOf = (/** @type {any} */ got) => { assert.ok(Array.isArray(got), `no reading: ${JSON.stringify(got)}`); return got.map((/** @type {any} */ m) => m.pr); };
+/** A hundred closed pull requests, none merged, each changed `changed` seconds before T, numbered down from `from`. */
+const hundred = (/** @type {number} */ from, /** @type {number} */ changed) => Array.from({ length: 100 }, (_, i) => closed(from - i, { changed }));
+
+test("what merged is read from GitHub's own list of closed pull requests, not its search, each with what judging it needs", () => {
+  const { got, asked } = listed([[
+    closed(9, { merged: 100 }),
+    closed(8, { changed: 200 }),
+    closed(7, { merged: 600, changed: 300, author: "merge-policy[bot]", baseRef: "release", headRef: "mp/task-3", head: sha("b"), mergeCommit: sha("e") }),
+    closed(6, { merged: 900 }),
+    closed(5, { merged: 5000, changed: 400 }),
+    closed(4, { merged: -60 }),
+    closed(3, { merged: 6000 }),
+  ]]);
+  assert.ok(Array.isArray(got), JSON.stringify(got));
+  // Merged within the time asked, both ends in; the oldest first. Closed unmerged, merged before it, or after it: not one.
+  assert.deepEqual(prsOf(got), [6, 7, 9]);
+  assert.deepEqual(got[1], { pr: 7, mergedAt: T - 600, head: sha("b"), mergeCommit: sha("e"), baseRef: "release", headRef: "mp/task-3", author: "merge-policy[bot]", title: "pull request 7" });
+  // One read: the page ends in a pull request last changed before the time asked, and none merged since lies beyond it.
+  assert.equal(asked.length, 1);
+  assert.match(asked[0], /^api repos\/o\/r\/pulls\?state=closed&sort=updated&direction=desc&per_page=100&page=1 /);
+  assert.doesNotMatch(asked.join("\n"), /search/, "GitHub's search lists a merge some time after it happens, and promises no time");
+  // An author GitHub doesn't give is kept as none, for the look to weigh.
+  const unnamed = listed([[closed(9, { merged: 100, author: null }), closed(3, { merged: 6000 })]]).got;
+  assert.deepEqual(prsOf(unnamed), [9]);
+  assert.equal(/** @type {any} */ (unnamed)[0].author, null);
+});
+
+test("the list is read page by page until one ends in a pull request last changed before the time asked", () => {
+  // A full page all changed since: the next is read too.
+  const two = listed([hundred(300, 100), [closed(50, { merged: 700, changed: 500 }), closed(49, { merged: 7000 })]]);
+  assert.deepEqual(prsOf(two.got), [50]);
+  assert.deepEqual(two.asked.map((a) => /[?&]page=(\d+)/.exec(a)?.[1]), ["1", "2", "1"], "and the first again, for what moved up meanwhile");
+  // A full page ending in one changed before it: no more is read.
+  const one = listed([[...hundred(300, 100).slice(0, 99), closed(49, { merged: 7000 })], [closed(40, { merged: 700 })]]);
+  assert.equal(one.asked.length, 1);
+  assert.deepEqual(one.got, []);
+  // More pages than a look reads is no reading: a merge may lie beyond them.
+  const endless = listed((/** @type {number} */ n) => hundred(100000 - n * 100, 100));
+  assert.match(/** @type {any} */ (endless.got).why ?? "", /more than/);
+  assert.equal(endless.asked.length, PAGES_AT_MOST);
+});
+
+test("a pull request that moves up the list while it's read is still found, and a list changed past telling is no reading", () => {
+  const first = hundred(300, 100), second = [closed(50, { merged: 700, changed: 500 }), closed(49, { merged: 7000 })];
+  // #77, merged in the time asked and on a page not yet read, is changed while the first is read: it moves to the top, past what was read.
+  const moved = listed((/** @type {number} */ n, /** @type {number} */ reads) => (n === 2 ? second : reads === 1 ? first : [closed(77, { merged: 800, changed: 0 }), ...first.slice(0, 99)]));
+  assert.deepEqual(prsOf(moved.got), [77, 50]);
+  // The first page again holds nothing the look began with: what moved where can't be told.
+  const lost = listed((/** @type {number} */ n, /** @type {number} */ reads) => (n === 2 ? second : reads === 1 ? first : hundred(900, 0)));
+  assert.match(/** @type {any} */ (lost.got).why ?? "", /changed while it was read/);
+});
+
+test("a list that can't be read whole vouches for nothing", () => {
+  const why = (/** @type {any} */ pages) => /** @type {any} */ (listed(pages).got).why ?? "";
+  assert.match(why(["fail"]), /HTTP 502/);
+  assert.match(why([["not json"]]), /doesn't read/);
+  assert.match(why([[closed(9, { merged: 100, baseRef: "" })]]), /doesn't read whole/, "a merge with no base named");
+  assert.match(why([[closed(9, { merged: 100, head: "abc" })]]), /doesn't read whole/, "a head that's no commit");
+  assert.match(why([[closed(9, { merged: 100, mergeCommit: "abc" })]]), /doesn't read whole/, "a merge commit that's none");
+  assert.match(why([[JSON.stringify({ number: 9, merged_at: null, updated_at: "when" })]]), /doesn't read whole/, "a time that doesn't read: where the list ends can't be told");
+  // A merge GitHub names no commit for is listed, for the look to keep as unjudged.
+  const uncommitted = listed([[closed(9, { merged: 100, mergeCommit: null }), closed(3, { merged: 6000 })]]).got;
+  assert.deepEqual(prsOf(uncommitted), [9]);
+  assert.equal(/** @type {any} */ (uncommitted)[0].mergeCommit, null);
 });
 
 test("a tick judges what merged since its last look, and a look that fails doesn't fail the tick", async () => {
   const now = Math.floor(Date.now() / 1000);
   /** @type {any[]} */ const judgedWith = [];
   const out = await run({ keepDir: true, evaluate: () => ({ ok: false, why: "not this test's" }),
-                          mergedSince: () => [{ pr: 7, mergedAt: now - 600, head: sha("a"), mergeCommit: sha("d"), baseRef: "main", headRef: "feature", author: "someone", title: "t" }],
+                          mergedList: () => [{ pr: 7, mergedAt: now - 600, head: sha("a"), mergeCommit: sha("d"), baseRef: "main", headRef: "feature", author: "someone", title: "t" }],
                           judgeAtMerge: (/** @type {any} */ a) => { judgedWith.push(a); return verdict("PASS"); } });
   assert.match(out.log, /merged #7: judged as it stood at its merge[^\n]*PASS/);
   assert.equal(judgedWith[0].nwo, "o/r");
@@ -291,7 +360,7 @@ test("a tick judges what merged since its last look, and a look that fails doesn
   } finally { db.close(); }
   // A look that throws is said, and the tick ends as any other.
   /** @type {any} */ let thrown = null;
-  await assert.doesNotReject(async () => { thrown = await run({ evaluate: () => ({ ok: false, why: "not this test's" }), mergedSince: () => { throw new Error("gh isn't there"); } }); },
+  await assert.doesNotReject(async () => { thrown = await run({ evaluate: () => ({ ok: false, why: "not this test's" }), mergedList: () => { throw new Error("gh isn't there"); } }); },
                              "a look that throws doesn't fail the tick");
   assert.match(thrown.log, /merges: judging what merged failed[^\n]*gh isn't there/);
   assert.equal(thrown.r.halted, false);
@@ -299,11 +368,38 @@ test("a tick judges what merged since its last look, and a look that fails doesn
   const marker = join(tempDir("reeve-judge-merges-halt-"), "HALT");
   let asked = 0;
   const halted = await run({ evaluate: () => ({ ok: false, why: "not this test's" }), haltMarker: marker,
-                             deriveSupply: () => { writeFileSync(marker, "halt\n"); return []; },
-                             mergedSince: () => { asked++; return []; } });
+                             runSelfAudit: () => { writeFileSync(marker, "halt\n"); return []; },
+                             mergedList: () => { asked++; return []; } });
   assert.equal(asked, 0, "the look didn't start once the halt was there");
   assert.doesNotMatch(halted.log, /merged #/);
   // Unread, as GitHub out of reach leaves it, none is judged and the tick says why.
   const offline = await run({ evaluate: () => ({ ok: false, why: "not this test's" }) });
   assert.match(offline.log, /merges: what merged since[^\n]*couldn't be read/);
+});
+
+test("a halt that arrives while the look runs is acted on before the tick ends: what it left passing is withdrawn", async () => {
+  const dir = tempDir("reeve-judge-merges-withdraw-");
+  /** @type {any[]} */ const withdrawn = [];
+  const head = "7".repeat(40);
+  const ctx = {
+    ...OFFLINE_READS,
+    nwo: "acme/widget", profile: { identity: { key: "acme/widget", defaultBranch: "main" }, authority: { policy: "propose_only" },
+      ci: { provider: "github-actions", requiredChecks: [] }, watch: { maxWorkers: 1, maxOpenPrs: 20 }, reviewers: [] },
+    db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"), haltMarker: join(dir, "HALT"),
+    execute: false, shadow: false, running: 0,
+    openPrs: () => [7], prState: () => "OPEN",
+    evaluate: () => ({ ok: true, pr: 7, state: "open", head, title: "t", headRef: "f7", baseRef: "main", updatedAt: "2026-09-26T10:00:00Z",
+                       verdict: { state: "PASS", head, summary: "pass", clauses: [] }, rounds: { n: 1, softCap: 5, hardCap: 10, unspilledCritical: 0 },
+                       checks: { verdict: "GREEN", caused: [], failing: [] }, reviewers: [], threads: { readable: true, total: 0, unresolved: 0, seen: 0 }, settled: { settled: true } }),
+    publish: async (/** @type {any} */ args) => ({ ok: true, id: 100, conclusion: "success", name: "merge-policy", head: args.verdict.head }),
+    withdraw: async (/** @type {any} */ args) => { withdrawn.push(args); return { ok: true }; },
+    observe: () => ({ observations: [], incomplete: false, threads: { readable: true, total: 0, unresolved: 0, seen: 0 } }),
+    derivePr: () => ({}), reviewState: () => ({ readable: true, total: 0, open: 0, resolved: 0, unspilledCritical: 0, rounds: 1 }),
+    // The halt arrives while GitHub is read for what merged: after the look began, and after every stop before it.
+    mergedList: () => { writeFileSync(join(dir, "HALT"), ""); return []; },
+  };
+  try {
+    await tick(ctx);
+    assert.ok(withdrawn.some((w) => w.head === head && /halted/.test(w.why)), `the pass the tick left standing is taken back: ${JSON.stringify(withdrawn)}`);
+  } finally { ctx.db.close(); }
 });

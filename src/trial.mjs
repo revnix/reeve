@@ -15,7 +15,7 @@ import { closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readdi
 import { basename, dirname, join } from "node:path";
 import { netTimeoutMs, netFailure } from "./net-bound.mjs";
 import { syncFolder } from "./signing.mjs";
-import { TICK_STARTED, TICK_STOPPED } from "./status.mjs";
+import { TICK_STARTED, TICK_STOPPED, MERGE_JUDGED } from "./status.mjs";
 import { sameCode } from "./decisions.mjs";
 import { decisionOf } from "./db/records.mjs";
 
@@ -41,7 +41,7 @@ export const CASE_KINDS = Object.freeze([
  * @typedef {{ pr: number, mergedAt: number, head: string, mergeCommit: string | null }} Merged
  * @typedef {"right" | "false pass" | "false block"} Mark
  * @typedef {{ mark: Mark, by: string, at: number, note: string, to: number }} Audited
- * @typedef {{ id: string, where: "head" | "queue", pr: number, head: string, state: string, summary: string, why: string, reasons: { why: string, ticks: number }[],
+ * @typedef {{ id: string, where: "head" | "queue" | "merge", pr: number, head: string, state: string, summary: string, why: string, reasons: { why: string, ticks: number }[],
  *             first: number, last: number, seq: number, ticks: number, record: string | null, final: boolean, audited: Audited | null, again?: boolean, gone?: boolean }} Call
  * @typedef {(seq: number) => { id: string, record: string | null } | null} Judgment
  * @typedef {{ repo: string, by: string, at: number, seq?: number,
@@ -67,15 +67,17 @@ export function callId(c) {
 /**
  * The call a judgment, a `pr.decided` or `queue.decided` event's payload `p`,
  * is of in `repo`, as `callId` names it.
- * @param {string} repo @param {"head" | "queue"} where @param {number} pr @param {any} p
+ * @param {string} repo @param {"head" | "queue" | "merge"} where @param {number} pr @param {any} p
  */
 const callOf = (repo, where, pr, p) => {
   const call = { where, pr, head: String(p.head ?? ""), state: String(p.state ?? ""), summary: String(p.summary ?? "") };
   return { id: callId({ repo, ...call }), ...call };
 };
 
+/** Where a call was judged, before the commit it's of: at a head, on the queue's commit, or after a merge as it stood at it (#342). @param {string} where */
+const placeText = (where) => (where === "queue" ? "on the queue's commit" : where === "merge" ? "as it stood at its merge, at" : "at");
 /** How a call reads where a person audits it. @param {{ where: string, pr: number, head: string, state: string }} c */
-const callText = (c) => `#${c.pr} ${c.state} ${c.where === "queue" ? "on the queue's commit" : "at"} ${c.head.slice(0, 10)}`;
+const callText = (c) => `#${c.pr} ${c.state} ${placeText(c.where)} ${c.head.slice(0, 10)}`;
 /**
  * A call's reason as a person reads it: its summary, and what it was judged
  * for, each reason with how many ticks gave it where there was more than one.
@@ -160,10 +162,16 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
 
   const decided = events(db, "pr.decided", since, now, upTo);
   const queued = events(db, "queue.decided", since, now, upTo);
+  // Each merge of the period judged after it, as it stood at its merge (#342).
+  // One of a merge from before the period, judged in it, is no call of this trial.
+  const atMerges = events(db, MERGE_JUDGED, since, now, upTo).filter((e) => Number(e.p.mergedAt) >= since);
 
   // Each merged pull request, its final head, and how it was judged there: by
-  // the verdict that stood when it merged, so not one kept after it.
-  /** @type {(Merged & { judged: boolean, state: string | null, record: string | null, down: boolean, queue: boolean, missed: string | null })[]} */
+  // its judgment as it stood at its merge, where the daemon made one after it,
+  // and otherwise by the verdict that stood when it merged, so not one kept
+  // after it.
+  /** @type {(Merged & { judged: boolean, state: string | null, record: string | null, down: boolean, queue: boolean, missed: string | null,
+   *              atMerge: boolean, stood: string | null })[]} */
   const merges = [];
   /** The events that stood when each pull request merged, at its head and in the queue. */
   const standing = new Set();
@@ -174,12 +182,21 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
     // commit reeve judged before the merge: a pull request the queue held,
     // then dropped, may have merged another way.
     const inQueue = m.mergeCommit ? queued.filter((e) => e.pr === m.pr && e.p.head === m.mergeCommit && e.at <= m.mergedAt).at(-1) : undefined;
+    // Its judgment as it stood at its merge: this merge's, the latest. It stands
+    // over the verdict that stood when it merged, which a tick before the merge
+    // gave on what it could see then; so a merge while the daemon was down, or
+    // between two ticks, is judged rather than missed (the founder, 2026-10-02).
+    // An unknown one says nothing of the merge, which is then as it was.
+    const late = atMerges.filter((e) => e.pr === m.pr && e.p.head === m.head && e.p.mergedAt === m.mergedAt).at(-1);
+    const told = late && (late.p.state === "PASS" || late.p.state === "BLOCK") ? late : null;
     if (last) standing.add(last.seq);
     if (inQueue) standing.add(inQueue.seq);
+    if (told) standing.add(told.seq);
     const isDown = wasDown(m.mergedAt);
-    merges.push({ ...m, judged: Boolean(last), state: last?.p.state ?? null, record: last?.p.record ?? null, down: isDown,
-                  queue: Boolean(inQueue),
-                  missed: isDown ? "merged while the daemon was down" : !last ? "its final head was never judged" : null });
+    const unknownAfter = late ? ", and its judgment after it, as it stood at its merge, is unknown" : "";
+    merges.push({ ...m, judged: Boolean(told ?? last), state: told ? String(told.p.state) : last?.p.state ?? null, record: told ? null : last?.p.record ?? null, down: isDown,
+                  queue: Boolean(inQueue), atMerge: Boolean(told), stood: last?.p.state ?? null,
+                  missed: told ? null : isDown ? `merged while the daemon was down${unknownAfter}` : !last ? `its final head was never judged${unknownAfter}` : null });
   }
   const passedFinal = merges.filter((m) => m.state === "PASS");
 
@@ -217,7 +234,7 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
   // Each judgment of the period, by its event: the call it's of, and its record.
   /** @type {Map<number, { id: string, record: string | null }>} */
   const judged = new Map();
-  for (const [where, list] of /** @type {const} */ ([["head", decided], ["queue", queued]])) for (const e of list) {
+  for (const [where, list] of /** @type {const} */ ([["head", decided], ["queue", queued], ["merge", atMerges]])) for (const e of list) {
     const { id, ...call } = callOf(repo, where, e.pr, e.p);
     const c = calls.get(id) ?? { id, ...call, why: "", reasons: [], first: e.at, last: e.at, seq: e.seq, ticks: 0, record: null, final: false, audited: null, again: false, gone: false };
     c.why = String(e.p.why ?? "");
@@ -249,11 +266,11 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
   const judgedAt = (seq) => {
     const inPeriod = judged.get(seq);
     if (inPeriod) return inPeriod;
-    const e = /** @type {any} */ (db.prepare(`SELECT op, subject, payload FROM event WHERE seq = ? AND op IN ('pr.decided', 'queue.decided')`).get(seq));
+    const e = /** @type {any} */ (db.prepare(`SELECT op, subject, payload FROM event WHERE seq = ? AND op IN ('pr.decided', 'queue.decided', ?)`).get(seq, MERGE_JUDGED));
     if (!e) return null;
     let p = {};
     try { p = JSON.parse(e.payload ?? "{}") ?? {}; } catch { /* a payload that can't be read says nothing */ }
-    return { id: callOf(repo, e.op === "queue.decided" ? "queue" : "head", Number(String(e.subject ?? "").replace(/^pr:/, "")), p).id, record: /** @type {any} */ (p).record ?? null };
+    return { id: callOf(repo, e.op === "queue.decided" ? "queue" : e.op === MERGE_JUDGED ? "merge" : "head", Number(String(e.subject ?? "").replace(/^pr:/, "")), p).id, record: /** @type {any} */ (p).record ?? null };
   };
   if (Array.isArray(audits)) for (const a of [...audits].sort((x, y) => (x.seq ?? 0) - (y.seq ?? 0) || x.at - y.at))
     for (const m of a.calls) {
@@ -288,7 +305,7 @@ export function trialReport(db, { repo, since, now, merged, seeded = null, audit
   /** @type {Condition[]} */
   const conditions = [
     { name: `at least ${FLOOR_HOURS} hours of running`, met: hours >= FLOOR_HOURS, detail: `${hours.toFixed(1)} hours` },
-    { name: "every merge judged at its final head, none while the daemon was down",
+    { name: "every merge judged at its final head, before it merged or as it stood at its merge",
       met: Array.isArray(merged) ? missed.length === 0 : false,
       detail: !Array.isArray(merged) ? `what merged couldn't be read: ${merged.why}`
         : missed.length ? `${missed.length} of ${merges.length} missed: ${missed.map((m) => `#${m.pr} (${m.missed})`).join(", ")}` : `${merges.length} merged, none missed` },
@@ -384,6 +401,8 @@ export function trialRanOn(db, { since, until, code, policy }) {
     const record = d && !d.corrupt ? d.record : null;
     tell("judgment", e.at, record?.code, record?.policy);
   }
+  // Each merge's judgment after it (#342), by what its event says made it, as a tick's says.
+  for (const e of events(db, MERGE_JUDGED, since, until)) tell("judgment", e.at, e.p.code, e.p.policy);
   // Each tick, its start, end or stop: the time the trial ran is counted from them.
   for (const op of [TICK_STARTED, "daemon.tick", TICK_STOPPED])
     for (const e of events(db, op, since, until)) tell("tick", e.at, e.p.code, e.p.policy);
@@ -479,12 +498,13 @@ export function renderTrial(r, nwo) {
   }
   out.push("", `merged: ${r.merges.length}`);
   for (const m of r.merges)
-    out.push(`  #${m.pr} at ${m.head.slice(0, 10)}: ${m.missed ? `MISSED, ${m.missed}` : `${m.state}${m.queue ? ", through the queue" : ""}`}`);
+    out.push(`  #${m.pr} at ${m.head.slice(0, 10)}: ${m.missed ? `MISSED, ${m.missed}` : `${m.state}${m.queue ? ", through the queue" : ""}${
+      m.atMerge ? `, judged as it stood at its merge${m.stood ? ` (${m.stood} stood when it merged)` : ""}` : ""}`}`);
   if (r.toAudit.length) {
     out.push("", "to audit (was each call right?):");
     for (const a of r.toAudit) {
       const why = reasonOf(a);
-      out.push(`  #${a.pr} ${a.state} ${a.where === "queue" ? "on the queue's commit" : "at"} ${a.head.slice(0, 10)}` +
+      out.push(`  #${a.pr} ${a.state} ${placeText(a.where)} ${a.head.slice(0, 10)}` +
                `${why ? ` (${why})` : ""}, ${a.ticks} tick(s)${a.final ? ", standing when it merged" : ""}` +
                `${a.record ? `, record ${a.record.slice(0, 12)}` : ""}` +
                `${a.audited ? `, audited: ${a.audited.mark}, by ${a.audited.by}${a.gone ? ", of a judgment this store doesn't hold" : a.again ? ", judged again since" : ""}` : ""}`);

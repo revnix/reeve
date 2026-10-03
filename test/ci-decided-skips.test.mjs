@@ -18,9 +18,9 @@ const DECIDER = "Decide what this commit can affect";
 const POSTGRES = "Integration (postgres)";
 const WINDOWS = "Pre-push gates (windows-latest)";
 
-/** A check run of GitHub Actions at a commit. */
-const run = (/** @type {string} */ name, /** @type {string} */ conclusion, app = ACTIONS) =>
-  ({ name, source: "check_run", state: "completed", conclusion, appId: app, id: "1", completedAt: new Date(0).toISOString() });
+/** A check run of GitHub Actions at a commit, in workflow run `suite`, its check suite. */
+const run = (/** @type {string} */ name, /** @type {string} */ conclusion, { app = ACTIONS, suite = "1" } = {}) =>
+  ({ name, source: "check_run", state: "completed", conclusion, appId: app, id: "1", suiteId: suite, completedAt: new Date(0).toISOString() });
 const required = [{ context: "Build", app: ACTIONS }, { context: POSTGRES, app: ACTIONS }];
 const decides = { ci: { provider: "github-actions", requiredChecks: [], decidedSkips: { by: DECIDER, checks: [POSTGRES] } } };
 /** The head's checks as reeve reads them, judged by `profile`'s rules. */
@@ -39,11 +39,15 @@ test("a required check skipped where CI's own decider succeeded at the head pass
   const ci = ciClause(head);
   assert.equal(ci?.state, "PASS");
   assert.match(String(ci?.detail), /Integration \(postgres\) skipped, as Decide what this commit can affect decided/);
-  // Every run of the decider: two workflows may each decide.
-  assert.equal(judged([run("Build", "success"), run(DECIDER, "success"), run(DECIDER, "success"), run(POSTGRES, "skipped")]).verdict, "GREEN");
+  // Two workflows may each have a job of that name: the skip's own run decides it.
+  assert.equal(judged([run("Build", "success", { suite: "2" }), run(DECIDER, "success", { suite: "2" }), run(DECIDER, "success"), run(POSTGRES, "skipped")]).verdict, "GREEN");
 });
 
 test("a skip stays unpassed where the decider failed, didn't run, isn't GitHub's run of the same App, or isn't named", () => {
+  // Only the skip's own workflow run can decide it: another's job of the decider's name can't.
+  assert.equal(judged([run("Build", "success"), run(DECIDER, "success", { suite: "2" }), run(POSTGRES, "skipped")]).verdict, "SKIPPED_REQUIRED", "a decider in another run");
+  assert.equal(judged([run("Build", "success"), { ...run(DECIDER, "success"), suiteId: null }, { ...run(POSTGRES, "skipped"), suiteId: null }]).verdict, "SKIPPED_REQUIRED",
+               "runs GitHub gave no suite for");
   const ok = [run("Build", "success"), run(DECIDER, "success"), run(POSTGRES, "skipped")];
   assert.equal(judged(ok).verdict, "GREEN", "control");
   assert.equal(judged([run("Build", "success"), run(DECIDER, "failure"), run(POSTGRES, "skipped")]).verdict, "SKIPPED_REQUIRED", "the decider failed");
@@ -51,9 +55,9 @@ test("a skip stays unpassed where the decider failed, didn't run, isn't GitHub's
   assert.equal(judged([run("Build", "success"), run(DECIDER, "skipped"), run(POSTGRES, "skipped")]).verdict, "SKIPPED_REQUIRED", "the decider skipped itself");
   assert.equal(judged([run("Build", "success"), run(DECIDER, "success"), run(DECIDER, "cancelled"), run(POSTGRES, "skipped")]).verdict, "SKIPPED_REQUIRED",
                "one of its runs didn't succeed");
-  assert.equal(judged([run("Build", "success"), { ...run(DECIDER, "success"), source: "status" }, run(POSTGRES, "skipped")]).verdict, "SKIPPED_REQUIRED",
-               "a commit status under the decider's name, which names no App");
-  assert.equal(judged([run("Build", "success"), run(DECIDER, "success", "999"), run(POSTGRES, "skipped")]).verdict, "SKIPPED_REQUIRED",
+  assert.equal(judged([run("Build", "success"), { ...run(DECIDER, "success"), source: "status", suiteId: undefined }, run(POSTGRES, "skipped")]).verdict, "SKIPPED_REQUIRED",
+               "a commit status under the decider's name, which is no job of a run");
+  assert.equal(judged([run("Build", "success"), run(DECIDER, "success", { app: "999", suite: "9" }), run(POSTGRES, "skipped")]).verdict, "SKIPPED_REQUIRED",
                "another App's run of that name");
   assert.equal(judged(ok, { ci: { provider: "github-actions", requiredChecks: [] } }).verdict, "SKIPPED_REQUIRED", "a profile naming no decider");
   assert.equal(judged([run("Build", "skipped"), run(DECIDER, "success"), run(POSTGRES, "success")]).verdict, "SKIPPED_REQUIRED",
@@ -61,12 +65,20 @@ test("a skip stays unpassed where the decider failed, didn't run, isn't GitHub's
   assert.equal(judged([run("Build", "success"), run(DECIDER, "success"), run(POSTGRES, "neutral")]).verdict, "SKIPPED_REQUIRED", "neutral, not skipped");
 });
 
-test("a skip isn't taken as decided beside any failure, as a job skipped for a failed one it needs looks the same", () => {
-  const head = judged([run("Build", "success"), run(DECIDER, "success"), run(POSTGRES, "skipped"), run(WINDOWS, "failure")]);
-  assert.equal(head.verdict, "SKIPPED_REQUIRED", head.why);
-  // Nor beside one cancelled or stale, which a job it needs may be as well.
-  for (const conclusion of ["cancelled", "stale"])
-    assert.notEqual(judged([run("Build", "success"), run(DECIDER, "success"), run(POSTGRES, "skipped"), run("Prepare", conclusion)]).verdict, "GREEN", conclusion);
+test("a skip isn't taken as decided beside another job of its run that was skipped, failed, was cancelled or went stale", () => {
+  // A job is skipped for one it needs that didn't succeed, and looks the same as one skipped by decision.
+  const beside = (/** @type {string} */ conclusion, suite = "1") =>
+    judged([run("Build", "success", { suite: "2" }), run(DECIDER, "success"), run(POSTGRES, "skipped"), run("Prepare", conclusion, { suite })]);
+  for (const conclusion of ["skipped", "failure", "cancelled", "stale"])
+    assert.notEqual(beside(conclusion).verdict, "GREEN", conclusion);
+  // Another run's jobs can't be what its own were skipped for.
+  for (const conclusion of ["skipped", "failure", "cancelled"]) {
+    const head = beside(conclusion, "3");
+    assert.notEqual(head.verdict === "SKIPPED_REQUIRED" && /Integration/.test(String(head.why)), true, `${conclusion} in another run: ${head.why}`);
+  }
+  const elsewhere = beside("failure", "3");
+  assert.equal(elsewhere.verdict, "GREEN", elsewhere.why);
+  assert.deepEqual([elsewhere.decided, elsewhere.ancillaryFailing], [[POSTGRES], ["Prepare"]]);
 });
 
 test("at a head only a failing required check blocks; another's failure is named, and doesn't hold it", () => {
@@ -128,7 +140,8 @@ test("a profile names the job that decides, and the required checks it may skip,
 test("through evaluatePr, the verdict at a head names a decided skip, and a failure no rule requires", () => {
   const HEAD = A, BASE = "b".repeat(40);
   const runJson = (/** @type {string} */ name, /** @type {string} */ conclusion) =>
-    JSON.stringify({ name, status: "completed", conclusion, id: 1, completed_at: new Date().toISOString(), app: { slug: "github-actions", id: 1 } });
+    JSON.stringify({ name, status: "completed", conclusion, id: 1, completed_at: new Date().toISOString(), app: { slug: "github-actions", id: 1 },
+                     check_suite: { id: name === "CI Gate" || name === WINDOWS ? 6 : 5 } });
   const db = open(join(tempDir("reeve-decided-head-db-"), "s.db"));
   const page = JSON.stringify({ data: { repository: { pullRequest: { mergeStateStatus: "CLEAN", mergeable: "MERGEABLE", reviewDecision: null,
     reviews: { totalCount: 0 }, reviewThreads: { totalCount: 0, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } } });

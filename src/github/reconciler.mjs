@@ -236,6 +236,9 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
     appId: c.app?.id != null ? String(c.app.id) : null,
     // When it finished: GitHub accepts a required check's pass for seven days.
     completedAt: c.completed_at ?? null,
+    // Its check suite, the workflow run it's a job of: a job is skipped only
+    // for another of its own run (#344).
+    suiteId: c.check_suite?.id != null ? String(c.check_suite.id) : null,
   }));
   const st = gh(`repos/${nwo}/commits/${sha}/status?per_page=100`, ".statuses[]", { paginate: true });
   const stRead = parse(st, x => ({
@@ -286,10 +289,11 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
  * request (#288). Null counts every check, as a base whose rules couldn't be
  * read, or that requires none, can't say which matter. `decided`, a profile's
  * `{ by, checks }`, names the job by which CI decides what a commit can affect
- * and the required checks it may skip: one of them skipped passes where every
- * run of that job at the commit succeeded, as GitHub's run from the App that
- * skipped it, and no check failed, was cancelled or went stale there, as a job
- * skipped for one it needs that didn't succeed looks the same (#344).
+ * and the required checks it may skip: one of them skipped passes as decided
+ * within its own workflow run, its check suite, where that job ran and
+ * succeeded, every other job skipped there is one it may skip, and every other
+ * one succeeded or still runs. A job is skipped only for one of its own run
+ * that didn't succeed, and looks the same as one skipped by decision (#344).
  */
 export function classify(allRows, requiredChecks = [], { requiredKnown = true, evidence = true, queueOnly = [], failuresOf = null, decided = null } = {}) {
   // A row with no name is a PARSE DEFECT, not a check. It cannot be reported to a
@@ -336,10 +340,13 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
   const notRunRequired = evidence ? required.filter(c => notRun(meeting(c))) : [];
   // Only skipped: one that failed was RED above, and one that never reported is missing.
   const deferred = notRunRequired.filter(c => queueOnly.includes(c.context) && meeting(c).every(r => r.conclusion === "skipped"));
-  const deciders = rows.filter(r => r.name === decided?.by);
-  const decidedSkip = (c) => !failingAll.length && !uninformative.length && (decided?.checks ?? []).includes(c.context) && deciders.length > 0 &&
-    meeting(c).every(s => s.conclusion === "skipped" &&
-      deciders.every(d => d.source === "check_run" && d.conclusion === "success" && String(d.appId) === String(s.appId)));
+  const decidedSkip = (c) => meeting(c).every(s => {
+    const own = s.suiteId == null ? [] : rows.filter(r => r.suiteId === s.suiteId);
+    return own.some(r => r.name === decided?.by) && own.every(r =>
+      r.name === decided?.by ? r.conclusion === "success"
+      : r.conclusion === "skipped" ? (decided?.checks ?? []).includes(r.name)
+      : r.state !== "completed" || r.conclusion === "success");
+  });
   const decidedOnes = notRunRequired.filter(c => !deferred.includes(c) && decidedSkip(c));
   const skipped = notRunRequired.filter(c => !deferred.includes(c) && !decidedOnes.includes(c));
   if (skipped.length) return { verdict: "SKIPPED_REQUIRED", why: `required check(s) skipped or neutral, so they never reported a pass: ${skipped.map(label).join(", ")}`,

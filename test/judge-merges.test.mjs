@@ -4,6 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
+import { writeFileSync } from "node:fs";
 import { open } from "../src/db/ops.mjs";
 import { mergedSince } from "../src/trial.mjs";
 import { run } from "./fixtures/tick-harness.mjs";
@@ -213,6 +214,28 @@ test("a look that can't read what merged judges nothing and keeps no look, so th
   } finally { w.db.close(); }
 });
 
+test("a halt stops the look: nothing is read or judged once it's seen, and what's left waits for the next", () => {
+  const w = world();
+  try {
+    // Seen before it starts: GitHub isn't asked, and nothing is kept.
+    const stopped = w.look(T, [merge(7, 2600), merge(8, 2300)], undefined, { halted: () => true });
+    assert.equal(stopped.ok, false);
+    assert.match(/** @type {any} */ (stopped).why, /halted/);
+    assert.equal(w.asked.length, 0, "what merged isn't read");
+    assert.equal(w.judgedWith.length, 0);
+    assert.equal(w.db.prepare("SELECT COUNT(*) n FROM event").get().n, 0, "nothing kept");
+    // Seen between two merges: the one judged is kept, the rest aren't judged, and no look says they were.
+    const midway = w.look(T, [merge(7, 2600), merge(8, 2300)], undefined, { halted: () => w.judgedWith.length >= 1 });
+    assert.equal(midway.ok, false);
+    assert.deepEqual(w.judgedWith.map((a) => a.merge.pr), [7]);
+    assert.deepEqual(w.events(MERGE_JUDGED).map((e) => e.subject), ["pr:7"]);
+    assert.deepEqual(w.events(MERGES_LOOKED), [], "the look isn't kept as having reached past what it left");
+    // The next look, the halt lifted, judges what was left and not the one judged.
+    assert.deepEqual(w.look(T + 300, [merge(7, 2600), merge(8, 2300)]), { ok: true, judged: 1, waiting: 0 });
+    assert.deepEqual(w.judgedWith.map((a) => a.merge.pr), [7, 8]);
+  } finally { w.db.close(); }
+});
+
 test("a builder's merged pull request is judged with its hold unreadable, and another's with none", () => {
   const w = world();
   try {
@@ -272,6 +295,14 @@ test("a tick judges what merged since its last look, and a look that fails doesn
                              "a look that throws doesn't fail the tick");
   assert.match(thrown.log, /merges: judging what merged failed[^\n]*gh isn't there/);
   assert.equal(thrown.r.halted, false);
+  // A halt that arrives late in the tick, after its last check, is seen before the look: what merged isn't read.
+  const marker = join(tempDir("reeve-judge-merges-halt-"), "HALT");
+  let asked = 0;
+  const halted = await run({ evaluate: () => ({ ok: false, why: "not this test's" }), haltMarker: marker,
+                             deriveSupply: () => { writeFileSync(marker, "halt\n"); return []; },
+                             mergedSince: () => { asked++; return []; } });
+  assert.equal(asked, 0, "the look didn't start once the halt was there");
+  assert.doesNotMatch(halted.log, /merged #/);
   // Unread, as GitHub out of reach leaves it, none is judged and the tick says why.
   const offline = await run({ evaluate: () => ({ ok: false, why: "not this test's" }) });
   assert.match(offline.log, /merges: what merged since[^\n]*couldn't be read/);

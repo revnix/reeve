@@ -89,7 +89,7 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
                     resolveRepoIdFn, project, keepDir = false, seams = null,
                     haltMarker, openPrs, containment, ticks = 1, dbPath, evaluate, treeOf, code, codeVersion,
                     readQueue, evaluateQueue, publish, withdraw, signer, anchor, keys, durably, prState, prIsFinished,
-                    afterTick, shadow = true, enforcement, trialHolds, mergedSince, judgeAtMerge } = {}) => {
+                    afterTick, shadow = true, enforcement, trialHolds, mergedSince, judgeAtMerge, deriveSupply } = {}) => {
   const dir = tempDir("reeve-prov-");
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
@@ -201,6 +201,9 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     // what merged is the offline read's, which can't be read, so none is judged.
     ...(mergedSince ? { mergedSince } : {}),
     ...(judgeAtMerge ? { judgeAtMerge } : {}),
+    // The supply's derivation, the tick's last step before it looks for what
+    // merged: a test puts what happens that late in a tick here.
+    ...(deriveSupply ? { deriveSupply } : {}),
     ...(evaluateQueue ? { evaluateQueue } : {}),
     ...(withdraw ? { withdraw } : {}),
     // What signs each decision record (#165). Unset, the tick keeps its records

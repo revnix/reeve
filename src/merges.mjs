@@ -52,11 +52,17 @@ const iso = (/** @type {number} */ t) => new Date(t * 1000).toISOString().replac
  * `merge.tried` event, and kept as it is after.
  * A builder's pull request is judged with its hold unreadable: a hold isn't
  * kept as it stood at the merge.
+ * A halt stops this work as it stops the rest: once `halted` says so, nothing
+ * more is read or judged, and no look is kept, so what's left waits for the
+ * next.
  * @param {{ nwo: string, profile: any, db: any, now: number, ran?: { code?: any, policy?: string | null } | null,
- *           merged?: typeof mergedSince, judge?: typeof judgeAtMerge, limit?: number, log?: (line: string) => void }} o
+ *           merged?: typeof mergedSince, judge?: typeof judgeAtMerge, limit?: number, log?: (line: string) => void,
+ *           halted?: () => boolean }} o
  * @returns {{ ok: true, judged: number, waiting: number } | { ok: false, why: string }}
  */
-export function judgeMerges({ nwo, profile, db, now, ran = null, merged = mergedSince, judge = judgeAtMerge, limit = JUDGED_A_TICK, log = () => {} }) {
+export function judgeMerges({ nwo, profile, db, now, ran = null, merged = mergedSince, judge = judgeAtMerge, limit = JUDGED_A_TICK, log = () => {}, halted = () => false }) {
+  const stopped = { ok: /** @type {const} */ (false), why: "the merge policy is halted" };
+  if (halted()) return stopped;
   let from = now - FIRST_LOOK_SECONDS;
   const last = /** @type {any} */ (db.prepare("SELECT payload FROM event WHERE op = ? ORDER BY seq DESC LIMIT 1").get(MERGES_LOOKED));
   try { const upTo = JSON.parse(last?.payload ?? "null")?.upTo; if (Number.isSafeInteger(upTo)) from = upTo; } catch { /* a look that doesn't read is no look */ }
@@ -77,6 +83,8 @@ export function judgeMerges({ nwo, profile, db, now, ran = null, merged = merged
   let judged = 0;
   for (const [i, m] of waiting.entries()) {
     if (i >= limit) { left.push(m.mergedAt); continue; }
+    // Seen between two merges: those judged are kept, and no look is, as it would say the rest were reached.
+    if (halted()) return stopped;
     /** @type {any} */ let e;
     try {
       e = m.mergeCommit

@@ -4954,10 +4954,12 @@ async function tickOnce(ctx, ran) {
   // What merged since the last look, each judged once as it stood at its merge
   // (#342): a merge between two ticks, or while the daemon was down, is judged
   // after it rather than missed. Nothing is published for one, and a look that
-  // fails never fails the tick.
+  // fails never fails the tick. A halt stops it as it stops the rest: the marker
+  // is looked at again here, as one may arrive after the check above.
   if (ctx.judgeMerges !== false) {
     try {
       (ctx.judgeMerges ?? judgeMerges)({ nwo, profile, db, now: now(), ran, merged: ctx.mergedSince, judge: ctx.judgeAtMerge,
+                                         halted: () => halted(ctx.haltMarker),
                                          log: (/** @type {string} */ line) => log(logPath, line) });
     } catch (err) { log(logPath, `merges: judging what merged failed — ${err.message}`); }
   }

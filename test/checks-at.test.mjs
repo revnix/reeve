@@ -29,7 +29,8 @@ const statusJson = (/** @type {string} */ context, /** @type {string} */ state, 
 const suiteJson = (/** @type {number} */ id, made = -3600, /** @type {number | null} */ total = 1) => JSON.stringify({ id, created_at: at(made), ...(total === null ? {} : { total }) });
 /** The suites `runs` are of, each made an hour before T. @param {string[]} runs */
 const suitesOf = (runs) => [...new Set(runs.map((x) => { try { return JSON.parse(x).check_suite.id; } catch { return null; } }).filter((x) => x != null))].map((id, _i, all) => suiteJson(id, -3600, all.length));
-const withGh = (/** @type {{ runs?: string[], statuses?: string[], activity?: string[], period?: string, log?: string, suites?: string[], runsFail?: boolean, later?: { runs?: string[], statuses?: string[] } }} */ answers,
+const withGh = (/** @type {{ runs?: string[], statuses?: string[], activity?: string[], period?: string, log?: string, suites?: string[], runsFail?: boolean, later?: { runs?: string[], statuses?: string[] },
+                              ancestors?: Record<string, string[]>, compare?: Record<string, string> }} */ answers,
                 /** @type {() => any} */ fn) => {
   const bin = tempDir("reeve-checks-at-bin-");
   const lines = (/** @type {string[]} */ xs) => xs.map((x) => `'${x}'`).join(" ");
@@ -42,6 +43,8 @@ case "$p" in
   */commits/${HEAD}/statuses*) printf '%s\\n' ${lines(answers.statuses ?? [])}
     [ -n "$all" ] && printf '%s\\n' ${lines(answers.later?.statuses ?? [])};;
   */commits/${HEAD}/check-suites*) printf '%s\\n' ${lines(answers.suites ?? suitesOf([...(answers.runs ?? []), ...(answers.later?.runs ?? [])]))};;
+${Object.entries(answers.ancestors ?? {}).map(([sha, xs]) => `  */commits*sha=${sha}*) printf '%s\\n' ${lines(xs)};;`).join("\n")}
+${Object.entries(answers.compare ?? {}).map(([ends, x]) => `  */compare/${ends}) printf '%s\\n' '${x}';;`).join("\n")}
   */activity*time_period=${answers.period ?? "day"}*) printf '%s\\n' ${lines(answers.activity ?? [])};;
   *) echo "not a read this test answers: $p" >&2; exit 1;;
 esac
@@ -196,4 +199,44 @@ test("the commit a merge went onto is the base branch's before the merge, as Git
   writeFileSync(log, "");
   assert.equal(withGh({ activity: [act("pr_merge", PARENT, MERGE)], period: "year", log }, () => r.mergedOnto("o/r", "main", MERGE, T, T + 400 * DAY)), null);
   assert.equal(readFileSync(log, "utf8"), "", "past a year, nothing asked");
+});
+
+test("an earlier merge of a push of the merge queue went onto the tip before that push", async () => {
+  const r = await reconciler();
+  const act = (/** @type {string} */ type, /** @type {string} */ before, /** @type {string} */ after) => JSON.stringify({ activity_type: type, before, after });
+  // The queue put several merges on the branch in one push. GitHub's activity records it once, from the tip before to the last merge's commit.
+  const LAST = "c".repeat(40), EARLIER = "b".repeat(40), ENDS = `${PARENT}...${LAST}`;
+  const push = act("merge_queue_merge", PARENT, LAST);
+  /** A commit as the read of a commit's ancestors gives one. */
+  const commit = (/** @type {string} */ sha, /** @type {string | null} */ parent) => JSON.stringify({ sha, parent });
+  /** GitHub's comparison of a push's two ends, as the read gives it. */
+  const compared = (/** @type {string[]} */ commits, status = "ahead") => JSON.stringify({ status, commits });
+  /** @param {Parameters<typeof withGh>[0]} answers */
+  const onto = (answers) => withGh(answers, () => r.mergedOnto("o/r", "main", MERGE, T, T + 3600));
+  const two = { activity: [push], ancestors: { [MERGE]: [commit(MERGE, PARENT), commit(PARENT, "f".repeat(40))] }, compare: { [ENDS]: compared([MERGE, LAST]) } };
+  assert.equal(onto(two), PARENT, "the first of two");
+  assert.equal(onto({ activity: [push], ancestors: { [MERGE]: [commit(MERGE, EARLIER), commit(EARLIER, PARENT), commit(PARENT, "f".repeat(40))] },
+                      compare: { [ENDS]: compared([EARLIER, MERGE, LAST]) } }), PARENT, "the second of three, by its first parents");
+  // Unread wherever that isn't shown.
+  assert.equal(onto({ ...two, ancestors: {} }), null, "its ancestors unread");
+  assert.equal(onto({ ...two, ancestors: { [MERGE]: [commit(MERGE, null)] } }), null, "a commit with no parent");
+  assert.equal(onto({ ...two, ancestors: { [MERGE]: [commit(MERGE, EARLIER), commit("9".repeat(40), PARENT)] } }), null,
+               "first parents that leave what was listed, beside a commit that isn't one of them");
+  assert.equal(onto({ ...two, ancestors: { [MERGE]: ["not json", commit(MERGE, PARENT)] } }), null, "ancestors with a line that doesn't read");
+  assert.equal(onto({ ...two, activity: [act("pr_merge", PARENT, LAST)] }), null, "from that tip a pull request was merged, by no push of the queue");
+  assert.equal(onto({ ...two, activity: [act("push", PARENT, LAST)] }), null, "from that tip a push");
+  assert.equal(onto({ ...two, activity: [push, act("merge_queue_merge", PARENT, "f".repeat(40))], compare: { ...two.compare, [`${PARENT}...${"f".repeat(40)}`]: compared([MERGE]) } }), null,
+               "two records from one tip");
+  assert.equal(onto({ ...two, activity: [act("merge_queue_merge", PARENT, "not-a-sha")], compare: { [`${PARENT}...not-a-sha`]: compared([MERGE]) } }), null, "a push that ends at no commit");
+  assert.equal(onto({ activity: [act("merge_queue_merge", "main", LAST)], ancestors: { [MERGE]: [commit(MERGE, "main")] }, compare: { [`main...${LAST}`]: compared([MERGE, LAST]) } }), null,
+               "a parent that is no commit");
+  assert.equal(onto({ ...two, compare: {} }), null, "the comparison unread");
+  assert.equal(onto({ ...two, compare: { [ENDS]: "not json" } }), null, "a comparison that doesn't read");
+  assert.equal(onto({ ...two, compare: { [ENDS]: compared([EARLIER, LAST]) } }), null, "a push that didn't carry it");
+  assert.equal(onto({ ...two, compare: { [ENDS]: compared([MERGE, LAST], "diverged") } }), null, "ends that diverged");
+  // A record that ends at the merge's own commit is the merge's, as before, and nothing more is asked.
+  const log = join(tempDir("reeve-checks-at-log-"), "asked");
+  writeFileSync(log, "");
+  assert.equal(withGh({ ...two, activity: [act("merge_queue_merge", PARENT, MERGE)], log }, () => r.mergedOnto("o/r", "main", MERGE, T, T + 3600)), PARENT);
+  assert.doesNotMatch(readFileSync(log, "utf8"), /commits|compare/, "its own record found, nothing more asked");
 });

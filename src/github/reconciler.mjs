@@ -308,7 +308,11 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
  *   - per check, its suite and name, the attempt begun last by then, running
  *     where it finished after;
  *   - per status, the one set last by then.
- * One begun or set after it wasn't there. Left out as readChecks leaves them out.
+ * What stood can't always be told, and then the reading is unread, never
+ * guessed: an attempt created after that one, by its id, that began since or
+ * hasn't begun may have been queued then, or the one that stood reset in place
+ * since; and GitHub lists the runs of a commit's latest thousand suites only.
+ * Left out as readChecks leaves them out.
  * @param {string} nwo @param {string} sha @param {number} at @param {{ reviewerContexts?: string[] }} [o]
  */
 export function readChecksAt(nwo, sha, at, { reviewerContexts = [] } = {}) {
@@ -318,29 +322,43 @@ export function readChecksAt(nwo, sha, at, { reviewerContexts = [] } = {}) {
   const st = gh(`repos/${nwo}/commits/${sha}/statuses?per_page=100`, ".[]", { paginate: true });
   const stRead = readLines(st, x => ({ ...statusRow(x), begun: x.created_at ?? null }), statuses);
   const secs = (/** @type {string | null} */ t) => (t == null ? NaN : Date.parse(t) / 1000);
-  /** The row begun last by `at` under each key. @param {any[]} xs @param {(r: any) => string} key */
-  const stood = (xs, key) => {
-    const last = new Map();
-    for (const r of xs) if (secs(r.begun) <= at && !(secs(last.get(key(r))?.begun) >= secs(r.begun))) last.set(key(r), r);
-    return [...last.values()];
-  };
-  const rows = [
-    ...stood(runs, r => `${r.suiteId}\u0000${r.name}`)
-      .map(({ begun: _b, ...r }) => (r.state === "completed" && secs(r.completedAt) <= at ? r : { ...r, state: "running", conclusion: null })),
-    ...stood(statuses, r => r.name).map(({ begun: _b, ...r }) => r),
-  ];
-  return counted(rows, cr, crRead, st, stRead, reviewerContexts);
+  const by = (/** @type {any[]} */ xs, /** @type {(r: any) => string} */ key) => Map.groupBy(xs, key).values();
+  /** The one begun last by `at` of `xs`, or undefined. @param {any[]} xs */
+  const last = (xs) => xs.filter(r => secs(r.begun) <= at).reduce((a, r) => (a && secs(a.begun) >= secs(r.begun) ? a : r), undefined);
+  /** @type {any[]} */ const rows = [];
+  let unsure = runs.length && new Set(runs.map(r => r.suiteId)).size >= 1000 ? "a thousand check suites or more, past what GitHub lists" : null;
+  for (const attempts of by(runs, r => `${r.suiteId}\u0000${r.name}`)) {
+    const stood = last(attempts);
+    if (attempts.some(r => !(secs(r.begun) <= at) && (!stood || Number(r.id) > Number(stood.id))))
+      unsure ??= `${attempts[0].name} has an attempt that began after the time asked, or hasn't begun, so what stood then can't be told`;
+    if (!stood) continue;
+    const { begun: _b, ...r } = stood;
+    rows.push(r.state === "completed" && secs(r.completedAt) <= at ? r : { ...r, state: "running", conclusion: null });
+  }
+  for (const set of by(statuses, r => r.name)) {
+    const stood = last(set);
+    if (stood) { const { begun: _b, ...r } = stood; rows.push(r); }
+  }
+  return counted(rows, unsure ? { ...cr, err: unsure } : cr, crRead && !unsure, st, stRead, reviewerContexts);
 }
 
 /**
- * The commit a merge went onto, its merge commit's first parent, or null where
- * that couldn't be read (#342).
- * @param {string} nwo @param {string} mergeCommit
+ * The commit a merge went onto: the base branch's tip just before it, as
+ * GitHub's activity on the branch records the merge, whatever its shape, a
+ * squash, a merge commit, a rebase or the queue's (#342). Null where it can't be
+ * read, or where the record isn't one merge.
+ * @param {string} nwo @param {string} baseRef @param {string} mergeCommit
  */
-export function mergedOnto(nwo, mergeCommit) {
-  const r = gh(`repos/${nwo}/commits/${mergeCommit}`, ".parents[0].sha // empty");
-  const sha = r.ok ? r.out.trim() : "";
-  return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+export function mergedOnto(nwo, baseRef, mergeCommit) {
+  const r = gh(`repos/${nwo}/activity?ref=${encodeURIComponent(`refs/heads/${baseRef}`)}&time_period=month&per_page=100`,
+               ".[] | {activity_type, before, after} | @json", { paginate: true });
+  if (!r.ok) return null;
+  /** @type {any[]} */ const items = [];
+  for (const line of r.out.split("\n").filter(Boolean)) {
+    try { items.push(JSON.parse(line)); } catch { return null; }
+  }
+  const merged = items.filter(x => x?.after === mergeCommit && (x.activity_type === "pr_merge" || x.activity_type === "merge_queue_merge"));
+  return merged.length === 1 && /^[0-9a-f]{40}$/.test(String(merged[0].before)) ? merged[0].before : null;
 }
 
 /**

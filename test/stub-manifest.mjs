@@ -20371,8 +20371,8 @@ export const STUBS = [
   {
     name: "at-merge-base-notes-at-merge-only",
     why: "say of every base what a merge's reading says. A pull request judged now would carry notes of a merge it hasn't made",
-    test: "test/trial-mismatches.test.mjs",
-    expectRed: "a merge queue's commit that repairs its red base passes the base clause there too",
+    test: "test/unknown-kinds.test.mjs",
+    expectRed: "a check read that failed is a retry through evaluatePr, never checks still settling",
     edits: [{ file: "src/pr.mjs",
               find: "const atMerge = !asOf ? null : {",
               replace: "const atMerge = false ? null : {" }],

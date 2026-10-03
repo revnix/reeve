@@ -233,6 +233,8 @@ test("a check read that failed is a retry through evaluatePr, never checks still
     const c = clausesAfterATick([read])[id];
     assert.equal(c?.state, "UNKNOWN", `control: ${read} unread leaves ${id} unknown`);
     assert.equal(c?.kind, "retry", `${read} unread`);
+    // What a merge judged after it says of its base's reading (#352) is no part of a pull request judged now.
+    if (id === "base") assert.equal(c.detail, "the base branch's checks couldn't be read", `${read} unread: a pull request judged now says no more of it`);
   }
 });
 

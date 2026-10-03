@@ -199,6 +199,9 @@ test("a commit's checks as each ended: one running at the time, or waiting to st
   // Still running now: running.
   got = ended({ runs: [runJson("Build", null, -600, null)] });
   assert.deepEqual([got.ok, shape(got), got.endedAfter], [true, [["Build", "running", null]], []]);
+  // And one not finished carries no result, whatever a conclusion it reads with says.
+  got = ended({ runs: [JSON.stringify({ ...JSON.parse(runJson("Build", null, -600, null)), conclusion: "success" })] });
+  assert.deepEqual([shape(got), got.endedAfter], [[["Build", "running", null]], []]);
   // Waiting to start then, in a suite made before the time, and begun since: as it stood nothing can be told, and it ended as it did.
   const waiting = { runs: [runJson("Gate", "success", 60, 120)] };
   assert.equal(stood(waiting).ok, false, "as it stood");

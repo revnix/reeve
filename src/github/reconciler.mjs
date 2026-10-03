@@ -383,22 +383,71 @@ const ACTIVITY_PERIODS = /** @type {const} */ ([["day", 86400], ["week", 7 * 864
  * GitHub's activity on the branch records the merge, whatever its shape, a
  * squash, a merge commit, a rebase or the queue's (#342). Asked over the
  * shortest period that covers the merge, at `mergedAt`, from `now`, in
- * seconds. Null where it can't be read, where the record isn't one merge, or
- * where the merge is older than GitHub's activity reaches.
+ * seconds. A merge no record ends at is looked for in a push of the queue
+ * (`queuedOnto`). Null where it can't be read, where the record isn't one
+ * merge, or where the merge is older than GitHub's activity reaches.
  * @param {string} nwo @param {string} baseRef @param {string} mergeCommit @param {number} mergedAt @param {number} [now]
  */
 export function mergedOnto(nwo, baseRef, mergeCommit, mergedAt, now = Math.floor(Date.now() / 1000)) {
   const period = ACTIVITY_PERIODS.find(([, covers]) => now - mergedAt < covers)?.[0];
   if (!period) return null;
   const r = gh(`repos/${nwo}/activity?ref=${encodeURIComponent(`refs/heads/${baseRef}`)}&time_period=${period}&per_page=100`,
-               ".[] | {activity_type, before, after} | @json", { paginate: true });
+               ".[] | {activity_type, before, after, timestamp} | @json", { paginate: true });
   if (!r.ok) return null;
   /** @type {any[]} */ const items = [];
   for (const line of r.out.split("\n").filter(Boolean)) {
     try { items.push(JSON.parse(line)); } catch { return null; }
   }
   const merged = items.filter(x => x?.after === mergeCommit && (x.activity_type === "pr_merge" || x.activity_type === "merge_queue_merge"));
+  // No record ends at the merge's commit: it may be an earlier merge of a push of the queue.
+  if (!merged.length) return queuedOnto(nwo, mergeCommit, items, mergedAt);
   return merged.length === 1 && /^[0-9a-f]{40}$/.test(String(merged[0].before)) ? merged[0].before : null;
+}
+
+/**
+ * How long, in seconds, before a merge the record of the push of the queue
+ * that carried it may be dated. GitHub dates a merge in the second of the
+ * push's record or up to two after it, never before it, measured on forty
+ * merges on 2026-10-03; a minute allows for a slow one.
+ */
+const QUEUE_PUSH_DATED_WITHIN = 60;
+
+/**
+ * The tip a push of the merge queue went onto, for a merge the push carried
+ * that isn't its last (#357). The queue can put several merges on the branch
+ * in one push, which GitHub's activity records once, ending at the last one's
+ * commit. Each merge of the push has the one before it as its first parent,
+ * and the first has the tip before the push. So the merge commit's first
+ * parents are followed, through one page of its ancestors as GitHub lists
+ * them, a commit before its parent, down to a tip that one push of the queue
+ * went on from. That push has to be the one at the merge's own time, recorded
+ * in the minute up to it and not after: a branch
+ * set back to a commit of the push, and built on again, has a later push of the
+ * queue from that commit, which carried other merges. And GitHub's comparison
+ * of the push's two ends has to list the merge's commit. Null where any of it
+ * isn't shown.
+ * @param {string} nwo @param {string} mergeCommit @param {any[]} activity the branch's records @param {number} mergedAt when it merged, in seconds
+ */
+function queuedOnto(nwo, mergeCommit, activity, mergedAt) {
+  const listed = gh(`repos/${nwo}/commits?sha=${mergeCommit}&per_page=100`, ".[] | {sha, parent: .parents[0].sha} | @json");
+  let at = mergeCommit;
+  for (const line of listed.out.split("\n").filter(Boolean)) {
+    let c; try { c = JSON.parse(line); } catch { return null; }
+    if (c?.sha !== at) continue;
+    at = c.parent;
+    if (!/^[0-9a-f]{40}$/.test(String(at))) return null;
+    const from = activity.filter(x => x?.before === at);
+    if (!from.length) continue;
+    if (from.length !== 1 || from[0].activity_type !== "merge_queue_merge" || !/^[0-9a-f]{40}$/.test(String(from[0].after))) return null;
+    const since = mergedAt - Date.parse(String(from[0].timestamp)) / 1000;
+    if (!(since >= 0 && since <= QUEUE_PUSH_DATED_WITHIN)) return null;
+    const compared = gh(`repos/${nwo}/compare/${at}...${from[0].after}`, "{status, commits: [.commits[].sha]} | @json");
+    try {
+      const got = JSON.parse(compared.out);
+      return got.status === "ahead" && got.commits.includes(mergeCommit) ? at : null;
+    } catch { return null; }
+  }
+  return null;
 }
 
 /**

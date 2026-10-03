@@ -389,7 +389,8 @@ export function readChecksAt(nwo, sha, at, { reviewerContexts = [], ended = fals
     if (!kept) continue;
     const { begun: _b, rank: _r, ...r } = kept;
     const done = waited ? r.state === "completed" : finishedBy;
-    if (waited && done) after.add(r);
+    // Said to have ended after the time only where its own time says so: one that reads completed with none isn't placed.
+    if (waited && done && secs(r.completedAt) > at) after.add(r);
     rows.push(done ? r : { ...r, state: "running", conclusion: null });
   }
   for (const set of by(statuses, r => String(r.name).toLowerCase())) {

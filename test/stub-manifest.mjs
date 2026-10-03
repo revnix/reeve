@@ -20248,8 +20248,17 @@ export const STUBS = [
     test: "test/checks-at.test.mjs",
     expectRed: "a commit's checks as each ended: one running at the time, or waiting to start then, counts by how that run finished",
     edits: [{ file: "src/github/reconciler.mjs",
-              find: "    if (waited && done) after.add(r);\n",
+              find: "    if (waited && done && secs(r.completedAt) > at) after.add(r);\n",
               replace: "" }],
+  },
+  {
+    name: "checks-ended-named-where-dated",
+    why: "say a check finished after the time wherever it reads completed. One with no time it finished at can't be put before the time or after",
+    test: "test/checks-at.test.mjs",
+    expectRed: "a commit's checks as each ended: one running at the time, or waiting to start then, counts by how that run finished",
+    edits: [{ file: "src/github/reconciler.mjs",
+              find: "if (waited && done && secs(r.completedAt) > at) after.add(r);",
+              replace: "if (waited && done) after.add(r);" }],
   },
   {
     name: "checks-ended-said-where-asked",

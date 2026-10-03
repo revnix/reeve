@@ -229,6 +229,10 @@ test("a commit's checks as each ended: one running at the time, or waiting to st
   got = ended({ statuses: [statusJson("deploy", "success", -100, 1), statusJson("deploy", "failure", 200, 2)] });
   assert.deepEqual([shape(got), got.endedAfter], [[["deploy", "completed", "success"]], []], "set by the time: as it stood, whatever it was set to since");
   assert.deepEqual(shape(ended({ statuses: [statusJson("deploy", "success", 200, 1)] })), [], "first set after the time: no part of it");
+  // One that reads completed with no time it finished at is taken with its result, and isn't said to have finished after the time: when it did can't be told.
+  const undated = JSON.stringify({ ...JSON.parse(runJson("Build", "success", -600, 300)), completed_at: null });
+  got = ended({ runs: [undated] });
+  assert.deepEqual([got.ok, shape(got), got.endedAfter], [true, [["Build", "completed", "success"]], []], got.why);
   // What's left out of a reading, reeve's own check, isn't named as having ended after the time either.
   got = ended({ runs: [runJson("Build", "success", -600, 300), runJson(r.POLICY_CONTEXT, "neutral", -60, 90, { slug: r.POLICY_APP, suite: 9, id: 3 })],
                 suites: [suiteJson(5, -3600, 2), suiteJson(9, -3600, 2)] });

@@ -155,10 +155,12 @@ export function computeVerdict(i) {
     /** @type {{ name: string, app: string | null }[]} */ const passed = i.checks?.passed ?? [];
     if (failing.length && i.base.complete === true && i.base.inHead === true && i.checks?.verdict === "GREEN" && i.checks.settled
         && failing.every((f) => passed.some((p) => p.name === f.name && p.app === f.app)))
-      add("base", PASS, `the base branch is red, and this pull request passes every check failing there (${[...new Set(failing.map((f) => f.name))].join(", ")}), so it repairs it`);
+      add("base", PASS, `the base branch is red, and this pull request passes every check failing there (${[...new Set(failing.map((f) => f.name))].join(", ")}), so it repairs it` + after);
     else add("base", BLOCK, "the base branch is red; merging into it hides the next failure" + after);
   }
   else if (i.base.readable === false) add("base", UNKNOWN, `the base branch's checks couldn't be read${i.base.why ? `: ${i.base.why}` : ""}`, "retry", "read the base branch's checks again");
+  // Of a merge judged after it, with every check of its base ended (#352): they are read as they ended, so reading again says the same.
+  else if (i.base.stillRunning && !i.base.stillRunning.length) add("base", UNKNOWN, `base verdict ${i.base.verdict}: every check there has ended, and none says whether the base was healthy`, "person", "weigh the base the merge went onto by hand");
   else add("base", UNKNOWN, `base verdict ${i.base.verdict}${i.base.stillRunning?.length ? `: ${i.base.stillRunning.join(", ")} still running` : ""}`, "waiting", "look again once the base branch's checks settle");
 
   // 3. Review coverage AT THIS HEAD, per blocking reviewer. Four states, never two:

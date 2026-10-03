@@ -324,9 +324,11 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
  * ended (#352): the attempt in flight at the time, or, where none had begun in
  * a suite made before it, the first to start. That is what a gate waiting for
  * the commit's checks to settle would have seen, and is how a base's are read
- * for a merge made while they ran. One that hasn't finished yet is running,
- * and each taken by a result that came after the time is named in
- * `endedAfter`. A check finished by then is as it stood.
+ * for a merge made while they ran. One that hasn't finished yet is running.
+ * A status pending at the time is taken as it was next set to something else,
+ * and is running where it's pending still. Each check the reading keeps that
+ * is taken by a result that came after the time is named in `endedAfter`. A
+ * check finished by then, or a status set, is as it stood.
  * @param {string} nwo @param {string} sha @param {number} at @param {{ reviewerContexts?: string[], ended?: boolean }} [o]
  */
 export function readChecksAt(nwo, sha, at, { reviewerContexts = [], ended = false } = {}) {
@@ -369,7 +371,7 @@ export function readChecksAt(nwo, sha, at, { reviewerContexts = [], ended = fals
     return ta < tr || (ta === tr && a.rank < r.rank) ? a : r;
   });
   /** @type {any[]} */ const rows = [];
-  /** @type {string[]} */ const endedAfter = [];
+  /** The rows taken, where `ended`, by a result that came after the time. @type {Set<any>} */ const after = new Set();
   let unsure = !suitesRead ? `the commit's check suites couldn't be read: ${suites.err || "they don't read"}`
     : suiteCount > 1000 ? "more than a thousand check suites, past what GitHub lists"
     : [...evidence].some(r => secs(r.begun) === at || (r.source === "check_run" && secs(r.completedAt) === at))
@@ -387,14 +389,21 @@ export function readChecksAt(nwo, sha, at, { reviewerContexts = [], ended = fals
     if (!kept) continue;
     const { begun: _b, rank: _r, ...r } = kept;
     const done = waited ? r.state === "completed" : finishedBy;
-    if (waited && done) endedAfter.push(r.name);
+    if (waited && done) after.add(r);
     rows.push(done ? r : { ...r, state: "running", conclusion: null });
   }
   for (const set of by(statuses, r => String(r.name).toLowerCase())) {
     const stood = last(set);
-    if (stood) { const { begun: _b, rank: _r, ...r } = stood; rows.push(r); }
+    if (!stood) continue;
+    // As each ended: a status pending at the time, as it was next set to something else.
+    const since = ended && stood.state === "running" ? set.filter(r => secs(r.begun) > at && r.state !== "running") : [];
+    const { begun: _b, rank: _r, ...r } = since.length ? first(since) : stood;
+    if (since.length) after.add(r);
+    rows.push(r);
   }
-  return { ...counted(rows, unsure ? { ...cr, err: unsure } : cr, crRead && !unsure, st, stRead, reviewerContexts), unvouched, ...(ended ? { endedAfter } : {}) };
+  const read = counted(rows, unsure ? { ...cr, err: unsure } : cr, crRead && !unsure, st, stRead, reviewerContexts);
+  // Named from what the reading keeps: reeve's own check and the reviewers' statuses, left out of it, aren't named either.
+  return { ...read, unvouched, ...(ended ? { endedAfter: read.rows.filter((/** @type {any} */ r) => after.has(r)).map((/** @type {any} */ r) => r.name) } : {}) };
 }
 
 /** GitHub's periods of recent activity, each with the age, in seconds, it surely covers. */

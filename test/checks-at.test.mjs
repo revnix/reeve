@@ -219,6 +219,20 @@ test("a commit's checks as each ended: one running at the time, or waiting to st
   assert.equal(ended({ runs: [runJson("Gate", "success", 60, 120, { suite: 9 })], suites: [suiteJson(9, 0)] }).ok, false, "a suite made in the very second asked");
   // One finished by the time and run again since is still not told: the later run may have been waiting then.
   assert.equal(ended({ runs: [runJson("Build", "success", -600, -300, { id: 1 }), runJson("Build", "failure", 400, 500, { id: 2 })] }).ok, false);
+  // A status pending at the time is taken as it was next set to something else, and one set by then is as it stood.
+  const pending = statusJson("deploy", "pending", -100, 1);
+  assert.deepEqual(shape(stood({ statuses: [pending, statusJson("deploy", "failure", 200, 2)] })), [["deploy", "running", null]], "as it stood: pending");
+  got = ended({ statuses: [pending, statusJson("deploy", "pending", 50, 2), statusJson("deploy", "failure", 200, 3), statusJson("deploy", "success", 900, 4)] });
+  assert.deepEqual([got.ok, shape(got), got.endedAfter], [true, [["deploy", "completed", "failure"]], ["deploy"]], "the first it was set to since that isn't pending");
+  got = ended({ statuses: [pending, statusJson("deploy", "pending", 50, 2)] });
+  assert.deepEqual([shape(got), got.endedAfter], [[["deploy", "running", null]], []], "still pending now");
+  got = ended({ statuses: [statusJson("deploy", "success", -100, 1), statusJson("deploy", "failure", 200, 2)] });
+  assert.deepEqual([shape(got), got.endedAfter], [[["deploy", "completed", "success"]], []], "set by the time: as it stood, whatever it was set to since");
+  assert.deepEqual(shape(ended({ statuses: [statusJson("deploy", "success", 200, 1)] })), [], "first set after the time: no part of it");
+  // What's left out of a reading, reeve's own check, isn't named as having ended after the time either.
+  got = ended({ runs: [runJson("Build", "success", -600, 300), runJson(r.POLICY_CONTEXT, "neutral", -60, 90, { slug: r.POLICY_APP, suite: 9, id: 3 })],
+                suites: [suiteJson(5, -3600, 2), suiteJson(9, -3600, 2)] });
+  assert.deepEqual([got.ok, shape(got), got.endedAfter], [true, [["Build", "completed", "success"]], ["Build"]], got.why);
 });
 
 test("the commit a merge went onto is the base branch's before the merge, as GitHub's activity records it", async () => {

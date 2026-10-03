@@ -164,7 +164,11 @@ const green = (passed) => ({ verdict: "GREEN", settled: true, readable: true, fa
 test("a pull request whose green head passes every check failing on a red base repairs it, and passes the base clause", () => {
   const c = baseClause(green([check("Build"), check("Lint")]), redBase([check("Build")]));
   assert.equal(c?.state, "PASS", JSON.stringify(c));
-  assert.match(String(c?.detail), /the base branch is red, and this pull request passes every check failing there \(Build\), so it repairs it/);
+  assert.match(String(c?.detail), /the base branch is red, and this pull request passes every check failing there \(Build\), so it repairs it$/);
+  // Of a merge judged after it, where the base's failing check finished only after the merge, the repair says so (#352).
+  const after = baseClause(green([check("Build")]), redBase([check("Build")], { endedAfter: ["Build"] }));
+  assert.equal(after?.state, "PASS", JSON.stringify(after));
+  assert.match(String(after?.detail), /so it repairs it; 1 check\(s\) there finished after the merge, taken as they ended$/);
 });
 
 test("a red base still blocks a pull request that doesn't show passing every check failing there", () => {

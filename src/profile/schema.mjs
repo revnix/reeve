@@ -295,8 +295,10 @@ export const FIELDS = {
   // integration suites are skipped by a change that can't reach them (#344).
   // Named with the checks it may skip, or not at all.
   "ci.decidedSkips.by":     [false, isStr],
-  // The required checks that job may skip: one of them skipped passes where
-  // every run of the job at the commit succeeded, and no check failed there.
+  // The required checks that job may skip: one of them skipped passes as
+  // decided within its own workflow run, where that job ran and succeeded, every
+  // other job skipped there is one it may skip, and every other one succeeded
+  // or still runs. Another workflow's jobs, which it can't have waited on, don't count.
   "ci.decidedSkips.checks": [false, isArr(isStr)],
   // Commit-status contexts published by REVIEWERS. Excluded from check
   // classification entirely: a rate-limited CodeRabbit reports state=success with

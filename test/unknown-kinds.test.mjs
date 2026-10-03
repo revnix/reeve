@@ -61,6 +61,11 @@ const CASES = [
   ["one a person settles beside one a run does", "mergeable", "person",
    blocked({ unevaluated: ["rule required_deployments", "rule required_signatures"], settlesAlone: ["rule required_deployments"] })],
   ["GitHub not settled on merging", "mergeable", "waiting", blocked({ mergeable: "UNKNOWN" })],
+  // Of a merge judged after it (#342).
+  ["a merge's rules record unread", "mergeable", "retry", i => { i.mergeState = "MERGED"; i.mergeRules = { readable: false, why: "HTTP 502" }; }],
+  ["a merge GitHub keeps no record of its rules judging", "mergeable", "person", i => { i.mergeState = "MERGED"; i.mergeRules = { readable: false, absent: true, why: "none kept" }; }],
+  ["a merge's rules record reading neither passed nor bypassed", "mergeable", "person", i => { i.mergeState = "MERGED"; i.mergeRules = { readable: true, result: "fail", failed: [] }; }],
+  ["a blocking reviewer's word in the merge's very second", "review", "person", i => { i.reviewers = [{ login: "bot", kind: "blocking", state: "UNPLACED" }]; }],
 ];
 const verdictFor = mutate => { const i = good(); mutate(i); return computeVerdict(i); };
 

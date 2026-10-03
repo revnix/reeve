@@ -179,8 +179,17 @@ export function classifyObservation(o, rev, resolve) {
  * cursor would buy nothing and cost the one property that matters -- a full fold
  * cannot half-apply, and a half-applied projection is a gate reading a review
  * whose thread is not there yet.
+ *
+ * `until`, in seconds, folds only what was made by then (#342): a merged pull
+ * request is judged as it stood at its merge, and a review, comment or thread
+ * made since is left out. One with no time of its own is kept, as leaving out
+ * a finding it can't place would pass what it might block. What such a fold
+ * can't place at the time is returned as `unplaced`, for its caller to take as
+ * unknown: a thread or a round made in that very second, or a review that
+ * reads dismissed, which GitHub's reviews give no time for. A comment no clause
+ * reads, made in that second, leaves the fold placed.
  */
-export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 1000), complete = true, head = null } = {}) {
+export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 1000), complete = true, head = null, until = null } = {}) {
   const version = classifierVersion(profile);
   const roster = rosterOf(profile);
   const heads = db.prepare("SELECT sha FROM head_seen WHERE nwo=? AND pr=?").all(nwo, pr).map(r => r.sha);
@@ -228,7 +237,11 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
                 ON c.pr_number = ? AND c.source = m.source AND c.external_id = m.external_id) sel
         ON sel.source = i.source AND sel.external_id = i.external_id AND sel.g = i.generation
      WHERE i.pr_number = ?
-     ORDER BY i.event_at, i.id`).all(pr, pr, pr);
+     ORDER BY i.event_at, i.id`).all(pr, pr, pr).filter(r => until == null || !(r.event_at > until));
+  // What a fold up to a time can't place there, the first of them: of what the
+  // fold takes, a thread or a round, never of a comment it reads nothing from.
+  /** @type {string | null} */ let unplaced = null;
+  const TIED = "a review thread, or a reviewer's round, was made in the very second asked, which can't be put before it or after";
 
   // Counted from the rows this fold is reading, not from the table afterwards, so
   // the number belongs to this snapshot and no other.
@@ -244,6 +257,7 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
     const rev = roster.get(r.source) ?? null;
 
     if (r.kind === "review_thread") {
+      if (r.event_at === until) unplaced ??= TIED;
       const p = o.payload;
       threads.push({
         thread_id: p.thread_id, reviewer: r.source,
@@ -272,6 +286,7 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
 
     const c = classifyObservation(o, rev, resolve);
     if (!c) continue;
+    if (r.event_at === until) unplaced ??= TIED;
     // The round's ORDINAL, taken before the push so it indexes the round itself.
     // Body findings clear by ordinal rather than by timestamp because the round
     // that files a finding shares its instant exactly -- they are the same
@@ -286,6 +301,7 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
     // findings left it clearing everyone else's: dismiss a review and the earlier
     // findings it was never about quietly went away.
     const dismissed = String(o.payload?.state ?? "").toUpperCase() === "DISMISSED";
+    if (dismissed) unplaced ??= "a review reads dismissed now, which it may not have been by the time asked";
     rounds.push({ reviewer: r.source, source_id: r.external_id, event_at: r.event_at ?? at, dismissed, ...c });
 
     // A substantive review BODY is the only place a body finding can come from.
@@ -485,7 +501,8 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
   } catch (e) { try { db.exec("ROLLBACK"); } catch {} throw e; }
 
   return { rounds: rounds.length, threads: threads.length,
-           bodyFindings: bodyFindings.length, bodyComplete, bodyAuthors: [...bodyAuthors], version };
+           bodyFindings: bodyFindings.length, bodyComplete, bodyAuthors: [...bodyAuthors], version,
+           unplaced: until == null ? null : unplaced };
 }
 
 /**

@@ -49,7 +49,8 @@ function worst(a, b) {
  * @param {object} i.rounds          {n, softCap, hardCap, unspilledCritical}
  * @param {object} i.threads         {unresolved, total, readable}
  * @param {number} i.ledgerBlockers  count of active findings blocking this PR, or null if unreadable
- * @param {string} i.mergeState      GitHub mergeStateStatus
+ * @param {string} i.mergeState      GitHub mergeStateStatus, or MERGED for a merge judged after it
+ * @param {object} [i.mergeRules]    for a merge: GitHub's record of the base's rules judging it, {readable, result, failed[]}
  * @param {object} i.profile
  */
 /**
@@ -175,7 +176,12 @@ export function computeVerdict(i) {
     const unreachable = blocking.filter(r => r.state === "REFUSED" || r.state === "NOT_INSTALLED");
     const notRun = blocking.filter(r => r.state === "NOT_RUN");
 
+    // Of a merge judged after it (#342): what a reviewer said in the merge's
+    // very second, a pass or a refusal, can't be put before it or after.
+    const unplaced = blocking.filter(r => r.state === "UNPLACED");
+
     if (atHead.length === blocking.length) add("review", PASS, `${blocking.length} blocking reviewer(s) covered at ${i.head?.slice(0, 8)}`);
+    else if (unplaced.length) add("review", UNKNOWN, `${unplaced.map(r => r.login).join(", ")} said something in the very second of the merge, which can't be put before it or after`, "person", "a person reads what the reviewer said at the merge");
     else if (unreachable.length) add("review", UNKNOWN, `unreachable: ${unreachable.map(r => `${r.login}=${r.state}`).join(", ")} — absence is not approval`, "person", "a person makes a blocking reviewer reachable again");
     else if (notRun.length) add("review", UNKNOWN, `not yet run: ${notRun.map(r => r.login).join(", ")}`, "missing", "ask the reviewers for a round at this head");
     else add("review", BLOCK, `covered at a different revision: ${covered.map(r => `${r.login}@${(r.reviewedHead ?? "?").slice(0, 8)}`).join(", ")}`);
@@ -342,6 +348,19 @@ export function computeVerdict(i) {
   const parts = i.mergeParts ?? null;
   if (!MS) add("mergeable", UNKNOWN, "mergeStateStatus not read", "retry", "read the merge state again");
   else if (MS === "CLEAN" || MS === "UNSTABLE") add("mergeable", PASS, MS);
+  // A merge judged after it (#342), by GitHub's own record of the base's rules
+  // judging its push: passed, or gone past by a bypass, which is no pass. That
+  // GitHub merged it shows neither. No live pull request reads so: GitHub's
+  // merge states have no MERGED.
+  else if (MS === "MERGED") {
+    const r = i.mergeRules;
+    // A record GitHub doesn't keep is no more there on reading again; one that couldn't be read may be.
+    if (r?.readable !== true && r?.absent) add("mergeable", UNKNOWN, `whether the base's rules passed at the merge can't be told: ${r.why}`, "person", "a person reads what the base's rules made of the merge");
+    else if (r?.readable !== true) add("mergeable", UNKNOWN, `whether the base's rules passed at the merge can't be told: ${r?.why ?? "GitHub's record of them wasn't read"}`, "retry", "read GitHub's record of the base's rules at the merge again");
+    else if (r.result === "pass") add("mergeable", PASS, "GitHub merged it, and the base's rules passed then");
+    else if (r.result === "bypass") add("mergeable", BLOCK, `merged past the base's rules, by a bypass${r.failed?.length ? `: ${r.failed.join("; ")}` : ""}`);
+    else add("mergeable", UNKNOWN, `GitHub's record of the base's rules at the merge reads ${r.result}, neither passed nor bypassed`, "person", "a person reads what the base's rules made of the merge");
+  }
   else if (MS === "UNKNOWN") add("mergeable", UNKNOWN, "GitHub is still computing mergeability", "waiting", "look again once GitHub has computed mergeability");
   else if (MS === "BLOCKED" && parts?.readable === false) add("mergeable", UNKNOWN, "mergeStateStatus BLOCKED, and GitHub reported an error reading its parts", "retry", "read what the base requires again");
   else if (MS === "BLOCKED" && parts) {

@@ -24,7 +24,12 @@ const statusJson = (/** @type {string} */ context, /** @type {string} */ state, 
   JSON.stringify({ id, context, state, description: "", created_at: at(created), updated_at: at(created) });
 
 /** `fn` with gh answering, by the path asked, the lines given for check runs, statuses and the merge commit. */
-const withGh = (/** @type {{ runs?: string[], statuses?: string[], activity?: string[], period?: string, log?: string, suites?: string, runsFail?: boolean, later?: { runs?: string[], statuses?: string[] } }} */ answers,
+/** A check suite as GitHub lists one, made `made` seconds from T. */
+/** A suite as the read's query gives one: with how many GitHub counts on the commit, `total`, left out where it's `null`. */
+const suiteJson = (/** @type {number} */ id, made = -3600, /** @type {number | null} */ total = 1) => JSON.stringify({ id, created_at: at(made), ...(total === null ? {} : { total }) });
+/** The suites `runs` are of, each made an hour before T. @param {string[]} runs */
+const suitesOf = (runs) => [...new Set(runs.map((x) => { try { return JSON.parse(x).check_suite.id; } catch { return null; } }).filter((x) => x != null))].map((id, _i, all) => suiteJson(id, -3600, all.length));
+const withGh = (/** @type {{ runs?: string[], statuses?: string[], activity?: string[], period?: string, log?: string, suites?: string[], runsFail?: boolean, later?: { runs?: string[], statuses?: string[] } }} */ answers,
                 /** @type {() => any} */ fn) => {
   const bin = tempDir("reeve-checks-at-bin-");
   const lines = (/** @type {string[]} */ xs) => xs.map((x) => `'${x}'`).join(" ");
@@ -36,7 +41,7 @@ case "$p" in
     [ -n "$all" ] && printf '%s\\n' ${lines(answers.later?.runs ?? [])};;
   */commits/${HEAD}/statuses*) printf '%s\\n' ${lines(answers.statuses ?? [])}
     [ -n "$all" ] && printf '%s\\n' ${lines(answers.later?.statuses ?? [])};;
-  */commits/${HEAD}/check-suites*) printf '%s\\n' '${answers.suites ?? "1"}';;
+  */commits/${HEAD}/check-suites*) printf '%s\\n' ${lines(answers.suites ?? suitesOf([...(answers.runs ?? []), ...(answers.later?.runs ?? [])]))};;
   */activity*time_period=${answers.period ?? "day"}*) printf '%s\\n' ${lines(answers.activity ?? [])};;
   *) echo "not a read this test answers: $p" >&2; exit 1;;
 esac
@@ -59,6 +64,11 @@ test("a check's attempt that finished by the time stands, and one begun since, o
     assert.equal(unsure.ok, false, why);
   }
   assert.equal(withGh({ runs: [runJson("Lint", "success", 120, 180)] }, () => r.readChecksAt("o/r", HEAD, T)).ok, false, "a check whose only attempt began since");
+  // A run of a suite made after the time wasn't there to be queued then, as a push to the base makes on a commit the queue merged.
+  const pushed = withGh({ runs: [runJson("Build", "success", -60, -30), runJson("Lint", "success", 60, 90, { suite: 6, id: 2 })],
+                          suites: [suiteJson(5), suiteJson(6, 30)] }, () => r.readChecksAt("o/r", HEAD, T));
+  assert.equal(pushed.ok, true, pushed.why);
+  assert.deepEqual(pushed.rows.map((/** @type {any} */ x) => x.name), ["Build"], "a suite made since");
   // GitHub's times are whole seconds: one in the very second asked can't be put before it or after.
   for (const [run, why] of [[runJson("Build", "success", -60, 0), "finished in that second"], [runJson("Build", "success", 0, 30), "begun in that second"]])
     assert.equal(withGh({ runs: [run] }, () => r.readChecksAt("o/r", HEAD, T)).ok, false, why);
@@ -133,10 +143,14 @@ test("a reading at a time is whole or unread, and leaves out what readChecks lea
                        () => r.readChecksAt("o/r", HEAD, T));
   assert.deepEqual(paged.rows.map((/** @type {any} */ x) => x.name).sort(), ["Build", "Lint", "deploy"], "every page");
   // GitHub lists the runs of a commit's latest thousand suites only, and a suite may hold no run: counted as GitHub counts them.
-  const many = withGh({ runs: [runJson("Build", "success", -60, -30)], suites: "1001" }, () => r.readChecksAt("o/r", HEAD, T));
+  const thousand = (/** @type {number} */ n, /** @type {number | null} */ counted = n) => Array.from({ length: n }, (_, i) => suiteJson(i + 5, -3600, counted));
+  const many = withGh({ runs: [runJson("Build", "success", -60, -30)], suites: thousand(1001) }, () => r.readChecksAt("o/r", HEAD, T));
   assert.equal(many.ok, false, "more than a thousand suites");
-  assert.equal(withGh({ runs: [runJson("Build", "success", -60, -30)], suites: "1000" }, () => r.readChecksAt("o/r", HEAD, T)).ok, true, "a thousand, all listed");
-  assert.equal(withGh({ runs: [runJson("Build", "success", -60, -30)], suites: "many" }, () => r.readChecksAt("o/r", HEAD, T)).ok, false, "a count that doesn't read");
+  assert.equal(withGh({ runs: [runJson("Build", "success", -60, -30)], suites: thousand(1000) }, () => r.readChecksAt("o/r", HEAD, T)).ok, true, "a thousand, all listed");
+  // By GitHub's own count, not by how many it lists: a list cut at a thousand holds a thousand rows of more.
+  assert.equal(withGh({ runs: [runJson("Build", "success", -60, -30)], suites: thousand(1000, 1001) }, () => r.readChecksAt("o/r", HEAD, T)).ok, false, "a thousand listed of more counted");
+  assert.equal(withGh({ runs: [runJson("Build", "success", -60, -30)], suites: thousand(3, null) }, () => r.readChecksAt("o/r", HEAD, T)).ok, false, "a count that doesn't read");
+  assert.equal(withGh({ runs: [runJson("Build", "success", -60, -30)], suites: ["not json"] }, () => r.readChecksAt("o/r", HEAD, T)).ok, false, "suites that don't read");
 });
 
 test("a status read now carries no id, as only a check run's leads to its job", async () => {

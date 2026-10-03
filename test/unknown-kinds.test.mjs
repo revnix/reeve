@@ -86,6 +86,14 @@ test("each UNKNOWN names the kind that says what happens next", () => {
   }
 });
 
+test("a checks reading that's unknown for a reason says the reason", () => {
+  const ci = (/** @type {any} */ checks) => verdictFor((/** @type {any} */ i) => { i.checks = checks; }).clauses.find((/** @type {any} */ c) => c.id === "ci");
+  // Seen on a real merge that skipped the queue (#352): the clause said "check verdict UNKNOWN" and nothing more.
+  assert.equal(ci({ verdict: "UNKNOWN", settled: true, readable: true, why: "at the merge queue's commit: no checks reported at this revision", failing: [] }).detail,
+               "check verdict UNKNOWN: at the merge queue's commit: no checks reported at this revision");
+  assert.equal(ci({ verdict: "WHATEVER", settled: true, failing: [] }).detail, "check verdict WHATEVER", "none given, none said");
+});
+
 test("an UNKNOWN verdict carries the most serious kind among its clauses, and a settled one carries none", () => {
   const waitingAndRetry = verdictFor(i => { i.checks = { verdict: "SETTLING", settled: false, failing: [] }; i.threads = { readable: false }; });
   assert.equal(waitingAndRetry.state, "UNKNOWN");

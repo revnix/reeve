@@ -229,7 +229,7 @@ test("a pull request's head is judged with its queue-only checks, the base's fai
   const body = src.slice(src.indexOf("export function evaluatePr("), src.indexOf("\n}\n", src.indexOf("export function evaluatePr(")));
   assert.match(body, /classifyRead\(read, headCheckRequirements\(req, profile, queued\)\)/, "the queue-only checks");
   assert.match(body, /queued = .*mergeQueueOnBase\(/, "where the base's rules require a merge queue");
-  assert.match(body, /base: baseHealthOf\(base, \{ complete: baseRead\?\.ok === true, inHead \}\),/, "the base's failing checks, read whole");
+  assert.match(body, /base: baseHealthOf\(base, \{ complete: baseRead\?\.ok === true, inHead, atMerge \}\),/, "the base's failing checks, read whole");
   assert.match(body, /inHead = .*baseContainedIn\(\{ nwo, base: baseHead\.sha, head: pin\.sha \}\)/, "whether the head contains the base");
   assert.match(body, /passed: passedChecks\(rows\)/, "and the head's passed ones");
 });

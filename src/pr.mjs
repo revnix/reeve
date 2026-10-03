@@ -776,11 +776,15 @@ const eachOnce = (list) => list.filter((c, i) => list.findIndex((d) => d.name ==
  * whether its checks were read whole, whether the commit judged contains the
  * base's, and the checks failing there. So the pull request that repairs a red
  * base can be told from one that would hide its next failure (#286).
+ *
+ * For a merge judged after it (#352), `atMerge` adds what its base's reading
+ * says of that: `endedAfter`, the checks taken as they ended after the merge;
+ * `stillRunning`, those not finished yet; and `why`, where it couldn't be read.
  * @param {{ verdict: string, readable?: boolean, failing?: any[] }} base
- * @param {{ complete?: boolean, inHead?: boolean | null }} [o]
+ * @param {{ complete?: boolean, inHead?: boolean | null, atMerge?: { endedAfter: string[], stillRunning: string[], why: string | null } | null }} [o]
  */
-export const baseHealthOf = (base, { complete = false, inHead = null } = {}) => ({
-  verdict: base.verdict, readable: base.readable !== false, complete, inHead,
+export const baseHealthOf = (base, { complete = false, inHead = null, atMerge = null } = {}) => ({
+  verdict: base.verdict, readable: base.readable !== false, complete, inHead, ...(atMerge ?? {}),
   failing: eachOnce((base.failing ?? []).filter((r) => r?.name).map(checkOf)),
   // Named, so a base passed with a workflow failing there says so (#288).
   ancillaryFailing: [.../** @type {any} */ (base).ancillaryFailing ?? []] });
@@ -958,7 +962,9 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // only on pull requests, and a push its path filters skip is a healthy one, so
   // neither the base's own requirements nor the head's rules about skipped checks
   // apply. Only a partial read does: it can hide a failure.
-  const baseAll = !baseHead.ok ? null : asOf ? readChecksAt(nwo, baseHead.sha, asOf.at, { reviewerContexts }) : readChecks(nwo, baseHead.sha, { reviewerContexts });
+  // At a merge, a check of the base still running then counts by how its run ended, as a gate that waited
+  // for the base to settle would have judged it (the founder, 2026-10-03, #352). The head's stay as they stood.
+  const baseAll = !baseHead.ok ? null : asOf ? readChecksAt(nwo, baseHead.sha, asOf.at, { reviewerContexts, ended: true }) : readChecks(nwo, baseHead.sha, { reviewerContexts });
   // Another App's run on the base, which it may have rewritten since, isn't read
   // as it stood (#342), and is left out of the rows. One whose failure would
   // count there, every check where none is required, leaves the base unread.
@@ -968,6 +974,14 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   const base = baseRead
     ? classifyRead(baseRead, { required: profile.ci?.requiredChecks ?? [], failuresOf: gatingOf(req) }, { evidence: false })
     : { verdict: "UNKNOWN", readable: false };
+  // What a merge judged after it says of its base's reading (#352): the checks taken as they ended after the
+  // merge, those not finished yet, and why it couldn't be read. A pull request judged now says none of it.
+  const atMerge = !asOf ? null : {
+    endedAfter: /** @type {any} */ (baseRead)?.endedAfter ?? [],
+    stillRunning: [...new Set((/** @type {any} */ (base).running ?? []).map((/** @type {any} */ r) => String(r?.name ?? r)))],
+    why: !baseHead.ok ? baseHead.why
+      : baseDoubtful.length ? `${baseDoubtful.join(", ")} there ${baseDoubtful.length === 1 ? "is" : "are"} another App's, which it may have rewritten since`
+      : baseAll?.ok === false ? baseAll.why ?? null : null };
   // Whether the head contains the base's commit, asked only of a red base: a head
   // from before it went red can't show the failure repaired (#286).
   const inHead = base.verdict === "RED" && baseHead.ok ? baseContainedIn({ nwo, base: baseHead.sha, head: pin.sha }) : null;
@@ -1078,7 +1092,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
               // Another App's check under reeve's own name: kept, never dropped.
               impostors: read.impostors ?? [], shadowRequired: req.shadowRequired, legacyRequired: req.legacyRequired,
               queueOnly: c.queueOnly ?? [], passed: passedChecks(rows), ...checksShown(c) },
-    base: baseHealthOf(base, { complete: baseRead?.ok === true, inHead }),
+    base: baseHealthOf(base, { complete: baseRead?.ok === true, inHead, atMerge }),
     reviewers, rounds, threads: threadsThen, cleared: facts.cleared,
     bodyFindings: facts.bodyFindings, unreadableBodies: facts.unreadableBodies,
     ledgerBlockers,

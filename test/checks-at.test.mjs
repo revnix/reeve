@@ -178,6 +178,49 @@ esac
   } finally { process.env.PATH = path; rmSync(bin, { recursive: true, force: true }); }
 });
 
+test("a commit's checks as each ended: one running at the time, or waiting to start then, counts by how that run finished", async () => {
+  const r = await reconciler();
+  /** As each ended, and as they stood. @param {Parameters<typeof withGh>[0]} answers */
+  const ended = (answers) => withGh(answers, () => r.readChecksAt("o/r", HEAD, T, { ended: true }));
+  const stood = (/** @type {Parameters<typeof withGh>[0]} */ answers) => withGh(answers, () => r.readChecksAt("o/r", HEAD, T));
+  const shape = (/** @type {any} */ got) => got.rows.map((/** @type {any} */ x) => [x.name, x.state, x.conclusion]);
+  // Running at the time, and finished since: as it stood it was running, and it ended as it did.
+  const inFlight = { runs: [runJson("Build", "success", -600, 300)] };
+  assert.deepEqual(shape(stood(inFlight)), [["Build", "running", null]], "as it stood");
+  assert.equal("endedAfter" in stood(inFlight), false, "and nothing said of how any ended");
+  let got = ended(inFlight);
+  assert.equal(got.ok, true, got.why);
+  assert.deepEqual(shape(got), [["Build", "completed", "success"]]);
+  assert.deepEqual(got.endedAfter, ["Build"], "named, as taken by a result that came after the time");
+  assert.deepEqual(shape(ended({ runs: [runJson("Build", "failure", -600, 300)] })), [["Build", "completed", "failure"]], "one that failed, failed");
+  // One finished by the time is as it stood, and isn't named.
+  got = ended({ runs: [runJson("Build", "success", -600, -300)] });
+  assert.deepEqual([shape(got), got.endedAfter], [[["Build", "completed", "success"]], []]);
+  // Still running now: running.
+  got = ended({ runs: [runJson("Build", null, -600, null)] });
+  assert.deepEqual([got.ok, shape(got), got.endedAfter], [true, [["Build", "running", null]], []]);
+  // Waiting to start then, in a suite made before the time, and begun since: as it stood nothing can be told, and it ended as it did.
+  const waiting = { runs: [runJson("Gate", "success", 60, 120)] };
+  assert.equal(stood(waiting).ok, false, "as it stood");
+  got = ended(waiting);
+  assert.deepEqual([got.ok, shape(got), got.endedAfter], [true, [["Gate", "completed", "success"]], ["Gate"]]);
+  // Not begun even now: running.
+  got = ended({ runs: [runJson("Gate", null, null, null)] });
+  assert.deepEqual([got.ok, shape(got), got.endedAfter], [true, [["Gate", "running", null]], []]);
+  // Run again since: the first to start is the one a gate that waited would have seen finish.
+  assert.deepEqual(shape(ended({ runs: [runJson("Gate", "failure", 60, 120, { id: 1 }), runJson("Gate", "success", 600, 700, { id: 2 })] })), [["Gate", "completed", "failure"]]);
+  assert.deepEqual(shape(ended({ runs: [runJson("Gate", "success", 600, 700, { id: 2 }), runJson("Gate", "failure", 60, 120, { id: 1 })] })), [["Gate", "completed", "failure"]], "however GitHub lists them");
+  // And one in flight at the time, run again since: the one in flight.
+  got = ended({ runs: [runJson("Build", "failure", -600, 300, { id: 1 }), runJson("Build", "success", 400, 500, { id: 2 })] });
+  assert.deepEqual([got.ok, shape(got)], [true, [["Build", "completed", "failure"]]]);
+  // In a suite made after the time it was no part of the commit's checks then, and in one made in that very second that can't be told.
+  got = ended({ runs: [runJson("Gate", "success", 60, 120, { suite: 9 })], suites: [suiteJson(9, 30)] });
+  assert.deepEqual([got.ok, shape(got)], [true, []]);
+  assert.equal(ended({ runs: [runJson("Gate", "success", 60, 120, { suite: 9 })], suites: [suiteJson(9, 0)] }).ok, false, "a suite made in the very second asked");
+  // One finished by the time and run again since is still not told: the later run may have been waiting then.
+  assert.equal(ended({ runs: [runJson("Build", "success", -600, -300, { id: 1 }), runJson("Build", "failure", 400, 500, { id: 2 })] }).ok, false);
+});
+
 test("the commit a merge went onto is the base branch's before the merge, as GitHub's activity records it", async () => {
   const r = await reconciler();
   assert.equal(typeof r.mergedOnto, "function", "mergedOnto");

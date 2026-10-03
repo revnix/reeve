@@ -12,12 +12,11 @@
  */
 import { judgeAtMerge } from "./at-merge.mjs";
 import { isBuilderPr } from "./pr.mjs";
+import { MERGE_JUDGED, MERGES_LOOKED } from "./status.mjs";
 import { mergedSince } from "./trial.mjs";
 
-/** The event a merge's judgment is kept as: subject `pr:N`, its payload the merge and the verdict on it. */
-export const MERGE_JUDGED = "merge.judged";
-/** The event a look is kept as: `upTo`, in seconds, the time every merge up to which is judged. */
-export const MERGES_LOOKED = "merges.looked";
+// The events' names live with the tick's own, where what reads them finds them without this module.
+export { MERGE_JUDGED, MERGES_LOOKED };
 /** How far back the first look reaches. */
 export const FIRST_LOOK_SECONDS = 7 * 86400;
 /** How many merges one tick judges: the rest wait for the next, oldest first. */

@@ -35,13 +35,14 @@ const check = (ok, name, detail) => {
 const src = readFileSync(new URL("../src/github/reconciler.mjs", import.meta.url), "utf8");
 
 /**
- * The code that decides what counts as a check: both exclusion helpers and the
- * reader that applies them. Comments and whitespace are stripped so rewriting a
+ * The code that decides what counts as a check: both exclusion helpers, the
+ * readers that apply them, now and at a time (#342), and what they share. Comments and whitespace are stripped so rewriting a
  * comment does not trip the guard, while any change to the LOGIC does.
  */
 function countedSetSource() {
   const grab = (name, kind = "function") => {
-    const start = src.indexOf(`export ${kind} ${name}`);
+    // Exported or not, and by its whole name: readChecks is no part of readChecksAt.
+    const start = [`export ${kind} ${name}(`, `\n${kind} ${name}(`].map(k => src.indexOf(k)).find(i => i >= 0) ?? -1;
     if (start < 0) return null;
     // Brace-match from the body's opening brace, which is the one AFTER the
     // parameter list closes. Starting at the first `{` instead captured the
@@ -62,7 +63,7 @@ function countedSetSource() {
     }
     return null;
   };
-  const wanted = ["excludeOwnPolicy", "excludeReviewerContexts", "readChecks"];
+  const wanted = ["excludeOwnPolicy", "excludeReviewerContexts", "checkRunRow", "statusRow", "readLines", "counted", "readChecks", "readChecksAt"];
   const parts = wanted.map(n => grab(n));
   countedSetSource.found = wanted.filter((_, i) => parts[i] !== null);
   countedSetSource.missing = wanted.filter((_, i) => parts[i] === null);
@@ -98,7 +99,7 @@ const fingerprint = createHash("sha256").update(body ?? "").digest("hex").slice(
 // fingerprint. If no — a rename, a refactor with identical behaviour — paste the
 // fingerprint and leave the version alone.
 const PINNED_ACCOUNTING = 6;
-const PINNED_FINGERPRINT = "979d61ee30e29be3";
+const PINNED_FINGERPRINT = "8a968837c65f6c6b";
 
 check(CHECK_ACCOUNTING === PINNED_ACCOUNTING,
   "CHECK_ACCOUNTING matches the version this fingerprint was taken under",

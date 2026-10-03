@@ -377,7 +377,11 @@ function ownAppId() {
  */
 const CLEAN_COMMIT = "Reviewed commit:\\**\\s*`?([0-9a-f]{7,40})`?";
 
-export function readReviewerStates(nwo, pr, head, reviewers, io = null) {
+/**
+ * `until`, in seconds, reads only what a reviewer said by then (#342): a merge
+ * judged after it isn't covered, or refused, by a word said since.
+ */
+export function readReviewerStates(nwo, pr, head, reviewers, io = null, until = null) {
   // Injected for tests: classifying a reviewer is pure once the rows are in hand,
   // and every branch here was previously reachable only with a live GitHub.
   let cRows, rRows;
@@ -406,11 +410,19 @@ export function readReviewerStates(nwo, pr, head, reviewers, io = null) {
     // not a line in this function.
     const comments = run(["--paginate", `repos/${nwo}/issues/${pr}/comments?per_page=100`, "--jq",
       '.[] | [.user.login, (.created_at), (.body|gsub("\n";" "))] | @tsv']);
-    const reviews = run(["--paginate", `repos/${nwo}/pulls/${pr}/reviews?per_page=100`, "--jq",
-      '.[] | [.user.login, (.commit_id // ""), (.state), (.body|gsub("\n";" "))] | @tsv']);
+    // A review's time is asked for only where it's needed, so the read a live
+    // pull request makes stays the one recorded cases replay.
+    const reviews = run(["--paginate", `repos/${nwo}/pulls/${pr}/reviews?per_page=100`, "--jq", until == null
+      ? '.[] | [.user.login, (.commit_id // ""), (.state), (.body|gsub("\n";" "))] | @tsv'
+      : '.[] | [.user.login, (.commit_id // ""), (.state), (.submitted_at // ""), (.body|gsub("\n";" "))] | @tsv']);
     cRows = comments.ok ? comments.out.split("\n").filter(Boolean).map(l => l.split("\t")) : [];
     rRows = reviews.ok ? reviews.out.split("\n").filter(Boolean).map(l => l.split("\t")) : [];
   }
+  // A comment's time and a review's, each as GitHub gives it; one said after
+  // `until` wasn't said by then.
+  const by = (/** @type {string | undefined} */ t) => until == null || !(Date.parse(String(t)) / 1000 > until);
+  cRows = cRows.filter((r) => by(r[1]));
+  rRows = rRows.filter((r) => by(r[3]));
 
   return reviewers.map(rev => {
     const mine = l => String(l).toLowerCase().includes(rev.login.toLowerCase());
@@ -856,10 +868,27 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   const queued = profile.ci?.queueOnlyChecks?.length ? mergeQueueOnBase({ nwo, base: baseRef }) : null;
   let c = classifyRead(read, headCheckRequirements(req, profile, queued));
   if (asOf) {
+    const named = (/** @type {any} */ r) => (typeof r === "string" ? r : r?.context);
+    const unknown = (/** @type {string} */ why) => ({ ...c, verdict: "UNKNOWN", readable: false, why });
     // Another App's run, which it may have rewritten in place since, can't be
-    // read as it stood: a required check only it could meet is unknown.
-    const unmet = [...(c.missing ?? []), ...(c.skipped ?? [])].filter((n) => (read.unvouched ?? []).includes(n));
-    if (unmet.length) c = { ...c, verdict: "UNKNOWN", readable: false, why: `required check(s) reported only by another App, which may have rewritten them since: ${unmet.join(", ")}` };
+    // read as it stood: a required check it reported is unknown, whatever else met it.
+    const doubtful = (req.required ?? []).map(named).filter((n) => (read.unvouched ?? []).includes(n));
+    // What the base required then is what it requires now only where its rules haven't changed since.
+    const changed = rulesChangedSince({ nwo, base: baseRef, at: asOf.at });
+    if (changed !== false) c = unknown(changed ? "the base's rules have changed since the merge, so what they required then can't be told"
+                                                : "whether the base's rules have changed since the merge couldn't be read");
+    else if (doubtful.length) c = unknown(`required check(s) another App reported, which it may have rewritten since: ${doubtful.join(", ")}`);
+    else if (c.verdict === "GREEN" && (c.queueOnly ?? []).length) {
+      // The checks run only in the merge queue ran on the queue's commit, which is what merged.
+      const q = readChecksAt(nwo, asOf.mergeCommit, asOf.at, { reviewerContexts });
+      // Only they count there: the queue merges once they pass, with its other jobs still running.
+      const queueReq = (req.required ?? []).filter((r) => c.queueOnly.includes(named(r)));
+      const qc = classifyRead(q, { required: queueReq, known: true, failuresOf: queueReq });
+      const qDoubtful = c.queueOnly.filter((n) => (q.unvouched ?? []).includes(n));
+      if (qDoubtful.length) c = unknown(`at the merge queue's commit, check(s) another App reported: ${qDoubtful.join(", ")}`);
+      else if (qc.verdict !== "GREEN") c = { ...c, verdict: qc.verdict, readable: qc.readable, failing: qc.failing ?? [], missing: qc.missing, skipped: qc.skipped,
+                                              why: `at the merge queue's commit: ${qc.why}` };
+    }
   }
   // ONE reading, folded into what the previous tick recorded. Settlement is about
   // the check SET being stable ACROSS TIME, so it can only be established by
@@ -908,7 +937,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   const inHead = base.verdict === "RED" && baseHead.ok ? baseContainedIn({ nwo, base: baseHead.sha, head: pin.sha }) : null;
 
   const threads = readThreads(nwo, pr);
-  const reviewers = readReviewerStates(nwo, pr, pin.sha, profile.reviewers ?? []);
+  const reviewers = readReviewerStates(nwo, pr, pin.sha, profile.reviewers ?? [], null, asOf?.at ?? null);
 
   const tl = readTimeline(nwo, pr);
   const forcePushedAt = tl.ok ? lastForcePush(tl.events) : null;
@@ -933,7 +962,15 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // absent, stale, incomplete, classified by another version, or derived for a
   // different revision -- and null flows through to a watcher that refuses to
   // spill on anything but a known zero. The unsafe direction stays impossible.
-  const facts = reviewFacts({ db, nwo, pr, profile, head: pin.sha, live: threads, io });
+  // A merge's projection is folded fresh from a whole reading, up to it; the
+  // live read is of now, another moment, so it's no check on it (#342).
+  const facts = reviewFacts({ db, nwo, pr, profile, head: pin.sha, live: threads,
+                              io: asOf ? { ...io, compare: (live, projected) => ({ ...compare(live, projected), comparable: true, agree: true, why: null }) } : io });
+  // And its threads are those the projection holds, as threads made since are none of it.
+  const held = asOf && db ? reviewState(db, nwo, pr, profile, { head: pin.sha }) : null;
+  const threadsThen = !asOf ? threads
+    : held?.readable ? { readable: true, total: held.total, unresolved: held.total - held.resolved }
+    : { readable: false, why: `the merge's threads couldn't be read as they stood: ${held?.why ?? "no store"}` };
 
   // The DERIVED round count when there is one. `judged.size` counts distinct heads
   // across the latest state per reviewer, so a single-reviewer pull request stays
@@ -1000,7 +1037,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
               impostors: read.impostors ?? [], shadowRequired: req.shadowRequired, legacyRequired: req.legacyRequired,
               queueOnly: c.queueOnly ?? [], passed: passedChecks(rows), ...checksShown(c) },
     base: baseHealthOf(base, { complete: baseRead?.ok === true, inHead }),
-    reviewers, rounds, threads, cleared: facts.cleared,
+    reviewers, rounds, threads: threadsThen, cleared: facts.cleared,
     bodyFindings: facts.bodyFindings, unreadableBodies: facts.unreadableBodies,
     ledgerBlockers,
     ...(acceptance ? { acceptance } : {}),
@@ -1378,6 +1415,35 @@ function baseRequirements({ nwo, base, gh = ghJson, now = Date.now() }) {
   const got = { at: now, checks, mergeQueue };
   if (checks !== null) REQUIRED_CHECKS.set(key, got);
   return got;
+}
+
+/**
+ * Whether the base's rules may have changed since `at`, in seconds (#342): true
+ * where a ruleset that applies to it was updated then or since, null where that
+ * can't be told (a ruleset's time unread, or classic protection, which keeps
+ * none), false where none was.
+ * @param {{ nwo: string, base: string, at: number, gh?: typeof ghJson }} o
+ */
+export function rulesChangedSince({ nwo, base, at, gh = ghJson }) {
+  const rules = gh(["--paginate", `repos/${nwo}/rules/branches/${encodeURIComponent(base)}`, "--jq", ".[]"]);
+  if (!rules.ok) return null;
+  /** @type {Map<string, any>} */ const sets = new Map();
+  for (const line of rules.out.split("\n").filter(Boolean)) {
+    let r; try { r = JSON.parse(line); } catch { return null; }
+    sets.set(`${r?.ruleset_source_type}\u0000${r?.ruleset_source}\u0000${r?.ruleset_id}`, r);
+  }
+  for (const r of sets.values()) {
+    const path = r.ruleset_source_type === "Organization" ? `orgs/${r.ruleset_source}/rulesets/${r.ruleset_id}` : `repos/${nwo}/rulesets/${r.ruleset_id}`;
+    const got = gh([path]);
+    let updated = NaN;
+    try { updated = Date.parse(JSON.parse(got.ok ? got.out : "null")?.updated_at) / 1000; } catch { return null; }
+    if (!Number.isFinite(updated)) return null;
+    if (updated >= at) return true;
+  }
+  const branch = gh([`repos/${nwo}/branches/${encodeURIComponent(base)}`]);
+  let b; try { b = JSON.parse(branch.ok ? branch.out : "null"); } catch { return null; }
+  if (!b) return null;
+  return b.protection?.enabled === true ? null : false;
 }
 
 /** Whether reeve's check is required on a base: requirementsOnBase's `own`. */

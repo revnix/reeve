@@ -329,9 +329,13 @@ export function readChecksAt(nwo, sha, at, { reviewerContexts = [] } = {}) {
   const crRead = readLines(cr, c => ({ ...checkRunRow(c), begun: c.started_at ?? null, rank: Number(c.id) }), runs);
   const st = gh(`repos/${nwo}/commits/${sha}/statuses?per_page=100`, ".[]", { paginate: true });
   const stRead = readLines(st, x => ({ ...statusRow(x), begun: x.created_at ?? null, rank: Number(x.id) }), statuses);
-  // As GitHub counts them: a suite may hold no run, so the runs can't say.
-  const suites = gh(`repos/${nwo}/commits/${sha}/check-suites?per_page=1`, ".total_count");
-  const suiteCount = suites.ok && /^\d+$/.test(suites.out.trim()) ? Number(suites.out.trim()) : null;
+  // The commit's suites as GitHub lists them, each with when it was made: a
+  // suite may hold no run, so the runs can't count them; and a suite made after
+  // the time, as a push to the base makes on a commit the queue merged, held no
+  // run then to be queued.
+  /** @type {any[]} */ const suiteRows = [];
+  const suites = gh(`repos/${nwo}/commits/${sha}/check-suites?per_page=100`, ".check_suites[] | {id, created_at}", { paginate: true });
+  const suitesRead = readLines(suites, x => ({ name: x?.id != null ? String(x.id) : "", made: x?.created_at ?? null }), suiteRows);
   // Only GitHub Actions' runs are taken as they stood: another App may rewrite
   // a finished run in place, its times kept, and nothing then shows it, where
   // Actions makes a new run. Those are named, unvouched, for the judgment to
@@ -343,18 +347,19 @@ export function readChecksAt(nwo, sha, at, { reviewerContexts = [] } = {}) {
   // of what stood, so an attempt of it begun since makes nothing unknown.
   const evidence = new Set(excludeReviewerContexts(excludeOwnPolicy([...taken, ...statuses]).rows, reviewerContexts).rows);
   const secs = (/** @type {string | null} */ t) => (t == null ? NaN : Date.parse(t) / 1000);
+  const madeAt = new Map(suiteRows.map(x => [x.name, secs(x.made)]));
   const by = (/** @type {any[]} */ xs, /** @type {(r: any) => string} */ key) => Map.groupBy(xs, key).values();
   /** The one begun last before `at` of `xs`, the newer by its rank of two begun in one second, or undefined. @param {any[]} xs */
   const last = (xs) => xs.filter(r => secs(r.begun) < at).reduce((a, r) =>
     (a && (secs(a.begun) > secs(r.begun) || (secs(a.begun) === secs(r.begun) && a.rank > r.rank)) ? a : r), undefined);
   /** @type {any[]} */ const rows = [];
-  let unsure = suiteCount === null ? `the commit's check suites couldn't be counted: ${suites.err || "the count doesn't read"}`
-    : suiteCount > 1000 ? "more than a thousand check suites, past what GitHub lists"
+  let unsure = !suitesRead ? `the commit's check suites couldn't be read: ${suites.err || "they don't read"}`
+    : suiteRows.length > 1000 ? "more than a thousand check suites, past what GitHub lists"
     : [...evidence].some(r => secs(r.begun) === at || (r.source === "check_run" && secs(r.completedAt) === at))
       ? "a check began, finished or was set in the very second asked, which can't be put before it or after" : null;
   for (const attempts of by(taken, r => `${r.suiteId}\u0000${r.name}`)) {
     const stood = last(attempts);
-    if (attempts.some(r => evidence.has(r) && !(secs(r.begun) < at) && (!stood || r.rank > stood.rank)))
+    if (attempts.some(r => evidence.has(r) && !(secs(r.begun) < at) && (!stood || r.rank > stood.rank) && !(madeAt.get(r.suiteId) > at)))
       unsure ??= `${attempts[0].name} has an attempt that began after the time asked, or hasn't begun, so what stood then can't be told`;
     if (!stood) continue;
     const { begun: _b, rank: _r, ...r } = stood;

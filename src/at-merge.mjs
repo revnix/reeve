@@ -17,10 +17,12 @@ import { derivePr } from "./review/derive.mjs";
 
 /**
  * The verdict on `merge`'s final head, as it stood at the merge.
+ * `hold` is the hold the caller reads for it, as it reads one for a live pull
+ * request: null asks none, as for one no builder made.
  * @param {{ nwo: string, merge: { pr: number, head: string, mergedAt: number, mergeCommit: string, baseRef: string, headRef?: string, title?: string },
- *           profile: any, db: any, now?: number }} o
+ *           profile: any, db: any, now?: number, hold?: any }} o
  */
-export function judgeAtMerge({ nwo, merge, profile, db, now = Math.floor(Date.now() / 1000) }) {
+export function judgeAtMerge({ nwo, merge, profile, db, now = Math.floor(Date.now() / 1000), hold = null }) {
   const { pr, head, mergedAt, mergeCommit, baseRef } = merge;
   // Pinned to the head GitHub merged: its branch may be gone.
   const anchor = { ok: true, headRef: merge.headRef ?? "", baseRef, state: "MERGED", title: merge.title ?? "",
@@ -29,5 +31,5 @@ export function judgeAtMerge({ nwo, merge, profile, db, now = Math.floor(Date.no
   const seen = observe(nwo, pr);
   ingest(db, nwo, pr, seen.observations, { at: now });
   derivePr(db, nwo, pr, profile, { at: now, head, complete: !seen.incomplete, until: mergedAt });
-  return evaluatePr({ nwo, pr, profile, db, anchor, hold: null, io: { foldPrecedesEvaluation: true }, asOf: { at: mergedAt, mergeCommit } });
+  return evaluatePr({ nwo, pr, profile, db, anchor, hold, io: { foldPrecedesEvaluation: true }, asOf: { at: mergedAt, mergeCommit } });
 }

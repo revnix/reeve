@@ -315,7 +315,9 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
  * set in the very second asked can't be put before it or after; and GitHub
  * lists the runs of a commit's latest thousand suites only, counted as GitHub
  * counts them. What's left out is no part of it. A status's context is the
- * same whatever its case, as GitHub takes it.
+ * same whatever its case, as GitHub takes it. Only GitHub Actions' check runs
+ * are taken: another App's are named in `unvouched`, as one may rewrite a
+ * finished run in place and leave its times as they were.
  * Left out as readChecks leaves them out.
  * @param {string} nwo @param {string} sha @param {number} at @param {{ reviewerContexts?: string[] }} [o]
  */
@@ -328,9 +330,16 @@ export function readChecksAt(nwo, sha, at, { reviewerContexts = [] } = {}) {
   // As GitHub counts them: a suite may hold no run, so the runs can't say.
   const suites = gh(`repos/${nwo}/commits/${sha}/check-suites?per_page=1`, ".total_count");
   const suiteCount = suites.ok && /^\d+$/.test(suites.out.trim()) ? Number(suites.out.trim()) : null;
+  // Only GitHub Actions' runs are taken as they stood: another App may rewrite
+  // a finished run in place, its times kept, and nothing then shows it, where
+  // Actions makes a new run. Those are named, unvouched, for the judgment to
+  // weigh. Reeve's own are kept, to be recognised and left out.
+  const vouched = (/** @type {any} */ r) => r.app === "github-actions" || r.app === POLICY_APP || r.name === POLICY_CONTEXT;
+  const unvouched = [...new Set(runs.filter(r => !vouched(r)).map(r => r.name))];
+  const taken = runs.filter(vouched);
   // What's left out, reeve's own check and the reviewers' statuses, is no part
   // of what stood, so an attempt of it begun since makes nothing unknown.
-  const evidence = new Set(excludeReviewerContexts(excludeOwnPolicy([...runs, ...statuses]).rows, reviewerContexts).rows);
+  const evidence = new Set(excludeReviewerContexts(excludeOwnPolicy([...taken, ...statuses]).rows, reviewerContexts).rows);
   const secs = (/** @type {string | null} */ t) => (t == null ? NaN : Date.parse(t) / 1000);
   const by = (/** @type {any[]} */ xs, /** @type {(r: any) => string} */ key) => Map.groupBy(xs, key).values();
   /** The one begun last before `at` of `xs`, the newer by its id of two begun in one second, or undefined. @param {any[]} xs */
@@ -341,7 +350,7 @@ export function readChecksAt(nwo, sha, at, { reviewerContexts = [] } = {}) {
     : suiteCount > 1000 ? "more than a thousand check suites, past what GitHub lists"
     : [...evidence].some(r => secs(r.begun) === at || (r.source === "check_run" && secs(r.completedAt) === at))
       ? "a check began, finished or was set in the very second asked, which can't be put before it or after" : null;
-  for (const attempts of by(runs, r => `${r.suiteId}\u0000${r.name}`)) {
+  for (const attempts of by(taken, r => `${r.suiteId}\u0000${r.name}`)) {
     const stood = last(attempts);
     if (attempts.some(r => evidence.has(r) && !(secs(r.begun) < at) && (!stood || Number(r.id) > Number(stood.id))))
       unsure ??= `${attempts[0].name} has an attempt that began after the time asked, or hasn't begun, so what stood then can't be told`;
@@ -353,7 +362,7 @@ export function readChecksAt(nwo, sha, at, { reviewerContexts = [] } = {}) {
     const stood = last(set);
     if (stood) { const { begun: _b, ...r } = stood; rows.push(r); }
   }
-  return counted(rows, unsure ? { ...cr, err: unsure } : cr, crRead && !unsure, st, stRead, reviewerContexts);
+  return { ...counted(rows, unsure ? { ...cr, err: unsure } : cr, crRead && !unsure, st, stRead, reviewerContexts), unvouched };
 }
 
 /** GitHub's periods of recent activity, each with the age, in seconds, it surely covers. */

@@ -20051,4 +20051,13 @@ export const STUBS = [
               find: "if (attempts.some(r => evidence.has(r) && ",
               replace: "if (attempts.some(r => " }],
   },
+  {
+    name: "at-time-actions-only",
+    why: "take any App run as it stood. A run its App rewrote in place since, times kept, would stand for what the merge was judged on",
+    test: "test/checks-at.test.mjs",
+    expectRed: "only GitHub Actions' runs stand as they were, and another App's are named, unvouched",
+    edits: [{ file: "src/github/reconciler.mjs",
+              find: "const vouched = (/** @type {any} */ r) => r.app === \"github-actions\" || ",
+              replace: "const vouched = (/** @type {any} */ r) => true || " }],
+  },
 ];

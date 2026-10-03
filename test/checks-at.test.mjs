@@ -78,6 +78,17 @@ test("a check's attempt that finished by the time stands, and one begun since, o
   assert.deepEqual(both.rows.map((/** @type {any} */ x) => [x.conclusion, x.id]), [["failure", "2"]]);
 });
 
+test("only GitHub Actions' runs stand as they were, and another App's are named, unvouched", async () => {
+  const r = await reconciler();
+  // Another App may rewrite a finished run in place, its times kept, and nothing then shows it; Actions makes a new run.
+  const got = withGh({ runs: [runJson("Build", "success", -60, -30), runJson("Vercel", "success", -60, -30, { slug: "vercel", app: 8329, suite: 7, id: 2 }),
+                              runJson(r.POLICY_CONTEXT, "neutral", -60, -30, { slug: r.POLICY_APP, suite: 9, id: 3 })] }, () => r.readChecksAt("o/r", HEAD, T));
+  assert.equal(got.ok, true, got.why);
+  assert.deepEqual(got.rows.map((/** @type {any} */ x) => x.name), ["Build"]);
+  assert.deepEqual(got.unvouched, ["Vercel"]);
+  assert.deepEqual(got.excluded.map((/** @type {any} */ x) => x.name), [r.POLICY_CONTEXT], "reeve's own still recognised");
+});
+
 test("an attempt begun but not finished by the time was running then", async () => {
   const r = await reconciler();
   const got = withGh({ runs: [runJson("Build", "success", -60, 300)] }, () => r.readChecksAt("o/r", HEAD, T));

@@ -4,7 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
-import { rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tempDir } from "./fixtures/temp.mjs";
 
 const HEAD = "a".repeat(40), MERGE = "d".repeat(40), PARENT = "e".repeat(40);
@@ -24,18 +24,19 @@ const statusJson = (/** @type {string} */ context, /** @type {string} */ state, 
   JSON.stringify({ context, state, description: "", created_at: at(created), updated_at: at(created) });
 
 /** `fn` with gh answering, by the path asked, the lines given for check runs, statuses and the merge commit. */
-const withGh = (/** @type {{ runs?: string[], statuses?: string[], activity?: string[], runsFail?: boolean, later?: { runs?: string[], statuses?: string[] } }} */ answers,
+const withGh = (/** @type {{ runs?: string[], statuses?: string[], activity?: string[], period?: string, log?: string, runsFail?: boolean, later?: { runs?: string[], statuses?: string[] } }} */ answers,
                 /** @type {() => any} */ fn) => {
   const bin = tempDir("reeve-checks-at-bin-");
   const lines = (/** @type {string[]} */ xs) => xs.map((x) => `'${x}'`).join(" ");
   writeFileSync(join(bin, "gh"), `#!/bin/sh
 for a in "$@"; do case "$a" in repos/*) p="$a";; --paginate) all=1;; esac; done
+${answers.log ? `echo "$p" >> '${answers.log}'` : ""}
 case "$p" in
   */commits/${HEAD}/check-runs*filter=all*) ${answers.runsFail ? 'echo "gh: HTTP 502" >&2; exit 1' : `printf '%s\\n' ${lines(answers.runs ?? [])}`}
     [ -n "$all" ] && printf '%s\\n' ${lines(answers.later?.runs ?? [])};;
   */commits/${HEAD}/statuses*) printf '%s\\n' ${lines(answers.statuses ?? [])}
     [ -n "$all" ] && printf '%s\\n' ${lines(answers.later?.statuses ?? [])};;
-  */activity*) printf '%s\\n' ${lines(answers.activity ?? [])};;
+  */activity*time_period=${answers.period ?? "day"}*) printf '%s\\n' ${lines(answers.activity ?? [])};;
   *) echo "not a read this test answers: $p" >&2; exit 1;;
 esac
 `, { mode: 0o755 });
@@ -57,6 +58,10 @@ test("a check's attempt that finished by the time stands, and one begun since, o
     assert.equal(unsure.ok, false, why);
   }
   assert.equal(withGh({ runs: [runJson("Lint", "success", 120, 180)] }, () => r.readChecksAt("o/r", HEAD, T)).ok, false, "a check whose only attempt began since");
+  // GitHub's times are whole seconds: one in the very second asked can't be put before it or after.
+  for (const [run, why] of [[runJson("Build", "success", -60, 0), "finished in that second"], [runJson("Build", "success", 0, 30), "begun in that second"]])
+    assert.equal(withGh({ runs: [run] }, () => r.readChecksAt("o/r", HEAD, T)).ok, false, why);
+  assert.equal(withGh({ statuses: [statusJson("deploy", "success", 0)] }, () => r.readChecksAt("o/r", HEAD, T)).ok, false, "a status set in that second");
   // An older attempt reset since doesn't matter: a newer one stood.
   const older = withGh({ runs: [runJson("Build", "failure", 600, 900, { id: 1 }), runJson("Build", "success", -300, -200, { id: 2 })] }, () => r.readChecksAt("o/r", HEAD, T));
   assert.deepEqual(older.ok && older.rows.map((/** @type {any} */ x) => [x.conclusion, x.id]), [["success", "2"]]);
@@ -76,11 +81,14 @@ test("an attempt begun but not finished by the time was running then", async () 
   assert.equal(two.rows.length, 2);
 });
 
-test("a status stands as it was last set by the time", async () => {
+test("a status stands as it was last set by the time, its context in any case", async () => {
   const r = await reconciler();
   const got = withGh({ statuses: [statusJson("deploy", "failure", 60), statusJson("deploy", "success", -60), statusJson("deploy", "pending", -600),
                                   statusJson("docs", "pending", -30)] }, () => r.readChecksAt("o/r", HEAD, T));
   assert.deepEqual(got.rows.map((/** @type {any} */ x) => [x.name, x.state, x.conclusion]).sort(), [["deploy", "completed", "success"], ["docs", "running", null]]);
+  // GitHub takes a status's context whatever its case: CI set again as ci is one status.
+  const recased = withGh({ statuses: [statusJson("CI", "failure", -60), statusJson("ci", "success", -30)] }, () => r.readChecksAt("o/r", HEAD, T));
+  assert.deepEqual(recased.rows.map((/** @type {any} */ x) => [x.name, x.conclusion]), [["ci", "success"]]);
 });
 
 test("a reading at a time is whole or unread, and leaves out what readChecks leaves out", async () => {
@@ -108,7 +116,8 @@ test("the commit a merge went onto is the base branch's before the merge, as Git
   const r = await reconciler();
   assert.equal(typeof r.mergedOnto, "function", "mergedOnto");
   const act = (/** @type {string} */ type, /** @type {string} */ before, /** @type {string} */ after) => JSON.stringify({ activity_type: type, before, after });
-  const onto = (/** @type {string[]} */ activity) => withGh({ activity }, () => r.mergedOnto("o/r", "main", MERGE));
+  const NOW = T + 3600;
+  const onto = (/** @type {string[]} */ activity) => withGh({ activity }, () => r.mergedOnto("o/r", "main", MERGE, T, NOW));
   // A squash, a merge commit, a rebase or the queue's merge: whatever its shape, the branch's tip before it.
   assert.equal(onto([act("push", "f".repeat(40), MERGE), act("merge_queue_merge", PARENT, MERGE)]), PARENT, "the queue's merge");
   assert.equal(onto([act("pr_merge", PARENT, MERGE)]), PARENT, "a pull request merged");
@@ -117,4 +126,13 @@ test("the commit a merge went onto is the base branch's before the merge, as Git
   assert.equal(onto([act("pr_merge", PARENT, MERGE), act("merge_queue_merge", "f".repeat(40), MERGE)]), null, "two that say otherwise");
   assert.equal(onto([act("pr_merge", "not a sha", MERGE)]), null);
   assert.equal(onto([act("pr_merge", PARENT, MERGE), "not json"]), null, "a line that doesn't read");
+  // Asked over a period that covers the merge, however long ago it was.
+  const DAY = 86400;
+  for (const [ago, period] of [[2 * DAY, "week"], [40 * DAY, "quarter"], [200 * DAY, "year"]])
+    assert.equal(withGh({ activity: [act("pr_merge", PARENT, MERGE)], period }, () => r.mergedOnto("o/r", "main", MERGE, T, T + ago)), PARENT, `${ago / DAY} days on`);
+  // Past a year, which GitHub's activity doesn't reach: not asked at all.
+  const log = join(tempDir("reeve-checks-at-log-"), "asked");
+  writeFileSync(log, "");
+  assert.equal(withGh({ activity: [act("pr_merge", PARENT, MERGE)], period: "year", log }, () => r.mergedOnto("o/r", "main", MERGE, T, T + 400 * DAY)), null);
+  assert.equal(readFileSync(log, "utf8"), "", "past a year, nothing asked");
 });

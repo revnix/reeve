@@ -311,7 +311,10 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
  * What stood can't always be told, and then the reading is unread, never
  * guessed: an attempt created after that one, by its id, that began since or
  * hasn't begun may have been queued then, or the one that stood reset in place
- * since; and GitHub lists the runs of a commit's latest thousand suites only.
+ * since; GitHub's times are whole seconds, so one that began, finished or was
+ * set in the very second asked can't be put before it or after; and GitHub
+ * lists the runs of a commit's latest thousand suites only. A status's context
+ * is the same whatever its case, as GitHub takes it.
  * Left out as readChecks leaves them out.
  * @param {string} nwo @param {string} sha @param {number} at @param {{ reviewerContexts?: string[] }} [o]
  */
@@ -323,34 +326,43 @@ export function readChecksAt(nwo, sha, at, { reviewerContexts = [] } = {}) {
   const stRead = readLines(st, x => ({ ...statusRow(x), begun: x.created_at ?? null }), statuses);
   const secs = (/** @type {string | null} */ t) => (t == null ? NaN : Date.parse(t) / 1000);
   const by = (/** @type {any[]} */ xs, /** @type {(r: any) => string} */ key) => Map.groupBy(xs, key).values();
-  /** The one begun last by `at` of `xs`, or undefined. @param {any[]} xs */
-  const last = (xs) => xs.filter(r => secs(r.begun) <= at).reduce((a, r) => (a && secs(a.begun) >= secs(r.begun) ? a : r), undefined);
+  /** The one begun last before `at` of `xs`, or undefined. @param {any[]} xs */
+  const last = (xs) => xs.filter(r => secs(r.begun) < at).reduce((a, r) => (a && secs(a.begun) >= secs(r.begun) ? a : r), undefined);
   /** @type {any[]} */ const rows = [];
-  let unsure = runs.length && new Set(runs.map(r => r.suiteId)).size >= 1000 ? "a thousand check suites or more, past what GitHub lists" : null;
+  let unsure = runs.length && new Set(runs.map(r => r.suiteId)).size >= 1000 ? "a thousand check suites or more, past what GitHub lists"
+    : [...runs, ...statuses].some(r => secs(r.begun) === at || (r.source === "check_run" && secs(r.completedAt) === at))
+      ? "a check began, finished or was set in the very second asked, which can't be put before it or after" : null;
   for (const attempts of by(runs, r => `${r.suiteId}\u0000${r.name}`)) {
     const stood = last(attempts);
-    if (attempts.some(r => !(secs(r.begun) <= at) && (!stood || Number(r.id) > Number(stood.id))))
+    if (attempts.some(r => !(secs(r.begun) < at) && (!stood || Number(r.id) > Number(stood.id))))
       unsure ??= `${attempts[0].name} has an attempt that began after the time asked, or hasn't begun, so what stood then can't be told`;
     if (!stood) continue;
     const { begun: _b, ...r } = stood;
-    rows.push(r.state === "completed" && secs(r.completedAt) <= at ? r : { ...r, state: "running", conclusion: null });
+    rows.push(r.state === "completed" && secs(r.completedAt) < at ? r : { ...r, state: "running", conclusion: null });
   }
-  for (const set of by(statuses, r => r.name)) {
+  for (const set of by(statuses, r => String(r.name).toLowerCase())) {
     const stood = last(set);
     if (stood) { const { begun: _b, ...r } = stood; rows.push(r); }
   }
   return counted(rows, unsure ? { ...cr, err: unsure } : cr, crRead && !unsure, st, stRead, reviewerContexts);
 }
 
+/** GitHub's periods of recent activity, each with the age, in seconds, it surely covers. */
+const ACTIVITY_PERIODS = /** @type {const} */ ([["day", 86400], ["week", 7 * 86400], ["month", 28 * 86400], ["quarter", 89 * 86400], ["year", 364 * 86400]]);
+
 /**
  * The commit a merge went onto: the base branch's tip just before it, as
  * GitHub's activity on the branch records the merge, whatever its shape, a
- * squash, a merge commit, a rebase or the queue's (#342). Null where it can't be
- * read, or where the record isn't one merge.
- * @param {string} nwo @param {string} baseRef @param {string} mergeCommit
+ * squash, a merge commit, a rebase or the queue's (#342). Asked over the
+ * shortest period that covers the merge, at `mergedAt`, from `now`, in
+ * seconds. Null where it can't be read, where the record isn't one merge, or
+ * where the merge is older than GitHub's activity reaches.
+ * @param {string} nwo @param {string} baseRef @param {string} mergeCommit @param {number} mergedAt @param {number} [now]
  */
-export function mergedOnto(nwo, baseRef, mergeCommit) {
-  const r = gh(`repos/${nwo}/activity?ref=${encodeURIComponent(`refs/heads/${baseRef}`)}&time_period=month&per_page=100`,
+export function mergedOnto(nwo, baseRef, mergeCommit, mergedAt, now = Math.floor(Date.now() / 1000)) {
+  const period = ACTIVITY_PERIODS.find(([, covers]) => now - mergedAt < covers)?.[0];
+  if (!period) return null;
+  const r = gh(`repos/${nwo}/activity?ref=${encodeURIComponent(`refs/heads/${baseRef}`)}&time_period=${period}&per_page=100`,
                ".[] | {activity_type, before, after} | @json", { paginate: true });
   if (!r.ok) return null;
   /** @type {any[]} */ const items = [];

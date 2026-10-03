@@ -909,8 +909,9 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
       // The checks run only in the merge queue ran on the queue's commit, which is what merged.
       const q = readChecksAt(nwo, asOf.mergeCommit, asOf.at, { reviewerContexts });
       // Only they count there: the queue merges once they pass, with its other jobs still running.
+      // One skipped there by CI's own decision is met by the profile's rule, as on the live queue (#344).
       const queueReq = (req.required ?? []).filter((r) => c.queueOnly.includes(named(r)));
-      const qc = classifyRead(q, { required: queueReq, known: true, failuresOf: queueReq });
+      const qc = classifyRead(q, checkRules({ required: queueReq, known: true }, profile));
       const qDoubtful = c.queueOnly.filter((n) => (q.unvouched ?? []).includes(n));
       if (qDoubtful.length) c = unknown(`at the merge queue's commit, check(s) another App reported: ${qDoubtful.join(", ")}`);
       else if (qc.verdict !== "GREEN") c = { ...c, verdict: qc.verdict, readable: qc.readable, failing: qc.failing ?? [], missing: qc.missing, skipped: qc.skipped,

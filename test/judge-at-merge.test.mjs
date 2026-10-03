@@ -314,6 +314,19 @@ test("a merge through the queue is judged on the queue's commit for the checks r
                "UNKNOWN", "another App's there too");
 });
 
+test("a check run only in the queue, skipped there by CI's own decision, is met at the queue's commit as on the live queue", async () => {
+  const queued = { ...profile, ci: { ...profile.ci, queueOnlyChecks: ["Queue review"] } };
+  const decides = { ...profile, ci: { ...queued.ci, decidedSkips: { by: "Decide", checks: ["Queue review"] } } };
+  const head = [runJson("Build", "success", -600, -300), runJson("Queue review", "skipped", -600, -300, { id: 2 })];
+  const at_ = (/** @type {string[]} */ queue, judgedBy = decides) => judged({ then: head, now: [], required: ["Build", "Queue review"], queue }, judgedBy).ci;
+  /** The queue's commit: the deciding job, and the check it skipped, in one suite. */
+  const there = (/** @type {string} */ decider) => [runJson("Decide", decider, -200, -150, { suite: 8, id: 4 }), runJson("Queue review", "skipped", -200, -100, { suite: 8, id: 5 })];
+  assert.equal(at_(there("success")).state, "PASS", JSON.stringify(at_(there("success"))));
+  // Only by the profile's rule, and only where the deciding job succeeded.
+  assert.notEqual(at_(there("success"), queued).state, "PASS", "control: a profile that names no decider");
+  assert.notEqual(at_(there("failure")).state, "PASS", "the decider failed");
+});
+
 test("a hold the caller read stands in the judgment", async () => {
   const c = judged({ then: [runJson("Build", "success", -600, -300)], now: [] }, profile, () => {}, { readable: false, why: "the hub couldn't be read" });
   assert.equal(c.hold?.state, "UNKNOWN", JSON.stringify(c.hold));

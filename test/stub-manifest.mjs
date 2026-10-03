@@ -142,6 +142,15 @@ export const GRANDFATHERED = [
 
 export const STUBS = [
   {
+    name: "manifest-separates-entries",
+    why: "run two stub entries together so the first is silently lost",
+    test: "test/stub-manifest.test.mjs",
+    expectRed: "every stub entry opens before its name so no entry is lost",
+    edits: [{ file: "test/stub-manifest.mjs",
+              find: "  },\n  {\n    name: \"anchor-reads-new-parts\",",
+              replace: "    name: \"anchor-reads-new-parts\"," }],
+  },
+  {
     name: "lease-gate",
     why: "let a dependent effect be leased before the one it waits for has delivered",
     test: "test/outbox-dependency-edge.test.mjs",
@@ -14040,6 +14049,8 @@ export const STUBS = [
     edits: [{ file: "scripts/capture-seeded.mjs",
               find: "export const renamed = (text) => NAMES.reduce((t, [from, to]) => t.split(from).join(to), text);",
               replace: "export const renamed = (text) => text;" }],
+  },
+  {
     name: "anchor-reads-new-parts",
     why: "read an anchor written before #279 and #281 as no anchor",
     test: "test/anchor-pins.test.mjs",

@@ -74,7 +74,7 @@ const threadPage = (/** @type {number} */ begun) => JSON.stringify({ data: { rep
  */
 /** @typedef {{ then: string[], now: string[], required?: string[], onto?: boolean, log?: string, comments?: string[], reviews?: string[], page?: string,
  *              rulesetAt?: number | null, orgRuleset?: boolean, classic?: boolean, queue?: string[],
- *              suite?: { result: string, evals?: any[] } | string | null, suites?: number, suiteTwice?: boolean, suiteFails?: boolean, noRules?: boolean }} Shape */
+ *              suite?: { result: string, evals?: any[] } | string | null, suites?: number, suiteTwice?: boolean, suiteFails?: boolean, noRules?: boolean, onto_?: string[] }} Shape */
 /** A rule's result in GitHub's record of a push, as the reader's query gives one. */
 const rule = (/** @type {number} */ id, result = "pass", /** @type {string | null} */ details = null, enforcement = "active") => ({ source: "ruleset", id, result, enforcement, details });
 /** GitHub's record of the base's rules passing, the rulesets `ids` judging. */
@@ -104,7 +104,7 @@ case "$p" in
   */actions/jobs/*) echo '{"name":"Build","run_id":1,"attempt":1,"steps":[]}';;
   */commits/${HEAD}/check-runs*filter=all*) printf '%s\\n' ${lines(o.then)};;
   */commits/${HEAD}/check-runs*) printf '%s\\n' ${lines(o.now)};;
-  */commits/${ONTO}/check-runs*filter=all*) printf '%s\\n' '${runJson("Build", "success", -900, -800)}';;
+  */commits/${ONTO}/check-runs*filter=all*) printf '%s\\n' ${lines(o.onto_ ?? [runJson("Build", "success", -900, -800)])};;
   */commits/${BASE_NOW}/check-runs*) printf '%s\\n' '${runJson("Build", "failure", 100, 200)}';;
   */check-suites*) printf '%s\n' ${[5, 7, 8].map((id) => `'${JSON.stringify({ id, created_at: at(-3600), total: 4 })}'`).join(" ")} '${JSON.stringify({ id: 9, created_at: at(30), total: 4 })}';;
   */activity*) ${o.onto === false ? "" : `echo '${JSON.stringify({ activity_type: "merge_queue_merge", before: ONTO, after: MERGE })}'`};;
@@ -325,6 +325,21 @@ test("a check run only in the queue, skipped there by CI's own decision, is met 
   // Only by the profile's rule, and only where the deciding job succeeded.
   assert.notEqual(at_(there("success"), queued).state, "PASS", "control: a profile that names no decider");
   assert.notEqual(at_(there("failure")).state, "PASS", "the decider failed");
+});
+
+test("a base check another App reported, which it may have rewritten since, leaves the merge's base unknown where its failure would count", async () => {
+  const then = [runJson("Build", "success", -600, -300)];
+  const build = runJson("Build", "success", -900, -800);
+  /** Another App's run at the commit the merge went onto. */
+  const theirs = (/** @type {string} */ name) => runJson(name, "success", -900, -800, { slug: "vercel", app: 8329, suite: 7, id: 3 });
+  const base = (/** @type {string[]} */ onto_, /** @type {string[]} */ required = ["Build"]) => judged({ then, now: [], onto_, required }).base;
+  // Under a required name: it may have failed there then, and read as it does now.
+  const doubted = base([build, theirs("Build")]);
+  assert.equal(doubted.state, "UNKNOWN", JSON.stringify(doubted));
+  // One no rule requires doesn't count on the base, so it leaves it as it is.
+  assert.equal(base([build, theirs("Preview")]).state, "PASS", "control: one that wouldn't count");
+  // Where the base requires nothing, every check on it counts, another App's too.
+  assert.equal(base([build, theirs("Preview")], []).state, "UNKNOWN", "every check counts where none is required");
 });
 
 test("a hold the caller read stands in the judgment", async () => {

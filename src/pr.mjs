@@ -956,7 +956,13 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // only on pull requests, and a push its path filters skip is a healthy one, so
   // neither the base's own requirements nor the head's rules about skipped checks
   // apply. Only a partial read does: it can hide a failure.
-  const baseRead = !baseHead.ok ? null : asOf ? readChecksAt(nwo, baseHead.sha, asOf.at, { reviewerContexts }) : readChecks(nwo, baseHead.sha, { reviewerContexts });
+  const baseAll = !baseHead.ok ? null : asOf ? readChecksAt(nwo, baseHead.sha, asOf.at, { reviewerContexts }) : readChecks(nwo, baseHead.sha, { reviewerContexts });
+  // Another App's run on the base, which it may have rewritten since, isn't read
+  // as it stood (#342), and is left out of the rows. One whose failure would
+  // count there, every check where none is required, leaves the base unread.
+  const counts = gatingOf(req);
+  const baseDoubtful = (baseAll?.unvouched ?? []).filter((/** @type {string} */ n) => !counts || counts.some((r) => (typeof r === "string" ? r : r?.context) === n));
+  const baseRead = baseDoubtful.length ? null : baseAll;
   const base = baseRead
     ? classifyRead(baseRead, { required: profile.ci?.requiredChecks ?? [], failuresOf: gatingOf(req) }, { evidence: false })
     : { verdict: "UNKNOWN", readable: false };

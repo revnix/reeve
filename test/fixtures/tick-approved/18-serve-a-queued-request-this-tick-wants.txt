@@ -29,7 +29,7 @@ hub	[]
 hub	[]
 providerRelease	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"owner":"guardian","repoId":7,"runRef":"o/r#42:FIX_CI","id":2,"token":"tok-fixture-1","isAlive":"<fn>"}]
 hub	[]
-mergedSince	["o/r",<now-604800>,{"until":<now>,"whole":true}]
+mergedSince	["o/r",<now-86400>,{"until":<now>,"whole":true}]
 
 == 2 ESCALATIONS
 #42: the worker changed its checkout's git configuration; the checkout is preserved at <tmp> for inspection

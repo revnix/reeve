@@ -12,7 +12,7 @@ publish	[{"nwo":"o/r","verdict":{"state":"BLOCK","summary":"ci is red","clauses"
 readQueue	["o/r","main"]
 capacity	[{"maxWorkers":5,"running":0}]
 hub	[]
-mergedSince	["o/r",<now-604800>,{"until":<now>,"whole":true}]
+mergedSince	["o/r",<now-86400>,{"until":<now>,"whole":true}]
 
 == 2 ESCALATIONS
 reeve has never backed up o/r

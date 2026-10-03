@@ -191,7 +191,7 @@ const REDACTIONS = [
 
   // WHAT MERGED IS ASKED FOR BETWEEN TWO CLOCKS (#342): from where the tick's
   // last look reached, up to now. Only now is the clock. How far back the look
-  // reaches is behaviour, a week on a first look, so it stays on the page as
+  // reaches is behaviour, a day on a first look, so it stays on the page as
   // its distance from now: a look that reached back nothing, or for ever, would
   // show.
   { name: "merges look clock", kind: "provenance",

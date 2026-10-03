@@ -17,7 +17,7 @@ capacity	[{"maxWorkers":5,"running":0}]
 hub	[]
 hub	[]
 providerClaim	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"owner":"guardian","repoId":7,"runRef":"o/r#42:FIX_CI","pid":<pid>,"lstart":"boot-1","isAlive":"<fn>"}]
-mergedSince	["o/r",<now-604800>,{"until":<now>,"whole":true}]
+mergedSince	["o/r",<now-86400>,{"until":<now>,"whole":true}]
 
 == 2 ESCALATIONS
 reeve has never backed up o/r

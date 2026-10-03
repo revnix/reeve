@@ -17,8 +17,12 @@ import { mergedSince } from "./trial.mjs";
 
 // The events' names live with the tick's own, where what reads them finds them without this module.
 export { MERGE_JUDGED, MERGES_LOOKED };
-/** How far back the first look reaches. */
-export const FIRST_LOOK_SECONDS = 7 * 86400;
+/**
+ * How far back the first look reaches: a day. Every later look starts where the
+ * last reached, however long the daemon was down between them, so this is only
+ * how much of what merged before reeve first looked it judges.
+ */
+export const FIRST_LOOK_SECONDS = 86400;
 /** How many merges one tick judges: the rest wait for the next, oldest first. */
 export const JUDGED_A_TICK = 3;
 /** How long after its merge a judgment only reading again settles is made again, before it's kept as it is. */

@@ -46,7 +46,7 @@ test("each merge since the last look is judged once, as it stood, and kept as it
   try {
     const got = w.look(T, [merge(7, 600), merge(8, 300, { head: sha("b"), mergeCommit: sha("e") })]);
     assert.deepEqual(got, { ok: true, judged: 2, waiting: 0 });
-    // The first look reaches back a week, and asks for what judging a merge needs.
+    // The first look reaches back a day, and asks for what judging a merge needs.
     assert.deepEqual(w.asked[0], { nwo: NWO, since: T - FIRST_LOOK_SECONDS, until: T, whole: true });
     assert.deepEqual(w.judgedWith.map((a) => a.merge), [
       { pr: 7, head: sha("a"), mergedAt: T - 600, mergeCommit: sha("d"), baseRef: "main", headRef: "feature", title: "pull request 7" },

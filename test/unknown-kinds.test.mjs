@@ -45,6 +45,9 @@ const CASES = [
   ["the base not read", "base", "retry", i => { delete i.base; }],
   ["the base still settling", "base", "waiting", i => { i.base = { verdict: "SETTLING" }; }],
   ["the base's checks unreadable", "base", "retry", i => { i.base = { verdict: "UNKNOWN", readable: false }; }],
+  ["a merge's base with a check that ended without saying", "base", "person", i => { i.base = { verdict: "UNKNOWN", stillRunning: [], endedUnsaid: ["Build"] }; }],
+  ["a merge's base with no check reported yet", "base", "waiting", i => { i.base = { verdict: "UNKNOWN", stillRunning: [], endedUnsaid: [] }; }],
+  ["a merge's base with a check not finished yet", "base", "waiting", i => { i.base = { verdict: "RUNNING", stillRunning: ["Build"] }; }],
   ["a blocking reviewer unreachable", "review", "person", i => { i.reviewers = [{ login: "bot", kind: "blocking", state: "REFUSED" }]; }],
   ["a blocking reviewer not yet run", "review", "missing", i => { i.reviewers = [{ login: "bot", kind: "blocking", state: "NOT_RUN" }]; }],
   ["threads unreadable", "threads", "retry", i => { i.threads = { readable: false }; }],
@@ -84,6 +87,14 @@ test("each UNKNOWN names the kind that says what happens next", () => {
     assert.equal(c?.kind, kind, what);
     assert.ok(typeof c?.next === "string" && c.next.length > 0, `${what} names its next action`);
   }
+});
+
+test("a checks reading that's unknown for a reason says the reason", () => {
+  const ci = (/** @type {any} */ checks) => verdictFor((/** @type {any} */ i) => { i.checks = checks; }).clauses.find((/** @type {any} */ c) => c.id === "ci");
+  // Seen on a real merge that skipped the queue (#352): the clause said "check verdict UNKNOWN" and nothing more.
+  assert.equal(ci({ verdict: "UNKNOWN", settled: true, readable: true, why: "at the merge queue's commit: no checks reported at this revision", failing: [] }).detail,
+               "check verdict UNKNOWN: at the merge queue's commit: no checks reported at this revision");
+  assert.equal(ci({ verdict: "WHATEVER", settled: true, failing: [] }).detail, "check verdict WHATEVER", "none given, none said");
 });
 
 test("an UNKNOWN verdict carries the most serious kind among its clauses, and a settled one carries none", () => {
@@ -225,6 +236,8 @@ test("a check read that failed is a retry through evaluatePr, never checks still
     const c = clausesAfterATick([read])[id];
     assert.equal(c?.state, "UNKNOWN", `control: ${read} unread leaves ${id} unknown`);
     assert.equal(c?.kind, "retry", `${read} unread`);
+    // What a merge judged after it says of its base's reading (#352) is no part of a pull request judged now.
+    if (id === "base") assert.equal(c.detail, "the base branch's checks couldn't be read", `${read} unread: a pull request judged now says no more of it`);
   }
 });
 

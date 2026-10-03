@@ -131,15 +131,17 @@ export function computeVerdict(i) {
     // worse, but it also cannot be called green. The scheduler decides whether to
     // proceed; the verdict only reports.
     add("ci", BLOCK, `failing: ${names}${i.checks.inherited?.length ? ` (inherited from base: ${i.checks.inherited.join(", ")})` : ""}`);
-  } else add("ci", UNKNOWN, `check verdict ${i.checks.verdict}`, "retry", "read the head's checks again");
+  } else add("ci", UNKNOWN, `check verdict ${i.checks.verdict}${i.checks.why ? `: ${i.checks.why}` : ""}`, "retry", "read the head's checks again");
 
   // 2. The base's own health. GitHub does not check this when strict is false, so
   //    a PR can merge cleanly into a branch that is already broken.
+  // Of a merge judged after it (#352): the base's checks that were running at the merge are taken as they ended.
+  const after = i.base?.endedAfter?.length ? `; ${i.base.endedAfter.length} check(s) there finished after the merge, taken as they ended` : "";
   if (!i.base) add("base", UNKNOWN, "base health not read", "retry", "read the base branch's checks again");
   else if (i.base.verdict === "GREEN") {
     // A workflow no rule requires, failing there, is named, not held against the pull request (#288).
     const beside = i.base.ancillaryFailing ?? [];
-    add("base", PASS, "base is green" + (beside.length ? `; ${beside.join(", ")} failing there, which no rule requires` : ""));
+    add("base", PASS, "base is green" + after + (beside.length ? `; ${beside.join(", ")} failing there, which no rule requires` : ""));
   }
   else if (i.base.verdict === "RED") {
     // The pull request that repairs a red base passes, at its own green head,
@@ -153,11 +155,14 @@ export function computeVerdict(i) {
     /** @type {{ name: string, app: string | null }[]} */ const passed = i.checks?.passed ?? [];
     if (failing.length && i.base.complete === true && i.base.inHead === true && i.checks?.verdict === "GREEN" && i.checks.settled
         && failing.every((f) => passed.some((p) => p.name === f.name && p.app === f.app)))
-      add("base", PASS, `the base branch is red, and this pull request passes every check failing there (${[...new Set(failing.map((f) => f.name))].join(", ")}), so it repairs it`);
-    else add("base", BLOCK, "the base branch is red; merging into it hides the next failure");
+      add("base", PASS, `the base branch is red, and this pull request passes every check failing there (${[...new Set(failing.map((f) => f.name))].join(", ")}), so it repairs it` + after);
+    else add("base", BLOCK, "the base branch is red; merging into it hides the next failure" + after);
   }
-  else if (i.base.readable === false) add("base", UNKNOWN, "the base branch's checks couldn't be read", "retry", "read the base branch's checks again");
-  else add("base", UNKNOWN, `base verdict ${i.base.verdict}`, "waiting", "look again once the base branch's checks settle");
+  else if (i.base.readable === false) add("base", UNKNOWN, `the base branch's checks couldn't be read${i.base.why ? `: ${i.base.why}` : ""}`, "retry", "read the base branch's checks again");
+  // Of a merge judged after it (#352): a check of its base that ended without saying, cancelled say, is read as it ended, so reading
+  // again says the same. One with no such check, none reported yet say, waits as any does: a check may report yet.
+  else if (i.base.endedUnsaid?.length) add("base", UNKNOWN, `base verdict ${i.base.verdict}: ${i.base.endedUnsaid.join(", ")} ended without saying whether the base was healthy`, "person", "weigh the base the merge went onto by hand");
+  else add("base", UNKNOWN, `base verdict ${i.base.verdict}${i.base.stillRunning?.length ? `: ${i.base.stillRunning.join(", ")} still running` : ""}`, "waiting", "look again once the base branch's checks settle");
 
   // 3. Review coverage AT THIS HEAD, per blocking reviewer. Four states, never two:
   //    a refusal is ABSENT, never a pass. 65 of 65 Codex comments on the last 40

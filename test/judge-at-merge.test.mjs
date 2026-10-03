@@ -345,6 +345,43 @@ test("a base check another App reported, which it may have rewritten since, leav
   assert.equal(base([build, theirs("Preview")], []).state, "UNKNOWN", "every check counts where none is required");
 });
 
+test("a merge onto a base whose own checks were still running is judged by how they ended, as a gate that waited for the base would have judged it", async () => {
+  const then = [runJson("Build", "success", -600, -300)];
+  const base = (/** @type {string[]} */ onto_, /** @type {any} */ o = {}) => judged({ then, now: [], onto_, required: ["Build"], ...o }).base;
+  // Running at the merge, and passed since: green, and said to be so by how it ended.
+  const passed = base([runJson("Build", "success", -100, 200)]);
+  assert.equal(passed.state, "PASS", JSON.stringify(passed));
+  assert.match(String(passed.detail), /1 check\(s\) there finished after the merge, taken as they ended/);
+  // Waiting to start at the merge, and passed since: the same.
+  assert.equal(base([runJson("Build", "success", 60, 120)]).state, "PASS");
+  // One finished before the merge says nothing of the kind.
+  assert.doesNotMatch(String(base([runJson("Build", "success", -900, -800)]).detail), /after the merge/);
+  // Failed since: red, as a gate that waited would have found it.
+  const failed = base([runJson("Build", "failure", -100, 200)]);
+  assert.equal(failed.state, "BLOCK", JSON.stringify(failed));
+  assert.match(String(failed.detail), /red[^]*1 check\(s\) there finished after the merge/);
+  // Not finished yet: still unknown, to look at again, and it says which.
+  const running = JSON.stringify({ name: "Build", id: 1, status: "in_progress", conclusion: null, started_at: at(-100), completed_at: null, app: { id: 15368, slug: "github-actions" }, check_suite: { id: 5 } });
+  const still = base([running]);
+  assert.deepEqual([still.state, still.kind], ["UNKNOWN", "waiting"], JSON.stringify(still));
+  assert.match(String(still.detail), /Build still running/);
+  // Ended without saying, cancelled say: every check there has ended, so reading again settles nothing, and it's for a person.
+  const cancelled = base([runJson("Build", "cancelled", -100, 200)]);
+  assert.deepEqual([cancelled.state, cancelled.kind], ["UNKNOWN", "person"], JSON.stringify(cancelled));
+  assert.match(String(cancelled.detail), /Build ended without saying whether the base was healthy/);
+  // A base with no check reported yet isn't one whose checks have ended: one may report yet, so it waits.
+  const none = base([]);
+  assert.deepEqual([none.state, none.kind], ["UNKNOWN", "waiting"], JSON.stringify(none));
+  assert.doesNotMatch(String(none.detail), /ended/);
+  // The head's own checks stay as they stood: a merge made before they finished isn't one they passed.
+  const head = judged({ then: [runJson("Build", "success", -100, 200)], now: [], required: ["Build"] });
+  assert.notEqual(head.ci.state, "PASS", JSON.stringify(head.ci));
+  // A base that couldn't be read says why.
+  const unfound = base([], { onto: false });
+  assert.equal(unfound.state, "UNKNOWN");
+  assert.match(String(unfound.detail), /couldn't be read: the commit the merge went onto couldn't be read/);
+});
+
 test("a hold the caller read stands in the judgment", async () => {
   const c = judged({ then: [runJson("Build", "success", -600, -300)], now: [] }, profile, () => {}, { readable: false, why: "the hub couldn't be read" });
   assert.equal(c.hold?.state, "UNKNOWN", JSON.stringify(c.hold));

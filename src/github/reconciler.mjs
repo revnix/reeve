@@ -332,10 +332,13 @@ export function readChecksAt(nwo, sha, at, { reviewerContexts = [] } = {}) {
   // The commit's suites as GitHub lists them, each with when it was made: a
   // suite may hold no run, so the runs can't count them; and a suite made after
   // the time, as a push to the base makes on a commit the queue merged, held no
-  // run then to be queued.
+  // run then to be queued. Each with how many GitHub counts on the commit, as a
+  // list cut short holds fewer than there are.
   /** @type {any[]} */ const suiteRows = [];
-  const suites = gh(`repos/${nwo}/commits/${sha}/check-suites?per_page=100`, ".check_suites[] | {id, created_at}", { paginate: true });
-  const suitesRead = readLines(suites, x => ({ name: x?.id != null ? String(x.id) : "", made: x?.created_at ?? null }), suiteRows);
+  const suites = gh(`repos/${nwo}/commits/${sha}/check-suites?per_page=100`, ".total_count as $n | .check_suites[] | {id, created_at, total: $n}", { paginate: true });
+  const suitesRead = readLines(suites, x => ({ name: x?.id != null ? String(x.id) : "", made: x?.created_at ?? null, total: x?.total }), suiteRows);
+  // As GitHub counts them, the most any row says; a count that doesn't read is past any.
+  const suiteCount = suiteRows.reduce((n, x) => Math.max(n, Number.isInteger(x.total) ? x.total : Infinity), 0);
   // Only GitHub Actions' runs are taken as they stood: another App may rewrite
   // a finished run in place, its times kept, and nothing then shows it, where
   // Actions makes a new run. Those are named, unvouched, for the judgment to
@@ -354,7 +357,7 @@ export function readChecksAt(nwo, sha, at, { reviewerContexts = [] } = {}) {
     (a && (secs(a.begun) > secs(r.begun) || (secs(a.begun) === secs(r.begun) && a.rank > r.rank)) ? a : r), undefined);
   /** @type {any[]} */ const rows = [];
   let unsure = !suitesRead ? `the commit's check suites couldn't be read: ${suites.err || "they don't read"}`
-    : suiteRows.length > 1000 ? "more than a thousand check suites, past what GitHub lists"
+    : suiteCount > 1000 ? "more than a thousand check suites, past what GitHub lists"
     : [...evidence].some(r => secs(r.begun) === at || (r.source === "check_run" && secs(r.completedAt) === at))
       ? "a check began, finished or was set in the very second asked, which can't be put before it or after" : null;
   for (const attempts of by(taken, r => `${r.suiteId}\u0000${r.name}`)) {

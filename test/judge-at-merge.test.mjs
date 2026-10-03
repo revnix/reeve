@@ -106,7 +106,7 @@ case "$p" in
   */commits/${HEAD}/check-runs*) printf '%s\\n' ${lines(o.now)};;
   */commits/${ONTO}/check-runs*filter=all*) printf '%s\\n' '${runJson("Build", "success", -900, -800)}';;
   */commits/${BASE_NOW}/check-runs*) printf '%s\\n' '${runJson("Build", "failure", 100, 200)}';;
-  */check-suites*) printf '%s\n' ${[5, 7, 8].map((id) => `'${JSON.stringify({ id, created_at: at(-3600) })}'`).join(" ")} '${JSON.stringify({ id: 9, created_at: at(30) })}';;
+  */check-suites*) printf '%s\n' ${[5, 7, 8].map((id) => `'${JSON.stringify({ id, created_at: at(-3600), total: 4 })}'`).join(" ")} '${JSON.stringify({ id: 9, created_at: at(30), total: 4 })}';;
   */activity*) ${o.onto === false ? "" : `echo '${JSON.stringify({ activity_type: "merge_queue_merge", before: ONTO, after: MERGE })}'`};;
   */rules/branches/*) ${o.noRules ? "exit 0;" : ""} printf '%s\n' '${o.orgRuleset ? requires(o.required ?? ["Build"]).replace('"Repository","ruleset_source":"o/r"', '"Organization","ruleset_source":"acme"') : requires(o.required ?? ["Build"])}' ${o.queue ? `'${QUEUE_RULE}'` : ""};;
   */branches/main) echo '${JSON.stringify({ protected: true, protection: { enabled: o.classic === true } })}';;
@@ -377,6 +377,8 @@ test("a merge's blocking findings are those that stood at it", async () => {
   assert.equal(findings("done", -120, 60).state, "UNKNOWN", "settled since");
   assert.equal(findings("open", -120, 60).state, "UNKNOWN", "changed since, and open now");
   assert.equal(findings("open", -120, 0).state, "UNKNOWN", "changed in the merge's very second");
+  // And a block made in that second, of a finding unchanged since long before, can't be put before the merge or after.
+  assert.equal(findings("open", 0, -60).state, "UNKNOWN", "made in the merge's very second");
 });
 
 test("a review that reads dismissed now, which it may not have been at the merge, leaves its reviews unknown", async () => {
@@ -396,7 +398,20 @@ test("a review that reads dismissed now, which it may not have been at the merge
 });
 
 test("a thread begun in the very second of the merge, which can't be put before it or after, leaves its reviews unknown", async () => {
-  const c = judged({ then: [runJson("Build", "success", -600, -300)], now: [] }, profile, (db) => ingest(db, NWO, 7, [thread("PRRT_tied", T)], { at: T + 30 }));
+  const checks = { then: [runJson("Build", "success", -600, -300)], now: [] };
+  const c = judged(checks, profile, (db) => ingest(db, NWO, 7, [thread("PRRT_tied", T)], { at: T + 30 }));
   assert.equal(c.threads.state, "UNKNOWN", JSON.stringify(c.threads));
   assert.match(String(c.input.threads.why), /second/);
+  // So does a reviewer's round made in it: it may clear a finding, or state one.
+  const blocking = { ...profile, reviewers: PROFILE.reviewers };
+  /** A comment made in the merge's very second. */
+  const said = (/** @type {string} */ source, /** @type {string} */ login, /** @type {string} */ body) =>
+    ({ source, external_id: "comment:5", kind: "issue_comment", head_sha: null, event_at: T, edited_at: null, payload: { login, body } });
+  const round = judged(checks, blocking, (db) => ingest(db, NWO, 7, [said("codex", "codex[bot]", `Didn't find any major issues. Reviewed commit: ${HEAD.slice(0, 10)}`)], { at: T + 30 }));
+  assert.equal(round.input.threads.readable, false, "a reviewer's clean pass in it");
+  // Another's comment in that second is read by no clause, and leaves the merge's reviews as they'd be without it.
+  const none = judged(checks, blocking);
+  const chatter = judged(checks, blocking, (db) => ingest(db, NWO, 7, [said("someone", "someone", "merging this now")], { at: T + 30 }));
+  assert.equal(chatter.input.threads.readable, true, String(chatter.input.threads.why));
+  for (const id of ["threads", "cleared", "bodyFindings", "bodyReadable"]) assert.equal(chatter[id].state, none[id].state, id);
 });

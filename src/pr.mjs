@@ -848,16 +848,17 @@ export const checkRules = (req, profile) => {
  * The findings blocking a pull request as they stood at `at`, in seconds
  * (#342): a block made since blocked nothing then. Null where one changed then
  * or since, settled or reopened: it may have stood otherwise at `at`, and its
- * status at a time isn't kept.
+ * status at a time isn't kept. Null too where a block was made in that very
+ * second, which can't be put before it or after.
  * @param {any} db @param {number} pr @param {number} at
  * @returns {string[] | null}
  */
 function blockersAt(db, pr, at) {
   const then = db.prepare(
-    `SELECT n.id AS id, n.updated_at AS changed, n.status NOT IN ('done','decided','cancelled','refuted') AS open
+    `SELECT n.id AS id, n.updated_at AS changed, e.at AS made, n.status NOT IN ('done','decided','cancelled','refuted') AS open
        FROM edge e JOIN node n ON n.id = e.src
       WHERE e.dst = ? AND e.type = 'BLOCKS' AND e.at <= ?`).all(`pr:${pr}`, at);
-  return then.some((/** @type {any} */ r) => !(r.changed < at)) ? null : then.filter((/** @type {any} */ r) => r.open).map((/** @type {any} */ r) => r.id);
+  return then.some((/** @type {any} */ r) => r.made === at || !(r.changed < at)) ? null : then.filter((/** @type {any} */ r) => r.open).map((/** @type {any} */ r) => r.id);
 }
 
 /**

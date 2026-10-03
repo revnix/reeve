@@ -179,8 +179,13 @@ export function classifyObservation(o, rev, resolve) {
  * cursor would buy nothing and cost the one property that matters -- a full fold
  * cannot half-apply, and a half-applied projection is a gate reading a review
  * whose thread is not there yet.
+ *
+ * `until`, in seconds, folds only what was made by then (#342): a merged pull
+ * request is judged as it stood at its merge, and a review, comment or thread
+ * made since is left out. One with no time of its own is kept, as leaving out
+ * a finding it can't place would pass what it might block.
  */
-export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 1000), complete = true, head = null } = {}) {
+export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 1000), complete = true, head = null, until = null } = {}) {
   const version = classifierVersion(profile);
   const roster = rosterOf(profile);
   const heads = db.prepare("SELECT sha FROM head_seen WHERE nwo=? AND pr=?").all(nwo, pr).map(r => r.sha);
@@ -228,7 +233,7 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
                 ON c.pr_number = ? AND c.source = m.source AND c.external_id = m.external_id) sel
         ON sel.source = i.source AND sel.external_id = i.external_id AND sel.g = i.generation
      WHERE i.pr_number = ?
-     ORDER BY i.event_at, i.id`).all(pr, pr, pr);
+     ORDER BY i.event_at, i.id`).all(pr, pr, pr).filter(r => until == null || !(r.event_at > until));
 
   // Counted from the rows this fold is reading, not from the table afterwards, so
   // the number belongs to this snapshot and no other.

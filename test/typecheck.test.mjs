@@ -29,6 +29,8 @@ const CORE = ["src/verdict.mjs", "src/pr.mjs", "src/github/reconciler.mjs", "src
               "src/published.mjs",
               // And the acceptance evidence a pull request gives for its task (#167).
               "src/acceptance.mjs",
+              // And a merge judged after it, as it stood at it (#342).
+              "src/at-merge.mjs",
               // And signed (#165), with the host's anchor (#274).
               "src/signing.mjs", "src/anchor.mjs"];
 

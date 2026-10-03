@@ -8,7 +8,7 @@
 // them says exactly what the gate WOULD have refused.
 
 import { acceptanceOf, pullBody } from "./acceptance.mjs";
-import { pinHead, pinPrHead, isFork, readChecks, classify, settle, inheritedOrCaused, readTimeline, lastForcePush, suitesComplete } from "./github/reconciler.mjs";
+import { pinHead, pinPrHead, isFork, readChecks, readChecksAt, mergedOnto, classify, settle, inheritedOrCaused, readTimeline, lastForcePush, suitesComplete } from "./github/reconciler.mjs";
 import { loadSettlement, saveSettlement } from "./db/ops.mjs";
 import { rootCause } from "./ci-rootcause.mjs";
 import { computeVerdict, renderVerdict, coversHead, PASS, BLOCK, UNKNOWN } from "./verdict.mjs";
@@ -827,7 +827,14 @@ export const checkRules = (req, profile) => {
   return { ...req, failuresOf: gatingOf(req), decided: by ? { by, checks: profile?.ci?.decidedSkips?.checks ?? [] } : null };
 };
 
-export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}, hold = null }) {
+/**
+ * `asOf`, `{ at, mergeCommit }` in seconds, judges a merged pull request as it
+ * stood at its merge (#342): its head's checks and its base's, at the commit
+ * the merge went onto, as they stood then, final as they are; what the base's
+ * rules made GitHub enforce, met, as GitHub merged it. A required check only
+ * another App reported, which it may since have rewritten, is unknown.
+ */
+export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}, hold = null, asOf = null }) {
   // Reuses the caller's anchor when it has one, so the head is pinned ONCE per
   // pull request per tick and the fold and the evaluation cannot disagree about
   // which revision they are talking about.
@@ -838,7 +845,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // A reviewer's commit status is never CI evidence: a rate-limited CodeRabbit
   // reports success. Excluded at the read, for the head AND the base alike.
   const reviewerContexts = profile.ci?.reviewerStatusContexts ?? [];
-  const read = readChecks(nwo, pin.sha, { reviewerContexts });
+  const read = asOf ? readChecksAt(nwo, pin.sha, asOf.at, { reviewerContexts }) : readChecks(nwo, pin.sha, { reviewerContexts });
   const { rows } = read;
   // Required: what the profile names and what the base requires. A skipped
   // required check didn't run, and a read that isn't whole is UNKNOWN. Except
@@ -847,7 +854,13 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // Asked only of a profile that names queue-only checks: they're left to the
   // queue's commit only where the base's rules send every merge through one.
   const queued = profile.ci?.queueOnlyChecks?.length ? mergeQueueOnBase({ nwo, base: baseRef }) : null;
-  const c = classifyRead(read, headCheckRequirements(req, profile, queued));
+  let c = classifyRead(read, headCheckRequirements(req, profile, queued));
+  if (asOf) {
+    // Another App's run, which it may have rewritten in place since, can't be
+    // read as it stood: a required check only it could meet is unknown.
+    const unmet = [...(c.missing ?? []), ...(c.skipped ?? [])].filter((n) => (read.unvouched ?? []).includes(n));
+    if (unmet.length) c = { ...c, verdict: "UNKNOWN", readable: false, why: `required check(s) reported only by another App, which may have rewritten them since: ${unmet.join(", ")}` };
+  }
   // ONE reading, folded into what the previous tick recorded. Settlement is about
   // the check SET being stable ACROSS TIME, so it can only be established by
   // successive ticks -- this used to call settle() three times over the same
@@ -857,7 +870,9 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   const reading = { ...c, sha: pin.sha, rows,
     suitesComplete: c.verdict === "MISSING_REQUIRED" ? missingSettled(nwo, pin.sha, c.missingChecks, profile) : null };
   let s;
-  if (db) {
+  // A reading as it stood at a merge is final: nothing more runs then.
+  if (asOf) s = { verdict: c.verdict, settled: c.verdict !== "RUNNING", why: c.why };
+  else if (db) {
     s = saveSettlement(db, nwo, pr, settle(loadSettlement(db, nwo, pr), reading));
   } else {
     // No store means no memory of previous readings, and an unrememberable
@@ -865,14 +880,16 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     s = { ...settle(null, reading), settled: false,
           why: "settlement needs a state store to compare readings across ticks" };
   }
-  if (c.failing.length) {
+  if (c.failing.length && !asOf) {
     // Rows, not names, so causes can be compared; and the resolver is handed in
     // because a shared job name is not a shared failure.
     const io = inheritedOrCaused(nwo, baseRef, c.failing, { resolveCause: rootCause, reviewerContexts });
     c.inherited = io.inherited; c.caused = io.caused; c.unverified = io.unverified;
   }
 
-  const baseHead = pinHead(nwo, baseRef);
+  // The base the merge went onto, as it stood then, for a merge; its tip now otherwise.
+  const onto = asOf ? mergedOnto(nwo, baseRef, asOf.mergeCommit, asOf.at) : null;
+  const baseHead = asOf ? (onto ? { ok: true, sha: onto } : { ok: false, why: "the commit the merge went onto couldn't be read" }) : pinHead(nwo, baseRef);
   // Judged against the profile's required set. Passing an empty list here meant
   // every check on the base counted equally, so one cancelled ancillary job made
   // the branch uncheckable and every open PR waited on it.
@@ -882,7 +899,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // only on pull requests, and a push its path filters skip is a healthy one, so
   // neither the base's own requirements nor the head's rules about skipped checks
   // apply. Only a partial read does: it can hide a failure.
-  const baseRead = baseHead.ok ? readChecks(nwo, baseHead.sha, { reviewerContexts }) : null;
+  const baseRead = !baseHead.ok ? null : asOf ? readChecksAt(nwo, baseHead.sha, asOf.at, { reviewerContexts }) : readChecks(nwo, baseHead.sha, { reviewerContexts });
   const base = baseRead
     ? classifyRead(baseRead, { required: profile.ci?.requiredChecks ?? [], failuresOf: gatingOf(req) }, { evidence: false })
     : { verdict: "UNKNOWN", readable: false };
@@ -987,8 +1004,8 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     bodyFindings: facts.bodyFindings, unreadableBodies: facts.unreadableBodies,
     ledgerBlockers,
     ...(acceptance ? { acceptance } : {}),
-    mergeState: threads.mergeState, profile,
-    mergeParts: readMergeParts(nwo, baseRef, threads, { rows: mergeRows(read), head: pin.sha }),
+    mergeState: asOf ? "MERGED" : threads.mergeState, profile,
+    mergeParts: asOf ? null : readMergeParts(nwo, baseRef, threads, { rows: mergeRows(read), head: pin.sha }),
     // Passed through, never read here. `pr_hold` is a HUB row and this function
     // holds the per-repository state database, so the reading is taken by the
     // caller that has the hub connection and handed in. Null when the caller has

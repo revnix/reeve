@@ -342,6 +342,10 @@ export function computeVerdict(i) {
   const parts = i.mergeParts ?? null;
   if (!MS) add("mergeable", UNKNOWN, "mergeStateStatus not read", "retry", "read the merge state again");
   else if (MS === "CLEAN" || MS === "UNSTABLE") add("mergeable", PASS, MS);
+  // A merge judged after it (#342): GitHub merged it, under what the base's
+  // rules made it enforce then. No live pull request reads so: GitHub's merge
+  // states have no MERGED.
+  else if (MS === "MERGED") add("mergeable", PASS, "GitHub merged it, under what the base's rules required then");
   else if (MS === "UNKNOWN") add("mergeable", UNKNOWN, "GitHub is still computing mergeability", "waiting", "look again once GitHub has computed mergeability");
   else if (MS === "BLOCKED" && parts?.readable === false) add("mergeable", UNKNOWN, "mergeStateStatus BLOCKED, and GitHub reported an error reading its parts", "retry", "read what the base requires again");
   else if (MS === "BLOCKED" && parts) {

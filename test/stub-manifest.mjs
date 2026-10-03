@@ -20122,8 +20122,17 @@ export const STUBS = [
     test: "test/checks-at.test.mjs",
     expectRed: "an earlier merge of a push of the merge queue went onto the tip before that push",
     edits: [{ file: "src/github/reconciler.mjs",
-              find: "    if (!(Math.abs(Date.parse(String(from[0].timestamp)) / 1000 - mergedAt) <= QUEUE_PUSH_DATED_WITHIN)) return null;\n",
+              find: "    if (!(since >= 0 && since <= QUEUE_PUSH_DATED_WITHIN)) return null;\n",
               replace: "" }],
+  },
+  {
+    name: "queued-onto-not-after-merge",
+    why: "take a push of the queue recorded after the merge. GitHub dates a merge after the push that carried it, so one recorded later, the branch set back and built on again within the minute, carried other merges",
+    test: "test/checks-at.test.mjs",
+    expectRed: "an earlier merge of a push of the merge queue went onto the tip before that push",
+    edits: [{ file: "src/github/reconciler.mjs",
+              find: "if (!(since >= 0 && since <= QUEUE_PUSH_DATED_WITHIN)) return null;",
+              replace: "if (!(Math.abs(since) <= QUEUE_PUSH_DATED_WITHIN)) return null;" }],
   },
   {
     name: "queued-onto-ahead",

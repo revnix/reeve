@@ -405,9 +405,10 @@ export function mergedOnto(nwo, baseRef, mergeCommit, mergedAt, now = Math.floor
 }
 
 /**
- * How far, in seconds, the record of a push of the queue may be dated from a
- * merge it carried. GitHub dates a merge up to two seconds after the push's
- * record, measured on forty merges on 2026-10-03; a minute allows for a slow one.
+ * How long, in seconds, before a merge the record of the push of the queue
+ * that carried it may be dated. GitHub dates a merge in the second of the
+ * push's record or up to two after it, never before it, measured on forty
+ * merges on 2026-10-03; a minute allows for a slow one.
  */
 const QUEUE_PUSH_DATED_WITHIN = 60;
 
@@ -419,7 +420,8 @@ const QUEUE_PUSH_DATED_WITHIN = 60;
  * and the first has the tip before the push. So the merge commit's first
  * parents are followed, through one page of its ancestors as GitHub lists
  * them, a commit before its parent, down to a tip that one push of the queue
- * went on from. That push has to be the one at the merge's own time: a branch
+ * went on from. That push has to be the one at the merge's own time, recorded
+ * in the minute up to it and not after: a branch
  * set back to a commit of the push, and built on again, has a later push of the
  * queue from that commit, which carried other merges. And GitHub's comparison
  * of the push's two ends has to list the merge's commit. Null where any of it
@@ -437,7 +439,8 @@ function queuedOnto(nwo, mergeCommit, activity, mergedAt) {
     const from = activity.filter(x => x?.before === at);
     if (!from.length) continue;
     if (from.length !== 1 || from[0].activity_type !== "merge_queue_merge" || !/^[0-9a-f]{40}$/.test(String(from[0].after))) return null;
-    if (!(Math.abs(Date.parse(String(from[0].timestamp)) / 1000 - mergedAt) <= QUEUE_PUSH_DATED_WITHIN)) return null;
+    const since = mergedAt - Date.parse(String(from[0].timestamp)) / 1000;
+    if (!(since >= 0 && since <= QUEUE_PUSH_DATED_WITHIN)) return null;
     const compared = gh(`repos/${nwo}/compare/${at}...${from[0].after}`, "{status, commits: [.commits[].sha]} | @json");
     try {
       const got = JSON.parse(compared.out);

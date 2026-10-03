@@ -242,9 +242,11 @@ test("an earlier merge of a push of the merge queue went onto the tip before tha
   assert.equal(onto({ ...two, activity: [queued(PARENT, LAST, null)] }), null, "one with no time");
   assert.equal(onto({ ...two, activity: [JSON.stringify({ activity_type: "merge_queue_merge", before: PARENT, after: LAST, timestamp: "not a time" })] }), null, "one whose time doesn't read");
   assert.equal(onto({ ...two, activity: [queued(PARENT, LAST, -60)] }), PARENT, "a minute before the merge is dated: within what's allowed");
-  assert.equal(onto({ ...two, activity: [queued(PARENT, LAST, 60)] }), PARENT, "a minute after");
+  assert.equal(onto({ ...two, activity: [queued(PARENT, LAST, 0)] }), PARENT, "in the merge's own second");
   assert.equal(onto({ ...two, activity: [queued(PARENT, LAST, -61)] }), null, "more than a minute before");
-  assert.equal(onto({ ...two, activity: [queued(PARENT, LAST, 61)] }), null, "more than a minute after");
+  // GitHub dates a merge after the record of the push that carried it, never before: a push recorded after the merge is another.
+  assert.equal(onto({ ...two, activity: [queued(PARENT, LAST, 1)] }), null, "a second after the merge");
+  assert.equal(onto({ ...two, activity: [queued(PARENT, LAST, 60)] }), null, "a minute after it");
   assert.equal(onto({ ...two, compare: {} }), null, "the comparison unread");
   assert.equal(onto({ ...two, compare: { [ENDS]: "not json" } }), null, "a comparison that doesn't read");
   assert.equal(onto({ ...two, compare: { [ENDS]: compared([EARLIER, LAST]) } }), null, "a push that didn't carry it");

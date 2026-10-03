@@ -25,6 +25,7 @@ noteRateLimit	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"signature":"cla
 hub	[]
 hub	[]
 providerRelease	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"owner":"guardian","repoId":7,"runRef":"o/r#42:FIX_CI","id":1,"token":"tok-fixture-1","isAlive":"<fn>"}]
+mergedSince	["o/r",<now-604800>,{"until":<now>,"whole":true}]
 
 == 2 ESCALATIONS
 #42: the worker changed its checkout's git configuration; the checkout is preserved at <tmp> for inspection
@@ -52,6 +53,7 @@ reeve has no notification channel, so escalations reach a log only
 <ts> NEEDS YOU: reeve has no notification channel, so escalations reach a log only
 <ts> did NOT push: no notify channel configured
 <ts> shadow: 0 consecutive day(s) agreeing over 0 comparison(s)
+<ts> merges: what merged since <ts> couldn't be read, so none is judged this tick — a test never reaches GitHub
 <ts> github: 0 request(s) in 0 call(s) this tick, 0.0 per pull request
 
 == 4 RESULT

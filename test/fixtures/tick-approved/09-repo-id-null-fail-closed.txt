@@ -12,6 +12,7 @@ publish	[{"nwo":"o/r","verdict":{"state":"BLOCK","summary":"ci is red","clauses"
 readQueue	["o/r","main"]
 capacity	[{"maxWorkers":5,"running":0}]
 hub	[]
+mergedSince	["o/r",<now-604800>,{"until":<now>,"whole":true}]
 
 == 2 ESCALATIONS
 reeve has never backed up o/r
@@ -32,6 +33,7 @@ the repository numeric id is unknown; provider leases cannot be scoped
 <ts> NEEDS YOU: reeve has no notification channel, so escalations reach a log only
 <ts> did NOT push: no notify channel configured
 <ts> shadow: 0 consecutive day(s) agreeing over 0 comparison(s)
+<ts> merges: what merged since <ts> couldn't be read, so none is judged this tick — a test never reaches GitHub
 <ts> github: 0 request(s) in 0 call(s) this tick, 0.0 per pull request
 
 == 4 RESULT

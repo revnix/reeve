@@ -114,6 +114,8 @@ const NODE_PATH_RE = new RegExp(pathForms(process.execPath), "g");
  * "this value came from the clock" is.
  */
 const EPOCH_RE = /"(observedAt|expiresAt)"\s*:\s*(\d+)/g;
+/** The read of what merged, as the seam log records it: since when, and up to when. */
+const MERGES_RE = /^(mergedSince\t\["[^"]*",)(\d+)(,\{"until":)(\d+)/gm;
 
 /** A stamp's distance from the artifact's origin. Signed, so a stamp BEFORE the
  *  origin is visible rather than silently clamped. */
@@ -186,6 +188,15 @@ const REDACTIONS = [
     apply: (s) => s.replace(/"lastBackupAt"\s*:\s*\d+/g, '"lastBackupAt":<epoch>'),
     cameFromTheHost: (t) => [...t.matchAll(/"lastBackupAt"\s*:\s*(\d+)/g)]
       .some((m) => Math.abs(Number(m[1]) - Date.now() / 1000) < 3600) },
+
+  // WHAT MERGED IS ASKED FOR BETWEEN TWO CLOCKS (#342): from where the tick's
+  // last look reached, up to now. Only now is the clock. How far back the look
+  // reaches is behaviour, a week on a first look, so it stays on the page as
+  // its distance from now: a look that reached back nothing, or for ever, would
+  // show.
+  { name: "merges look clock", kind: "provenance",
+    apply: (s) => s.replace(MERGES_RE, (_, lead, since, mid, until) => `${lead}<now${offsetOf(Number(since), Number(until))}>${mid}<now>`),
+    cameFromTheHost: (t) => [...t.matchAll(MERGES_RE)].some((m) => Math.abs(Number(m[4]) - Date.now() / 1000) < 3600) },
 
   // MEASURED: six scenarios failed in CI against artifacts approved locally,
   // with no change to the tick at all. `spawnWorker` records an allow-rule

@@ -118,6 +118,19 @@ test("a judgment only reading again settles is made again next tick, and kept as
   }
 });
 
+test("a look never reaches back before where it started, though the earliest merge left merged in that very second", () => {
+  const w = world();
+  try {
+    w.look(T, []);
+    // Merged in the second of the last look, and listed only after it.
+    w.look(T + 300, [merge(7, 0)], () => verdict("UNKNOWN", "retry"));
+    assert.deepEqual(w.events(MERGES_LOOKED).map((e) => e.upTo), [T, T], "not a second further back each tick");
+    w.look(T + 600, [merge(7, 0)], () => verdict("PASS"));
+    assert.equal(w.asked.at(-1).since, T, "and it's asked from there, the merge's own second within it");
+    assert.deepEqual(w.events(MERGE_JUDGED).map((e) => e.subject), ["pr:7"]);
+  } finally { w.db.close(); }
+});
+
 test("an unknown only a person settles is kept at once: reading again changes nothing", () => {
   const w = world();
   try {
@@ -184,8 +197,8 @@ test("what merged is read with what judging it needs: its branches, its title, a
                    [[7, "main", "feature", "a pull request", "merge-policy[bot]"], [8, "release", "fix", "another", "someone"]]);
   // A person whose login starts as an App's is named in gh isn't one.
   assert.equal(/** @type {any[]} */ (read([{ ...rows[1], author: { login: "app/le", is_bot: false } }], { whole: true }))[0].author, "app/le");
-  // One with no base named doesn't read whole, and vouches for nothing.
-  assert.match(/** @type {any} */ (read([{ ...rows[0], baseRefName: "" }], { whole: true })).why ?? "", /doesn't read whole/);
+  // One with no base named vouches for nothing.
+  assert.match(/** @type {any} */ (read([{ ...rows[0], baseRefName: "" }], { whole: true })).why ?? "", /no base named/);
   // Unasked, none of it is read, and the read is the one the trial's report makes.
   const plain = /** @type {any[]} */ (read(rows));
   assert.match(asked.at(-1)?.join(" ") ?? "", /--json number,mergedAt,headRefOid,mergeCommit --limit/);
@@ -211,7 +224,9 @@ test("a tick judges what merged since its last look, and a look that fails doesn
     assert.ok(kept[0].seq < tickEnd.seq, "within the tick");
   } finally { db.close(); }
   // A look that throws is said, and the tick ends as any other.
-  const thrown = await run({ evaluate: () => ({ ok: false, why: "not this test's" }), mergedSince: () => { throw new Error("gh isn't there"); } });
+  /** @type {any} */ let thrown = null;
+  await assert.doesNotReject(async () => { thrown = await run({ evaluate: () => ({ ok: false, why: "not this test's" }), mergedSince: () => { throw new Error("gh isn't there"); } }); },
+                             "a look that throws doesn't fail the tick");
   assert.match(thrown.log, /merges: judging what merged failed[^\n]*gh isn't there/);
   assert.equal(thrown.r.halted, false);
   // Unread, as GitHub out of reach leaves it, none is judged and the tick says why.

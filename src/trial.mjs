@@ -38,7 +38,8 @@ export const CASE_KINDS = Object.freeze([
 ]);
 
 /**
- * @typedef {{ pr: number, mergedAt: number, head: string, mergeCommit: string | null }} Merged
+ * @typedef {{ pr: number, mergedAt: number, head: string, mergeCommit: string | null,
+ *             baseRef?: string, headRef?: string, author?: string | null, title?: string }} Merged
  * @typedef {"right" | "false pass" | "false block"} Mark
  * @typedef {{ mark: Mark, by: string, at: number, note: string, to: number }} Audited
  * @typedef {{ id: string, where: "head" | "queue", pr: number, head: string, state: string, summary: string, why: string, reasons: { why: string, ticks: number }[],
@@ -1001,16 +1002,18 @@ function gh(args) {
  * time: one merged while the report was made belongs to the next, as the
  * store's decisions are read only up to that time (#295). `why` where it
  * couldn't be read, which vouches for nothing, or where there may be more than
- * one read holds.
- * @param {string} nwo @param {number} since @param {{ run?: typeof gh, limit?: number, until?: number | null }} [o]
+ * one read holds. `whole` asks for what judging a merge needs too (#342): its
+ * base and head branches, its title, and its author, by the login GitHub's
+ * REST API gives, an App's ending in [bot].
+ * @param {string} nwo @param {number} since @param {{ run?: typeof gh, limit?: number, until?: number | null, whole?: boolean }} [o]
  * @returns {Merged[] | { why: string }}
  */
-export function mergedSince(nwo, since, { run = gh, limit = 1000, until = null } = {}) {
+export function mergedSince(nwo, since, { run = gh, limit = 1000, until = null, whole = false } = {}) {
   const iso = (/** @type {number} */ t) => new Date(t * 1000).toISOString().replace(/\.\d+Z$/, "Z");
   // Bounded at `until` in the search too, so merges after the period don't
   // fill the one read the period's own merges must fit in.
   const r = run(["pr", "list", "--repo", nwo, "--state", "merged", "--search", until == null ? `merged:>=${iso(since)}` : `merged:${iso(since)}..${iso(until)}`,
-                 "--json", "number,mergedAt,headRefOid,mergeCommit", "--limit", String(limit)]);
+                 "--json", "number,mergedAt,headRefOid,mergeCommit" + (whole ? ",baseRefName,headRefName,author,title" : ""), "--limit", String(limit)]);
   if (!r.ok) return { why: r.err || "gh failed" };
   let rows;
   try { rows = JSON.parse(r.out); } catch { return { why: "GitHub's answer doesn't read as a list of pull requests" }; }
@@ -1024,7 +1027,13 @@ export function mergedSince(nwo, since, { run = gh, limit = 1000, until = null }
     if (!Number.isSafeInteger(x?.number) || !Number.isFinite(at) || typeof x?.headRefOid !== "string" || !/^[0-9a-f]{40}$/.test(x.headRefOid) ||
         (mergeCommit !== null && !/^[0-9a-f]{40}$/.test(String(mergeCommit))))
       return { why: `GitHub's answer holds a pull request that doesn't read whole: ${JSON.stringify(x).slice(0, 120)}` };
-    if (at / 1000 >= since && (until == null || at / 1000 <= until)) out.push({ pr: x.number, mergedAt: Math.floor(at / 1000), head: x.headRefOid, mergeCommit });
+    if (whole && (typeof x.baseRefName !== "string" || !x.baseRefName))
+      return { why: `GitHub's answer holds a merged pull request with no base named: ${JSON.stringify(x).slice(0, 120)}` };
+    // gh names an App's login app/<slug>; GitHub's REST API, which the rest of reeve reads, <slug>[bot].
+    const login = typeof x.author?.login === "string" ? x.author.login : null;
+    const more = !whole ? {} : { baseRef: x.baseRefName, headRef: typeof x.headRefName === "string" ? x.headRefName : "", title: typeof x.title === "string" ? x.title : "",
+                                  author: login !== null && x.author.is_bot === true && login.startsWith("app/") ? `${login.slice(4)}[bot]` : login };
+    if (at / 1000 >= since && (until == null || at / 1000 <= until)) out.push({ pr: x.number, mergedAt: Math.floor(at / 1000), head: x.headRefOid, mergeCommit, ...more });
   }
   return out.sort((a, b) => a.mergedAt - b.mergedAt);
 }

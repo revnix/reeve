@@ -31,6 +31,7 @@ import { canaryIdFor, netListener, instrumentHash, linuxProbeTargets, probeShape
 import { claimProvider, releaseProvider, bindProviderLease, noteRateLimit, heartbeatProvider,
          reapProviderLeases, cancelQueued, queuedGuardianRequests } from "./provider.mjs";
 import { openHold } from "./build/holds.mjs";
+import { judgeMerges } from "./merges.mjs";
 import { hubSession, NO_HUB } from "./build/hubsession.mjs";
 import { resolveRepoId } from "./build/repoid.mjs";
 import { readState, noteTick, noteTickStart, noteTickStopped, cleanMergeRate, noteEnforcement } from "./status.mjs";
@@ -4948,6 +4949,17 @@ async function tickOnce(ctx, ran) {
   if (ctx.reviewIngest !== false) {
     try { (ctx.deriveSupply ?? deriveSupply)(db, nwo, profile, { at: now() }); }
     catch (err) { log(logPath, `supply derive failed — ${err.message}`); }
+  }
+
+  // What merged since the last look, each judged once as it stood at its merge
+  // (#342): a merge between two ticks, or while the daemon was down, is judged
+  // after it rather than missed. Nothing is published for one, and a look that
+  // fails never fails the tick.
+  if (ctx.judgeMerges !== false) {
+    try {
+      (ctx.judgeMerges ?? judgeMerges)({ nwo, profile, db, now: now(), ran, merged: ctx.mergedSince, judge: ctx.judgeAtMerge,
+                                         log: (/** @type {string} */ line) => log(logPath, line) });
+    } catch (err) { log(logPath, `merges: judging what merged failed — ${err.message}`); }
   }
 
   noteTick(db, now(), witnessedAt === null ? ran : { ...ran, witnessed: witnessedAt });

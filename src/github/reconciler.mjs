@@ -411,41 +411,50 @@ export function mergedOnto(nwo, baseRef, mergeCommit, mergedAt, now = Math.floor
  * merges on 2026-10-03; a minute allows for a slow one.
  */
 const QUEUE_PUSH_DATED_WITHIN = 60;
+/** How many pages of a merge commit's ancestors, a hundred commits each, are read for the tip its push went on from. */
+const ANCESTOR_PAGES_AT_MOST = 3;
 
 /**
  * The tip a push of the merge queue went onto, for a merge the push carried
  * that isn't its last (#357). The queue can put several merges on the branch
  * in one push, which GitHub's activity records once, ending at the last one's
  * commit. Each merge of the push has the one before it as its first parent,
- * and the first has the tip before the push. So the merge commit's first
- * parents are followed, through one page of its ancestors as GitHub lists
- * them, a commit before its parent, down to a tip that one push of the queue
- * went on from. That push has to be the one at the merge's own time, recorded
- * in the minute up to it and not after: a branch
- * set back to a commit of the push, and built on again, has a later push of the
- * queue from that commit, which carried other merges. And GitHub's comparison
- * of the push's two ends has to list the merge's commit. Null where any of it
- * isn't shown.
+ * and the first has the tip before the push; merging by rebase, each of a
+ * pull request's commits has. So the merge commit's first parents are
+ * followed, through a few pages of its ancestors as GitHub lists them, a
+ * commit before its parent, down to a tip that one push of the queue went on
+ * from.
+ *
+ * Only a push at the merge's own time counts, recorded in the minute up to it
+ * and not after, and ending at a commit (#359): a branch set back to a commit
+ * of the push, or to its tip, and built on again, has other records from
+ * there, which carried other merges. A tip only those went on from is passed
+ * by. Two such pushes from one tip leave which carried the merge unknown.
+ *
+ * And the push has to have carried the merge: its end comes after the merge's
+ * commit, as GitHub's comparison of the two says, which with the tip before
+ * the merge's commit, by its first parents, puts the commit in the push,
+ * however many commits that is. Null where any of it isn't shown.
  * @param {string} nwo @param {string} mergeCommit @param {any[]} activity the branch's records @param {number} mergedAt when it merged, in seconds
  */
 function queuedOnto(nwo, mergeCommit, activity, mergedAt) {
-  const listed = gh(`repos/${nwo}/commits?sha=${mergeCommit}&per_page=100`, ".[] | {sha, parent: .parents[0].sha} | @json");
+  const pushes = activity.filter(x => {
+    const since = mergedAt - Date.parse(String(x?.timestamp)) / 1000;
+    return x?.activity_type === "merge_queue_merge" && /^[0-9a-f]{40}$/.test(String(x.after)) && since >= 0 && since <= QUEUE_PUSH_DATED_WITHIN;
+  });
   let at = mergeCommit;
-  for (const line of listed.out.split("\n").filter(Boolean)) {
-    let c; try { c = JSON.parse(line); } catch { return null; }
-    if (c?.sha !== at) continue;
-    at = c.parent;
-    if (!/^[0-9a-f]{40}$/.test(String(at))) return null;
-    const from = activity.filter(x => x?.before === at);
-    if (!from.length) continue;
-    if (from.length !== 1 || from[0].activity_type !== "merge_queue_merge" || !/^[0-9a-f]{40}$/.test(String(from[0].after))) return null;
-    const since = mergedAt - Date.parse(String(from[0].timestamp)) / 1000;
-    if (!(since >= 0 && since <= QUEUE_PUSH_DATED_WITHIN)) return null;
-    const compared = gh(`repos/${nwo}/compare/${at}...${from[0].after}`, "{status, commits: [.commits[].sha]} | @json");
-    try {
-      const got = JSON.parse(compared.out);
-      return got.status === "ahead" && got.commits.includes(mergeCommit) ? at : null;
-    } catch { return null; }
+  for (let page = 1; page <= ANCESTOR_PAGES_AT_MOST; page++) {
+    const listed = gh(`repos/${nwo}/commits?sha=${mergeCommit}&per_page=100&page=${page}`, ".[] | {sha, parent: .parents[0].sha} | @json");
+    for (const line of listed.out.split("\n").filter(Boolean)) {
+      let c; try { c = JSON.parse(line); } catch { return null; }
+      if (c?.sha !== at) continue;
+      at = c.parent;
+      if (!/^[0-9a-f]{40}$/.test(String(at))) return null;
+      const from = pushes.filter(x => x.before === at);
+      if (!from.length) continue;
+      if (from.length !== 1) return null;
+      return gh(`repos/${nwo}/compare/${mergeCommit}...${from[0].after}`, ".status").out === "ahead" ? at : null;
+    }
   }
   return null;
 }

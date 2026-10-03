@@ -236,6 +236,9 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
     appId: c.app?.id != null ? String(c.app.id) : null,
     // When it finished: GitHub accepts a required check's pass for seven days.
     completedAt: c.completed_at ?? null,
+    // Its check suite, the workflow run it's a job of: a job is skipped only
+    // for another of its own run (#344).
+    suiteId: c.check_suite?.id != null ? String(c.check_suite.id) : null,
   }));
   const st = gh(`repos/${nwo}/commits/${sha}/status?per_page=100`, ".statuses[]", { paginate: true });
   const stRead = parse(st, x => ({
@@ -284,9 +287,15 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
  * known: only theirs then count, failing, running or cancelled, and another's
  * failure is named in `ancillaryFailing` rather than held against every pull
  * request (#288). Null counts every check, as a base whose rules couldn't be
- * read, or that requires none, can't say which matter.
+ * read, or that requires none, can't say which matter. `decided`, a profile's
+ * `{ by, checks }`, names the job by which CI decides what a commit can affect
+ * and the required checks it may skip: one of them skipped passes as decided
+ * within its own workflow run, its check suite, where that job ran and
+ * succeeded, every other job skipped there is one it may skip, and every other
+ * one succeeded or still runs. A job is skipped only for one of its own run
+ * that didn't succeed, and looks the same as one skipped by decision (#344).
  */
-export function classify(allRows, requiredChecks = [], { requiredKnown = true, evidence = true, queueOnly = [], failuresOf = null } = {}) {
+export function classify(allRows, requiredChecks = [], { requiredKnown = true, evidence = true, queueOnly = [], failuresOf = null, decided = null } = {}) {
   // A row with no name is a PARSE DEFECT, not a check. It cannot be reported to a
   // fixer ("failing: undefined") and it must not block on its own, but it must
   // also not vanish silently, so it is counted and surfaced.
@@ -331,7 +340,15 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
   const notRunRequired = evidence ? required.filter(c => notRun(meeting(c))) : [];
   // Only skipped: one that failed was RED above, and one that never reported is missing.
   const deferred = notRunRequired.filter(c => queueOnly.includes(c.context) && meeting(c).every(r => r.conclusion === "skipped"));
-  const skipped = notRunRequired.filter(c => !deferred.includes(c));
+  const decidedSkip = (c) => meeting(c).every(s => {
+    const own = s.suiteId == null ? [] : rows.filter(r => r.suiteId === s.suiteId);
+    return own.some(r => r.name === decided?.by) && own.every(r =>
+      r.name === decided?.by ? r.conclusion === "success"
+      : r.conclusion === "skipped" ? (decided?.checks ?? []).includes(r.name)
+      : r.state !== "completed" || r.conclusion === "success");
+  });
+  const decidedOnes = notRunRequired.filter(c => !deferred.includes(c) && decidedSkip(c));
+  const skipped = notRunRequired.filter(c => !deferred.includes(c) && !decidedOnes.includes(c));
   if (skipped.length) return { verdict: "SKIPPED_REQUIRED", why: `required check(s) skipped or neutral, so they never reported a pass: ${skipped.map(label).join(", ")}`,
     failing, running, skipped: skipped.map(c => c.context), malformed };
   // Green needs the whole required set: a requirement unread may be one no row
@@ -339,6 +356,7 @@ export function classify(allRows, requiredChecks = [], { requiredKnown = true, e
   const green = (result) => (evidence && !requiredKnown ? { verdict: "UNKNOWN", failing: [], running: [], malformed,
     why: "the base's required checks couldn't be read, so whether each one passed can't be told" }
     : { ...result, ...(deferred.length ? { queueOnly: deferred.map(c => c.context) } : {}),
+        ...(decidedOnes.length ? { decided: decidedOnes.map(c => c.context), decidedBy: decided?.by } : {}),
         ...(ancillaryFailing.length ? { ancillaryFailing } : {}) });
   // A head where nothing ran has no evidence at all, however many rows say so.
   // Unless every required check was left to the merge queue: then the head

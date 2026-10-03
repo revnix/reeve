@@ -116,8 +116,12 @@ export function computeVerdict(i) {
   else if (i.checks.verdict === "GREEN") {
     // Named, so a pass here is never read as the queue's own check having run (#286).
     const q = i.checks.queueOnly ?? [];
-    add("ci", PASS, "all checks passing at the pinned head" +
-      (q.length ? `; ${q.join(" and ")} ${q.length === 1 ? "runs" : "run"} only in the merge queue, and ${q.length === 1 ? "is" : "are"} judged at its commit` : ""));
+    // And what passed without running, or failed where no rule requires it, named too (#344).
+    const decided = i.checks.decided ?? [], beside = i.checks.ancillaryFailing ?? [];
+    add("ci", PASS, `${beside.length ? "every required check" : "all checks"} passing at the pinned head` +
+      (q.length ? `; ${q.join(" and ")} ${q.length === 1 ? "runs" : "run"} only in the merge queue, and ${q.length === 1 ? "is" : "are"} judged at its commit` : "") +
+      (decided.length ? `; ${decided.join(" and ")} skipped, as ${i.checks.decidedBy} decided` : "") +
+      (beside.length ? `; ${beside.join(", ")} failing, which no rule requires` : ""));
   }
   else if (i.checks.verdict === "MISSING_REQUIRED" || i.checks.verdict === "SKIPPED_REQUIRED") add("ci", BLOCK, i.checks.why);
   else if (i.checks.verdict === "RED") {

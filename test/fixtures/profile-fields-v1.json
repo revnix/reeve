@@ -26,6 +26,8 @@
     "ci.appSlug",
     "ci.provider",
     "ci.queueOnlyChecks",
+    "ci.decidedSkips.by",
+    "ci.decidedSkips.checks",
     "ci.requiredChecks",
     "ci.reviewerStatusContexts",
     "identity.baseBranch",
@@ -81,7 +83,7 @@
     "worker.isolation",
     "worker.maxOutputBytes"
   ],
-  "count": 78,
-  "reference_sha256": "32ab102a593e99069433638da0436402943b62a04493ff2be4cd82f8846e2d78",
+  "count": 80,
+  "reference_sha256": "005b78ff7fc32df92f4a8d55e1b66677de0c30037ccca245d25541c60d34b928",
   "note": "a new key is deliberate: add it, regenerate the reference, and update both halves here"
 }

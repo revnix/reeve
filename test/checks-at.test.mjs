@@ -139,6 +139,26 @@ test("a reading at a time is whole or unread, and leaves out what readChecks lea
   assert.equal(withGh({ runs: [runJson("Build", "success", -60, -30)], suites: "many" }, () => r.readChecksAt("o/r", HEAD, T)).ok, false, "a count that doesn't read");
 });
 
+test("a status read now carries no id, as only a check run's leads to its job", async () => {
+  const r = await reconciler();
+  // The failure-cause reader takes a row with an id for a check run and asks Actions for its job (#342's fifth review).
+  const bin = tempDir("reeve-checks-now-bin-");
+  writeFileSync(join(bin, "gh"), `#!/bin/sh
+for a in "$@"; do case "$a" in repos/*) p="$a";; esac; done
+case "$p" in
+  */commits/${HEAD}/check-runs*) printf '%s\\n' '${runJson("Build", "failure", -60, -30)}';;
+  */commits/${HEAD}/status*) printf '%s\\n' '${statusJson("deploy", "failure", -30, 77)}';;
+esac
+`, { mode: 0o755 });
+  const path = process.env.PATH;
+  try {
+    process.env.PATH = `${bin}:${path}`;
+    const now = r.readChecks("o/r", HEAD);
+    assert.equal(now.ok, true, now.why);
+    assert.deepEqual(now.rows.map((/** @type {any} */ x) => [x.name, x.source, x.id ?? null]), [["Build", "check_run", "1"], ["deploy", "status", null]]);
+  } finally { process.env.PATH = path; rmSync(bin, { recursive: true, force: true }); }
+});
+
 test("the commit a merge went onto is the base branch's before the merge, as GitHub's activity records it", async () => {
   const r = await reconciler();
   assert.equal(typeof r.mergedOnto, "function", "mergedOnto");

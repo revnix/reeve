@@ -19859,7 +19859,7 @@ export const STUBS = [
     test: "test/checks-at.test.mjs",
     expectRed: "a check's attempt that finished by the time stands, and one begun since, or not yet, leaves what stood unknown",
     edits: [{ file: "src/github/reconciler.mjs",
-              find: "(a && (secs(a.begun) > secs(r.begun) || (secs(a.begun) === secs(r.begun) && Number(a.id) > Number(r.id))) ? a : r)",
+              find: "(a && (secs(a.begun) > secs(r.begun) || (secs(a.begun) === secs(r.begun) && a.rank > r.rank)) ? a : r)",
               replace: "r" }],
   },
   {
@@ -19886,7 +19886,7 @@ export const STUBS = [
     test: "test/checks-at.test.mjs",
     expectRed: "a check's attempt that finished by the time stands, and one begun since, or not yet, leaves what stood unknown",
     edits: [{ file: "src/github/reconciler.mjs",
-              find: "if (attempts.some(r => evidence.has(r) && !(secs(r.begun) < at) && (!stood || Number(r.id) > Number(stood.id))))",
+              find: "if (attempts.some(r => evidence.has(r) && !(secs(r.begun) < at) && (!stood || r.rank > stood.rank)))",
               replace: "if (false)" }],
   },
   {
@@ -19895,7 +19895,7 @@ export const STUBS = [
     test: "test/checks-at.test.mjs",
     expectRed: "a check's attempt that finished by the time stands, and one begun since, or not yet, leaves what stood unknown",
     edits: [{ file: "src/github/reconciler.mjs",
-              find: "(!stood || Number(r.id) > Number(stood.id))",
+              find: "(!stood || r.rank > stood.rank)",
               replace: "true" }],
   },
   {
@@ -20030,7 +20030,7 @@ export const STUBS = [
     test: "test/checks-at.test.mjs",
     expectRed: "a check's attempt that finished by the time stands, and one begun since, or not yet, leaves what stood unknown",
     edits: [{ file: "src/github/reconciler.mjs",
-              find: " || (secs(a.begun) === secs(r.begun) && Number(a.id) > Number(r.id))",
+              find: " || (secs(a.begun) === secs(r.begun) && a.rank > r.rank)",
               replace: "" }],
   },
   {
@@ -20061,12 +20061,12 @@ export const STUBS = [
               replace: "const vouched = (/** @type {any} */ r) => true || " }],
   },
   {
-    name: "status-carries-id",
-    why: "read a status without its id. Of two set in one second, the older could stand for the newer",
+    name: "at-time-status-rank",
+    why: "read a status at a time without its rank. Of two set in one second, the older could stand for the newer",
     test: "test/checks-at.test.mjs",
     expectRed: "a status stands as it was last set by the time, its context in any case",
     edits: [{ file: "src/github/reconciler.mjs",
-              find: "    id: x.id != null ? String(x.id) : null,\n",
-              replace: "" }],
+              find: "begun: x.created_at ?? null, rank: Number(x.id) }",
+              replace: "begun: x.created_at ?? null }" }],
   },
 ];

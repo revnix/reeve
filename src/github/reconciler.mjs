@@ -227,8 +227,6 @@ function checkRunRow(c) {
 function statusRow(x) {
   return {
     name: x.context, source: "status",
-    // Its own: of two set in one second, the newer by it (#342).
-    id: x.id != null ? String(x.id) : null,
     state: x.state === "pending" ? "running" : "completed",
     conclusion: x.state === "pending" ? null : x.state,
     // A rate-limited CodeRabbit reports state=success with the truth relegated
@@ -326,9 +324,11 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
 export function readChecksAt(nwo, sha, at, { reviewerContexts = [] } = {}) {
   /** @type {any[]} */ const runs = [], statuses = [];
   const cr = gh(`repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=all`, ".check_runs[]", { paginate: true });
-  const crRead = readLines(cr, c => ({ ...checkRunRow(c), begun: c.started_at ?? null }), runs);
+  // Each ranked by GitHub's own id, the newer the higher, kept to this reading:
+  // a status read now has none, as only a check run's id leads to its job.
+  const crRead = readLines(cr, c => ({ ...checkRunRow(c), begun: c.started_at ?? null, rank: Number(c.id) }), runs);
   const st = gh(`repos/${nwo}/commits/${sha}/statuses?per_page=100`, ".[]", { paginate: true });
-  const stRead = readLines(st, x => ({ ...statusRow(x), begun: x.created_at ?? null }), statuses);
+  const stRead = readLines(st, x => ({ ...statusRow(x), begun: x.created_at ?? null, rank: Number(x.id) }), statuses);
   // As GitHub counts them: a suite may hold no run, so the runs can't say.
   const suites = gh(`repos/${nwo}/commits/${sha}/check-suites?per_page=1`, ".total_count");
   const suiteCount = suites.ok && /^\d+$/.test(suites.out.trim()) ? Number(suites.out.trim()) : null;
@@ -344,9 +344,9 @@ export function readChecksAt(nwo, sha, at, { reviewerContexts = [] } = {}) {
   const evidence = new Set(excludeReviewerContexts(excludeOwnPolicy([...taken, ...statuses]).rows, reviewerContexts).rows);
   const secs = (/** @type {string | null} */ t) => (t == null ? NaN : Date.parse(t) / 1000);
   const by = (/** @type {any[]} */ xs, /** @type {(r: any) => string} */ key) => Map.groupBy(xs, key).values();
-  /** The one begun last before `at` of `xs`, the newer by its id of two begun in one second, or undefined. @param {any[]} xs */
+  /** The one begun last before `at` of `xs`, the newer by its rank of two begun in one second, or undefined. @param {any[]} xs */
   const last = (xs) => xs.filter(r => secs(r.begun) < at).reduce((a, r) =>
-    (a && (secs(a.begun) > secs(r.begun) || (secs(a.begun) === secs(r.begun) && Number(a.id) > Number(r.id))) ? a : r), undefined);
+    (a && (secs(a.begun) > secs(r.begun) || (secs(a.begun) === secs(r.begun) && a.rank > r.rank)) ? a : r), undefined);
   /** @type {any[]} */ const rows = [];
   let unsure = suiteCount === null ? `the commit's check suites couldn't be counted: ${suites.err || "the count doesn't read"}`
     : suiteCount > 1000 ? "more than a thousand check suites, past what GitHub lists"
@@ -354,15 +354,15 @@ export function readChecksAt(nwo, sha, at, { reviewerContexts = [] } = {}) {
       ? "a check began, finished or was set in the very second asked, which can't be put before it or after" : null;
   for (const attempts of by(taken, r => `${r.suiteId}\u0000${r.name}`)) {
     const stood = last(attempts);
-    if (attempts.some(r => evidence.has(r) && !(secs(r.begun) < at) && (!stood || Number(r.id) > Number(stood.id))))
+    if (attempts.some(r => evidence.has(r) && !(secs(r.begun) < at) && (!stood || r.rank > stood.rank)))
       unsure ??= `${attempts[0].name} has an attempt that began after the time asked, or hasn't begun, so what stood then can't be told`;
     if (!stood) continue;
-    const { begun: _b, ...r } = stood;
+    const { begun: _b, rank: _r, ...r } = stood;
     rows.push(r.state === "completed" && secs(r.completedAt) < at ? r : { ...r, state: "running", conclusion: null });
   }
   for (const set of by(statuses, r => String(r.name).toLowerCase())) {
     const stood = last(set);
-    if (stood) { const { begun: _b, ...r } = stood; rows.push(r); }
+    if (stood) { const { begun: _b, rank: _r, ...r } = stood; rows.push(r); }
   }
   return { ...counted(rows, unsure ? { ...cr, err: unsure } : cr, crRead && !unsure, st, stRead, reviewerContexts), unvouched };
 }

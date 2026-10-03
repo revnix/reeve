@@ -374,7 +374,8 @@ export function readChecksAt(nwo, sha, at, { reviewerContexts = [], ended = fals
   /** The rows taken, where `ended`, by a result that came after the time. @type {Set<any>} */ const after = new Set();
   let unsure = !suitesRead ? `the commit's check suites couldn't be read: ${suites.err || "they don't read"}`
     : suiteCount > 1000 ? "more than a thousand check suites, past what GitHub lists"
-    : [...evidence].some(r => secs(r.begun) === at || (r.source === "check_run" && secs(r.completedAt) === at))
+    // Read as each ended, a run finished in that second has the same result whichever side of it, and is taken.
+    : [...evidence].some(r => secs(r.begun) === at || (!ended && r.source === "check_run" && secs(r.completedAt) === at))
       ? "a check began, finished or was set in the very second asked, which can't be put before it or after" : null;
   for (const attempts of by(taken, r => `${r.suiteId}\u0000${r.name}`)) {
     const stood = last(attempts);

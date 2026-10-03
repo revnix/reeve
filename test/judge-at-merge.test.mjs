@@ -368,7 +368,11 @@ test("a merge onto a base whose own checks were still running is judged by how t
   // Ended without saying, cancelled say: every check there has ended, so reading again settles nothing, and it's for a person.
   const cancelled = base([runJson("Build", "cancelled", -100, 200)]);
   assert.deepEqual([cancelled.state, cancelled.kind], ["UNKNOWN", "person"], JSON.stringify(cancelled));
-  assert.match(String(cancelled.detail), /every check there has ended/);
+  assert.match(String(cancelled.detail), /Build ended without saying whether the base was healthy/);
+  // A base with no check reported yet isn't one whose checks have ended: one may report yet, so it waits.
+  const none = base([]);
+  assert.deepEqual([none.state, none.kind], ["UNKNOWN", "waiting"], JSON.stringify(none));
+  assert.doesNotMatch(String(none.detail), /ended/);
   // The head's own checks stay as they stood: a merge made before they finished isn't one they passed.
   const head = judged({ then: [runJson("Build", "success", -100, 200)], now: [], required: ["Build"] });
   assert.notEqual(head.ci.state, "PASS", JSON.stringify(head.ci));

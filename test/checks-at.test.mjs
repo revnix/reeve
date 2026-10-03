@@ -199,6 +199,12 @@ test("a commit's checks as each ended: one running at the time, or waiting to st
   // Still running now: running.
   got = ended({ runs: [runJson("Build", null, -600, null)] });
   assert.deepEqual([got.ok, shape(got), got.endedAfter], [true, [["Build", "running", null]], []]);
+  // Finished in the very second asked: as it stood that can't be put before the time or after, and as it ended it needn't be.
+  // Its result is the same either way, and it isn't said to have finished after.
+  const onTheSecond = { runs: [runJson("Build", "success", -600, 0)] };
+  assert.equal(stood(onTheSecond).ok, false, "as it stood: unread");
+  got = ended(onTheSecond);
+  assert.deepEqual([got.ok, shape(got), got.endedAfter], [true, [["Build", "completed", "success"]], []], got.why);
   // And one not finished carries no result, whatever a conclusion it reads with says.
   got = ended({ runs: [JSON.stringify({ ...JSON.parse(runJson("Build", null, -600, null)), conclusion: "success" })] });
   assert.deepEqual([shape(got), got.endedAfter], [[["Build", "running", null]], []]);

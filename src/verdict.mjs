@@ -159,8 +159,9 @@ export function computeVerdict(i) {
     else add("base", BLOCK, "the base branch is red; merging into it hides the next failure" + after);
   }
   else if (i.base.readable === false) add("base", UNKNOWN, `the base branch's checks couldn't be read${i.base.why ? `: ${i.base.why}` : ""}`, "retry", "read the base branch's checks again");
-  // Of a merge judged after it, with every check of its base ended (#352): they are read as they ended, so reading again says the same.
-  else if (i.base.stillRunning && !i.base.stillRunning.length) add("base", UNKNOWN, `base verdict ${i.base.verdict}: every check there has ended, and none says whether the base was healthy`, "person", "weigh the base the merge went onto by hand");
+  // Of a merge judged after it (#352): a check of its base that ended without saying, cancelled say, is read as it ended, so reading
+  // again says the same. One with no such check, none reported yet say, waits as any does: a check may report yet.
+  else if (i.base.endedUnsaid?.length) add("base", UNKNOWN, `base verdict ${i.base.verdict}: ${i.base.endedUnsaid.join(", ")} ended without saying whether the base was healthy`, "person", "weigh the base the merge went onto by hand");
   else add("base", UNKNOWN, `base verdict ${i.base.verdict}${i.base.stillRunning?.length ? `: ${i.base.stillRunning.join(", ")} still running` : ""}`, "waiting", "look again once the base branch's checks settle");
 
   // 3. Review coverage AT THIS HEAD, per blocking reviewer. Four states, never two:

@@ -779,9 +779,10 @@ const eachOnce = (list) => list.filter((c, i) => list.findIndex((d) => d.name ==
  *
  * For a merge judged after it (#352), `atMerge` adds what its base's reading
  * says of that: `endedAfter`, the checks taken as they ended after the merge;
- * `stillRunning`, those not finished yet; and `why`, where it couldn't be read.
+ * `stillRunning`, those not finished yet; `endedUnsaid`, those that ended
+ * without saying; and `why`, where it couldn't be read.
  * @param {{ verdict: string, readable?: boolean, failing?: any[] }} base
- * @param {{ complete?: boolean, inHead?: boolean | null, atMerge?: { endedAfter: string[], stillRunning: string[], why: string | null } | null }} [o]
+ * @param {{ complete?: boolean, inHead?: boolean | null, atMerge?: { endedAfter: string[], stillRunning: string[], endedUnsaid: string[], why: string | null } | null }} [o]
  */
 export const baseHealthOf = (base, { complete = false, inHead = null, atMerge = null } = {}) => ({
   verdict: base.verdict, readable: base.readable !== false, complete, inHead, ...(atMerge ?? {}),
@@ -975,10 +976,12 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     ? classifyRead(baseRead, { required: profile.ci?.requiredChecks ?? [], failuresOf: gatingOf(req) }, { evidence: false })
     : { verdict: "UNKNOWN", readable: false };
   // What a merge judged after it says of its base's reading (#352): the checks taken as they ended after the
-  // merge, those not finished yet, and why it couldn't be read. A pull request judged now says none of it.
+  // merge, those not finished yet, those that ended without saying whether the base was healthy, cancelled say,
+  // and why it couldn't be read. A pull request judged now says none of it.
   const atMerge = !asOf ? null : {
     endedAfter: /** @type {any} */ (baseRead)?.endedAfter ?? [],
     stillRunning: [...new Set((/** @type {any} */ (base).running ?? []).map((/** @type {any} */ r) => String(r?.name ?? r)))],
+    endedUnsaid: [...new Set((/** @type {any} */ (base).uninformative ?? []).map((/** @type {any} */ r) => String(r?.name ?? r)))],
     why: !baseHead.ok ? baseHead.why
       : baseDoubtful.length ? `${baseDoubtful.join(", ")} there ${baseDoubtful.length === 1 ? "is" : "are"} another App's, which it may have rewritten since`
       : baseAll?.ok === false ? baseAll.why ?? null : null };

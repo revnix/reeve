@@ -198,34 +198,11 @@ export function excludeReviewerContexts(rows, contexts = []) {
 }
 
 /**
- * Every check at a SHA, from both surfaces. Returns rows normalised to
- * {name, source, state, conclusion, id}. `state` is "completed" or "running".
- *
- * `reviewerContexts` comes from the profile. It is applied HERE, beside the
- * own-policy exclusion and for the same reason: the base head is read through
- * this same function, and a caller that forgot would reintroduce the fail-open
- * silently. test/reviewer-status.test.mjs asserts every call site supplies it.
+ * A check run as reeve reads one: `state` is "completed" or "running".
+ * @param {any} c
  */
-export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
-  const rows = [];
-  // JSON, not TSV. A commit-status description may contain a newline or a tab,
-  // and a TSV parse then splits it into a phantom row whose "name" is a fragment
-  // of the description and whose conclusion is undefined — which classifies as a
-  // failure and reports "failing: undefined" to the fixer.
-  //
-  // Every page, one JSON value per line. A page holds 100 runs, and statuses
-  // came 30 to a page, so a check past the first page went unread. A surface
-  // counts as read only when every line of every page was.
-  const parse = (r, fn) => {
-    if (!r.ok) return false;
-    for (const line of r.out.split("\n").filter(Boolean)) {
-      let item; try { item = JSON.parse(line); } catch { return false; }
-      const row = fn(item); if (row && row.name) rows.push(row);
-    }
-    return true;
-  };
-  const cr = gh(`repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=latest`, ".check_runs[]", { paginate: true });
-  const crRead = parse(cr, c => ({
+function checkRunRow(c) {
+  return {
     name: c.name, source: "check_run",
     state: c.status === "completed" ? "completed" : "running",
     conclusion: c.conclusion || null, id: c.id != null ? String(c.id) : null,
@@ -239,10 +216,16 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
     // Its check suite, the workflow run it's a job of: a job is skipped only
     // for another of its own run (#344).
     suiteId: c.check_suite?.id != null ? String(c.check_suite.id) : null,
-  }));
-  const st = gh(`repos/${nwo}/commits/${sha}/status?per_page=100`, ".statuses[]", { paginate: true });
-  const stRead = parse(st, x => ({
-    // A StatusContext has .state and no .conclusion. "pending" is in flight.
+  };
+}
+
+/**
+ * A commit status as reeve reads one. It has .state and no .conclusion, and
+ * "pending" is in flight.
+ * @param {any} x
+ */
+function statusRow(x) {
+  return {
     name: x.context, source: "status",
     state: x.state === "pending" ? "running" : "completed",
     conclusion: x.state === "pending" ? null : x.state,
@@ -250,7 +233,39 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
     // here, so the description is carried rather than discarded.
     description: x.description ?? "",
     completedAt: x.updated_at ?? x.created_at ?? null,
-  }));
+  };
+}
+
+/**
+ * Each line of a read added to `rows` as `fn` makes it, or false where the read
+ * failed or a line didn't read.
+ *
+ * JSON, not TSV. A commit-status description may contain a newline or a tab,
+ * and a TSV parse then splits it into a phantom row whose "name" is a fragment
+ * of the description and whose conclusion is undefined — which classifies as a
+ * failure and reports "failing: undefined" to the fixer.
+ *
+ * Every page, one JSON value per line. A page holds 100 runs, and statuses
+ * came 30 to a page, so a check past the first page went unread. A surface
+ * counts as read only when every line of every page was.
+ * @param {{ ok: boolean, out: string }} r @param {(item: any) => any} fn @param {any[]} rows
+ */
+function readLines(r, fn, rows) {
+  if (!r.ok) return false;
+  for (const line of r.out.split("\n").filter(Boolean)) {
+    let item; try { item = JSON.parse(line); } catch { return false; }
+    const row = fn(item); if (row && row.name) rows.push(row);
+  }
+  return true;
+}
+
+/**
+ * What a read of both surfaces counts: reeve's own check and the reviewers'
+ * statuses left out, and `ok` only where both were read in full.
+ * @param {any[]} rows @param {{ ok: boolean, err?: string }} cr @param {boolean} crRead
+ * @param {{ ok: boolean, err?: string }} st @param {boolean} stRead @param {string[]} reviewerContexts
+ */
+function counted(rows, cr, crRead, st, stRead, reviewerContexts) {
   // Filtered HERE rather than by each caller: the base head is read through this
   // same function, and a caller that forgot would reintroduce the latch silently.
   const own = excludeOwnPolicy(rows);
@@ -265,6 +280,67 @@ export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
   return { ok, rows: rev.rows, reviewerRows: rev.reviewerRows,
            excluded: own.excluded, impostors: own.impostors,
            why: ok ? null : !crRead ? (cr.err || "check runs couldn't be parsed") : (st.err || "statuses couldn't be parsed") };
+}
+
+/**
+ * Every check at a SHA, from both surfaces. Returns rows normalised to
+ * {name, source, state, conclusion, id}. `state` is "completed" or "running".
+ *
+ * `reviewerContexts` comes from the profile. It is applied HERE, beside the
+ * own-policy exclusion and for the same reason: the base head is read through
+ * this same function, and a caller that forgot would reintroduce the fail-open
+ * silently. test/reviewer-status.test.mjs asserts every call site supplies it.
+ */
+export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
+  /** @type {any[]} */ const rows = [];
+  const cr = gh(`repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=latest`, ".check_runs[]", { paginate: true });
+  const crRead = readLines(cr, checkRunRow, rows);
+  const st = gh(`repos/${nwo}/commits/${sha}/status?per_page=100`, ".statuses[]", { paginate: true });
+  const stRead = readLines(st, statusRow, rows);
+  return counted(rows, cr, crRead, st, stRead, reviewerContexts);
+}
+
+/**
+ * Every check at a SHA as it stood at `at`, in seconds (#342): what a merge was
+ * judged on, read after it. GitHub's latest attempt of a check may be one begun
+ * since, and a status may have been set again, so every attempt and every
+ * status is read, and the one that stood is kept:
+ *   - per check, its suite and name, the attempt begun last by then, running
+ *     where it finished after;
+ *   - per status, the one set last by then.
+ * One begun or set after it wasn't there. Left out as readChecks leaves them out.
+ * @param {string} nwo @param {string} sha @param {number} at @param {{ reviewerContexts?: string[] }} [o]
+ */
+export function readChecksAt(nwo, sha, at, { reviewerContexts = [] } = {}) {
+  /** @type {any[]} */ const runs = [], statuses = [];
+  const cr = gh(`repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=all`, ".check_runs[]", { paginate: true });
+  const crRead = readLines(cr, c => ({ ...checkRunRow(c), begun: c.started_at ?? null }), runs);
+  const st = gh(`repos/${nwo}/commits/${sha}/statuses?per_page=100`, ".[]", { paginate: true });
+  const stRead = readLines(st, x => ({ ...statusRow(x), begun: x.created_at ?? null }), statuses);
+  const secs = (/** @type {string | null} */ t) => (t == null ? NaN : Date.parse(t) / 1000);
+  /** The row begun last by `at` under each key. @param {any[]} xs @param {(r: any) => string} key */
+  const stood = (xs, key) => {
+    const last = new Map();
+    for (const r of xs) if (secs(r.begun) <= at && !(secs(last.get(key(r))?.begun) >= secs(r.begun))) last.set(key(r), r);
+    return [...last.values()];
+  };
+  const rows = [
+    ...stood(runs, r => `${r.suiteId}\u0000${r.name}`)
+      .map(({ begun: _b, ...r }) => (r.state === "completed" && secs(r.completedAt) <= at ? r : { ...r, state: "running", conclusion: null })),
+    ...stood(statuses, r => r.name).map(({ begun: _b, ...r }) => r),
+  ];
+  return counted(rows, cr, crRead, st, stRead, reviewerContexts);
+}
+
+/**
+ * The commit a merge went onto, its merge commit's first parent, or null where
+ * that couldn't be read (#342).
+ * @param {string} nwo @param {string} mergeCommit
+ */
+export function mergedOnto(nwo, mergeCommit) {
+  const r = gh(`repos/${nwo}/commits/${mergeCommit}`, ".parents[0].sha // empty");
+  const sha = r.ok ? r.out.trim() : "";
+  return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
 }
 
 /**

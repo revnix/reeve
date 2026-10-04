@@ -664,20 +664,21 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
 // both worked, and only these paths closed them.
 const linuxOnly = (name, run) => (process.platform === "linux" ? run() : test(name, { skip: `Linux only; this is ${process.platform}` }, () => {}));
 {
-  check(JSON.stringify(hostEscapePaths({ platform: "linux", uid: 1000 })) === JSON.stringify(["/mnt", "/run/WSL", "/run/user/1000", "/run/dbus"])
-    && hostEscapePaths({ platform: "darwin", uid: 501 }).length === 0,
+  const mounts = "";
+  check(JSON.stringify(hostEscapePaths({ platform: "linux", uid: 1000, mounts })) === JSON.stringify(["/mnt", "/run/WSL", "/run/user/1000", "/run/dbus"])
+    && hostEscapePaths({ platform: "darwin", uid: 501, mounts }).length === 0,
     "on Linux the host's ways out are /mnt, WSL's interop sockets, the session's runtime directory and the system bus, and elsewhere there are none",
-    JSON.stringify({ linux: hostEscapePaths({ platform: "linux", uid: 1000 }), darwin: hostEscapePaths({ platform: "darwin", uid: 501 }) }));
+    JSON.stringify({ linux: hostEscapePaths({ platform: "linux", uid: 1000, mounts }), darwin: hostEscapePaths({ platform: "darwin", uid: 501, mounts }) }));
   check(["~/.local/share/keyrings", "~/.config/gh"].every(p => CREDENTIAL_PATHS.includes(p)),
     "Linux's credential stores are denied by path: GNOME Keyring's files, and gh's config", JSON.stringify(CREDENTIAL_PATHS.slice(-3)));
   linuxOnly("the host's ways out are denied to the shell and to the Read tool", () => {
-    const s = sandboxFor({ profile, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: TMP });
-    const host = hostEscapePaths();
+    const s = sandboxFor({ profile, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: TMP, mounts });
+    const host = hostEscapePaths({ mounts });
     check(host.length === 4 && host.every(p => s.settings.sandbox.filesystem.denyRead.includes(p)) && host.every(p => s.settings.permissions.deny.includes(`Read(/${p}/**)`)),
       "the host's ways out are denied to the shell and to the Read tool", JSON.stringify({ host, deny: s.settings.permissions.deny.filter(d => /\/(mnt|run)\//.test(d)) }));
     const open = structuredClone(s.settings);
     open.sandbox.filesystem.denyRead = open.sandbox.filesystem.denyRead.filter(p => p !== "/mnt");
-    const v = validateSettings(open, { tmpDir: TMP });
+    const v = validateSettings(open, { tmpDir: TMP, mounts });
     check(!v.ok && v.errors.some(e => e.includes("/mnt")), "a Linux policy that leaves /mnt readable is refused", JSON.stringify(v.errors));
   });
 

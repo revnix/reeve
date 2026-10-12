@@ -50,6 +50,26 @@ const seedTasks = (db, n) => {
   return ids;
 };
 const CLI = fileURLToPath(new URL("../bin/reeve", import.meta.url));
+/**
+ * A profile that is deliverable on EVERY platform.
+ *
+ * NOT `{ desktop: true }`. The desktop channel runs `osascript`, which exists on
+ * macOS alone, so a desktop-only profile is deliverable on a developer's Mac and
+ * refused on CI's Ubuntu -- and a fixture built on it asserts one thing here and
+ * the opposite there. Ten fixtures had that dependency and the suite was green
+ * locally and red in CI for exactly that reason.
+ *
+ * ntfy with a readable credential is deliverable wherever node runs, so a test
+ * that needs "a working profile" gets one without inheriting the host's identity.
+ * The platform rule is asserted in ONE place, by the test that is about it.
+ */
+const deliverableProfile = (home) => {
+  writeFileSync(join(home, "cred"), "user:pass");
+  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: {
+    provider: "ntfy", url: "http://127.0.0.1:9", topic: "t",
+    credentialFile: join(home, "cred") } }));
+};
+
 const KEY = escalationKey({ kind: "backup:failed" });
 const raise = (db, why, count, at) => db.prepare(
   `INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count)
@@ -136,7 +156,7 @@ const raise = (db, why, count, at) => db.prepare(
   // AND THEN IT DOES. This is the property the whole shape exists for.
   const sent = [];
   const send = (a) => { sent.push(a); return { ok: true, channels: [{ name: "t", ok: true, ref: "r" }] }; };
-  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: { desktop: true } }));
+  deliverableProfile(home);
   const after = pageStandingCauses(db, { home, at: NOW + 150, isAlive: ALIVE, send });
   check(sent.length === 1 && after.paged.length === 1,
     "a cause that could not be delivered is paged by the first pass that can",
@@ -161,7 +181,7 @@ const raise = (db, why, count, at) => db.prepare(
     "and a profile with no notify block says that, which is a third", machineProfile(c).why);
 
   const d = freshHome();
-  writeFileSync(machineProfilePath(d), JSON.stringify({ notify: { desktop: true } }));
+  deliverableProfile(d);
   check(machineProfile(d).profile !== null && machineProfile(d).why === null,
     "control: a profile carrying a notify block is accepted, so this refuses shapes and not files",
     JSON.stringify(machineProfile(d)));
@@ -201,7 +221,7 @@ const raise = (db, why, count, at) => db.prepare(
 // that recorded one event.
 {
   const home = freshHome(), db = hubOf(home);
-  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: { desktop: true } }));
+  deliverableProfile(home);
   raise(db, KEY, 1, NOW);
   const send = () => ({ ok: true, channels: [{ name: "t", ok: true, ref: "r" }] });
   const row = () => db.prepare("SELECT last_seen_at, announced_count FROM escalation WHERE why=?").get(KEY);
@@ -322,8 +342,10 @@ const raise = (db, why, count, at) => db.prepare(
   }
   // CONTROLS: both shapes `notify` actually builds a channel from are accepted,
   // so this refuses configurations rather than refusing configuration.
-  for (const [what, cfg] of [["desktop", { desktop: true }],
-                             ["a complete ntfy", { provider: "ntfy", url: "http://x", topic: "t",
+  // DESKTOP IS NOT IN THIS LIST, and that is the point: its deliverability depends
+  // on the platform, so it cannot serve as a general control for "a usable
+  // channel is accepted". It has its own test, which asserts on both platforms.
+  for (const [what, cfg] of [["a complete ntfy", { provider: "ntfy", url: "http://x", topic: "t",
                                                    credentialFile: "CRED" }]]) {
     const home = freshHome();
     writeFileSync(join(home, "cred"), "user:pass");
@@ -345,7 +367,7 @@ const raise = (db, why, count, at) => db.prepare(
 // costs a daemon its lease has cost more than it reported.
 {
   const home = freshHome(), db = hubOf(home);
-  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: { desktop: true } }));
+  deliverableProfile(home);
   const tasks = seedTasks(db, 8);
   check(tasks.length >= 6, "control: the fixture has enough tasks to exceed the bound",
     String(tasks.length));
@@ -390,7 +412,7 @@ const raise = (db, why, count, at) => db.prepare(
 // will believe what they find.
 {
   const home = freshHome(), db = hubOf(home);
-  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: { desktop: true } }));
+  deliverableProfile(home);
   const task = seedTasks(db, 1)[0];
   raise(db, `${task}:phase:blocked:RESEARCH`, 1, NOW);
   const sent = [];
@@ -422,7 +444,7 @@ const raise = (db, why, count, at) => db.prepare(
 
   // EVERY CAUSE IS REACHED ACROSS PASSES, which is the property the tail needs.
   const home = freshHome(), db = hubOf(home);
-  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: { desktop: true } }));
+  deliverableProfile(home);
   const ids = seedTasks(db, 4);
   for (const [i, id] of ids.entries()) raise(db, `${id}:phase:blocked:RESEARCH`, 1, NOW + i);
   const reached = new Set();
@@ -450,7 +472,7 @@ const raise = (db, why, count, at) => db.prepare(
 // three. This is the one unusable shape a config file cannot reveal.
 {
   const home = freshHome();
-  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: { desktop: true } }));
+  deliverableProfile(home);
   const m = machineProfile(home);
   if (process.platform === "darwin") {
     check(m.profile !== null,
@@ -477,7 +499,7 @@ const raise = (db, why, count, at) => db.prepare(
 // been dead for hours, and the row is marked announced so nothing retries it.
 {
   const home = freshHome(), db = hubOf(home);
-  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: { desktop: true } }));
+  deliverableProfile(home);
   raise(db, KEY, 1, NOW);
   const half = () => ({ ok: false, channels: [{ name: "desktop", ok: true, ref: "d" },
                                               { name: "ntfy", ok: false, why: "curl could not connect" }] });
@@ -508,7 +530,7 @@ const raise = (db, why, count, at) => db.prepare(
 // different hub, which is worse than failing.
 {
   const home = freshHome(), db = hubOf(home);
-  writeFileSync(machineProfilePath(home), JSON.stringify({ notify: { desktop: true } }));
+  deliverableProfile(home);
   const task = seedTasks(db, 1)[0];
   raise(db, `${task}:phase:blocked:RESEARCH`, 1, NOW);
   const sent = [];
